@@ -1,8 +1,16 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use crate::server::cluster_lobby::LOBBY_TELEPORT_ID;
 
 impl JavaClient {
     pub fn handle_confirm_teleport(&self, player: &Player, confirm_teleport: &SConfirmTeleport) {
+        if confirm_teleport.teleport_id == VarInt(LOBBY_TELEPORT_ID)
+            && player
+                .lobby_teleport_pending
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
         enum TeleportResult {
             Success,
             WrongId,

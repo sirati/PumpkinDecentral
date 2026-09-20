@@ -52,6 +52,9 @@ impl ServerPlayerData {
             .on_closed(player.as_ref());
         player.on_handled_screen_closed();
 
+        if pumpkin_world::level::is_cluster_secondary() {
+            return Ok(());
+        }
         let mut nbt = NbtCompound::new();
         player.write_nbt(&mut nbt);
 
@@ -64,6 +67,9 @@ impl ServerPlayerData {
     /// This function is called synchronously on the server tick loop to check
     /// if it is time to save player data.
     pub fn tick(&self, server: &Server) {
+        if pumpkin_world::level::is_cluster_secondary() {
+            return;
+        }
         let now = Instant::now();
 
         // Only save players periodically based on save_interval
@@ -103,6 +109,9 @@ impl ServerPlayerData {
     /// This function immediately saves all online players' data to disk.
     /// Useful for server shutdown or backup operations.
     pub fn save_all_players(&self, server: &Server) -> Result<(), PlayerDataError> {
+        if pumpkin_world::level::is_cluster_secondary() {
+            return Ok(());
+        }
         let mut total_players = 0;
 
         // Save players from all worlds
@@ -130,6 +139,9 @@ impl ServerPlayerData {
     ///
     /// A Result indicating success or the error that occurred.
     pub fn load_data(&self, uuid: &uuid::Uuid) -> Result<Option<NbtCompound>, PlayerDataError> {
+        if pumpkin_world::level::is_cluster_secondary() {
+            return Ok(None);
+        }
         let result = self.storage.load_player_data(uuid);
 
         match result {
@@ -166,6 +178,9 @@ impl ServerPlayerData {
     ///
     /// A Result indicating success or the error that occurred.
     pub fn extract_data_and_save_player(&self, player: &Player) -> Result<(), PlayerDataError> {
+        if pumpkin_world::level::is_cluster_secondary() {
+            return Ok(());
+        }
         if !self.storage.is_save_enabled() {
             return Ok(());
         }

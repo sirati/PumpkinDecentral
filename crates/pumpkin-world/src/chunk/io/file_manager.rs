@@ -480,6 +480,13 @@ where
         folder: &'a LevelFolder,
         chunks_data: Vec<(Vector2<i32>, Self::Data)>,
     ) -> Result<(), ChunkWritingError> {
+        if crate::level::is_cluster_secondary() {
+            debug!(
+                chunks = chunks_data.len(),
+                "refusing region write on cluster secondary (diskless); discarding"
+            );
+            return Ok(());
+        }
         match self {
             Self::Linear(io) => io.save_chunks(folder, chunks_data).await,
             Self::Anvil(io) => io.save_chunks(folder, chunks_data).await,

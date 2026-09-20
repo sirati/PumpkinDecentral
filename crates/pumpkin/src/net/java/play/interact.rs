@@ -1,5 +1,6 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use super::attack::attack_and_replicate;
 
 impl JavaClient {
     #[expect(clippy::too_many_lines)]
@@ -79,7 +80,15 @@ impl JavaClient {
                                     return;
                                 }
                             }
-                            player.attack(&event.target);
+                            attack_and_replicate(
+                                player,
+                                &event.target,
+                                player_target.is_some(),
+                                player_target
+                                    .as_ref()
+                                    .and_then(|victim| victim.cluster_gid()),
+                                server,
+                            );
                         }
                         ActionType::Interact | ActionType::InteractAt => {
                             if event.action == ActionType::InteractAt

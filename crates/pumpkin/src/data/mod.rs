@@ -3,6 +3,8 @@ use std::{env, fs, path::Path, sync::RwLock};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, warn};
 
+use pumpkin_world::level::is_cluster_secondary;
+
 const DATA_FOLDER: &str = "data/";
 
 pub mod op;
@@ -27,12 +29,26 @@ pub struct VanillaData {
 impl VanillaData {
     #[must_use]
     pub fn load() -> Self {
+        if is_cluster_secondary() {
+            return Self::empty();
+        }
         Self {
             banned_ip_list: RwLock::new(banned_ip::BannedIpList::load()),
             banned_player_list: RwLock::new(banned_player::BannedPlayerList::load()),
             operator_config: RwLock::new(op::OperatorConfig::load()),
             user_cache: RwLock::new(usercache::UserCache::load()),
             whitelist_config: RwLock::new(whitelist::WhitelistConfig::load()),
+        }
+    }
+
+    #[must_use]
+    pub fn empty() -> Self {
+        Self {
+            banned_ip_list: RwLock::new(banned_ip::BannedIpList::default()),
+            banned_player_list: RwLock::new(banned_player::BannedPlayerList::default()),
+            operator_config: RwLock::new(op::OperatorConfig::default()),
+            user_cache: RwLock::new(usercache::UserCache::default()),
+            whitelist_config: RwLock::new(whitelist::WhitelistConfig::default()),
         }
     }
 }
@@ -76,7 +92,9 @@ pub trait LoadJSONConfiguration {
         } else {
             let content = Self::default();
 
-            if let Ok(json_str) = serde_json::to_string_pretty(&content) {
+            if !pumpkin_world::level::is_cluster_secondary()
+                && let Ok(json_str) = serde_json::to_string_pretty(&content)
+            {
                 let _ = fs::write(&path, json_str);
             }
 
@@ -105,6 +123,9 @@ pub trait SaveJSONConfiguration: LoadJSONConfiguration {
         }
         let path = data_dir.join(Self::get_path());
 
+        if pumpkin_world::level::is_cluster_secondary() {
+            return;
+        }
         let content = match serde_json::to_string_pretty(self) {
             Ok(content) => content,
             Err(err) => {

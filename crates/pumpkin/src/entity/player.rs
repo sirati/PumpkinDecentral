@@ -496,6 +496,16 @@ pub struct Player {
     pub held_chunk_tickets: Mutex<Option<(Option<i8>, Option<i8>)>>,
     pub chunk_send_epoch: AtomicU32,
     pub has_played_before: AtomicBool,
+    /// Whether the client is parked in the cluster lobby wait room.
+    ///
+    /// While set, the player is not treated as logged in: their command source
+    /// carries no entity, selectors skip them, and only fake client-side lobby
+    /// data is shown. Cleared on handoff; never persisted to player data.
+    pub in_cluster_lobby: AtomicBool,
+    pub lobby_teleport_pending: AtomicBool,
+    pub lobby_hold: AtomicBool,
+    pub lobby_forced: AtomicBool,
+    pub cluster_login_announced: AtomicBool,
     root_vehicle_uuid: AtomicCell<Option<Uuid>>,
     pub chat_session: Arc<Mutex<ChatSession>>,
     pub signature_cache: Mutex<MessageCache>,
@@ -527,6 +537,7 @@ pub struct Player {
     pub spawn_extra_particles_on_fall: AtomicBool,
     /// Inbound packets waiting to be processed during player tick.
     pub inbound_packets: SegQueue<RawPacket>,
+    pub cluster_gid: arc_swap::ArcSwap<Option<pumpkin_cluster::identity::GlobalPlayerId>>,
 }
 
 use base64::prelude::*;
@@ -563,6 +574,12 @@ struct SkinMetadata {
 }
 
 impl Player {
+    pub fn cluster_gid(&self) -> Option<pumpkin_cluster::identity::GlobalPlayerId> {
+        **self.cluster_gid.load()
+    }
+    pub fn set_cluster_gid(&self, gid: Option<pumpkin_cluster::identity::GlobalPlayerId>) {
+        self.cluster_gid.store(std::sync::Arc::new(gid));
+    }
     #[must_use]
     pub fn fetch_skin(properties: &[Property]) -> Option<pumpkin_protocol::bedrock::client::Skin> {
         let textures_prop = properties.iter().find(|p| &*p.name == "textures")?;
@@ -798,6 +815,11 @@ impl Player {
             last_food_saturation: AtomicBool::new(true),
             subscribed_debug_sample: AtomicBool::new(false),
             has_played_before: AtomicBool::new(false),
+            in_cluster_lobby: AtomicBool::new(false),
+            lobby_teleport_pending: AtomicBool::new(false),
+            cluster_login_announced: AtomicBool::new(false),
+            lobby_hold: AtomicBool::new(false),
+            lobby_forced: AtomicBool::new(false),
             root_vehicle_uuid: AtomicCell::new(None),
             chat_session: Arc::new(Mutex::new(ChatSession::default())), // Placeholder value until the player actually sets their session id
             signature_cache: Mutex::new(MessageCache::default()),
@@ -826,6 +848,7 @@ impl Player {
             score: AtomicI32::new(0),
             spawn_extra_particles_on_fall: AtomicBool::new(false),
             inbound_packets: SegQueue::new(),
+            cluster_gid: ArcSwap::new(Arc::new(None)),
         }
     }
 
@@ -2553,6 +2576,10 @@ impl Player {
     #[expect(clippy::too_many_lines)]
     pub fn tick<'a>(&'a self, server: &'a Server) {
         self.process_inbound_packets();
+        crate::server::cluster_lobby::lobby_tick_on_player_tick(self, server);
+        if self.is_in_cluster_lobby() {
+            return;
+        }
 
         if self.is_spectator() {
             self.living_entity
@@ -6374,7 +6401,28 @@ impl Player {
         (!state.is_air()).then_some(fallback_pos)
     }
 
+    /// Reports whether this player is waiting in the cluster lobby.
+    ///
+    /// Lobby players are not logged in yet and own no server-side entity for
+    /// command purposes, even though their `Player` struct already exists.
+    #[must_use]
+    pub fn is_in_cluster_lobby(&self) -> bool {
+        self.in_cluster_lobby.load(Ordering::Relaxed)
+    }
+
+    /// Marks the player as waiting in (or released from) the cluster lobby.
+    ///
+    /// This is transient client-state bookkeeping only; it is never saved.
+    pub fn set_in_cluster_lobby(&self, in_lobby: bool) {
+        self.in_cluster_lobby.store(in_lobby, Ordering::Relaxed);
+    }
+
     pub fn get_command_source(self: &Arc<Self>, server: &Arc<Server>) -> CommandSource {
+        if self.is_in_cluster_lobby() {
+            let mut source = CommandSender::Player(self.clone()).into_source(server);
+            source.entity = None;
+            return source;
+        }
         CommandSender::Player(self.clone()).into_source(server)
     }
 
@@ -7692,6 +7740,25 @@ impl InventoryPlayer for Player {
     fn enqueue_equipment_change(&self, slot: &EquipmentSlot, stack: &ItemStack) {
         self.living_entity
             .send_equipment_changes(&[(slot.clone(), stack.clone())]);
+
+        if slot.is_armor_slot() {
+            let index = match slot {
+                EquipmentSlot::Feet(_) => 36,
+                EquipmentSlot::Legs(_) => 37,
+                EquipmentSlot::Chest(_) => 38,
+                EquipmentSlot::Head(_) => 39,
+                _ => return,
+            };
+            let item = if stack.is_empty() { 0 } else { stack.item.id };
+            pumpkin_cluster::visual::emit_armor(
+                self.cluster_gid(),
+                pumpkin_cluster::visual::tick_from_counter(
+                    self.tick_counter.load(Ordering::Relaxed),
+                ),
+                index,
+                item,
+            );
+        }
 
         if let Some(equippable) = stack.get_data_component::<EquippableImpl>() {
             self.world().play_sound_event(

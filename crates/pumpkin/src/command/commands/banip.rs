@@ -35,7 +35,12 @@ fn parse_ip(target: &str, server: &Server) -> Option<IpAddr> {
     IpAddr::from_str(target).ok().or_else(|| {
         server
             .get_player_by_name(target)
-            .map(|p| p.client.address().ip())
+            .or_else(|| {
+                server.get_all_players().into_iter().find(|player| {
+                    player.gameprofile.name.eq_ignore_ascii_case(target)
+                })
+            })
+            .map(|player| player.client.address().ip())
     })
 }
 

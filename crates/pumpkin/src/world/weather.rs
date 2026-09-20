@@ -69,10 +69,23 @@ impl Weather {
         self.thundering = thundering;
 
         if was_raining != raining {
+            let lobby_waiters: Vec<_> = world
+                .players
+                .load()
+                .iter()
+                .filter(|player| player.is_in_cluster_lobby())
+                .map(|player| player.gameprofile.id)
+                .collect();
             if was_raining {
-                world.broadcast_packet_all(&CGameEvent::new(GameEvent::EndRaining, 0.0));
+                world.broadcast_packet_except(
+                    &lobby_waiters,
+                    &CGameEvent::new(GameEvent::EndRaining, 0.0),
+                );
             } else {
-                world.broadcast_packet_all(&CGameEvent::new(GameEvent::BeginRaining, 0.0));
+                world.broadcast_packet_except(
+                    &lobby_waiters,
+                    &CGameEvent::new(GameEvent::BeginRaining, 0.0),
+                );
             }
         }
     }
@@ -99,18 +112,25 @@ impl Weather {
         }
 
         // Broadcast level changes if needed
+        let lobby_waiters: Vec<_> = world
+            .players
+            .load()
+            .iter()
+            .filter(|player| player.is_in_cluster_lobby())
+            .map(|player| player.gameprofile.id)
+            .collect();
         if (self.old_rain_level - self.rain_level).abs() > f32::EPSILON {
-            world.broadcast_packet_all(&CGameEvent::new(
-                GameEvent::RainLevelChange,
-                self.rain_level,
-            ));
+            world.broadcast_packet_except(
+                &lobby_waiters,
+                &CGameEvent::new(GameEvent::RainLevelChange, self.rain_level),
+            );
         }
 
         if (self.old_thunder_level - self.thunder_level).abs() > f32::EPSILON {
-            world.broadcast_packet_all(&CGameEvent::new(
-                GameEvent::ThunderLevelChange,
-                self.thunder_level,
-            ));
+            world.broadcast_packet_except(
+                &lobby_waiters,
+                &CGameEvent::new(GameEvent::ThunderLevelChange, self.thunder_level),
+            );
         }
     }
 

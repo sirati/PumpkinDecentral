@@ -27,6 +27,13 @@ impl BedrockClient {
 
         let inv = player.inventory();
         inv.set_selected_slot(slot);
+        pumpkin_cluster::visual::emit_held(
+            player.cluster_gid(),
+            pumpkin_cluster::visual::tick_from_counter(
+                player.tick_counter.load(Ordering::Relaxed),
+            ),
+            slot,
+        );
         let stack = inv.held_item();
         let equipment = &[(EquipmentSlot::MAIN_HAND, stack)];
         player.living_entity.send_equipment_changes(equipment);

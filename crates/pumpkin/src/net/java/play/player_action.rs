@@ -1,5 +1,11 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use crossbeam::queue::SegQueue;
+use pumpkin_cluster::break_emit::{capture_break, chunk_of_block, next_break_seq};
+use pumpkin_cluster::protocol::BreakBlockUpdate;
+use pumpkin_cluster::time::TickStamp;
+
+static BREAK_OUTBOX: SegQueue<BreakBlockUpdate> = SegQueue::new();
 
 impl JavaClient {
     #[expect(clippy::too_many_lines)]
@@ -80,6 +86,12 @@ impl JavaClient {
                             BlockFlags::NOTIFY_ALL | BlockFlags::SKIP_DROPS,
                         );
                         if new_state.is_some() {
+                            record_cluster_break_snapshot(
+                                player,
+                                server,
+                                position,
+                                state.id.as_u16(),
+                            );
                             server
                                 .block_registry
                                 .broken(&world, block, player, &position, server, state);
@@ -105,6 +117,12 @@ impl JavaClient {
                             };
                             let new_state = world.break_block(&position, Some(player), flags);
                             if new_state.is_some() {
+                                record_cluster_break_snapshot(
+                                    player,
+                                    server,
+                                    position,
+                                    broken_state.id.as_u16(),
+                                );
                                 server.block_registry.broken(
                                     &world,
                                     block,
@@ -215,6 +233,12 @@ impl JavaClient {
                         },
                     );
                     if new_state.is_some() {
+                        record_cluster_break_snapshot(
+                            player,
+                            server,
+                            location,
+                            state.id.as_u16(),
+                        );
                         server
                             .block_registry
                             .broken(&world, block, player, &location, server, state);
@@ -250,6 +274,20 @@ impl JavaClient {
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .clone();
                     if let Some(stack) = item_in_use {
+                        if stack
+                            .get_data_component::<
+                                pumpkin_data::data_component_impl::BlocksAttacksImpl,
+                            >()
+                            .is_some()
+                        {
+                            pumpkin_cluster::visual::emit_blocking(
+                                player.cluster_gid(),
+                                pumpkin_cluster::visual::tick_from_counter(
+                                    player.tick_counter.load(Ordering::Relaxed),
+                                ),
+                                false,
+                            );
+                        }
                         server.item_registry.on_stopped_using(&stack, player);
                     }
 
@@ -288,4 +326,54 @@ impl JavaClient {
             VarInt(i32::from(synced_state_id.as_u16())),
         ));
     }
+
+    pub fn drain_break_outbox() -> Vec<BreakBlockUpdate> {
+        let mut drained = Vec::new();
+        while let Some(update) = BREAK_OUTBOX.pop() {
+            drained.push(update);
+        }
+        drained
+    }
+
+    #[cfg(test)]
+    pub fn stage_break_for_test(update: BreakBlockUpdate) {
+        BREAK_OUTBOX.push(update);
+    }
+}
+
+fn record_cluster_break_snapshot(
+    player: &Player,
+    server: &Server,
+    position: BlockPos,
+    expected_old_state: u16,
+) {
+    if !server.advanced_config.cluster.enabled {
+        return;
+    }
+    let Some(gid) = player.cluster_gid() else {
+        return;
+    };
+    let chunk = chunk_of_block(position.0.x, position.0.z);
+    let update = capture_break(
+        gid,
+        next_break_seq(gid),
+        TickStamp::now(),
+        pumpkin_cluster::protocol::BlockPos {
+            x: position.0.x,
+            y: position.0.y,
+            z: position.0.z,
+        },
+        expected_old_state,
+        chunk,
+    );
+    BREAK_OUTBOX.push(update);
+    debug!(
+        expected_old_state = expected_old_state,
+        pos_x = position.0.x,
+        pos_y = position.0.y,
+        pos_z = position.0.z,
+        chunk_x = chunk.x,
+        chunk_z = chunk.z,
+        "cluster break snapshot"
+    );
 }

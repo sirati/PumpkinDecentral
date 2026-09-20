@@ -8,6 +8,7 @@ use crate::command::node::dispatcher::CommandDispatcher;
 use crate::command::node::{CommandExecutor, CommandExecutorResult};
 use pumpkin_util::PermissionLvl;
 use pumpkin_util::permission::{Permission, PermissionDefault, PermissionRegistry};
+use tracing::info;
 
 const NAME: &str = "say";
 
@@ -21,12 +22,24 @@ impl CommandExecutor for Executor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let msg = context.get_argument::<String>(ARG_MESSAGE)?;
 
-        context.server().broadcast_message(
+        let server = context.server();
+        server.broadcast_message(
             &TextComponent::text(msg.clone()),
             &context.source.display_name,
             SAY_COMMAND,
             None,
         );
+        if let Some(player) = context.source.player_or_none() {
+            info!("<chat> {}: {}", player.gameprofile.name, msg);
+            crate::server::cluster_chat_out::broadcast_say_from_player(server, &player, msg);
+        } else {
+            info!("<chat> {}: {}", context.source.name, msg);
+            crate::server::cluster_chat_out::broadcast_say_from_console(
+                server,
+                &context.source.name,
+                msg,
+            );
+        }
 
         Ok(1)
     }

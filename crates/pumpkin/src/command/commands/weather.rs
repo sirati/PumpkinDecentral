@@ -33,6 +33,7 @@ impl CommandExecutor for WeatherExecutor {
         };
 
         let world = context.source.world();
+        let server = context.server();
         let (message, return_val) = {
             let mut weather = world
                 .weather
@@ -84,6 +85,8 @@ impl CommandExecutor for WeatherExecutor {
                 }
             }
         };
+
+        crate::server::cluster_world_time::publish_weather_for_world(server, world);
 
         context.source.send_feedback(message, true);
 

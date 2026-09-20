@@ -34,6 +34,7 @@ fn ensure_dependency_chain_builds_multistage_chain() {
         chunk_pos,
         &mut holder,
         StagedChunkEnum::Surface,
+        false,
     );
 
     let start = (holder.current_stage as usize + 1).max(StagedChunkEnum::Empty as usize);
@@ -91,6 +92,7 @@ fn ensure_dependency_chain_resumes_partial_chain() {
         chunk_pos,
         &mut holder,
         StagedChunkEnum::Surface,
+        false,
     );
 
     // Dynamically calculate the next stage after Biomes instead of guessing
@@ -137,6 +139,7 @@ fn ensure_dependency_chain_does_nothing_if_already_met() {
         chunk_pos,
         &mut holder,
         StagedChunkEnum::Surface, // Requesting a lower stage than it currently is
+        false,
     );
 
     // Ensure the function returned early without creating any tasks or queueing anything
@@ -182,6 +185,7 @@ fn ensure_dependency_chain_respects_occupied_lock() {
         chunk_pos,
         &mut holder,
         StagedChunkEnum::Surface,
+        false,
     );
 
     let start = StagedChunkEnum::Empty as usize;
@@ -229,6 +233,7 @@ fn ensure_dependency_chain_early_return_skips_edge() {
         ChunkPos::new(0, 0),
         &mut holder,
         StagedChunkEnum::Empty,
+        false,
     );
 
     let dep_node = graph.nodes.get(dependency_task).unwrap();

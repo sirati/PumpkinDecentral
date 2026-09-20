@@ -207,14 +207,7 @@ pub async fn handle_packet(
         return Ok(());
     }
 
-    let players = server
-        .get_status()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .status_response
-        .players
-        .as_ref()
-        .map_or(0, |players| players.online) as i32;
+    let players = crate::server::cluster_status::cluster_status_online() as i32;
     let game_mode = server
         .defaultgamemode
         .lock()

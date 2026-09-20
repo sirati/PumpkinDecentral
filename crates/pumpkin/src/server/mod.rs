@@ -20,11 +20,15 @@ use crate::{
 use arc_swap::ArcSwap;
 use connection_cache::{CachedBranding, CachedStatus};
 use key_store::KeyStore;
-use pumpkin_config::{AdvancedConfiguration, BasicConfiguration, TelemetryConfig};
+use pumpkin_cluster::primary::{
+    DEFAULT_PRIMARY_SAVE_QUEUE_CAPACITY, PrimarySaveHandle, primary_save_channel,
+};
+use pumpkin_config::{AdvancedConfiguration, BasicConfiguration, ClusterRole, TelemetryConfig};
 use pumpkin_data::dimension::Dimension;
 use pumpkin_util::permission::PermissionManager;
 use pumpkin_util::text::color::NamedColor;
 use pumpkin_world::dimension::into_level;
+use pumpkin_world::level::set_cluster_secondary;
 use pumpkin_world::generation::generator::GeneratorInit;
 use pumpkin_world::world::WorldPortalExt;
 use tracing::{debug, error, info, warn};
@@ -50,6 +54,30 @@ use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
 use tokio_util::task::TaskTracker;
 
+pub mod cluster;
+pub mod cluster_admin_apply;
+pub mod cluster_chat_in;
+pub mod cluster_chat_out;
+pub mod cluster_chat_pm;
+pub mod cluster_combat_apply;
+pub mod cluster_datagram;
+pub mod cluster_entity_apply;
+pub mod cluster_entity_emit;
+/// Cluster-wide invsee snapshot and edit routing.
+pub mod cluster_invsee;
+pub mod cluster_lobby;
+pub mod cluster_world_apply;
+pub mod cluster_world_delta;
+pub mod cluster_world_time;
+pub mod cluster_transient;
+pub mod cluster_visual;
+pub mod cluster_moderation;
+pub mod cluster_movement_sample;
+pub mod cluster_hide;
+pub mod cluster_presence;
+pub mod cluster_regions;
+pub mod cluster_status;
+pub mod cluster_tick_pump;
 mod connection_cache;
 pub(crate) mod debug_profiler;
 pub mod enchantment;
@@ -118,6 +146,7 @@ pub struct Server {
     pub defaultgamemode: std::sync::Mutex<DefaultGamemode>,
     /// Manages player data storage
     pub player_data_storage: ServerPlayerData,
+    pub primary_save: Option<PrimarySaveHandle>,
     /// Command storage for `/data` command
     pub command_storage:
         std::sync::Mutex<std::collections::HashMap<String, pumpkin_nbt::compound::NbtCompound>>,
@@ -164,6 +193,12 @@ impl Server {
         telemetry_config: TelemetryConfig,
         vanilla_data: VanillaData,
     ) -> Arc<Self> {
+        let cluster_secondary_early = advanced_config.cluster.enabled
+            && matches!(advanced_config.cluster.role, ClusterRole::Secondary);
+        set_cluster_secondary(cluster_secondary_early);
+        if cluster_secondary_early {
+            info!("Cluster secondary: diskless mode, persistence delegated to primary");
+        }
         let permission_manager = Arc::new(PermissionManager::new());
         // First register the default commands. After that, plugins can put in their own.
         let command_dispatcher = ArcSwap::from_pointee(default_dispatcher(
@@ -191,6 +226,20 @@ impl Server {
                 level_info
             }
             Err(WorldInfoError::InfoNotFound) => {
+                if cluster_secondary_early {
+                    error!(
+                        "Cluster secondary found no {LEVEL_DAT_FILE_NAME} in {}; refusing to invent a seed",
+                        world_path.display()
+                    );
+                    error!(
+                        "Copy the primary's {LEVEL_DAT_FILE_NAME} into {} so every node generates the same terrain",
+                        world_path.display()
+                    );
+                    error!(
+                        "Run tools/cluster/collect-pins.sh to sync the primary seed before starting this secondary"
+                    );
+                    std::process::exit(1);
+                }
                 warn!(
                     "No {LEVEL_DAT_FILE_NAME} in {}, creating a new world with seed {}",
                     world_path.display(),
@@ -202,7 +251,11 @@ impl Server {
                 );
                 let default_data =
                     LevelData::from_world_generator(basic_config.seed, &overworld_gen);
-                if let Err(err) = AnvilLevelInfo.write_world_info(&default_data, &world_path) {
+                if cluster_secondary_early {
+                    info!("Cluster secondary: keeping fresh level info in memory only");
+                } else if let Err(err) =
+                    AnvilLevelInfo.write_world_info(&default_data, &world_path)
+                {
                     error!("Failed to save level.dat: {err}");
                 }
                 default_data
@@ -242,11 +295,11 @@ impl Server {
         let player_data_storage = ServerPlayerData::new(
             players_dir.join("data"),
             Duration::from_secs(advanced_config.player_data.save_player_cron_interval),
-            advanced_config.player_data.save_player_data,
+            advanced_config.player_data.save_player_data && !cluster_secondary_early,
         );
         let advancement_manager = Arc::new(AdvancementManager::new(
             players_dir.clone(),
-            advanced_config.advancement.save_advancements,
+            advanced_config.advancement.save_advancements && !cluster_secondary_early,
         ));
         let white_list = AtomicBool::new(basic_config.white_list);
 
@@ -277,6 +330,17 @@ impl Server {
             );
         }
 
+        let cluster_primary = advanced_config.cluster.enabled
+            && matches!(advanced_config.cluster.role, ClusterRole::Primary);
+        let cluster_secondary = advanced_config.cluster.enabled
+            && matches!(advanced_config.cluster.role, ClusterRole::Secondary);
+        let (primary_save, primary_inbox) = if cluster_primary {
+            let (handle, inbox) = primary_save_channel(DEFAULT_PRIMARY_SAVE_QUEUE_CAPACITY);
+            (Some(handle), Some(inbox))
+        } else {
+            (None, None)
+        };
+
         let server = Self {
             basic_config,
             advanced_config,
@@ -303,6 +367,7 @@ impl Server {
             map_manager: MapManager::new(),
             defaultgamemode,
             player_data_storage,
+            primary_save,
             command_storage: std::sync::Mutex::new(std::collections::HashMap::new()),
             stopwatches: std::sync::Mutex::new(crate::world::stopwatches::Stopwatches::new()),
             random_sequences: std::sync::Mutex::new(
@@ -326,6 +391,47 @@ impl Server {
             level_info,
         };
         let server = Arc::new(server);
+        {
+            let favicon = server
+                .listing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .status_response
+                .favicon
+                .clone();
+            cluster_status::install_favicon(favicon);
+        }
+        cluster_status::spawn_cluster_status_poller(&server);
+
+        if cluster_primary {
+            info!("Cluster primary: persisting accepted ticks; player logins are refused");
+            if let Some(inbox) = primary_inbox {
+                let saver = server.clone();
+                server.spawn_task(async move {
+                    inbox
+                        .run(
+                            |accepted| {
+                                debug!(
+                                    tick = accepted.tick.0,
+                                    bytes = accepted.payload.len(),
+                                    "Primary saver applying accepted tick"
+                                );
+                            },
+                            || {
+                                let saver = saver.clone();
+                                async move {
+                                    if let Err(err) = saver.save_all().await {
+                                        error!("Primary saver failed to persist world: {err}");
+                                    }
+                                }
+                            },
+                        )
+                        .await;
+                });
+            }
+        } else if cluster_secondary {
+            info!("Cluster secondary: persistence delegated to primary; disk saves disabled");
+        }
 
         // Fetch / generate keys in background tasks to avoid blocking startup
         let server_clone = server.clone();
@@ -425,6 +531,8 @@ impl Server {
         }
 
         server.worlds.store(Arc::new(worlds_vec));
+
+        crate::server::cluster::maybe_bootstrap(&server);
 
         info!("All worlds loaded successfully.");
 
@@ -533,7 +641,21 @@ impl Server {
         Ok(())
     }
 
+    pub(crate) fn persistence_delegated_to_primary(&self) -> bool {
+        self.advanced_config.cluster.enabled
+            && matches!(self.advanced_config.cluster.role, ClusterRole::Secondary)
+    }
+
+    fn is_cluster_primary(&self) -> bool {
+        self.advanced_config.cluster.enabled
+            && matches!(self.advanced_config.cluster.role, ClusterRole::Primary)
+    }
+
     pub fn save_world_info(&self) -> Result<(), WorldInfoError> {
+        if self.persistence_delegated_to_primary() {
+            debug!("Skipping level.dat write on cluster secondary (diskless)");
+            return Ok(());
+        }
         let level_data = self.level_info.load();
         self.world_info_writer
             .write_world_info(&level_data, &self.basic_config.get_world_path())
@@ -585,6 +707,11 @@ impl Server {
     }
 
     pub async fn save_all(&self) -> Result<(), String> {
+        if self.persistence_delegated_to_primary() {
+            debug!("Skipping disk save on cluster secondary; the primary persists world state");
+            return Ok(());
+        }
+
         if let Err(err) = self.save_world_info() {
             error!("Failed to save world info: {err}");
             return Err(format!("Failed to save world info: {err}"));
@@ -642,6 +769,14 @@ impl Server {
         profile: GameProfile,
         config: Option<PlayerConfig>,
     ) -> Option<(Arc<Player>, Arc<World>)> {
+        if self.is_cluster_primary() {
+            client.try_kick(
+                DisconnectReason::Kicked,
+                &TextComponent::text("This server is a cluster primary and hosts no players"),
+            );
+            return None;
+        }
+
         let gamemode = self
             .defaultgamemode
             .lock()
@@ -650,7 +785,9 @@ impl Server {
 
         let first_world = self.worlds.load().first().cloned()?;
 
-        let (world, nbt) = if let Ok(Some(data)) = self.player_data_storage.load_data(&profile.id) {
+        let (world, nbt) = if pumpkin_world::level::is_cluster_secondary() {
+            (first_world, None)
+        } else if let Ok(Some(data)) = self.player_data_storage.load_data(&profile.id) {
             if let Some(dimension_key) = data.get_string("Dimension") {
                 if let Some(dimension) = Dimension::from_name(dimension_key) {
                     let world = self.get_world_from_dimension(dimension);
@@ -685,6 +822,7 @@ impl Server {
 
         // Wrap in Arc after data is loaded
         let player = Arc::new(player);
+        let _ = cluster_presence::assign_login_gid(self, &player);
         {
             let mut advancements = player
                 .advancements
@@ -696,7 +834,7 @@ impl Server {
             advancements.player = Arc::downgrade(&player);
         };
 
-        send_cancellable_blocking! {{
+        let joined = send_cancellable_blocking! {{
             self;
             &mut PlayerLoginEvent::new(player.clone(), TextComponent::text("You have been kicked from the server"));
             'after: {
@@ -730,10 +868,15 @@ impl Server {
                 player.kick(DisconnectReason::Kicked, &event.kick_message);
                 None
             }
-        }}
+        }};
+        if let Some((joined_player, _)) = joined.as_ref() {
+            cluster_presence::publish_login(self, joined_player);
+        }
+        joined
     }
 
     pub fn remove_player(&self, player: &Player) {
+        cluster_presence::publish_logout(self, player);
         player.increment_stat(
             pumpkin_data::statistic::StatisticCategory::Custom,
             pumpkin_data::statistic::CustomStatistic::LeaveGame as i32,
@@ -747,10 +890,16 @@ impl Server {
     }
 
     pub async fn shutdown(&self) {
+        crate::server::cluster::log_cluster_shutdown_progress(self, "server shutdown starting");
+        crate::server::cluster::begin_cluster_leave_drain(self);
+        if let Some(primary) = self.primary_save.as_ref() {
+            primary.shutdown();
+        }
         self.tasks.close();
         debug!("Awaiting tasks for server");
-        self.tasks.wait().await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.tasks.wait()).await;
         debug!("Done awaiting tasks for server");
+        crate::server::cluster::log_cluster_shutdown_progress(self, "server tasks drained");
 
         info!("Starting worlds");
         for world in self.worlds.load().iter() {
@@ -759,11 +908,13 @@ impl Server {
         let level_data = self.level_info.load();
         // then lets save the world info
 
-        if let Err(err) = self
-            .world_info_writer
-            .write_world_info(&level_data, &self.basic_config.get_world_path())
-        {
-            error!("Failed to save level.dat: {err}");
+        if !self.persistence_delegated_to_primary() {
+            if let Err(err) = self
+                .world_info_writer
+                .write_world_info(&level_data, &self.basic_config.get_world_path())
+            {
+                error!("Failed to save level.dat: {err}");
+            }
         }
         info!("Completed worlds");
     }
@@ -920,13 +1071,28 @@ impl Server {
     /// # Returns
     ///
     /// An `Option<Arc<Player>>` containing the player if found, or `None` if not found.
+    /// Looks up a logged-in player by name, skipping lobby waiters.
+    ///
+    /// Lobby clients are not logged in yet and own no command-visible entity,
+    /// so name selectors never resolve them.
     pub fn get_player_by_name(&self, name: &str) -> Option<Arc<Player>> {
         for world in self.worlds.load().iter() {
-            if let Some(player) = world.get_player_by_name(name) {
+            if let Some(player) = world.get_player_by_name(name)
+                && !player.is_in_cluster_lobby()
+            {
                 return Some(player);
             }
         }
         None
+    }
+
+    #[must_use]
+    pub fn player_in_cluster_lobby(&self, name: &str) -> bool {
+        self.worlds.load().iter().any(|world| {
+            world.players.load().iter().any(|player| {
+                player.is_in_cluster_lobby() && player.gameprofile.name.eq_ignore_ascii_case(name)
+            })
+        }) || cluster_presence::remote_player_in_lobby(name)
     }
 
     pub fn get_players_by_ip(&self, ip: IpAddr) -> Vec<Arc<Player>> {
@@ -1030,6 +1196,10 @@ impl Server {
 
     /// Starts the background telemetry task if enabled in configuration.
     pub fn start_telemetry(self: &Arc<Self>) {
+        if self.persistence_delegated_to_primary() {
+            debug!("Skipping telemetry on cluster secondary (diskless)");
+            return;
+        }
         crate::telemetry::start_telemetry(self.clone());
     }
 
@@ -1101,6 +1271,19 @@ impl Server {
     /// Main server tick method. This now handles both player/network ticking (which always runs)
     /// and world/game logic ticking (which is affected by freeze state).
     pub fn tick(self: &Arc<Self>) {
+        if pumpkin_world::level::is_cluster_secondary()
+            && self
+                .worlds
+                .load()
+                .iter()
+                .all(|world| world.players.load().is_empty())
+        {
+            return;
+        }
+
+        let _ = cluster_movement_sample::sample_server_tick(self);
+        let _ = cluster_entity_emit::sample_entities_tick(self);
+        let _ = cluster_tick_pump::pump_staged_tick(self);
         if self.tick_rate_manager.runs_normally() || self.tick_rate_manager.is_sprinting() {
             self.tick_worlds();
             // Always run player and network ticking, even when game is frozen
@@ -1116,6 +1299,9 @@ impl Server {
         let handle = self.runtime.clone();
 
         for world in worlds.iter() {
+            if pumpkin_world::level::is_cluster_secondary() && world.players.load().is_empty() {
+                continue;
+            }
             world.flush_block_updates();
             world.flush_synced_block_events();
 
@@ -1130,6 +1316,16 @@ impl Server {
 
     /// Ticks the game logic for all worlds. This is the part that is affected by `/tick freeze`.
     pub fn tick_worlds(self: &Arc<Self>) {
+        if pumpkin_world::level::is_cluster_secondary() {
+            let worlds = self.worlds.load();
+            let handle = self.runtime.clone();
+            worlds.par_iter().for_each(|world| {
+                let _guard = handle.enter();
+                world.tick(self);
+            });
+            return;
+        }
+
         let source = crate::command::CommandSender::Console
             .into_source(self)
             .with_silent();
@@ -1152,7 +1348,9 @@ impl Server {
         });
 
         // Global tasks
-        self.player_data_storage.tick(self);
+        if !self.persistence_delegated_to_primary() {
+            self.player_data_storage.tick(self);
+        }
     }
 
     /// Updates the tick time statistics with the duration of the last tick.

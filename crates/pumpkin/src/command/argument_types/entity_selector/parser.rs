@@ -606,8 +606,25 @@ impl EntitySelectorParserSuggestions {
         let _ = parser.parse();
 
         parser.fill_suggestions(suggestions_builder, |mut suggestions| {
+            let can_see_hidden = context
+                .source
+                .has_permission(crate::server::cluster_hide::HIDE_PERMISSION);
             for player in context.server().get_all_players() {
+                if !can_see_hidden
+                    && crate::server::cluster_hide::is_hidden_player(&player)
+                {
+                    continue;
+                }
                 suggestions = suggestions.filter_and_suggest_one(player.gameprofile.name.clone());
+            }
+            // Also complete player names learned from other cluster hosts so that
+            // cross-server targets (e.g. `/msg <name>`) tab-complete like locals.
+            for name in crate::server::cluster_chat_pm::extra_completion_names_for_viewer(
+                context.server(),
+                can_see_hidden,
+            )
+            {
+                suggestions = suggestions.filter_and_suggest_one(name);
             }
             // ONLY FOR EntityArgumentType: This is server-side, so no other entity will show up.
             suggestions

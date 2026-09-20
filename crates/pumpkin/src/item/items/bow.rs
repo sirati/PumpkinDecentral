@@ -110,6 +110,9 @@ impl BowItem {
             1.0,
             is_crit,
         );
+        if power >= 0.1 {
+            Self::stage_fire(player, power, pumpkin_cluster::combat::FIRE_KIND_BOW);
+        }
 
         // Consume arrow (if not creative and no Infinity)
         if let Some(slot) = arrow_slot
@@ -121,6 +124,36 @@ impl BowItem {
 
         // Damage bow
         player.damage_held_item(1);
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn stage_fire(player: &Player, power: f32, kind: u8) {
+        let Some(server) = player.world().server.upgrade() else {
+            return;
+        };
+        if !server.advanced_config.cluster.enabled {
+            return;
+        }
+        let Some(gid) = player.cluster_gid() else {
+            return;
+        };
+        let (yaw, pitch) = player.rotation();
+        let yaw_rad = yaw.to_radians();
+        let pitch_rad = pitch.to_radians();
+        let dir = [
+            -yaw_rad.sin() * pitch_rad.cos(),
+            -pitch_rad.sin(),
+            yaw_rad.cos() * pitch_rad.cos(),
+        ];
+        let update = pumpkin_cluster::combat::capture_fire(
+            gid,
+            pumpkin_cluster::combat::next_combat_seq(gid),
+            crate::net::java::play::attack::combat_tick(),
+            kind,
+            (power * 1000.0).clamp(0.0, 5000.0) as u16,
+            dir,
+        );
+        pumpkin_cluster::combat::stage_fire(update);
     }
 
     /// Check if player has arrows in their inventory

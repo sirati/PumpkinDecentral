@@ -20,6 +20,7 @@ impl AdvancementManager {
     pub fn new(player_data_path: impl Into<PathBuf>, save_enabled: bool) -> Self {
         let path = player_data_path.into().join("advancements");
         if !path.exists()
+            && !pumpkin_world::level::is_cluster_secondary()
             && let Err(e) = create_dir_all(&path)
         {
             error!(

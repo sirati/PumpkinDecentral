@@ -19,6 +19,7 @@ members = [
     "crates/pumpkin-util", 
     "crates/pumpkin-host-bindings",
     "crates/pumpkin-world",
+    "crates/pumpkin-cluster",
     "tools/pumpkin-codegen",
     "tools/pumpkin-fuzzer",
 ]
@@ -114,9 +115,12 @@ rust-version = "1.96"
 license = "GPL-3.0"
 
 [profile.release]
-lto = true
+lto = "thin"
 strip = "debuginfo"
-codegen-units = 1
+codegen-units = 16
+
+[profile.release.package.pumpkin-data]
+codegen-units = 256
 
 [profile.bench]
 debug = true
@@ -186,6 +190,7 @@ pumpkin-config = { path = "crates/pumpkin-config", default-features = false }
 pumpkin-data = { path = "crates/pumpkin-data", default-features = false }
 pumpkin-inventory = { path = "crates/pumpkin-inventory", default-features = false }
 pumpkin-macros = { path = "crates/pumpkin-macros", default-features = false }
+pumpkin-cluster = { path = "crates/pumpkin-cluster", default-features = false }
 pumpkin-nbt = { path = "crates/pumpkin-nbt", default-features = false }
 pumpkin-plugin-api = { path = "crates/pumpkin-plugin-api", default-features = false }
 pumpkin-plugin-runtime = { path = "crates/pumpkin-plugin-runtime", default-features = false }
@@ -194,6 +199,7 @@ pumpkin-protocol = { path = "crates/pumpkin-protocol", default-features = false 
 pumpkin-util = { path = "crates/pumpkin-util", default-features = false }
 pumpkin-host-bindings = { path = "crates/pumpkin-host-bindings", default-features = false }
 pumpkin-world = { path = "crates/pumpkin-world", default-features = false }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 quote = { version = "1.0", default-features = false, features = ["proc-macro"] }
 rand = { version = "0.10.2", default-features = false, features = ["std", "std_rng", "thread_rng"] }
 rsa = { version = "=0.10.0-rc.18", default-features = false, features = ["std", "encoding"] }
@@ -217,6 +223,7 @@ time = { version = "0.3", default-features = false, features = ["std"] }
 arc-swap = { version = "1.9", default-features = false }
 tokio-util = { version = "0.7.19", default-features = false }
 toml = { version = "1.1", default-features = false, features = ["parse", "display", "serde"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "http2"] }
 notify = { version = "8.2.0", default-features = false, features = ["macos_fsevent"] }
 

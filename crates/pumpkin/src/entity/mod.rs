@@ -4104,6 +4104,19 @@ impl Entity {
         }
     }
 
+    pub fn is_owned_by_local_peer(caller: &dyn EntityBase, server: &Server) -> bool {
+        if !server.advanced_config.cluster.enabled {
+            return true;
+        }
+        match caller.get_player() {
+            None => true,
+            Some(player) => match player.cluster_gid() {
+                None => true,
+                Some(gid) => gid.server.0 == server.advanced_config.cluster.server_id,
+            },
+        }
+    }
+
     pub fn check_out_of_world(&self, dyn_self: &dyn EntityBase) {
         if self.pos.load().y < f64::from(self.world.load().dimension.min_y) - 64.0 {
             dyn_self.tick_in_void(dyn_self);
@@ -4351,7 +4364,7 @@ impl Entity {
 }
 
 impl EntityBase for Entity {
-    fn tick(&self, caller: &dyn EntityBase, _server: &Server) {
+    fn tick(&self, caller: &dyn EntityBase, server: &Server) {
         // Recomputed during movement/block-collision handling in the same tick.
         let was_in_powder_snow = self.is_in_powder_snow.load(Ordering::Relaxed);
         self.was_in_powder_snow
@@ -4361,7 +4374,9 @@ impl EntityBase for Entity {
         self.update_last_pos();
         self.tick_portal(caller);
         self.update_fluid_state(caller);
-        self.check_out_of_world(caller);
+        if Self::is_owned_by_local_peer(caller, server) {
+            self.check_out_of_world(caller);
+        }
         let fire_ticks = self.fire_ticks.load(Ordering::Relaxed);
 
         // Check for fire immunity (or if the specific entity is)
@@ -4373,7 +4388,7 @@ impl EntityBase for Entity {
                     self.extinguish();
                 }
             } else {
-                if fire_ticks % 20 == 0 {
+                if fire_ticks % 20 == 0 && Self::is_owned_by_local_peer(caller, server) {
                     caller.damage(caller, 1.0, DamageType::ON_FIRE);
                 }
 

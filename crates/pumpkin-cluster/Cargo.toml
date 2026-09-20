@@ -1,0 +1,22 @@
+[package]
+name = "pumpkin-cluster"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+postcard.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "net", "rt"] }
+sha2.workspace = true
+xxhash-rust.workspace = true
+tracing.workspace = true
+quinn.workspace = true
+rcgen.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "time", "macros", "rt"] }
+
+[lints]
+workspace = true

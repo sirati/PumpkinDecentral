@@ -28,6 +28,10 @@ impl BedrockClient {
                     None => event.message.clone(),
                 };
 
+                crate::server::cluster_chat_out::broadcast_public_chat_from_player(
+                    server, player, &message,
+                );
+
                 let decorated_message = TextComponent::chat_decorated(
                     &config.chat.format,
                     &gameprofile.name,

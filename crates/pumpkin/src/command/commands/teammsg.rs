@@ -45,7 +45,7 @@ impl CommandExecutor for TeamMsgCommandExecutor {
         };
 
         let team_display_name = team.display_name.clone().color_named(team.color);
-        let message_component = TextComponent::text(message_text);
+        let message_component = TextComponent::text(message_text.clone());
 
         let online_players = world.players.load();
         let mut recipients = 0;
@@ -78,6 +78,15 @@ impl CommandExecutor for TeamMsgCommandExecutor {
                 recipients += 1;
             }
         }
+
+        // Fan the team message out to the rest of the cluster; remote hosts deliver it
+        // to their own same-named team members through cluster chat sync.
+        let _cluster_sent = crate::server::cluster_chat_pm::broadcast_team_from_player(
+            context.source.server(),
+            player,
+            &team.name,
+            &message_text,
+        );
 
         Ok(recipients)
     }

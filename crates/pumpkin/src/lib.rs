@@ -24,7 +24,7 @@ use crate::net::{lan_broadcast::LANBroadcast, query, rcon::RCONServer};
 use crate::plugin::server::server_command::ServerCommandEvent;
 use crate::server::{Server, ticker::Ticker};
 use plugin::server::server_load::{LoadType, ServerLoadEvent};
-use pumpkin_config::{AdvancedConfiguration, BasicConfiguration, TelemetryConfig};
+use pumpkin_config::{AdvancedConfiguration, BasicConfiguration, ClusterRole, TelemetryConfig};
 use pumpkin_util::text::TextComponent;
 use pumpkin_util::text::color::{Color, NamedColor};
 use rustyline::Editor;
@@ -263,6 +263,15 @@ impl PumpkinServer {
         #[cfg(target_family = "unix")]
         adjust_file_descriptor_limit();
 
+        let cluster_primary = server.advanced_config.cluster.enabled
+            && matches!(
+                server.advanced_config.cluster.role,
+                ClusterRole::Primary
+            );
+        if cluster_primary {
+            info!("Cluster primary: game listeners disabled, QUIC mesh only");
+        }
+
         let rcon = server.advanced_config.networking.rcon.clone();
 
         if rcon.enabled {
@@ -275,7 +284,7 @@ impl PumpkinServer {
             });
         }
 
-        let tcp_listener = if server.advanced_config.networking.java.enabled {
+        let tcp_listener = if !cluster_primary && server.advanced_config.networking.java.enabled {
             let address = server.advanced_config.networking.java.address;
             // Setup the TCP server socket.
             let listener = match TcpListener::bind(address).await {
@@ -343,8 +352,16 @@ impl PumpkinServer {
             }
         };
 
-        let (bedrock_status, ice_socket) = Self::bind_bedrock_status(&server).await;
-        let nethernet_listener = Self::bind_nethernet(&server, ice_socket).await;
+        let (bedrock_status, ice_socket) = if cluster_primary {
+            (None, None)
+        } else {
+            Self::bind_bedrock_status(&server).await
+        };
+        let nethernet_listener = if cluster_primary {
+            None
+        } else {
+            Self::bind_nethernet(&server, ice_socket).await
+        };
 
         Self {
             server,
@@ -503,21 +520,23 @@ impl PumpkinServer {
 
         info!("Stopped accepting incoming connections");
 
-        if let Err(e) = self
-            .server
-            .player_data_storage
-            .save_all_players(&self.server)
-        {
-            error!("Error saving all players during shutdown: {e}");
-        }
+        if !self.server.persistence_delegated_to_primary() {
+            if let Err(e) = self
+                .server
+                .player_data_storage
+                .save_all_players(&self.server)
+            {
+                error!("Error saving all players during shutdown: {e}");
+            }
 
-        if let Err(e) = self
-            .server
-            .advancement_manager
-            .save_all_players(&self.server.get_all_players())
-            .await
-        {
-            error!("Error saving all players advancements during shutdown: {e}");
+            if let Err(e) = self
+                .server
+                .advancement_manager
+                .save_all_players(&self.server.get_all_players())
+                .await
+            {
+                error!("Error saving all players advancements during shutdown: {e}");
+            }
         }
 
         let kick_message = TextComponent::text("Server stopped");
@@ -525,6 +544,8 @@ impl PumpkinServer {
             player.kick(DisconnectReason::Shutdown, &kick_message);
         }
 
+        crate::server::cluster::log_cluster_shutdown_progress(&self.server, "shutdown ending player tasks");
+        crate::server::cluster::begin_cluster_leave_drain(&self.server);
         info!("Ending player tasks");
 
         tasks.close();
@@ -532,6 +553,7 @@ impl PumpkinServer {
 
         self.unload_plugins().await;
 
+        crate::server::cluster::log_cluster_shutdown_progress(&self.server, "shutdown starting save");
         info!("Starting save.");
 
         self.server.shutdown().await;
@@ -612,17 +634,19 @@ impl PumpkinServer {
                                      }
                                      player.remove().await;
                                      server_clone.remove_player(&player);
-                                    if let Err(e) = server_clone
-                                        .player_data_storage
-                                        .handle_player_leave(&player)
-                                    {
-                                        error!("Failed to save player data on disconnect: {e}");
-                                    }
-                                    if let Err(e) = server_clone.advancement_manager
-                                        .save_player(&player)
-                                        .await {
-                                            error!("Failed to save player advancement on disconnect: {e}");
+                                    if !server_clone.persistence_delegated_to_primary() {
+                                        if let Err(e) = server_clone
+                                            .player_data_storage
+                                            .handle_player_leave(&player)
+                                        {
+                                            error!("Failed to save player data on disconnect: {e}");
                                         }
+                                        if let Err(e) = server_clone.advancement_manager
+                                            .save_player(&player)
+                                            .await {
+                                                error!("Failed to save player advancement on disconnect: {e}");
+                                            }
+                                    }
                                     }
                                 },
                             }
@@ -719,9 +743,12 @@ impl PumpkinServer {
                         client.await_tasks().await;
                         player.remove().await;
                         server.remove_player(&player);
-                        if let Err(error) = server.player_data_storage.handle_player_leave(&player)
-                        {
-                            error!("Failed to save player data on disconnect: {error}");
+                        if !server.persistence_delegated_to_primary() {
+                            if let Err(error) =
+                                server.player_data_storage.handle_player_leave(&player)
+                            {
+                                error!("Failed to save player data on disconnect: {error}");
+                            }
                         }
                     }
                 }

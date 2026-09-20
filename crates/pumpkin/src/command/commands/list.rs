@@ -28,12 +28,27 @@ struct ListCommandExecutor(ListMode);
 
 impl CommandExecutor for ListCommandExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
-        let players: Vec<Arc<Player>> = context.server().get_all_players();
-        let players_len = players.len();
+        let viewer = context.source.player_or_none().map(|player| player.gameprofile.id);
+        let players: Vec<Arc<Player>> = context
+            .server()
+            .get_all_players()
+            .into_iter()
+            .filter(|player| {
+                viewer.is_some_and(|id| id == player.gameprofile.id)
+                    || !crate::server::cluster_hide::is_hidden_player(player)
+            })
+            .collect();
+        let mut remote = crate::server::cluster_presence::remote_presence_entries();
+        remote.retain(|(gid, entry)| {
+            !crate::server::cluster_hide::is_hidden_gid(gid)
+                && !crate::server::cluster_hide::is_hidden_uuid_bytes(&entry.uuid)
+        });
+        remote.sort_by(|a, b| a.1.name.cmp(&b.1.name));
+        let players_len = players.len().saturating_add(remote.len());
 
         let list = match self.0 {
-            ListMode::Names => get_player_names(&players),
-            ListMode::Uuids => get_player_names_and_ids(&players),
+            ListMode::Names => get_visible_player_names(&players, &remote),
+            ListMode::Uuids => get_visible_player_names_and_ids(&players, &remote),
         };
 
         let max_players = context.source.output.as_player().map_or_else(
@@ -70,13 +85,23 @@ impl CommandExecutor for ListCommandExecutor {
     }
 }
 
-fn get_player_names(players: &[Arc<Player>]) -> TextComponent {
-    let display_names = players.iter().map(|p| p.get_display_name()).collect();
+fn get_visible_player_names(
+    players: &[Arc<Player>],
+    remote: &[(pumpkin_cluster::identity::GlobalPlayerId, pumpkin_cluster::presence::RemotePlayerEntry)],
+) -> TextComponent {
+    let mut display_names: Vec<TextComponent> =
+        players.iter().map(|p| p.get_display_name()).collect();
+    for entry in remote.iter() {
+        display_names.push(TextComponent::text(entry.1.name.clone()));
+    }
     TextComponent::join_with_comma(display_names)
 }
 
-fn get_player_names_and_ids(players: &[Arc<Player>]) -> TextComponent {
-    let names_and_ids = players
+fn get_visible_player_names_and_ids(
+    players: &[Arc<Player>],
+    remote: &[(pumpkin_cluster::identity::GlobalPlayerId, pumpkin_cluster::presence::RemotePlayerEntry)],
+) -> TextComponent {
+    let mut names_and_ids: Vec<TextComponent> = players
         .iter()
         .map(|p| {
             TextComponent::translate_cross(
@@ -89,6 +114,16 @@ fn get_player_names_and_ids(players: &[Arc<Player>]) -> TextComponent {
             )
         })
         .collect();
+    for entry in remote.iter() {
+        names_and_ids.push(TextComponent::translate_cross(
+            COMMANDS_LIST_NAMEANDID,
+            COMMANDS_LIST_NAMEANDID,
+            &[
+                TextComponent::text(entry.1.name.clone()),
+                TextComponent::text(uuid::Uuid::from_bytes(entry.1.uuid).to_string()),
+            ],
+        ));
+    }
     TextComponent::join_with_comma(names_and_ids)
 }
 

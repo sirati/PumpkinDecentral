@@ -15,13 +15,10 @@ use tracing::debug;
 impl PendingConnection {
     pub async fn handle_status_request(&mut self, server: &Arc<Server>) {
         debug!("Handling status request");
-        let mut status_response = {
-            let status = server.get_status();
-            status
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get_status_response(self.version.load().protocol_version())
-        };
+        let mut status_response = crate::server::cluster_status::base_status_response(
+            server,
+            self.version.load().protocol_version(),
+        );
 
         let (max_players, num_players) = status_response
             .players

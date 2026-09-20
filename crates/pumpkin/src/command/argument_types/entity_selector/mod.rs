@@ -179,12 +179,15 @@ impl EntitySelector {
             let player = source
                 .server
                 .as_ref()
-                .and_then(|s| s.get_player_by_name(name));
+                .and_then(|s| s.get_player_by_name(name))
+                .filter(|p| !p.is_in_cluster_lobby());
             Ok(player.map_or_else(Vec::new, |p| vec![p]))
         } else if let Some(uuid) = self.entity_uuid.as_ref() {
             // Try to get an entity by UUID.
             for world in source.server().worlds.load().iter() {
-                if let Some(player) = world.get_player_by_uuid(*uuid) {
+                if let Some(player) = world.get_player_by_uuid(*uuid)
+                    && !player.is_in_cluster_lobby()
+                {
                     return Ok(vec![player]);
                 }
             }
@@ -234,6 +237,9 @@ impl EntitySelector {
         limit: usize,
     ) {
         for player in world.players.load().iter() {
+            if player.is_in_cluster_lobby() {
+                continue;
+            }
             if predicate.test(player.as_ref()) {
                 list.push(player.clone());
                 if list.len() >= limit {

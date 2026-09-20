@@ -69,6 +69,19 @@ impl Ticker {
 
             server.update_tick_times(tick_duration_nanos);
 
+            if server.advanced_config.cluster.enabled {
+                let millis = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|age| age.as_millis() as i64)
+                    .unwrap_or(0);
+                pumpkin_cluster::tick::end_tick_all(
+                    crate::server::cluster::disciplined_tick_stamp(millis),
+                );
+                if let Some(fused) = pumpkin_cluster::tick::take_fused_outbox() {
+                    crate::server::cluster::forward_fused(fused);
+                }
+            }
+
             let tick_interval = if manager.is_sprinting() {
                 Duration::ZERO
             } else {

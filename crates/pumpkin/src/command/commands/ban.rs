@@ -40,15 +40,29 @@ fn ban_profile(context: &CommandContext, profile: &GameProfile, reason: Option<S
         return false;
     }
 
+    let ban_source = context.source.name.clone();
     banned_players.banned_players.push(BannedPlayerEntry::new(
         profile,
-        context.source.name.clone(),
+        ban_source.clone(),
         None,
         reason.clone(),
     ));
 
     banned_players.save();
     drop(banned_players);
+    crate::server::cluster_admin_apply::publish_ban_add(
+        server,
+        profile.id,
+        &profile.name,
+        &ban_source,
+        &reason,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|age| age.as_secs() as i64)
+            .unwrap_or(0),
+        None,
+        &context.source.name,
+    );
 
     context.source.send_feedback(
         TextComponent::translate_cross(

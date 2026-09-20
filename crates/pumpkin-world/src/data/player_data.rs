@@ -29,6 +29,7 @@ impl PlayerDataStorage {
     pub fn new(data_path: impl Into<PathBuf>, enabled: bool) -> Self {
         let path = data_path.into();
         if !path.exists()
+            && !crate::level::is_cluster_secondary()
             && let Err(e) = create_dir_all(&path)
         {
             error!(
@@ -76,6 +77,9 @@ impl PlayerDataStorage {
     ///
     /// A Result containing either the player's NBT data or an error.
     pub fn load_player_data(&self, uuid: &Uuid) -> Result<(bool, NbtCompound), PlayerDataError> {
+        if crate::level::is_cluster_secondary() {
+            return Ok((false, NbtCompound::new()));
+        }
         // If player data saving is disabled, return empty data
         if !self.is_save_enabled() {
             return Ok((false, NbtCompound::new()));
@@ -124,6 +128,10 @@ impl PlayerDataStorage {
     pub fn save_player_data(&self, uuid: &Uuid, data: NbtCompound) -> Result<(), PlayerDataError> {
         // Skip saving if disabled in config
         if !self.is_save_enabled() {
+            return Ok(());
+        }
+        if crate::level::is_cluster_secondary() {
+            debug!("Refusing player data write for {uuid} on cluster secondary (diskless)");
             return Ok(());
         }
 
