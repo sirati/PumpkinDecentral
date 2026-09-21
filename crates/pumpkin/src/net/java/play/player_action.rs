@@ -1,11 +1,6 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
-use crossbeam::queue::SegQueue;
 use pumpkin_cluster::break_emit::{capture_break, chunk_of_block, next_break_seq};
-use pumpkin_cluster::protocol::BreakBlockUpdate;
-use pumpkin_cluster::time::TickStamp;
-
-static BREAK_OUTBOX: SegQueue<BreakBlockUpdate> = SegQueue::new();
 
 impl JavaClient {
     #[expect(clippy::too_many_lines)]
@@ -280,13 +275,18 @@ impl JavaClient {
                             >()
                             .is_some()
                         {
-                            pumpkin_cluster::visual::emit_blocking(
-                                player.cluster_gid(),
-                                pumpkin_cluster::visual::tick_from_counter(
-                                    player.tick_counter.load(Ordering::Relaxed),
-                                ),
-                                false,
-                            );
+                            if let Some(tick) = crate::server::cluster::disciplined_tick_now() {
+                                pumpkin_cluster::visual::emit_blocking(
+                                    player.cluster_gid(),
+                                    tick,
+                                    false,
+                                );
+                            } else {
+                                warn!(
+                                    player = %player.gameprofile.name,
+                                    "cluster blocking action dropped before NTP discipline is available"
+                                );
+                            }
                         }
                         server.item_registry.on_stopped_using(&stack, player);
                     }
@@ -327,21 +327,9 @@ impl JavaClient {
         ));
     }
 
-    pub fn drain_break_outbox() -> Vec<BreakBlockUpdate> {
-        let mut drained = Vec::new();
-        while let Some(update) = BREAK_OUTBOX.pop() {
-            drained.push(update);
-        }
-        drained
-    }
-
-    #[cfg(test)]
-    pub fn stage_break_for_test(update: BreakBlockUpdate) {
-        BREAK_OUTBOX.push(update);
-    }
 }
 
-fn record_cluster_break_snapshot(
+pub(crate) fn record_cluster_break_snapshot(
     player: &Player,
     server: &Server,
     position: BlockPos,
@@ -354,10 +342,17 @@ fn record_cluster_break_snapshot(
         return;
     };
     let chunk = chunk_of_block(position.0.x, position.0.z);
+    let Some(tick) = crate::server::cluster::disciplined_tick_now() else {
+        warn!(
+            player = %player.gameprofile.name,
+            "cluster break action dropped before NTP discipline is available"
+        );
+        return;
+    };
     let update = capture_break(
         gid,
         next_break_seq(gid),
-        TickStamp::now(),
+        tick,
         pumpkin_cluster::protocol::BlockPos {
             x: position.0.x,
             y: position.0.y,
@@ -366,7 +361,9 @@ fn record_cluster_break_snapshot(
         expected_old_state,
         chunk,
     );
-    BREAK_OUTBOX.push(update);
+    let mut batch = pumpkin_cluster::protocol::TickBatch::new(tick);
+    batch.break_block.push(update);
+    crate::server::cluster_world_apply::submit_local_optimistic_batch(batch);
     debug!(
         expected_old_state = expected_old_state,
         pos_x = position.0.x,

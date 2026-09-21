@@ -106,13 +106,7 @@ impl SlimeEntity {
         entity.data.store(actual_size, Ordering::Relaxed);
 
         // Update attributes
-        {
-            let mut attributes = self
-                .entity
-                .living_entity
-                .attributes
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.entity.living_entity.update_attributes(|attributes| {
             if let Some(health) = attributes.get_mut(&Attributes::MAX_HEALTH.id) {
                 health.base_value = (actual_size * actual_size) as f64;
                 health.dirty.store(true, Ordering::Relaxed);
@@ -125,7 +119,7 @@ impl SlimeEntity {
                 damage.base_value = actual_size as f64;
                 damage.dirty.store(true, Ordering::Relaxed);
             }
-        }
+        });
 
         if update_health {
             let max_health = self

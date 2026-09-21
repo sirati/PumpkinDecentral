@@ -34,7 +34,7 @@ pub const PLAYER_STREAM_KINDS: [StreamKind; 4] = [
     StreamKind::PlayerCombat,
 ];
 
-pub const SHARED_STREAM_KINDS: [StreamKind; 9] = [
+pub const SHARED_STREAM_KINDS: [StreamKind; 10] = [
     StreamKind::EntityPos,
     StreamKind::EntityVisual,
     StreamKind::EntityTransient,
@@ -44,13 +44,14 @@ pub const SHARED_STREAM_KINDS: [StreamKind; 9] = [
     StreamKind::ChunkData,
     StreamKind::ChunkAdvert,
     StreamKind::Accept,
+    StreamKind::PrimaryTick,
 ];
 
 /// Uni streams opened per player on each mesh connection.
 pub const PLAYER_STREAM_COUNT: usize = 4;
 
 /// Shared (player-independent) uni streams on each mesh connection.
-pub const SHARED_STREAM_COUNT: usize = 9;
+pub const SHARED_STREAM_COUNT: usize = 10;
 
 const _: () = assert!(PLAYER_STREAM_COUNT == PLAYER_STREAM_KINDS.len());
 const _: () = assert!(SHARED_STREAM_COUNT == SHARED_STREAM_KINDS.len());
@@ -430,9 +431,13 @@ impl StreamRegistry {
         }
         if self.tombstones.contains(&key) {
             self.dropped_late = self.dropped_late.saturating_add(1);
-        } else {
-            self.dropped_unknown = self.dropped_unknown.saturating_add(1);
+            return false;
         }
+        if is_player_kind(kind) && player.is_some_and(|gid| gid.server == peer) {
+            self.open.insert(key);
+            return true;
+        }
+        self.dropped_unknown = self.dropped_unknown.saturating_add(1);
         false
     }
 
@@ -566,6 +571,7 @@ pub enum DemuxCategory {
     Control,
     Chunk,
     Accept,
+    PrimaryTick,
 }
 
 #[must_use]
@@ -584,6 +590,7 @@ pub const fn category_for(kind: StreamKind) -> DemuxCategory {
             DemuxCategory::Chunk
         }
         StreamKind::Accept => DemuxCategory::Accept,
+        StreamKind::PrimaryTick => DemuxCategory::PrimaryTick,
     }
 }
 
@@ -650,6 +657,7 @@ pub struct DemuxSenders {
     pub control: mpsc::Sender<InboundParcel>,
     pub chunk: mpsc::Sender<InboundParcel>,
     pub accept: mpsc::Sender<InboundParcel>,
+    pub primary_tick: mpsc::Sender<InboundParcel>,
 }
 
 impl DemuxSenders {
@@ -664,6 +672,7 @@ impl DemuxSenders {
             DemuxCategory::Control => &self.control,
             DemuxCategory::Chunk => &self.chunk,
             DemuxCategory::Accept => &self.accept,
+            DemuxCategory::PrimaryTick => &self.primary_tick,
         }
     }
 }
@@ -678,6 +687,7 @@ pub struct DemuxReceivers {
     pub control: mpsc::Receiver<InboundParcel>,
     pub chunk: mpsc::Receiver<InboundParcel>,
     pub accept: mpsc::Receiver<InboundParcel>,
+    pub primary_tick: mpsc::Receiver<InboundParcel>,
 }
 
 #[must_use]
@@ -691,6 +701,7 @@ pub fn demux_channels(depth: usize) -> (DemuxSenders, DemuxReceivers) {
     let (control_tx, control_rx) = mpsc::channel(depth);
     let (chunk_tx, chunk_rx) = mpsc::channel(depth);
     let (accept_tx, accept_rx) = mpsc::channel(depth);
+    let (primary_tick_tx, primary_tick_rx) = mpsc::channel(depth);
     let senders = DemuxSenders {
         visual: visual_tx,
         transient: transient_tx,
@@ -700,6 +711,7 @@ pub fn demux_channels(depth: usize) -> (DemuxSenders, DemuxReceivers) {
         control: control_tx,
         chunk: chunk_tx,
         accept: accept_tx,
+        primary_tick: primary_tick_tx,
     };
     let receivers = DemuxReceivers {
         visual: visual_rx,
@@ -710,6 +722,7 @@ pub fn demux_channels(depth: usize) -> (DemuxSenders, DemuxReceivers) {
         control: control_rx,
         chunk: chunk_rx,
         accept: accept_rx,
+        primary_tick: primary_tick_rx,
     };
     (senders, receivers)
 }
@@ -724,6 +737,7 @@ pub struct DemuxStats {
     pub control: u64,
     pub chunk: u64,
     pub accept: u64,
+    pub primary_tick: u64,
     pub dropped_late: u64,
     pub dropped_unknown: u64,
     pub dropped_queue_closed: u64,
@@ -741,6 +755,7 @@ impl DemuxStats {
             control: 0,
             chunk: 0,
             accept: 0,
+            primary_tick: 0,
             dropped_late: 0,
             dropped_unknown: 0,
             dropped_queue_closed: 0,
@@ -757,6 +772,9 @@ impl DemuxStats {
             DemuxCategory::Control => self.control = self.control.saturating_add(1),
             DemuxCategory::Chunk => self.chunk = self.chunk.saturating_add(1),
             DemuxCategory::Accept => self.accept = self.accept.saturating_add(1),
+            DemuxCategory::PrimaryTick => {
+                self.primary_tick = self.primary_tick.saturating_add(1);
+            }
         }
     }
 
@@ -770,6 +788,7 @@ impl DemuxStats {
             .saturating_add(self.control)
             .saturating_add(self.chunk)
             .saturating_add(self.accept)
+            .saturating_add(self.primary_tick)
     }
 }
 
@@ -801,7 +820,7 @@ pub async fn run_demux(
             continue;
         }
         let category = parcel.header.category();
-        if senders.sender_for(category).send(parcel).await.is_err() {
+        if senders.sender_for(category).try_send(parcel).is_err() {
             stats.dropped_queue_closed = stats.dropped_queue_closed.saturating_add(1);
         } else {
             stats.note_forwarded(category);
@@ -909,8 +928,8 @@ mod tests {
         assert_eq!(registry.dropped_late, 2);
         assert_eq!(registry.dropped_unknown, 0);
 
-        assert!(!registry.should_deliver(test_peer(), StreamKind::PlayerCombat, player));
-        assert_eq!(registry.dropped_unknown, 1);
+        assert!(registry.should_deliver(test_peer(), StreamKind::PlayerCombat, player));
+        assert_eq!(registry.dropped_unknown, 0);
 
         assert!(registry.open(test_peer(), StreamKind::PlayerVisual, player));
         assert!(!registry.is_tombstoned(test_peer(), StreamKind::PlayerVisual, player));
@@ -932,6 +951,18 @@ mod tests {
             assert!(!registry.should_deliver(test_peer(), kind, Some(test_player())));
         }
         assert_eq!(registry.dropped_late, PLAYER_STREAM_KINDS.len() as u64);
+    }
+
+    #[test]
+    fn registry_lazily_opens_only_the_authenticated_peers_player_stream() {
+        let mut registry = StreamRegistry::new();
+        let player = test_player();
+        assert!(registry.should_deliver(test_peer(), StreamKind::PlayerWorld, Some(player)));
+        assert!(registry.is_open(test_peer(), StreamKind::PlayerWorld, Some(player)));
+
+        let foreign = GlobalPlayerId::new(ServerId(8), PlayerSlot(3));
+        assert!(!registry.should_deliver(test_peer(), StreamKind::PlayerWorld, Some(foreign)));
+        assert_eq!(registry.dropped_unknown, 1);
     }
 
     #[test]
@@ -982,6 +1013,7 @@ mod tests {
             StreamKind::ChunkData,
             StreamKind::ChunkAdvert,
             StreamKind::Accept,
+            StreamKind::PrimaryTick,
         ];
         assert_eq!(category_for(StreamKind::PlayerVisual), DemuxCategory::Visual);
         assert_eq!(
@@ -1003,7 +1035,11 @@ mod tests {
         assert_eq!(category_for(StreamKind::ChunkData), DemuxCategory::Chunk);
         assert_eq!(category_for(StreamKind::ChunkAdvert), DemuxCategory::Chunk);
         assert_eq!(category_for(StreamKind::Accept), DemuxCategory::Accept);
-        assert_eq!(kinds.len(), 13);
+        assert_eq!(
+            category_for(StreamKind::PrimaryTick),
+            DemuxCategory::PrimaryTick
+        );
+        assert_eq!(kinds.len(), 14);
     }
 
     #[tokio::test]
@@ -1051,10 +1087,14 @@ mod tests {
             .send(parcel_for(StreamKind::Accept, None))
             .await
             .unwrap();
+        inbound_tx
+            .send(parcel_for(StreamKind::PrimaryTick, None))
+            .await
+            .unwrap();
         drop(inbound_tx);
 
         let stats = task.await.unwrap();
-        assert_eq!(stats.total_forwarded(), 8);
+        assert_eq!(stats.total_forwarded(), 9);
         assert_eq!(stats.dropped_late, 0);
         assert_eq!(stats.dropped_unknown, 0);
         assert_eq!(queues.visual.recv().await.unwrap().header.kind, StreamKind::PlayerVisual);
@@ -1068,6 +1108,10 @@ mod tests {
         assert_eq!(queues.control.recv().await.unwrap().header.kind, StreamKind::Control);
         assert_eq!(queues.chunk.recv().await.unwrap().header.kind, StreamKind::ChunkData);
         assert_eq!(queues.accept.recv().await.unwrap().header.kind, StreamKind::Accept);
+        assert_eq!(
+            queues.primary_tick.recv().await.unwrap().header.kind,
+            StreamKind::PrimaryTick
+        );
     }
 
     #[tokio::test]
@@ -1223,8 +1267,6 @@ mod tests {
         registry.close_peer(test_peer());
         assert_eq!(registry.open_count(), 0);
         assert_eq!(registry.open_count_for_peer(test_peer()), 0);
-        assert!(
-            !registry.should_deliver(test_peer(), StreamKind::PlayerVisual, Some(test_player()))
-        );
+        assert!(registry.should_deliver(test_peer(), StreamKind::PlayerVisual, Some(test_player())));
     }
 }

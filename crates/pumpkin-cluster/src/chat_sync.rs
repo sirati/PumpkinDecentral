@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use crate::identity::{GlobalPlayerId, ServerId};
 use crate::protocol::StreamKind;
@@ -238,22 +238,6 @@ pub fn private_parcel_for_host(
     ))
 }
 
-pub async fn broadcast_control_message(
-    tx: &mpsc::Sender<ChatParcel>,
-    message: &ChatControlMessage,
-    peers: &[u16],
-) -> Result<usize, ChatSyncError> {
-    let bytes = encode_control_message(message)?;
-    let mut sent = 0_usize;
-    for peer in peers {
-        let parcel = ChatParcel::new(*peer, chat_control_kind(), bytes.clone());
-        if tx.send(parcel).await.is_ok() {
-            sent = sent.saturating_add(1);
-        }
-    }
-    Ok(sent)
-}
-
 pub fn try_broadcast_control_message(
     tx: &mpsc::Sender<ChatParcel>,
     message: &ChatControlMessage,
@@ -441,39 +425,6 @@ pub fn handle_chat_bytes(
         ChatControlMessage::Emote(broadcast) => ChatInboundEffect::EmoteDelivery(broadcast),
         ChatControlMessage::Say(broadcast) => ChatInboundEffect::SayDelivery(broadcast),
     })
-}
-
-#[derive(Debug)]
-pub struct ChatCompletionQuery {
-    pub prefix: String,
-    pub reply: oneshot::Sender<Vec<String>>,
-}
-
-impl ChatCompletionQuery {
-    #[must_use]
-    pub fn new(prefix: String, reply: oneshot::Sender<Vec<String>>) -> Self {
-        Self { prefix, reply }
-    }
-}
-
-pub fn answer_completion_query(directory: &ChatDirectorySnapshot, query: ChatCompletionQuery) {
-    let ChatCompletionQuery { prefix, reply } = query;
-    let _ = reply.send(directory.completion_names(prefix.as_str()));
-}
-
-pub async fn query_completion_names(
-    tx: &mpsc::Sender<ChatCompletionQuery>,
-    prefix: String,
-) -> Option<Vec<String>> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    let query = ChatCompletionQuery::new(prefix, reply_tx);
-    if tx.send(query).await.is_err() {
-        return None;
-    }
-    match reply_rx.await {
-        Ok(names) => Some(names),
-        Err(_) => None,
-    }
 }
 
 #[cfg(test)]
@@ -670,17 +621,6 @@ mod tests {
         assert!(matches!(effect, ChatInboundEffect::SayDelivery(_)));
     }
 
-    #[tokio::test]
-    async fn broadcast_sends_to_all_peers() {
-        let (tx, mut rx) = mpsc::channel(8);
-        let count = broadcast_control_message(&tx, &ChatControlMessage::Public(public()), &[2, 3])
-            .await
-            .unwrap();
-        assert_eq!(count, 2);
-        assert!(rx.recv().await.is_some());
-        assert!(rx.recv().await.is_some());
-    }
-
     #[test]
     fn try_broadcast_skips_full_queue() {
         let (tx, _rx) = mpsc::channel(1);
@@ -689,26 +629,4 @@ mod tests {
         assert_eq!(count, 1);
     }
 
-    #[tokio::test]
-    async fn completion_query_roundtrips_without_locks() {
-        let snapshot = directory();
-        let (tx, mut rx) = mpsc::channel(4);
-        let task = tokio::spawn(async move {
-            let Some(query) = rx.recv().await else {
-                return;
-            };
-            answer_completion_query(&snapshot, query);
-        });
-        let names = query_completion_names(&tx, String::from("b")).await.unwrap();
-        assert_eq!(names, vec![String::from("Bob"), String::from("Bobby")]);
-        task.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn completion_query_missing_receiver_returns_none() {
-        let (tx, rx) = mpsc::channel::<ChatCompletionQuery>(1);
-        drop(rx);
-        let names = query_completion_names(&tx, String::from("b")).await;
-        assert!(names.is_none());
-    }
 }

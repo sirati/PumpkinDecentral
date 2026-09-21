@@ -471,6 +471,7 @@ mod tests {
                 seq: PlayerSeq(0),
                 tick: TickStamp(11),
                 pos,
+                expected_old_state: DIRT,
                 new_state,
                 inv: crate::inventory::INV_MAIN,
                 slot: 3,

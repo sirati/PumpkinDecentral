@@ -1,3 +1,11 @@
+use std::cell::RefCell;
+
+use pumpkin_cluster::combat::chunk_of_pos;
+use pumpkin_cluster::entity_action::{
+    EntityMutationSeqClock, capture_add_effect, capture_remove_effect, stage,
+};
+use pumpkin_cluster::identity::{ActionActor, ServerId};
+use pumpkin_cluster::protocol::{EntityMutationTarget, StatusEffectState};
 use pumpkin_data::potion::Effect;
 use pumpkin_data::translation;
 use pumpkin_util::PermissionLvl;
@@ -14,6 +22,10 @@ use crate::command::errors::error_types::CommandErrorType;
 use crate::command::node::dispatcher::CommandDispatcher;
 use crate::command::node::{CommandExecutor, CommandExecutorResult};
 use crate::entity::EntityBase;
+
+thread_local! {
+    static ENTITY_MUTATION_SEQUENCES: RefCell<EntityMutationSeqClock> = RefCell::new(EntityMutationSeqClock::new());
+}
 
 const DESCRIPTION: &str = "Adds or removes the status effects of players and other entities.";
 const PERMISSION: &str = "minecraft:command.effect";
@@ -51,6 +63,122 @@ struct GiveExecutor {
     has_hide_particles: bool,
 }
 
+fn effect_state(effect: Effect) -> StatusEffectState {
+    let mut flags = 0_u8;
+    if effect.ambient {
+        flags |= 1;
+    }
+    if effect.show_particles {
+        flags |= 2;
+    }
+    if effect.show_icon {
+        flags |= 4;
+    }
+    if effect.blend {
+        flags |= 8;
+    }
+    StatusEffectState {
+        effect: u16::from(effect.effect_type.id),
+        duration_ticks: effect.duration,
+        amplifier: effect.amplifier,
+        flags,
+    }
+}
+
+fn mutation_actor(context: &CommandContext) -> ActionActor {
+    context
+        .source
+        .as_player()
+        .and_then(|player| player.cluster_gid())
+        .map(ActionActor::Player)
+        .unwrap_or_else(|| {
+            ActionActor::Server(ServerId(
+                context.source.server().advanced_config.cluster.server_id,
+            ))
+        })
+}
+
+fn mutation_target(target: &crate::entity::player::Player) -> Option<EntityMutationTarget> {
+    let gid = target.cluster_gid()?;
+    let position = target.position();
+    Some(EntityMutationTarget::Player {
+        gid,
+        chunk: chunk_of_pos(position.x, position.z),
+    })
+}
+
+fn issue_mutation_sequence(actor: ActionActor) -> Option<pumpkin_cluster::identity::ActionSeq> {
+    ENTITY_MUTATION_SEQUENCES
+        .try_with(|sequences| sequences.try_borrow_mut().ok().map(|mut sequences| sequences.issue(actor)))
+        .ok()
+        .flatten()
+}
+
+fn stage_add_effect(
+    context: &CommandContext,
+    target: &crate::entity::player::Player,
+    effect: Effect,
+) -> bool {
+    let server = context.source.server();
+    if !server.advanced_config.cluster.enabled {
+        target.add_effect(effect);
+        return true;
+    }
+    let Some(tick) = crate::server::cluster::disciplined_tick_now() else {
+        return false;
+    };
+    let Some(target_ref) = mutation_target(target) else {
+        return false;
+    };
+    let actor = mutation_actor(context);
+    let Some(seq) = issue_mutation_sequence(actor) else {
+        return false;
+    };
+    let update = capture_add_effect(
+        actor,
+        seq,
+        tick,
+        target_ref,
+        target.living_entity.get_effect(effect.effect_type).map(effect_state),
+        effect_state(effect),
+    );
+    if !crate::server::cluster_entity_apply::stage_owned_entity_mutation(update) {
+        return false;
+    }
+    stage(update);
+    true
+}
+
+fn stage_remove_effect(
+    context: &CommandContext,
+    target: &crate::entity::player::Player,
+    effect: &'static pumpkin_data::effect::StatusEffect,
+) -> bool {
+    let server = context.source.server();
+    if !server.advanced_config.cluster.enabled {
+        return target.remove_effect(effect);
+    }
+    let Some(before) = target.living_entity.get_effect(effect).map(effect_state) else {
+        return false;
+    };
+    let Some(tick) = crate::server::cluster::disciplined_tick_now() else {
+        return false;
+    };
+    let Some(target_ref) = mutation_target(target) else {
+        return false;
+    };
+    let actor = mutation_actor(context);
+    let Some(seq) = issue_mutation_sequence(actor) else {
+        return false;
+    };
+    let update = capture_remove_effect(actor, seq, tick, target_ref, before);
+    if !crate::server::cluster_entity_apply::stage_owned_entity_mutation(update) {
+        return false;
+    }
+    stage(update);
+    true
+}
+
 impl CommandExecutor for GiveExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let targets = EntityArgumentType::get_players(context, "targets")?;
@@ -83,7 +211,7 @@ impl CommandExecutor for GiveExecutor {
                 .is_some_and(|existing| existing.amplifier >= amplifier);
 
             if !should_skip {
-                target.add_effect(Effect {
+                if stage_add_effect(context, target, Effect {
                     effect_type: effect,
                     duration: duration_ticks,
                     amplifier,
@@ -91,8 +219,9 @@ impl CommandExecutor for GiveExecutor {
                     show_particles: !hide_particles,
                     show_icon: true,
                     blend: false,
-                });
-                successes += 1;
+                }) {
+                    successes += 1;
+                }
             }
         }
 
@@ -161,14 +290,20 @@ impl CommandExecutor for ClearExecutor {
             ClearMode::SelfAll | ClearMode::TargetsAll => {
                 let mut succeeded_clears = 0;
                 for target in &targets {
-                    let has_effects = !target
-                        .living_entity
-                        .active_effects
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .is_empty();
-                    if has_effects {
-                        target.remove_all_effects();
+                    if !context.source.server().advanced_config.cluster.enabled {
+                        if !target.living_entity.active_effects.is_empty() {
+                            target.remove_all_effects();
+                            succeeded_clears += 1;
+                        }
+                        continue;
+                    }
+                    let mut cleared = false;
+                    for effect in target.living_entity.active_effects.types() {
+                        if stage_remove_effect(context, target, effect) {
+                            cleared = true;
+                        }
+                    }
+                    if cleared {
                         succeeded_clears += 1;
                     }
                 }
@@ -202,8 +337,9 @@ impl CommandExecutor for ClearExecutor {
                 let effect = ResourceArgument::get_mob_effect(context, "effect")?;
                 let mut succeeded_clears = 0;
                 for target in &targets {
-                    if target.living_entity.has_effect(effect) {
-                        target.remove_effect(effect);
+                    if target.living_entity.has_effect(effect)
+                        && stage_remove_effect(context, target, effect)
+                    {
                         succeeded_clears += 1;
                     }
                 }

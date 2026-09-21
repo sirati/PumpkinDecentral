@@ -30,6 +30,7 @@ use pumpkin_data::{
     sound::{Sound, SoundCategory},
 };
 use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
+use pumpkin_nbt::{Nbt, deserializer::NbtReadHelperJava};
 use pumpkin_protocol::bedrock::client::{CAddActor, CSetActorMotion};
 use pumpkin_protocol::codec::var_long::VarLong;
 use pumpkin_protocol::java::client::play::{CUpdateEntityPos, CUpdateEntityPosRot};
@@ -69,10 +70,11 @@ use pumpkin_util::text::TextComponent;
 use pumpkin_util::text::hover::HoverEvent;
 use pumpkin_util::version::JavaMinecraftVersion;
 use std::collections::{BTreeMap, HashSet};
+use std::io::Cursor;
 use std::sync::{
     Arc,
     atomic::{
-        AtomicBool, AtomicI32, AtomicU8, AtomicU32,
+        AtomicBool, AtomicI32, AtomicU16, AtomicU8, AtomicU32,
         Ordering::{self, Relaxed},
     },
 };
@@ -97,6 +99,7 @@ pub mod lightning;
 pub mod living;
 pub mod marker;
 pub mod mob;
+pub mod nonliving_attack;
 pub mod passive;
 pub mod player;
 pub mod projectile;
@@ -137,6 +140,26 @@ impl dyn EntityBase + '_ {
         self.get_entity().entity_id == other.get_entity().entity_id
             || self.considers_entity_as_ally(other)
             || other.considers_entity_as_ally(self)
+    }
+
+    pub fn cluster_nonliving_attack_snapshot(
+        &self,
+    ) -> Option<pumpkin_cluster::protocol::NonLivingAttackOutcome> {
+        cluster_nonliving_attack_snapshot(self)
+    }
+
+    pub fn cluster_apply_nonliving_attack(
+        &self,
+        outcome: &pumpkin_cluster::protocol::NonLivingAttackOutcome,
+    ) -> bool {
+        cluster_apply_nonliving_attack(self, outcome)
+    }
+
+    pub fn cluster_restore_nonliving_attack(
+        &self,
+        outcome: &pumpkin_cluster::protocol::NonLivingAttackOutcome,
+    ) -> bool {
+        cluster_apply_nonliving_attack(self, outcome)
     }
 }
 
@@ -840,6 +863,245 @@ impl RemovalReason {
 static CURRENT_ID: AtomicI32 = AtomicI32::new(1);
 
 /// Represents a non-living Entity (e.g. Item, Egg, Snowball...)
+fn cluster_nonliving_kind(entity: &dyn EntityBase) -> pumpkin_cluster::protocol::NonLivingAttackKind {
+    use pumpkin_cluster::protocol::NonLivingAttackKind;
+
+    let entity_type = entity.get_entity().entity_type;
+    let name = entity_type.resource_name;
+    if entity_type.id == EntityType::ARMOR_STAND.id {
+        NonLivingAttackKind::ArmorStand
+    } else if entity_type.id == EntityType::ITEM_FRAME.id {
+        NonLivingAttackKind::ItemFrame
+    } else if entity_type.id == EntityType::GLOW_ITEM_FRAME.id {
+        NonLivingAttackKind::GlowItemFrame
+    } else if entity_type.id == EntityType::ITEM.id {
+        NonLivingAttackKind::Item
+    } else if name.ends_with("_chest_boat") {
+        NonLivingAttackKind::ChestBoat
+    } else if name.ends_with("_boat") || name.ends_with("_raft") {
+        NonLivingAttackKind::Boat
+    } else if name == "minecart" {
+        NonLivingAttackKind::Minecart
+    } else if name == "chest_minecart" {
+        NonLivingAttackKind::ChestMinecart
+    } else if name == "furnace_minecart" {
+        NonLivingAttackKind::FurnaceMinecart
+    } else if name == "hopper_minecart" {
+        NonLivingAttackKind::HopperMinecart
+    } else if name == "tnt_minecart" {
+        NonLivingAttackKind::TntMinecart
+    } else if name == "command_block_minecart" {
+        NonLivingAttackKind::CommandBlockMinecart
+    } else if name == "spawner_minecart" {
+        NonLivingAttackKind::SpawnerMinecart
+    } else if entity_type.id == EntityType::PAINTING.id {
+        NonLivingAttackKind::Painting
+    } else if entity_type.id == EntityType::END_CRYSTAL.id {
+        NonLivingAttackKind::EndCrystal
+    } else if entity_type.id == EntityType::INTERACTION.id {
+        NonLivingAttackKind::Interaction
+    } else if entity_type.id == EntityType::MARKER.id {
+        NonLivingAttackKind::Marker
+    } else if name.ends_with("_display") {
+        NonLivingAttackKind::Display
+    } else if name.contains("arrow")
+        || name.contains("fireball")
+        || name == "snowball"
+        || name == "egg"
+        || name == "trident"
+        || name == "wind_charge"
+    {
+        NonLivingAttackKind::Projectile
+    } else {
+        NonLivingAttackKind::Other(entity_type.id)
+    }
+}
+
+fn cluster_nonliving_nbt(entity: &dyn EntityBase) -> Vec<u8> {
+    let mut nbt = NbtCompound::new();
+    entity.write_nbt(&mut nbt);
+    Nbt::from(nbt).write_unnamed().to_vec()
+}
+
+fn cluster_apply_nonliving_nbt(entity: &dyn EntityBase, bytes: &[u8]) -> bool {
+    let mut cursor = Cursor::new(bytes);
+    let mut reader = NbtReadHelperJava::new(&mut cursor);
+    let Ok(nbt) = Nbt::read_unnamed(&mut reader) else {
+        return false;
+    };
+    if cursor.position() != bytes.len() as u64 {
+        return false;
+    }
+    entity.read_nbt_non_mut(&nbt.root_tag);
+    true
+}
+
+fn cluster_nonliving_attack_snapshot(
+    entity: &dyn EntityBase,
+) -> Option<pumpkin_cluster::protocol::NonLivingAttackOutcome> {
+    use pumpkin_cluster::protocol::{
+        EntityNbtTransition, InteractionAttackOutcome, ItemEntityAttackOutcome,
+        ItemFrameAttackOutcome, NonLivingAttackOutcome, VehicleAttackOutcome,
+    };
+
+    let kind = cluster_nonliving_kind(entity);
+    if entity.get_living_entity().is_some() && kind != pumpkin_cluster::protocol::NonLivingAttackKind::ArmorStand {
+        return None;
+    }
+    let removed = entity.get_entity().is_removed();
+    if let Some(frame) = entity
+        .cast_any()
+        .downcast_ref::<crate::entity::decoration::item_frame::ItemFrameEntity>()
+    {
+        let item = crate::entity::item::ItemEntity::cluster_stack_from_item_stack(&frame.get_item());
+        return Some(NonLivingAttackOutcome::ItemFrame(ItemFrameAttackOutcome {
+            kind,
+            fixed: frame.is_fixed(),
+            item_drop_chance_bits: frame.get_drop_chance().to_bits(),
+            item_before: item.clone(),
+            item_after: item,
+            rotation_before: frame.get_rotation(),
+            rotation_after: frame.get_rotation(),
+            removed_before: removed,
+            removed_after: removed,
+            drops: Vec::new(),
+            lifecycle: pumpkin_cluster::protocol::NonLivingAttackLifecycle {
+                present_before: !removed,
+                present_after: !removed,
+                spawned: Vec::new(),
+            },
+        }));
+    }
+    if let Some(item) = entity.get_item_entity() {
+        let stack = item.cluster_stack_snapshot();
+        return Some(NonLivingAttackOutcome::Item(ItemEntityAttackOutcome {
+            stack_before: stack.clone(),
+            stack_after: stack,
+            health_before_bits: item.cluster_attack_health_bits(),
+            health_after_bits: item.cluster_attack_health_bits(),
+            removed_before: removed,
+            removed_after: removed,
+            lifecycle: pumpkin_cluster::protocol::NonLivingAttackLifecycle {
+                present_before: !removed,
+                present_after: !removed,
+                spawned: Vec::new(),
+            },
+        }));
+    }
+    if let Some(vehicle) = entity
+        .cast_any()
+        .downcast_ref::<crate::entity::vehicle::boat::BoatEntity>()
+        .map(|boat| &boat.vehicle)
+        .or_else(|| {
+            entity
+                .cast_any()
+                .downcast_ref::<crate::entity::vehicle::minecart::MinecartEntity>()
+                .map(|minecart| &minecart.vehicle)
+        })
+    {
+        return Some(NonLivingAttackOutcome::Vehicle(VehicleAttackOutcome {
+            kind,
+            hurt_time_before: vehicle.get_hurt_time(),
+            hurt_time_after: vehicle.get_hurt_time(),
+            hurt_dir_before: vehicle.get_hurt_dir(),
+            hurt_dir_after: vehicle.get_hurt_dir(),
+            damage_before_bits: vehicle.get_damage().to_bits(),
+            damage_after_bits: vehicle.get_damage().to_bits(),
+            removed_before: removed,
+            removed_after: removed,
+            drops: Vec::new(),
+            lifecycle: pumpkin_cluster::protocol::NonLivingAttackLifecycle {
+                present_before: !removed,
+                present_after: !removed,
+                spawned: Vec::new(),
+            },
+        }));
+    }
+    let nbt = cluster_nonliving_nbt(entity);
+    let transition = EntityNbtTransition {
+        kind,
+        before: nbt.clone(),
+        after: nbt,
+        removed_before: removed,
+        removed_after: removed,
+        drops: Vec::new(),
+        lifecycle: pumpkin_cluster::protocol::NonLivingAttackLifecycle {
+            present_before: !removed,
+            present_after: !removed,
+            spawned: Vec::new(),
+        },
+    };
+    if kind == pumpkin_cluster::protocol::NonLivingAttackKind::Interaction {
+        Some(NonLivingAttackOutcome::Interaction(InteractionAttackOutcome {
+            before: transition.before,
+            after: transition.after,
+            lifecycle: transition.lifecycle,
+        }))
+    } else if kind == pumpkin_cluster::protocol::NonLivingAttackKind::ArmorStand {
+        Some(NonLivingAttackOutcome::ArmorStand(transition))
+    } else {
+        Some(NonLivingAttackOutcome::Destroy(transition))
+    }
+}
+
+fn cluster_apply_nonliving_attack(
+    entity: &dyn EntityBase,
+    outcome: &pumpkin_cluster::protocol::NonLivingAttackOutcome,
+) -> bool {
+    use pumpkin_cluster::protocol::NonLivingAttackOutcome;
+
+    match outcome {
+        NonLivingAttackOutcome::Noop(kind) => cluster_nonliving_attack_snapshot(entity)
+            .is_some_and(|snapshot| snapshot == NonLivingAttackOutcome::Noop(*kind)),
+        NonLivingAttackOutcome::ItemFrame(outcome) => {
+            let Some(frame) = entity
+                .cast_any()
+                .downcast_ref::<crate::entity::decoration::item_frame::ItemFrameEntity>()
+            else {
+                return false;
+            };
+            let item = if outcome.item_after.is_empty() {
+                pumpkin_data::item_stack::ItemStack::EMPTY.clone()
+            } else {
+                let Some(item) = crate::entity::item::ItemEntity::item_stack_from_cluster_snapshot(&outcome.item_after) else {
+                    return false;
+                };
+                item
+            };
+            frame.set_item(item, true);
+            frame.set_rotation(outcome.rotation_after, true);
+            true
+        }
+        NonLivingAttackOutcome::Vehicle(outcome) => {
+            let vehicle = entity
+                .cast_any()
+                .downcast_ref::<crate::entity::vehicle::boat::BoatEntity>()
+                .map(|boat| &boat.vehicle)
+                .or_else(|| {
+                    entity
+                        .cast_any()
+                        .downcast_ref::<crate::entity::vehicle::minecart::MinecartEntity>()
+                        .map(|minecart| &minecart.vehicle)
+                });
+            let Some(vehicle) = vehicle else {
+                return false;
+            };
+            vehicle.set_hurt_time(outcome.hurt_time_after);
+            vehicle.set_hurt_dir(outcome.hurt_dir_after);
+            vehicle.set_damage(f32::from_bits(outcome.damage_after_bits));
+            vehicle.send_wobble_metadata();
+            true
+        }
+        NonLivingAttackOutcome::Item(outcome) => entity.get_item_entity().is_some_and(|item| {
+            item.cluster_set_attack_state(outcome.stack_after.clone(), outcome.health_after_bits)
+        }),
+        NonLivingAttackOutcome::Interaction(outcome) => cluster_apply_nonliving_nbt(entity, &outcome.after),
+        NonLivingAttackOutcome::ArmorStand(outcome) | NonLivingAttackOutcome::Destroy(outcome) => {
+            cluster_apply_nonliving_nbt(entity, &outcome.after)
+        }
+    }
+}
+
 pub struct Entity {
     /// A unique identifier for the entity
     pub entity_id: i32,
@@ -847,6 +1109,9 @@ pub struct Entity {
     pub entity_uuid: uuid::Uuid,
     /// The type of entity (e.g., player, zombie, item)
     pub entity_type: &'static EntityType,
+    pub cluster_owner: AtomicU16,
+    pub cluster_origin_server: AtomicU16,
+    pub cluster_origin_id: AtomicI32,
     /// The world in which the entity exists.
     /// Uses `ArcSwap` to allow atomic updates when changing dimensions.
     pub world: ArcSwap<World>,
@@ -1026,6 +1291,9 @@ impl Entity {
             entity_id,
             entity_uuid,
             entity_type,
+            cluster_owner: AtomicU16::new(u16::MAX),
+            cluster_origin_server: AtomicU16::new(u16::MAX),
+            cluster_origin_id: AtomicI32::new(entity_id),
             on_ground: AtomicBool::new(false),
             touching_water: AtomicBool::new(false),
             water_height: AtomicCell::new(0.0),
@@ -3109,7 +3377,7 @@ impl Entity {
             for player in players.iter() {
                 if (tracked.seen_by.contains(&player.gameprofile.id)
                     || player.entity_id() == self.entity_id)
-                    && let ClientPlatform::Bedrock(client) = player.client.as_ref()
+                    && let Some(ClientPlatform::Bedrock(client)) = player.client.as_deref()
                 {
                     bedrock_recipients.push(client);
                 }
@@ -3121,7 +3389,7 @@ impl Entity {
                     .watched_section
                     .load()
                     .is_within_distance(chunk_pos.x, chunk_pos.y)
-                    && let ClientPlatform::Bedrock(client) = player.client.as_ref()
+                    && let Some(ClientPlatform::Bedrock(client)) = player.client.as_deref()
                 {
                     bedrock_recipients.push(client);
                 }
@@ -3158,7 +3426,7 @@ impl Entity {
             for player in players.iter() {
                 if (tracked.seen_by.contains(&player.gameprofile.id)
                     || player.entity_id() == self.entity_id)
-                    && let ClientPlatform::Java(_) = player.client.as_ref()
+                    && let Some(ClientPlatform::Java(_)) = player.client.as_deref()
                 {
                     java_recipients.push(player);
                 }
@@ -3170,7 +3438,7 @@ impl Entity {
                     .watched_section
                     .load()
                     .is_within_distance(chunk_pos.x, chunk_pos.y)
-                    && let ClientPlatform::Java(_) = player.client.as_ref()
+                    && let Some(ClientPlatform::Java(_)) = player.client.as_deref()
                 {
                     java_recipients.push(player);
                 }
@@ -3219,7 +3487,7 @@ impl Entity {
             for player in players.iter() {
                 if (tracked.seen_by.contains(&player.gameprofile.id)
                     || player.entity_id() == self.entity_id)
-                    && let ClientPlatform::Java(_) = player.client.as_ref()
+                    && let Some(ClientPlatform::Java(_)) = player.client.as_deref()
                 {
                     java_recipients.push(player);
                 }
@@ -3231,7 +3499,7 @@ impl Entity {
                     .watched_section
                     .load()
                     .is_within_distance(chunk_pos.x, chunk_pos.y)
-                    && let ClientPlatform::Java(_) = player.client.as_ref()
+                    && let Some(ClientPlatform::Java(_)) = player.client.as_deref()
                 {
                     java_recipients.push(player);
                 }

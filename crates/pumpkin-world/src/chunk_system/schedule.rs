@@ -9,7 +9,9 @@ use super::{
     LevelChannel,
 };
 use crate::chunk::io::Dirtiable;
-use crate::level::{Level, LoadedChunkChange, SyncChunk};
+use crate::level::{
+    Level, LoadedChunkChange, SyncChunk, note_cluster_chunk_drop, note_cluster_chunk_full,
+};
 use dashmap::DashMap;
 use pumpkin_config::lighting::LightingEngineConfig;
 use pumpkin_util::math::vector2::Vector2;
@@ -17,11 +19,28 @@ use slotmap::Key;
 use std::cmp::{Ordering, max};
 use std::collections::{BinaryHeap, HashMap};
 use std::mem::swap;
-use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, trace, warn};
+
+static CLUSTER_SNAPSHOT_DIAGNOSTIC_LAST_MILLIS: [AtomicU64; 2] =
+    [const { AtomicU64::new(0) }; 2];
+
+fn cluster_snapshot_diagnostic_cooldown_elapsed(stage: usize) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|age| age.as_millis() as u64)
+        .unwrap_or(0);
+    let last = CLUSTER_SNAPSHOT_DIAGNOSTIC_LAST_MILLIS[stage].load(Relaxed);
+    if now.saturating_sub(last) < 1_000 {
+        return false;
+    }
+    CLUSTER_SNAPSHOT_DIAGNOSTIC_LAST_MILLIS[stage]
+        .compare_exchange(last, now, Relaxed, Relaxed)
+        .is_ok()
+}
 
 pub(crate) struct TaskHeapNode(i8, NodeKey);
 impl PartialEq for TaskHeapNode {
@@ -82,12 +101,23 @@ pub struct GenerationSchedule {
     generation_pool: Option<Arc<rayon::ThreadPool>>,
 }
 
+fn public_chunk_became_full(previous: Option<&SyncChunk>, full: bool) -> bool {
+    full
+        && !previous.is_some_and(|previous| {
+            previous.status == pumpkin_data::chunk::ChunkStatus::Full
+        })
+}
+
 impl GenerationSchedule {
     fn publish_chunk(&self, pos: ChunkPos, chunk: SyncChunk) -> Option<SyncChunk> {
+        let full = chunk.status == pumpkin_data::chunk::ChunkStatus::Full;
         let previous = self.public_chunk_map.insert(pos, chunk);
-        if previous.is_none() {
-            self.loaded_chunk_changes
-                .push(LoadedChunkChange::Loaded(pos));
+        if public_chunk_became_full(previous.as_ref(), full) {
+            if previous.is_none() {
+                self.loaded_chunk_changes
+                    .push(LoadedChunkChange::Loaded(pos));
+            }
+            note_cluster_chunk_full(pos);
         }
         previous
     }
@@ -97,6 +127,7 @@ impl GenerationSchedule {
         if removed.is_some() {
             self.loaded_chunk_changes
                 .push(LoadedChunkChange::Unloaded(pos));
+            note_cluster_chunk_drop(pos);
         }
         removed
     }
@@ -324,6 +355,15 @@ impl GenerationSchedule {
         self.apply_lighting_override(&snapshot);
         self.publish_chunk(pos, snapshot.clone());
         holder.public = true;
+        if cluster_snapshot_diagnostic_cooldown_elapsed(0) {
+            info!(
+                target: "cluster_chunk",
+                stage = "secondary_full_chunk_published",
+                chunk_x = pos.x,
+                chunk_z = pos.y,
+                "secondary snapshot became a public full chunk and emitted availability"
+            );
+        }
         trace!(
             "Notifying players: chunk {:?} fetched from holding peer (Full status)",
             pos
@@ -366,7 +406,17 @@ impl GenerationSchedule {
             }
         }
         for (pos, snapshot) in completed {
-            fetch_level.cluster_ingest_snapshot(pos, &snapshot);
+            let installed = fetch_level.cluster_ingest_snapshot(pos, &snapshot);
+            if cluster_snapshot_diagnostic_cooldown_elapsed(1) {
+                info!(
+                    target: "cluster_chunk",
+                    stage = "secondary_snapshot_installed",
+                    chunk_x = pos.x,
+                    chunk_z = pos.y,
+                    installed,
+                    "secondary snapshot reached the dual chunk store"
+                );
+            }
             self.receive_chunk(pos, RecvChunk::Cluster((pos, snapshot)));
         }
         let wanted: Vec<_> = fetch_level
@@ -2083,6 +2133,31 @@ mod secondary_park_regression {
             cluster_fetches: HashMapType::default(),
             cluster_level: None,
         }
+    }
+
+    #[test]
+    fn full_publication_follows_an_already_public_partial_chunk() {
+        let pos = ChunkPos::new(3, 5);
+        let schedule = secondary_test_schedule();
+        let mut partial = crate::chunk::ChunkData::empty_sync(pos.x, pos.y);
+        Arc::get_mut(&mut partial)
+            .expect("partial chunk has no other holders")
+            .status = pumpkin_data::chunk::ChunkStatus::Features;
+        assert!(public_chunk_became_full(Some(&partial), true));
+        assert!(!public_chunk_became_full(Some(&partial), false));
+        schedule.public_chunk_map.insert(pos, partial);
+
+        let full = crate::chunk::ChunkData::empty_sync(pos.x, pos.y);
+        schedule.publish_chunk(pos, full);
+
+        assert_eq!(
+            schedule
+                .public_chunk_map
+                .get(&pos)
+                .expect("full chunk replaced partial")
+                .status,
+            pumpkin_data::chunk::ChunkStatus::Full
+        );
     }
 
     fn parked_noise_task(schedule: &mut GenerationSchedule) -> NodeKey {

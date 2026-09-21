@@ -14,10 +14,11 @@ use pumpkin_util::GameMode;
 use pumpkin_util::Hand;
 use pumpkin_util::math::position::BlockPos;
 use rustc_hash::FxHashMap;
+use arc_swap::ArcSwap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{
-    AtomicBool, AtomicI32, AtomicI64, AtomicU8,
+    AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicU8,
     Ordering::{Relaxed, SeqCst},
 };
 use tracing::warn;
@@ -32,13 +33,14 @@ use crate::entity::attributes::Modifier;
 use crate::entity::attributes::ModifierOperation;
 use crate::entity::combat::{CombatRules, CombatTracker, FallLocation, knockback_after_resistance};
 use crate::entity::mob::equipment::DEFAULT_EQUIPMENT_DROP_CHANCE;
+use crate::entity::player::Player;
 use crate::entity::player::statistics::{CustomStatistic, StatisticCategory};
 use crate::server::Server;
 use crate::world::loot::LootContextParameters;
 use crossbeam::atomic::AtomicCell;
 use pumpkin_data::AttributeModifierSlot;
 use pumpkin_data::attributes::Attributes;
-use pumpkin_data::data_component_impl::Operation;
+use pumpkin_data::data_component_impl::{IDSetContent, Operation};
 use pumpkin_data::data_component_impl::food::{ConsumableImpl, ConsumeEffect};
 use pumpkin_data::data_component_impl::{
     AttributeModifiersImpl, BlocksAttacksImpl, DeathProtectionImpl, EnchantmentsImpl,
@@ -52,8 +54,20 @@ use pumpkin_data::item_stack::{DamageResult, ItemStack};
 use pumpkin_data::sound::SoundCategory;
 use pumpkin_data::{Block, Enchantment};
 use pumpkin_data::{damage::DamageType, sound::Sound};
+use pumpkin_cluster::combat::{
+    CapturedAttackSnapshot, CapturedAttackState, CapturedAttackTargetSnapshot, CombatStateSnapshot,
+    living_damage_is_exact,
+};
+use pumpkin_cluster::entity_action::EntityEffects;
+use pumpkin_cluster::inventory::InventoryStack;
+use pumpkin_cluster::protocol::{
+    AttackDamageType, CapturedAttackOutcome, CapturedAttackTarget, CombatAttributeSnapshot,
+    CombatEquipmentSnapshot, CapturedAttackTargetOutcome, EntityMutationTarget,
+    LivingAttackPrecondition, LivingHurtCooldownResolution, StatusEffectState,
+};
 use pumpkin_inventory::entity_equipment::EntityEquipment;
 use pumpkin_nbt::compound::NbtCompound;
+use pumpkin_nbt::deserializer::NbtReadHelperJava;
 use pumpkin_nbt::tag::NbtTag;
 use pumpkin_protocol::codec::var_int::VarInt;
 use pumpkin_protocol::java::client::play::{
@@ -68,7 +82,6 @@ use pumpkin_util::math::boundingbox::BoundingBox;
 use pumpkin_util::math::vector3::Vector3;
 use pumpkin_util::text::TextComponent;
 use rand::RngExt;
-use std::sync::RwLock;
 
 /// Represents a living entity within the game world.
 ///
@@ -93,8 +106,10 @@ pub struct LivingEntity {
     pub dead: AtomicBool,
     /// The distance the entity has been falling.
     pub fall_distance: AtomicCell<f32>,
-    pub active_effects: std::sync::Mutex<FxHashMap<&'static StatusEffect, Effect>>,
+    pub active_effects: ActiveEffects,
     pub entity_equipment: Arc<std::sync::Mutex<EntityEquipment>>,
+    cluster_combat_equipment: ArcSwap<ClusterCombatEquipment>,
+    pub cluster_equipment: AtomicI32,
     pub equipment_drop_chances: Arc<std::sync::Mutex<FxHashMap<EquipmentSlot, f32>>>,
     pub movement_input: AtomicCell<Vector3<f64>>,
     pub equipment_slots: Arc<FxHashMap<usize, EquipmentSlot>>,
@@ -112,7 +127,7 @@ pub struct LivingEntity {
     pub last_attacker_id: AtomicI32,
     /// The tick at which this entity was last attacked (entity age).
     pub last_attacked_time: AtomicI32,
-    last_damage_type: std::sync::Mutex<Option<DamageType>>,
+    last_damage_type: AtomicI32,
     last_damage_stamp: std::sync::atomic::AtomicI64,
 
     /// The entity ID of the entity this living entity last attacked.
@@ -121,7 +136,7 @@ pub struct LivingEntity {
     pub last_attack_time: AtomicI32,
 
     /// Tracks combat entries, assisted falls, kill credit, and death messages.
-    pub combat_tracker: std::sync::Mutex<CombatTracker>,
+    pub combat_tracker: CombatTrackerStore,
 
     /// The ID of the player that last hurt this entity.
     pub last_hurt_by_player_id: AtomicI32,
@@ -139,7 +154,7 @@ pub struct LivingEntity {
     pub last_block_pos: AtomicCell<Option<BlockPos>>,
 
     /// The attributes of the entity
-    pub attributes: RwLock<FxHashMap<u8, AttributeInstance>>,
+    attributes: ArcSwap<FxHashMap<u8, AttributeInstance>>,
     /// Modifier ids applied from the current item in each equipment slot.
     /// Used to remove them on unequip without the previous stack.
     equipment_attribute_modifier_ids: std::sync::Mutex<FxHashMap<EquipmentSlot, Vec<(u8, String)>>>,
@@ -153,6 +168,791 @@ struct EffectParticle {
 
 #[derive(Clone)]
 struct EffectParticles(Vec<EffectParticle>);
+
+pub struct CombatTrackerStore {
+    state: ArcSwap<CombatTracker>,
+}
+
+impl CombatTrackerStore {
+    pub fn new() -> Self {
+        Self {
+            state: ArcSwap::from_pointee(CombatTracker::new()),
+        }
+    }
+
+    pub fn snapshot(&self) -> CombatTracker {
+        (*self.state.load_full()).clone()
+    }
+
+    pub fn replace(&self, tracker: CombatTracker) {
+        self.state.store(Arc::new(tracker));
+    }
+
+    pub fn update(&self, update: impl FnOnce(&mut CombatTracker)) {
+        let mut next = self.snapshot();
+        update(&mut next);
+        self.replace(next);
+    }
+}
+
+pub struct ActiveEffects {
+    slots: [AtomicU64; 40],
+}
+
+#[derive(Clone, Default)]
+struct ClusterCombatEquipment {
+    equipment: Vec<CombatEquipmentSnapshot>,
+    attributes: Vec<CombatAttributeSnapshot>,
+}
+
+impl ClusterCombatEquipment {
+    fn initial(entity: &Entity) -> Self {
+        Self {
+            equipment: Vec::new(),
+            attributes: Self::attribute_values_from(entity.entity_type.attributes.iter().map(
+                |(attribute, base)| (attribute.id, *base),
+            )),
+        }
+    }
+
+    fn attribute_values_from(
+        values: impl IntoIterator<Item = (u8, f64)>,
+    ) -> Vec<CombatAttributeSnapshot> {
+        let mut values: FxHashMap<_, _> = values.into_iter().collect();
+        for attribute in [
+            Attributes::ARMOR,
+            Attributes::ARMOR_TOUGHNESS,
+            Attributes::KNOCKBACK_RESISTANCE,
+            Attributes::ATTACK_DAMAGE,
+            Attributes::ATTACK_SPEED,
+        ] {
+            values.entry(attribute.id).or_insert(attribute.default_value);
+        }
+        let mut attributes = values
+            .into_iter()
+            .map(|(id, value)| CombatAttributeSnapshot {
+                id: u16::from(id),
+                value_bits: value.to_bits(),
+            })
+            .collect::<Vec<_>>();
+        attributes.sort_by_key(|attribute| attribute.id);
+        attributes
+    }
+
+    fn attribute(&self, attribute: &Attributes) -> Option<f64> {
+        self.attributes
+            .iter()
+            .find(|snapshot| snapshot.id == u16::from(attribute.id))
+            .map(|snapshot| f64::from_bits(snapshot.value_bits))
+            .filter(|value| value.is_finite())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapturedAttackDefenseSnapshot {
+    pub armor_bits: u64,
+    pub toughness_bits: u64,
+    pub protection_exact: i32,
+    pub fire_protection: i32,
+    pub blast_protection: i32,
+    pub projectile_protection: i32,
+    pub feather_falling: i32,
+    pub resistance_amplifier: Option<i32>,
+    pub fire_resistance: bool,
+    pub knockback_resistance_bits: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapturedAttackOffenseSnapshot {
+    pub attack_damage_bits: u64,
+    pub main_hand_attack_damage_bits: u64,
+    pub main_hand_attack_speed_bits: u64,
+    pub sharpness: i32,
+    pub smite: i32,
+    pub bane_of_arthropods: i32,
+    pub knockback: i32,
+    pub breach: i32,
+    pub strength_amplifier: Option<i32>,
+    pub weakness_amplifier: Option<i32>,
+}
+
+impl ActiveEffects {
+    const PRESENT: u64 = 1_u64 << 63;
+
+    pub fn new() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+
+    fn slot(&self, effect: &'static StatusEffect) -> &AtomicU64 {
+        &self.slots[usize::from(effect.id)]
+    }
+
+    fn decode(effect_type: &'static StatusEffect, encoded: u64) -> Option<Effect> {
+        if encoded & Self::PRESENT == 0 {
+            return None;
+        }
+        let duration = (encoded as u32) as i32;
+        let amplifier = ((encoded >> 32) & 0xff) as u8;
+        let flags = ((encoded >> 40) & 0x0f) as u8;
+        Some(Effect {
+            effect_type,
+            duration,
+            amplifier,
+            ambient: flags & 1 != 0,
+            show_particles: flags & 2 != 0,
+            show_icon: flags & 4 != 0,
+            blend: flags & 8 != 0,
+        })
+    }
+
+    fn encode(effect: &Effect) -> u64 {
+        let mut flags = 0_u64;
+        if effect.ambient {
+            flags |= 1;
+        }
+        if effect.show_particles {
+            flags |= 2;
+        }
+        if effect.show_icon {
+            flags |= 4;
+        }
+        if effect.blend {
+            flags |= 8;
+        }
+        Self::PRESENT
+            | u64::from(effect.duration as u32)
+            | (u64::from(effect.amplifier) << 32)
+            | (flags << 40)
+    }
+
+    pub fn get(&self, effect: &'static StatusEffect) -> Option<Effect> {
+        Self::decode(effect, self.slot(effect).load(Relaxed))
+    }
+
+    pub fn contains(&self, effect: &'static StatusEffect) -> bool {
+        self.slot(effect).load(Relaxed) & Self::PRESENT != 0
+    }
+
+    pub fn insert(&self, effect: Effect) -> Option<Effect> {
+        let effect_type = effect.effect_type;
+        Self::decode(effect_type, self.slot(effect_type).swap(Self::encode(&effect), SeqCst))
+    }
+
+    pub fn remove(&self, effect: &'static StatusEffect) -> Option<Effect> {
+        Self::decode(effect, self.slot(effect).swap(0, SeqCst))
+    }
+
+    pub fn values(&self) -> Vec<Effect> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(id, slot)| {
+                let effect = StatusEffect::from_id(id as u16)?;
+                Self::decode(effect, slot.load(Relaxed))
+            })
+            .collect()
+    }
+
+    pub fn types(&self) -> Vec<&'static StatusEffect> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(id, slot)| {
+                (slot.load(Relaxed) & Self::PRESENT != 0)
+                    .then(|| StatusEffect::from_id(id as u16))
+                    .flatten()
+            })
+            .collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots
+            .iter()
+            .all(|slot| slot.load(Relaxed) & Self::PRESENT == 0)
+    }
+
+    fn replace_cluster_states(&self, states: &[StatusEffectState]) -> bool {
+        let mut next = [0_u64; 40];
+        for state in states {
+            let Some(effect) = ClusterEffectMutation::effect(*state) else {
+                return false;
+            };
+            let index = usize::from(effect.effect_type.id);
+            if next[index] != 0 {
+                return false;
+            }
+            next[index] = Self::encode(&effect);
+        }
+        for (slot, state) in self.slots.iter().zip(next) {
+            slot.store(state, Relaxed);
+        }
+        true
+    }
+}
+
+pub struct ClusterEffectMutation<'a> {
+    target: EntityMutationTarget,
+    living: &'a LivingEntity,
+}
+
+impl ClusterEffectMutation<'_> {
+    fn state(effect: Effect) -> StatusEffectState {
+        let mut flags = 0_u8;
+        if effect.ambient {
+            flags |= 1;
+        }
+        if effect.show_particles {
+            flags |= 2;
+        }
+        if effect.show_icon {
+            flags |= 4;
+        }
+        if effect.blend {
+            flags |= 8;
+        }
+        StatusEffectState {
+            effect: u16::from(effect.effect_type.id),
+            duration_ticks: effect.duration,
+            amplifier: effect.amplifier,
+            flags,
+        }
+    }
+
+    fn effect(state: StatusEffectState) -> Option<Effect> {
+        if state.duration_ticks == 0 || state.duration_ticks < -1 || state.flags & !0x0f != 0 {
+            return None;
+        }
+        let effect_type = StatusEffect::from_id(state.effect)?;
+        if effect_type == &StatusEffect::INSTANT_HEALTH || effect_type == &StatusEffect::INSTANT_DAMAGE {
+            return None;
+        }
+        Some(Effect {
+            effect_type,
+            duration: state.duration_ticks,
+            amplifier: state.amplifier,
+            ambient: state.flags & 1 != 0,
+            show_particles: state.flags & 2 != 0,
+            show_icon: state.flags & 4 != 0,
+            blend: state.flags & 8 != 0,
+        })
+    }
+}
+
+impl EntityEffects for ClusterEffectMutation<'_> {
+    fn effect(&self, target: EntityMutationTarget, effect: u16) -> Option<StatusEffectState> {
+        target.same_identity(self.target)
+            .then(|| StatusEffect::from_id(effect))
+            .flatten()
+            .and_then(|effect_type| self.living.get_effect(effect_type))
+            .map(Self::state)
+    }
+
+    fn set_effect(&mut self, target: EntityMutationTarget, state: StatusEffectState) -> bool {
+        if !target.same_identity(self.target) {
+            return false;
+        }
+        let Some(effect) = Self::effect(state) else {
+            return false;
+        };
+        if self.living.get_effect(effect.effect_type).map(Self::state) == Some(state) {
+            return false;
+        }
+        self.living.apply_effect(effect);
+        true
+    }
+
+    fn remove_effect(&mut self, target: EntityMutationTarget, effect: u16) -> bool {
+        if !target.same_identity(self.target) {
+            return false;
+        }
+        let Some(effect_type) = StatusEffect::from_id(effect) else {
+            return false;
+        };
+        self.living.remove_effect(effect_type)
+    }
+}
+
+impl LivingEntity {
+    pub fn cluster_combat_snapshot(&self) -> CombatStateSnapshot {
+        let velocity = self.entity.velocity.load();
+        CombatStateSnapshot {
+            health_milli: (self.health.load() * 1000.0).round() as i32,
+            absorption_milli: (self.absorption.load() * 1000.0).round() as i32,
+            hurt_cooldown: self.hurt_cooldown.load(Relaxed),
+            last_damage_taken_milli: (self.last_damage_taken.load() * 1000.0).round() as i32,
+            dead: self.dead.load(Relaxed),
+            death_time: self.death_time.load(Relaxed),
+            last_damage_type: u16::try_from(self.last_damage_type.load(Relaxed)).ok(),
+            last_damage_tick: self.last_damage_stamp.load(Relaxed),
+            last_attacker_id: self.last_attacker_id.load(Relaxed),
+            last_attacked_tick: self.last_attacked_time.load(Relaxed),
+            last_attacking_id: self.last_attacking_id.load(Relaxed),
+            last_attack_tick: self.last_attack_time.load(Relaxed),
+            last_hurt_by_player_id: self.last_hurt_by_player_id.load(Relaxed),
+            last_hurt_by_player_tick: self.last_hurt_by_player_time.load(Relaxed),
+            last_hurt_by_mob_id: self.last_hurt_by_mob_id.load(Relaxed),
+            last_hurt_by_mob_tick: self.last_hurt_by_mob_time.load(Relaxed),
+            velocity_bits: [velocity.x.to_bits(), velocity.y.to_bits(), velocity.z.to_bits()],
+            fire_ticks: self.entity.fire_ticks.load(Relaxed).max(0) as u32,
+            visual_fire: self.entity.has_visual_fire.load(Relaxed),
+            active_effects: self
+                .active_effects
+                .values()
+                .into_iter()
+                .map(ClusterEffectMutation::state)
+                .collect(),
+            combat_tracker: self.combat_tracker.snapshot().cluster_state(),
+        }
+    }
+
+    pub fn cluster_restore_combat_snapshot(&self, snapshot: &CombatStateSnapshot) -> bool {
+        let Some(tracker) = CombatTracker::from_cluster_state(&snapshot.combat_tracker) else {
+            return false;
+        };
+        if snapshot
+            .last_damage_type
+            .is_some_and(|id| u8::try_from(id).ok().and_then(DamageType::from_id).is_none())
+            || i32::try_from(snapshot.fire_ticks).is_err()
+        {
+            return false;
+        }
+        if !self.active_effects.replace_cluster_states(&snapshot.active_effects) {
+            return false;
+        }
+        self.health.store(snapshot.health_milli as f32 / 1000.0);
+        self.absorption
+            .store(snapshot.absorption_milli as f32 / 1000.0);
+        self.hurt_cooldown.store(snapshot.hurt_cooldown, Relaxed);
+        self.last_damage_taken
+            .store(snapshot.last_damage_taken_milli as f32 / 1000.0);
+        self.dead.store(snapshot.dead, Relaxed);
+        self.death_time.store(snapshot.death_time, Relaxed);
+        self.last_damage_type.store(
+            snapshot
+                .last_damage_type
+                .map_or(-1, i32::from),
+            Relaxed,
+        );
+        self.last_damage_stamp
+            .store(snapshot.last_damage_tick, Relaxed);
+        self.last_attacker_id
+            .store(snapshot.last_attacker_id, Relaxed);
+        self.last_attacked_time
+            .store(snapshot.last_attacked_tick, Relaxed);
+        self.last_attacking_id
+            .store(snapshot.last_attacking_id, Relaxed);
+        self.last_attack_time
+            .store(snapshot.last_attack_tick, Relaxed);
+        self.last_hurt_by_player_id
+            .store(snapshot.last_hurt_by_player_id, Relaxed);
+        self.last_hurt_by_player_time
+            .store(snapshot.last_hurt_by_player_tick, Relaxed);
+        self.last_hurt_by_mob_id
+            .store(snapshot.last_hurt_by_mob_id, Relaxed);
+        self.last_hurt_by_mob_time
+            .store(snapshot.last_hurt_by_mob_tick, Relaxed);
+        self.entity.velocity.store(Vector3::new(
+            f64::from_bits(snapshot.velocity_bits[0]),
+            f64::from_bits(snapshot.velocity_bits[1]),
+            f64::from_bits(snapshot.velocity_bits[2]),
+        ));
+        self.entity
+            .velocity_dirty
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.entity
+            .fire_ticks
+            .store(snapshot.fire_ticks as i32, Relaxed);
+        self.entity
+            .has_visual_fire
+            .store(snapshot.visual_fire, Relaxed);
+        self.combat_tracker.replace(tracker);
+        true
+    }
+
+    pub fn cluster_restore_combat_snapshot_if_current(
+        &self,
+        current: &CombatStateSnapshot,
+        restore: &CombatStateSnapshot,
+    ) -> bool {
+        self.cluster_combat_snapshot() == *current && self.cluster_restore_combat_snapshot(restore)
+    }
+
+    #[must_use]
+    pub fn cluster_captured_attack_target_snapshot(
+        &self,
+        target: EntityMutationTarget,
+    ) -> CapturedAttackTargetSnapshot {
+        CapturedAttackTargetSnapshot::Living {
+            target,
+            state: self.cluster_combat_snapshot(),
+        }
+    }
+
+    #[must_use]
+    pub fn cluster_captured_attack_living_precondition(&self) -> LivingAttackPrecondition {
+        let velocity = self.entity.velocity.load();
+        let combat = self.cluster_combat_equipment.load();
+        LivingAttackPrecondition {
+            health_milli: (self.health.load() * 1000.0).round() as i32,
+            absorption_milli: (self.absorption.load() * 1000.0).round() as i32,
+            hurt_cooldown: self.hurt_cooldown.load(Relaxed),
+            last_damage_taken_milli: (self.last_damage_taken.load() * 1000.0).round() as i32,
+            fire_ticks: self.entity.fire_ticks.load(Relaxed).max(0) as u32,
+            visual_fire: self.entity.has_visual_fire.load(Relaxed),
+            velocity_bits: [velocity.x.to_bits(), velocity.y.to_bits(), velocity.z.to_bits()],
+            effects: self
+                .active_effects
+                .values()
+                .into_iter()
+                .map(ClusterEffectMutation::state)
+                .collect(),
+            attributes: combat.attributes.clone(),
+            equipment: combat.equipment.clone(),
+        }
+    }
+
+    #[must_use]
+    pub fn cluster_captured_attack_target_precondition(
+        &self,
+        target: &CapturedAttackTarget,
+    ) -> bool {
+        let CapturedAttackTargetOutcome::Living(outcome) = &target.outcome else {
+            return false;
+        };
+        if self.dead.load(Relaxed)
+            || self.health.load() <= 0.0
+            || self.cluster_captured_attack_living_precondition() != outcome.before
+            || outcome.fire_ticks_before != outcome.before.fire_ticks
+            || outcome.visual_fire_before != outcome.before.visual_fire
+            || i32::try_from(outcome.fire_ticks_after).is_err()
+        {
+            return false;
+        }
+        outcome.knockback.is_none_or(|knockback| {
+            let velocity = self.entity.velocity.load();
+            [velocity.x.to_bits(), velocity.y.to_bits(), velocity.z.to_bits()]
+                == knockback.velocity_before_bits
+                && knockback
+                    .velocity_after_bits
+                    .iter()
+                    .all(|bits| f64::from_bits(*bits).is_finite())
+        })
+    }
+
+    pub fn cluster_apply_captured_attack_target(
+        &self,
+        target: &CapturedAttackTarget,
+        attacker_id: i32,
+        attack_tick: i64,
+        attacker_is_player: bool,
+    ) -> bool {
+        let CapturedAttackTargetOutcome::Living(outcome) = &target.outcome else {
+            return false;
+        };
+        living_damage_is_exact(outcome)
+            && self.cluster_apply_captured_attack_target_unchecked(
+                target,
+                attacker_id,
+                attack_tick,
+                attacker_is_player,
+            )
+    }
+
+    fn cluster_apply_captured_attack_target_unchecked(
+        &self,
+        target: &CapturedAttackTarget,
+        attacker_id: i32,
+        attack_tick: i64,
+        attacker_is_player: bool,
+    ) -> bool {
+        let CapturedAttackTargetOutcome::Living(outcome) = &target.outcome else {
+            return false;
+        };
+        if !self.cluster_captured_attack_target_precondition(target) {
+            return false;
+        }
+        if !living_damage_is_exact(outcome)
+            || self.absorption.load() * 1000.0 + 0.5 < outcome.absorption_damage_milli as f32
+            || self.health.load() * 1000.0 + 0.5 < outcome.health_damage_milli as f32
+        {
+            return false;
+        }
+        let LivingHurtCooldownResolution::Applied {
+            last_damage_taken_after_milli,
+        } = outcome.hurt_cooldown_resolution
+        else {
+            return outcome.fire_ticks_before == outcome.fire_ticks_after
+                && outcome.visual_fire_before == outcome.visual_fire_after
+                && outcome.knockback.is_none();
+        };
+        let effective_damage = outcome.effective_damage_milli as f32 / 1000.0;
+        let absorption_damage = outcome.absorption_damage_milli as f32 / 1000.0;
+        let health_damage = outcome.health_damage_milli as f32 / 1000.0;
+        let damage_type = match outcome.damage_type {
+            AttackDamageType::PlayerAttack => DamageType::PLAYER_ATTACK,
+            AttackDamageType::MaceSmash => DamageType::MACE_SMASH,
+        };
+        let absorption = self.absorption.load();
+        let health = (self.health.load() - health_damage).max(0.0);
+        if outcome.before.hurt_cooldown <= 10 {
+            self.hurt_cooldown.store(20, Relaxed);
+        }
+        self.last_damage_taken
+            .store(last_damage_taken_after_milli as f32 / 1000.0);
+        self.last_damage_type.store(i32::from(damage_type.id), Relaxed);
+        self.last_damage_stamp.store(attack_tick, Relaxed);
+        self.last_attacker_id.store(attacker_id, Relaxed);
+        self.last_attacked_time
+            .store(self.entity.age.load(Relaxed), Relaxed);
+        if attacker_is_player {
+            self.last_hurt_by_player_id.store(attacker_id, Relaxed);
+            self.last_hurt_by_player_time.store(attack_tick, Relaxed);
+        } else {
+            self.last_hurt_by_mob_id.store(attacker_id, Relaxed);
+            self.last_hurt_by_mob_time.store(attack_tick, Relaxed);
+        }
+        self.absorption.store(absorption - absorption_damage);
+        self.health.store(health);
+        self.dead.store(health <= 0.0, Relaxed);
+        self.combat_tracker.update(|tracker| {
+            tracker.record_cluster_attack(
+                attack_tick,
+                health > 0.0,
+                self.fall_distance.load(),
+                damage_type,
+                effective_damage,
+                attacker_id,
+                attacker_is_player,
+            );
+        });
+        if let Some(knockback) = outcome.knockback {
+            self.entity.velocity.store(Vector3::new(
+                f64::from_bits(knockback.velocity_after_bits[0]),
+                f64::from_bits(knockback.velocity_after_bits[1]),
+                f64::from_bits(knockback.velocity_after_bits[2]),
+            ));
+            self.entity
+                .velocity_dirty
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        self.entity
+            .fire_ticks
+            .store(outcome.fire_ticks_after as i32, Relaxed);
+        self.entity
+            .has_visual_fire
+            .store(outcome.visual_fire_after, Relaxed);
+        true
+    }
+
+    pub fn cluster_restore_captured_attack_target(
+        &self,
+        snapshot: &CapturedAttackTargetSnapshot,
+    ) -> bool {
+        match snapshot {
+            CapturedAttackTargetSnapshot::Living { state, .. } => {
+                self.cluster_restore_combat_snapshot(state)
+            }
+            CapturedAttackTargetSnapshot::NonLiving { .. } => false,
+        }
+    }
+}
+
+pub struct CapturedAttackTargetBinding<'a> {
+    pub target: EntityMutationTarget,
+    pub living: &'a LivingEntity,
+}
+
+pub struct LivingCapturedAttackState<'a> {
+    actor: &'a Player,
+    targets: Vec<CapturedAttackTargetBinding<'a>>,
+}
+
+impl<'a> LivingCapturedAttackState<'a> {
+    #[must_use]
+    pub fn new(actor: &'a Player, targets: Vec<CapturedAttackTargetBinding<'a>>) -> Self {
+        Self { actor, targets }
+    }
+
+    fn matching_targets<'attack, 'state>(
+        &'state self,
+        attack: &'attack pumpkin_cluster::protocol::CapturedAttack,
+    ) -> Option<Vec<(&'attack CapturedAttackTarget, &'state LivingEntity)>> {
+        let mut matched: Vec<(&CapturedAttackTarget, &LivingEntity)> =
+            Vec::with_capacity(1 + attack.sweeping.len());
+        for target in attack.targets().filter(|target| {
+            matches!(target.outcome, CapturedAttackTargetOutcome::Living(_))
+        }) {
+            if matched
+                .iter()
+                .any(|(existing, _)| existing.target.same_identity(target.target))
+            {
+                return None;
+            }
+            let binding = self
+                .targets
+                .iter()
+                .find(|binding| binding.target.same_identity(target.target))?;
+            matched.push((target, binding.living));
+        }
+        Some(matched)
+    }
+
+    fn target_snapshots(
+        &self,
+        attack: &pumpkin_cluster::protocol::CapturedAttack,
+    ) -> Option<Vec<CapturedAttackTargetSnapshot>> {
+        self.matching_targets(attack).map(|matched| {
+            matched
+                .into_iter()
+                .map(|(target, living)| {
+                    living.cluster_captured_attack_target_snapshot(target.target)
+                })
+                .collect()
+        })
+    }
+
+    pub fn snapshot_for_restore(
+        &self,
+        snapshot: &CapturedAttackSnapshot,
+    ) -> Option<CapturedAttackSnapshot> {
+        let mut targets = Vec::with_capacity(snapshot.targets.len());
+        for target in &snapshot.targets {
+            let binding = self
+                .targets
+                .iter()
+                .find(|binding| binding.target.same_identity(target.target()))?;
+            targets.push(binding.living.cluster_captured_attack_target_snapshot(target.target()));
+        }
+        Some(CapturedAttackSnapshot {
+            actor: self.actor.cluster_captured_attack_actor_snapshot(),
+            targets,
+        })
+    }
+
+    fn restore_snapshot(&mut self, snapshot: &CapturedAttackSnapshot) -> bool {
+        if !self
+            .actor
+            .cluster_restore_captured_attack_actor(&snapshot.actor)
+        {
+            return false;
+        }
+        for target in &snapshot.targets {
+            let Some(binding) = self
+                .targets
+                .iter()
+                .find(|binding| binding.target.same_identity(target.target()))
+            else {
+                return false;
+            };
+            if !binding.living.cluster_restore_captured_attack_target(target) {
+                return false;
+            }
+        }
+        true
+    }
+
+}
+
+impl CapturedAttackState for LivingCapturedAttackState<'_> {
+    fn captured_attack_snapshot(
+        &self,
+        attack: &pumpkin_cluster::protocol::CapturedAttack,
+    ) -> Option<CapturedAttackSnapshot> {
+        Some(CapturedAttackSnapshot {
+            actor: self.actor.cluster_captured_attack_actor_snapshot(),
+            targets: if attack.outcome == CapturedAttackOutcome::NoDamage {
+                Vec::new()
+            } else {
+                self.target_snapshots(attack)?
+            },
+        })
+    }
+
+    fn apply_captured_attack(
+        &mut self,
+        attack: &pumpkin_cluster::protocol::CapturedAttack,
+    ) -> bool {
+        if attack.outcome == CapturedAttackOutcome::NoDamage {
+            let Some(matched) = self.matching_targets(attack) else {
+                return false;
+            };
+            return matched.iter().all(|(target, living)| {
+                living.cluster_captured_attack_target_precondition(target)
+                    && matches!(
+                        &target.outcome,
+                        CapturedAttackTargetOutcome::Living(outcome)
+                            if matches!(outcome.hurt_cooldown_resolution, LivingHurtCooldownResolution::NoDamage)
+                                && living_damage_is_exact(outcome)
+                    )
+            })
+                && self
+                    .actor
+                    .cluster_captured_attack_actor_precondition(&attack.attacker_effects)
+                && self
+                    .actor
+                    .cluster_apply_captured_attack_actor(&attack.attacker_effects);
+        }
+        let Some(matched) = self.matching_targets(attack) else {
+            return false;
+        };
+        if !self
+            .actor
+            .cluster_captured_attack_actor_precondition(&attack.attacker_effects)
+            || matched
+                .iter()
+                .any(|(target, living)| !living.cluster_captured_attack_target_precondition(target))
+        {
+            return false;
+        }
+        let actor_before = self.actor.cluster_captured_attack_actor_snapshot();
+        let target_before: Vec<_> = matched
+            .iter()
+            .map(|(target, living)| living.cluster_captured_attack_target_snapshot(target.target))
+            .collect();
+        if !self
+            .actor
+            .cluster_apply_captured_attack_actor(&attack.attacker_effects)
+        {
+            return false;
+        }
+        let attacker_id = self.actor.entity_id();
+        for (index, (target, living)) in matched.iter().enumerate() {
+            if !living.cluster_apply_captured_attack_target(
+                target,
+                attacker_id,
+                i64::from(attack.tick.0),
+                true,
+            ) {
+                for snapshot in target_before.iter().take(index) {
+                    if let Some(binding) = self
+                        .targets
+                        .iter()
+                        .find(|binding| binding.target.same_identity(snapshot.target()))
+                    {
+                        let _ = binding.living.cluster_restore_captured_attack_target(snapshot);
+                    }
+                }
+                let _ = self.actor.cluster_restore_captured_attack_actor(&actor_before);
+                return false;
+            }
+        }
+        true
+    }
+
+    fn restore_captured_attack_snapshot(&mut self, snapshot: &CapturedAttackSnapshot) -> bool {
+        let Some(current) = self.snapshot_for_restore(snapshot) else {
+            return false;
+        };
+        if self.restore_snapshot(snapshot) {
+            true
+        } else {
+            let _ = self.restore_snapshot(&current);
+            false
+        }
+    }
+}
 
 impl MetadataSerializer for EffectParticles {
     fn write_metadata(
@@ -253,6 +1053,7 @@ impl LivingEntity {
             0.8
         };
         let mut max_health: f32 = 20.0; // Overridden by attribute base below
+        let cluster_combat_equipment = ClusterCombatEquipment::initial(&entity);
         Self {
             // Populate local attribute instances from the default registry and get initial vars
             attributes: {
@@ -264,7 +1065,7 @@ impl LivingEntity {
                     }
                     m.insert(attr.id, AttributeInstance::new(*base));
                 }
-                std::sync::RwLock::new(m)
+                ArcSwap::from_pointee(m)
             },
             health: AtomicCell::new(max_health), // Initial health value from attributes
             entity,
@@ -279,8 +1080,10 @@ impl LivingEntity {
             active_hand: std::sync::Mutex::new(None),
             recent_kinetic_enemies: std::sync::Mutex::new(FxHashMap::default()),
             livings_flags: AtomicU8::new(0),
-            active_effects: std::sync::Mutex::new(FxHashMap::default()),
+            active_effects: ActiveEffects::new(),
             entity_equipment: Arc::new(std::sync::Mutex::new(EntityEquipment::new())),
+            cluster_combat_equipment: ArcSwap::from_pointee(cluster_combat_equipment),
+            cluster_equipment: AtomicI32::new(0),
             equipment_drop_chances: Arc::new(std::sync::Mutex::new(FxHashMap::default())),
             equipment_slots: Arc::new(build_equipment_slots()),
             jumping: AtomicBool::new(false),
@@ -289,11 +1092,11 @@ impl LivingEntity {
             climbing_pos: AtomicCell::new(None),
             last_attacker_id: AtomicI32::new(0),
             last_attacked_time: AtomicI32::new(0),
-            last_damage_type: std::sync::Mutex::new(None),
+            last_damage_type: AtomicI32::new(-1),
             last_damage_stamp: std::sync::atomic::AtomicI64::new(0),
             last_attacking_id: AtomicI32::new(0),
             last_attack_time: AtomicI32::new(0),
-            combat_tracker: std::sync::Mutex::new(CombatTracker::new()),
+            combat_tracker: CombatTrackerStore::new(),
             last_hurt_by_player_id: AtomicI32::new(0),
             last_hurt_by_player_time: AtomicI64::new(0),
             last_hurt_by_mob_id: AtomicI32::new(0),
@@ -332,10 +1135,7 @@ impl LivingEntity {
             return Some(mob);
         }
 
-        let tracker = self
-            .combat_tracker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tracker = self.combat_tracker.snapshot();
         if let Some(killer) = tracker.get_killer_entry()
             && let Some(killer_id) = killer.attacker_id
         {
@@ -377,7 +1177,16 @@ impl LivingEntity {
         if equipment.is_empty() {
             return;
         }
+        let mut visual = 0_i32;
+        for (slot, stack) in equipment {
+            if !stack.is_empty() {
+                visual = i32::from(stack.item.id) | (i32::from(slot.discriminant()) << 16);
+                break;
+            }
+        }
+        self.cluster_equipment.store(visual, Relaxed);
         self.apply_and_send_equipment_attribute_modifiers(equipment);
+        self.update_cluster_combat_equipment(equipment);
 
         if equipment
             .iter()
@@ -444,6 +1253,173 @@ impl LivingEntity {
         }
     }
 
+    pub fn cluster_equipment_snapshot(&self) -> (u8, u16) {
+        let packed = self.cluster_equipment.load(Relaxed) as u32;
+        ((packed >> 16) as u8, packed as u16)
+    }
+
+    pub fn update_cluster_combat_equipment(&self, equipment: &[(EquipmentSlot, ItemStack)]) {
+        let mut next = (*self.cluster_combat_equipment.load_full()).clone();
+        for (slot, stack) in equipment {
+            let item = if stack.is_empty() {
+                InventoryStack::empty()
+            } else {
+                let mut compound = NbtCompound::new();
+                stack.write_item_stack(&mut compound);
+                InventoryStack {
+                    item: stack.item.id,
+                    count: stack.item_count,
+                    nbt: pumpkin_nbt::Nbt::from(compound).write_unnamed().to_vec(),
+                }
+                .normalized()
+            };
+            let Ok(slot) = u8::try_from(slot.discriminant()) else {
+                continue;
+            };
+            if let Some(existing) = next
+                .equipment
+                .iter_mut()
+                .find(|existing| existing.slot == slot)
+            {
+                existing.item = item;
+            } else {
+                next.equipment.push(CombatEquipmentSnapshot { slot, item });
+            }
+        }
+        next.equipment.sort_by_key(|equipment| equipment.slot);
+        next.attributes = self.cluster_combat_attribute_values();
+        self.cluster_combat_equipment.store(Arc::new(next));
+    }
+
+    #[must_use]
+    pub fn cluster_captured_attack_equipment_snapshot(&self) -> Vec<CombatEquipmentSnapshot> {
+        self.cluster_combat_equipment.load().equipment.clone()
+    }
+
+    #[must_use]
+    pub fn cluster_captured_attack_attribute_snapshot(&self) -> Vec<CombatAttributeSnapshot> {
+        self.cluster_combat_equipment.load().attributes.clone()
+    }
+
+    fn cluster_combat_attribute_values(&self) -> Vec<CombatAttributeSnapshot> {
+        let attributes = self.attributes.load();
+        ClusterCombatEquipment::attribute_values_from(attributes.iter().map(
+            |(id, instance)| (*id, instance.value()),
+        ))
+    }
+
+    #[must_use]
+    fn cluster_combat_item(snapshot: &InventoryStack) -> Option<ItemStack> {
+        if snapshot.is_empty() {
+            return Some(ItemStack::EMPTY.clone());
+        }
+        let mut cursor = std::io::Cursor::new(snapshot.nbt.as_slice());
+        let mut reader = NbtReadHelperJava::new(&mut cursor);
+        pumpkin_nbt::Nbt::read_unnamed(&mut reader)
+            .ok()
+            .and_then(|nbt| ItemStack::read_item_stack(&nbt.root_tag))
+    }
+
+    fn cluster_combat_slot_item(
+        equipment: &ClusterCombatEquipment,
+        slot: u8,
+    ) -> Option<ItemStack> {
+        equipment
+            .equipment
+            .iter()
+            .find(|entry| entry.slot == slot)
+            .map_or_else(
+                || Some(ItemStack::EMPTY.clone()),
+                |entry| Self::cluster_combat_item(&entry.item),
+            )
+    }
+
+    #[must_use]
+    pub fn cluster_captured_attack_defense_snapshot(&self) -> Option<CapturedAttackDefenseSnapshot> {
+        let equipment = self.cluster_combat_equipment.load();
+        let mut protection_exact = 0_i32;
+        let mut fire_protection = 0_i32;
+        let mut blast_protection = 0_i32;
+        let mut projectile_protection = 0_i32;
+        let mut feather_falling = 0_i32;
+        for entry in equipment
+            .equipment
+            .iter()
+            .filter(|entry| (1..=4).contains(&entry.slot))
+        {
+            let item = Self::cluster_combat_item(&entry.item)?;
+            protection_exact += item.get_enchantment_level(&Enchantment::PROTECTION).max(0);
+            fire_protection += item
+                .get_enchantment_level(&Enchantment::FIRE_PROTECTION)
+                .max(0);
+            blast_protection += item
+                .get_enchantment_level(&Enchantment::BLAST_PROTECTION)
+                .max(0);
+            projectile_protection += item
+                .get_enchantment_level(&Enchantment::PROJECTILE_PROTECTION)
+                .max(0);
+            feather_falling += item
+                .get_enchantment_level(&Enchantment::FEATHER_FALLING)
+                .max(0);
+        }
+        let armor = equipment.attribute(&Attributes::ARMOR)?;
+        let toughness = equipment.attribute(&Attributes::ARMOR_TOUGHNESS)?;
+        Some(CapturedAttackDefenseSnapshot {
+            armor_bits: armor.to_bits(),
+            toughness_bits: toughness.to_bits(),
+            protection_exact,
+            fire_protection,
+            blast_protection,
+            projectile_protection,
+            feather_falling,
+            resistance_amplifier: self
+                .get_effect(&StatusEffect::RESISTANCE)
+                .map(|effect| i32::from(effect.amplifier)),
+            fire_resistance: self.has_effect(&StatusEffect::FIRE_RESISTANCE),
+            knockback_resistance_bits: equipment
+                .attribute(&Attributes::KNOCKBACK_RESISTANCE)?
+                .to_bits(),
+        })
+    }
+
+    #[must_use]
+    pub fn cluster_captured_attack_offense_snapshot(&self) -> Option<CapturedAttackOffenseSnapshot> {
+        let equipment = self.cluster_combat_equipment.load();
+        let item = Self::cluster_combat_slot_item(&equipment, 0)?;
+        let mut main_hand_attack_damage = 0.0;
+        let mut main_hand_attack_speed = if item.is_empty() { -2.4 } else { 0.0 };
+        if let Some(modifiers) = item.get_data_component::<AttributeModifiersImpl>() {
+            for modifier in modifiers.attribute_modifiers.iter() {
+                if modifier.operation != Operation::AddValue {
+                    continue;
+                }
+                if modifier.r#type == &Attributes::ATTACK_DAMAGE {
+                    main_hand_attack_damage += modifier.amount;
+                } else if modifier.r#type == &Attributes::ATTACK_SPEED {
+                    main_hand_attack_speed += modifier.amount;
+                }
+            }
+        }
+        Some(CapturedAttackOffenseSnapshot {
+            attack_damage_bits: equipment.attribute(&Attributes::ATTACK_DAMAGE)?.to_bits(),
+            main_hand_attack_damage_bits: main_hand_attack_damage.to_bits(),
+            main_hand_attack_speed_bits: main_hand_attack_speed.to_bits(),
+            sharpness: item.get_enchantment_level(&Enchantment::SHARPNESS).max(0),
+            smite: item.get_enchantment_level(&Enchantment::SMITE).max(0),
+            bane_of_arthropods: item
+                .get_enchantment_level(&Enchantment::BANE_OF_ARTHROPODS)
+                .max(0),
+            knockback: item.get_enchantment_level(&Enchantment::KNOCKBACK).max(0),
+            breach: item.get_enchantment_level(&Enchantment::BREACH).max(0),
+            strength_amplifier: self
+                .get_effect(&StatusEffect::STRENGTH)
+                .map(|effect| i32::from(effect.amplifier)),
+            weakness_amplifier: self
+                .get_effect(&StatusEffect::WEAKNESS)
+                .map(|effect| i32::from(effect.amplifier)),
+        })
+    }
+
     /// Applies the held item's attack attribute modifiers to this entity's
     /// attribute map and sends the changed attributes to clients. Without this
     /// the client never sees the reduced attack speed and does not show the
@@ -477,11 +1453,7 @@ impl LivingEntity {
         }
 
         let mut changed: Vec<Attributes> = Vec::new();
-        {
-            let mut attributes = self
-                .attributes
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.update_attributes(|attributes| {
             for (attribute, modifiers) in [
                 (Attributes::ATTACK_SPEED, speed_modifiers),
                 (Attributes::ATTACK_DAMAGE, damage_modifiers),
@@ -496,7 +1468,7 @@ impl LivingEntity {
                 instance.dirty.store(true, Ordering::Relaxed);
                 changed.push(attribute);
             }
-        }
+        });
         if !changed.is_empty() {
             crate::entity::attributes::send_attribute_updates_for_living(self, changed);
         }
@@ -745,8 +1717,8 @@ impl LivingEntity {
                     .cast_any()
                     .downcast_ref::<crate::entity::player::Player>()
                 && matches!(
-                    player.client.as_ref(),
-                    crate::net::ClientPlatform::Bedrock(_)
+                    player.client.as_deref(),
+                    Some(crate::net::ClientPlatform::Bedrock(_))
                 ) {
                 0
             } else {
@@ -840,55 +1812,93 @@ impl LivingEntity {
         attribute: &Attributes,
         f: F,
     ) {
-        let mut map = self
-            .attributes
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let inst = map.entry(attribute.id).or_insert_with(|| {
-            let base = self
-                .entity
-                .entity_type
-                .attributes
-                .iter()
-                .find(|a| a.0.id == attribute.id)
-                .map_or_else(
-                    || {
-                        tracing::warn!(
-                            "Entity type {:?} has no base value for attribute {:?}; falling back to default {}",
-                            self.entity.entity_type,
-                            attribute.id,
-                            attribute.default_value,
-                        );
-                        attribute.default_value
-                    },
-                    |a| a.1,
-                );
-            AttributeInstance::new(base)
+        self.update_attributes(|map| {
+            let inst = map.entry(attribute.id).or_insert_with(|| {
+                let base = self
+                    .entity
+                    .entity_type
+                    .attributes
+                    .iter()
+                    .find(|a| a.0.id == attribute.id)
+                    .map_or_else(
+                        || {
+                            tracing::warn!(
+                                "Entity type {:?} has no base value for attribute {:?}; falling back to default {}",
+                                self.entity.entity_type,
+                                attribute.id,
+                                attribute.default_value,
+                            );
+                            attribute.default_value
+                        },
+                        |a| a.1,
+                    );
+                AttributeInstance::new(base)
+            });
+            f(inst);
+            inst.dirty.store(true, Ordering::Relaxed);
         });
+    }
 
-        f(inst);
-        inst.dirty.store(true, Ordering::Relaxed);
+    pub fn update_attributes<F: FnOnce(&mut FxHashMap<u8, AttributeInstance>)>(&self, update: F) {
+        let mut attributes = (*self.attributes.load_full()).clone();
+        update(&mut attributes);
+        let mut combat = (*self.cluster_combat_equipment.load_full()).clone();
+        combat.attributes = ClusterCombatEquipment::attribute_values_from(
+            attributes
+                .iter()
+                .map(|(id, instance)| (*id, instance.value())),
+        );
+        self.cluster_combat_equipment.store(Arc::new(combat));
+        self.attributes.store(Arc::new(attributes));
+    }
+
+    pub fn has_attribute(&self, attribute: &Attributes) -> bool {
+        self.attributes.load().contains_key(&attribute.id)
+    }
+
+    pub fn attribute_modifiers(&self, attribute: &Attributes) -> Option<Vec<Modifier>> {
+        self.attribute_instance(attribute)
+            .map(|instance| instance.modifiers)
+    }
+
+    pub fn remove_attribute(&self, attribute: &Attributes) {
+        self.update_attributes(|attributes| {
+            attributes.remove(&attribute.id);
+        });
+    }
+
+    fn attribute_instance(&self, attribute: &Attributes) -> Option<AttributeInstance> {
+        let mut instance = self.attributes.load().get(&attribute.id)?.clone();
+        for effect in self.active_effects.values() {
+            for modifier in effect.effect_type.attribute_modifiers {
+                if modifier.attribute.id != attribute.id {
+                    continue;
+                }
+                instance.add_or_replace_modifier(Modifier {
+                    id: modifier.id.to_string(),
+                    amount: modifier.base_value * (f64::from(effect.amplifier) + 1.0),
+                    operation: match modifier.operation {
+                        Operation::AddValue => ModifierOperation::Add,
+                        Operation::AddMultipliedBase => ModifierOperation::MultiplyBase,
+                        Operation::AddMultipliedTotal => ModifierOperation::MultiplyTotal,
+                    },
+                });
+            }
+        }
+        Some(instance)
     }
 
     /// Returns the computed value for `attribute` using the local instance, falling back
     /// to `attribute.default_value` if no local instance exists.
     pub fn get_attribute_value(&self, attribute: &Attributes) -> f64 {
-        let map = self
-            .attributes
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.get(&attribute.id)
-            .map_or(attribute.default_value, AttributeInstance::value)
+        self.attribute_instance(attribute)
+            .map_or(attribute.default_value, |instance| instance.value())
     }
 
     /// Returns the base attribute value for `attribute` for this entity's type.
     pub fn get_attribute_base(&self, attribute: &Attributes) -> f64 {
         // Check the local base value first (could be modified)
-        let map = self
-            .attributes
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = self.attributes.load();
         if let Some(instance) = map.get(&attribute.id) {
             return instance.base_value;
         }
@@ -905,31 +1915,20 @@ impl LivingEntity {
     /// Update or insert the base value for an attribute on this entity.
     /// If the attribute doesn't exist locally yet, it will be inserted.
     pub fn set_attribute_base(&self, attribute: &Attributes, new_base: f64) {
-        let mut map = self
-            .attributes
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(inst) = map.get_mut(&attribute.id) {
-            inst.base_value = new_base;
-            inst.dirty.store(true, Ordering::Relaxed);
-        } else {
-            let ai = AttributeInstance::new(new_base);
-            ai.dirty.store(true, Ordering::Relaxed);
-            map.insert(attribute.id, ai);
-        }
+        self.update_attributes(|map| {
+            if let Some(inst) = map.get_mut(&attribute.id) {
+                inst.base_value = new_base;
+                inst.dirty.store(true, Ordering::Relaxed);
+            } else {
+                let ai = AttributeInstance::new(new_base);
+                ai.dirty.store(true, Ordering::Relaxed);
+                map.insert(attribute.id, ai);
+            }
+        });
     }
 
     pub fn reset_effects_and_attributes(&self) {
-        // Clear active effects and reset modified attributes
-        let effects_to_remove: Vec<_> = {
-            let lock = self
-                .active_effects
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            lock.keys().copied().collect()
-        };
-
-        for effect_type in effects_to_remove {
+        for effect_type in self.active_effects.types() {
             self.remove_effect(effect_type);
         }
     }
@@ -956,6 +1955,12 @@ impl LivingEntity {
             return;
         }
 
+        self.apply_effect(effect);
+    }
+
+    #[expect(clippy::too_many_lines)]
+    fn apply_effect(&self, effect: Effect) {
+
         // Apply instant effects immediately before storing
         if effect.effect_type == &StatusEffect::INSTANT_HEALTH {
             let heal_amount = 4.0 * (1 << effect.amplifier) as f32;
@@ -975,32 +1980,9 @@ impl LivingEntity {
             return;
         }
 
-        // Apply non-instant effects
+        self.active_effects.insert(effect.clone());
 
-        // Effects that modify attributes (ex. speed) should also update the
-        // entity's attribute instances (server-side) and then notify clients.
         if !effect.effect_type.attribute_modifiers.is_empty() {
-            // Apply each attribute modifier into the local AttributeInstance
-            for m in effect.effect_type.attribute_modifiers {
-                let id = m.id.to_string();
-                let op = match m.operation {
-                    Operation::AddValue => ModifierOperation::Add,
-                    Operation::AddMultipliedBase => ModifierOperation::MultiplyBase,
-                    Operation::AddMultipliedTotal => ModifierOperation::MultiplyTotal,
-                };
-                let scaled_amount = m.base_value * (f64::from(effect.amplifier) + 1.);
-                let mod_inst = Modifier {
-                    id,
-                    amount: scaled_amount,
-                    operation: op,
-                };
-
-                self.update_attribute(m.attribute, |inst| {
-                    inst.add_or_replace_modifier(mod_inst.clone());
-                });
-            }
-
-            // Recompute packet modifiers from active effects for each affected attribute
             let mut touched_attrs: Vec<pumpkin_data::attributes::Attributes> = Vec::new();
             for m in effect.effect_type.attribute_modifiers {
                 if !touched_attrs.iter().any(|a| a.id == m.attribute.id) {
@@ -1070,35 +2052,23 @@ impl LivingEntity {
             .world
             .load()
             .broadcast_to_chunk_editioned(chunk_pos, &je_packet, &be_packet);
-        if effect.effect_type != &StatusEffect::INSTANT_HEALTH
-            && effect.effect_type != &StatusEffect::INSTANT_DAMAGE
-        {
-            self.active_effects
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(effect.effect_type, effect);
-        }
         self.sync_effect_particles();
     }
 
     fn sync_effect_particles(&self) {
-        let effects = self
-            .active_effects
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let effects = self.active_effects.values();
         let has_effects = !effects.is_empty();
         let particles = EffectParticles(
             effects
-                .values()
+                .iter()
                 .filter(|effect| effect.show_particles)
                 .map(EffectParticle::from_effect)
                 .collect(),
         );
         let ambient = effects
-            .values()
+            .iter()
             .filter(|effect| effect.show_particles)
             .all(|effect| effect.ambient);
-        drop(effects);
 
         self.entity
             .set_synced_data(tracked_data::living_entity::EFFECT_PARTICLES, particles);
@@ -1110,12 +2080,7 @@ impl LivingEntity {
 
     pub fn remove_effect(&self, effect_type: &'static StatusEffect) -> bool {
         // Remove the effect
-        let succeeded = self
-            .active_effects
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&effect_type)
-            .is_some();
+        let succeeded = self.active_effects.remove(effect_type).is_some();
 
         // Broadcast effect removal
         self.entity
@@ -1123,19 +2088,10 @@ impl LivingEntity {
             .load()
             .send_remove_mob_effect(&self.entity, effect_type);
 
-        // Remove attribute modifiers, if any
         if !effect_type.attribute_modifiers.is_empty() {
             let mut touched_attrs = Vec::new();
 
             for m in effect_type.attribute_modifiers {
-                let id = m.id.to_string();
-
-                // Clean local server state
-                self.update_attribute(m.attribute, |inst| {
-                    inst.remove_modifier(&id);
-                });
-
-                // Track unique attributes for the packet update
                 if !touched_attrs
                     .iter()
                     .any(|a: &Attributes| a.id == m.attribute.id)
@@ -1144,7 +2100,6 @@ impl LivingEntity {
                 }
             }
 
-            // Sync the clean state to the client
             if !touched_attrs.is_empty() {
                 crate::entity::attributes::send_attribute_updates_for_living(self, touched_attrs);
             }
@@ -1182,18 +2137,21 @@ impl LivingEntity {
     }
 
     pub fn has_effect(&self, effect: &'static StatusEffect) -> bool {
-        self.active_effects
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(&effect)
+        self.active_effects.contains(effect)
     }
 
     pub fn get_effect(&self, effect: &'static StatusEffect) -> Option<Effect> {
-        self.active_effects
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&effect)
-            .cloned()
+        self.active_effects.get(effect)
+    }
+
+    pub fn cluster_effect_mutation(
+        &self,
+        target: EntityMutationTarget,
+    ) -> ClusterEffectMutation<'_> {
+        ClusterEffectMutation {
+            target,
+            living: self,
+        }
     }
 
     pub fn is_in_fall_damage_resetting(&self) -> (bool, &Block) {
@@ -1935,10 +2893,7 @@ impl LivingEntity {
         let kill_credit_name = kill_credit.as_ref().map(|c| c.get_display_name());
 
         if let Some(living) = dyn_self.get_living_entity() {
-            let tracker = living
-                .combat_tracker
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let tracker = living.combat_tracker.snapshot();
             return tracker.get_death_message(dyn_self.get_display_name(), kill_credit_name);
         }
 
@@ -2033,10 +2988,7 @@ impl LivingEntity {
 
             let has_player_kill =
                 killer.is_some_and(|c| c.get_entity().entity_type == &EntityType::PLAYER) || {
-                    let tracker = self
-                        .combat_tracker
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let tracker = self.combat_tracker.snapshot();
                     tracker.has_player_attacker()
                 };
 
@@ -2080,16 +3032,12 @@ impl LivingEntity {
             self.broadcast_death_message(&*dyn_self, damage_type, source, cause);
 
             // Trigger on_mob_death for active status effects
-            let active_effects_vec: Vec<_> = {
-                let effects = self
-                    .active_effects
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                effects
-                    .values()
-                    .map(|e| (e.effect_type, e.amplifier))
-                    .collect()
-            };
+            let active_effects_vec: Vec<_> = self
+                .active_effects
+                .values()
+                .into_iter()
+                .map(|effect| (effect.effect_type, effect.amplifier))
+                .collect();
             for (effect_type, amplifier) in active_effects_vec {
                 if let Some(mob_effect) = crate::entity::effect::get_mob_effect(effect_type) {
                     mob_effect.on_mob_death(self, amplifier, &damage_type);
@@ -2288,32 +3236,28 @@ impl LivingEntity {
         let mut effects_to_remove = Vec::new();
         let mut effects_to_apply = Vec::new();
 
-        {
-            let Ok(mut effects) = self.active_effects.try_lock() else {
-                return;
+        let entity_age = self.entity.age.load(Relaxed);
+        for mut effect in self.active_effects.values() {
+            if effect.duration == 0 {
+                effects_to_remove.push(effect.effect_type);
+                continue;
+            }
+
+            let tick_duration = if effect.duration == -1 {
+                entity_age
+            } else {
+                effect.duration
             };
-            let entity_age = self.entity.age.load(Relaxed);
-            for effect in effects.values_mut() {
-                if effect.duration == 0 {
-                    effects_to_remove.push(effect.effect_type);
-                    continue;
-                }
 
-                let tick_duration = if effect.duration == -1 {
-                    entity_age
-                } else {
-                    effect.duration
-                };
+            if let Some(mob_effect) = crate::entity::effect::get_mob_effect(effect.effect_type)
+                && mob_effect.should_apply_effect_tick(tick_duration, effect.amplifier)
+            {
+                effects_to_apply.push((mob_effect, effect.amplifier));
+            }
 
-                if let Some(mob_effect) = crate::entity::effect::get_mob_effect(effect.effect_type)
-                    && mob_effect.should_apply_effect_tick(tick_duration, effect.amplifier)
-                {
-                    effects_to_apply.push((mob_effect, effect.amplifier));
-                }
-
-                if effect.duration != -1 {
-                    effect.duration -= 1;
-                }
+            if effect.duration != -1 {
+                effect.duration -= 1;
+                self.active_effects.insert(effect);
             }
         }
 
@@ -2527,14 +3471,12 @@ impl LivingEntity {
     /// Forgotten after 40 ticks.
     pub fn get_last_damage_type(&self) -> Option<DamageType> {
         let stamp = self.last_damage_stamp.load(Ordering::Relaxed);
-        let mut last = self
-            .last_damage_type
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if self.entity.world.load().get_world_age() - stamp > 40 {
-            *last = None;
+            self.last_damage_type.store(-1, Relaxed);
         }
-        *last
+        u8::try_from(self.last_damage_type.load(Relaxed))
+            .ok()
+            .and_then(DamageType::from_id)
     }
 
     pub fn can_take_damage(&self) -> bool {
@@ -2646,13 +3588,7 @@ impl LivingEntity {
         nbt.put_short("DeathTime", i16::from(self.death_time.load(Relaxed)));
         nbt.put_bool("FallFlying", self.entity.is_fall_flying());
         {
-            let effects_vec: Vec<pumpkin_data::potion::Effect> = {
-                let effects = self
-                    .active_effects
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                effects.values().cloned().collect()
-            };
+            let effects_vec = self.active_effects.values();
             if !effects_vec.is_empty() {
                 // Iterate effects and create Box<[NbtTag]>
                 let mut effects_list = Vec::with_capacity(effects_vec.len());
@@ -2743,12 +3679,8 @@ impl LivingEntity {
                     }
                 }
                 if !read_effects.is_empty() {
-                    let mut active_effects = self
-                        .active_effects
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     for effect in read_effects {
-                        active_effects.insert(effect.effect_type, effect);
+                        self.active_effects.insert(effect);
                     }
                 }
             }
@@ -3145,10 +4077,7 @@ impl LivingEntity {
         let damage_amount = damage_amount.max(0.0);
 
         // Record the source once the hit is confirmed.
-        *self
-            .last_damage_type
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(damage_type);
+        self.last_damage_type.store(i32::from(damage_type.id), Relaxed);
         self.last_damage_stamp.store(world.get_world_age(), Relaxed);
 
         let Some(server) = world.server.upgrade() else {
@@ -3286,11 +4215,7 @@ impl LivingEntity {
             let fall_location = FallLocation::get_current_fall_location(self, &world);
             let fall_distance = self.fall_distance.load();
 
-            {
-                let mut tracker = self
-                    .combat_tracker
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.combat_tracker.update(|tracker| {
                 tracker.record_damage(
                     current_tick,
                     self.health.load() > 0.0 && !self.dead.load(Relaxed),
@@ -3301,7 +4226,7 @@ impl LivingEntity {
                     source,
                     cause,
                 );
-            }
+            });
         }
 
         if new_health <= 0.0 {
@@ -3927,6 +4852,62 @@ pub(crate) const fn bypasses_armor_durability(damage_type: &DamageType) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cluster_combat_attributes_preserve_all_values_and_required_defaults() {
+        let snapshots = ClusterCombatEquipment::attribute_values_from([(
+            Attributes::MAX_HEALTH.id,
+            37.25,
+        )]);
+        assert_eq!(
+            snapshots
+                .iter()
+                .find(|snapshot| snapshot.id == u16::from(Attributes::MAX_HEALTH.id))
+                .map(|snapshot| snapshot.value_bits),
+            Some(37.25_f64.to_bits())
+        );
+        for attribute in [
+            Attributes::ARMOR,
+            Attributes::ARMOR_TOUGHNESS,
+            Attributes::KNOCKBACK_RESISTANCE,
+            Attributes::ATTACK_DAMAGE,
+            Attributes::ATTACK_SPEED,
+        ] {
+            assert_eq!(
+                snapshots
+                    .iter()
+                    .find(|snapshot| snapshot.id == u16::from(attribute.id))
+                    .map(|snapshot| snapshot.value_bits),
+                Some(attribute.default_value.to_bits())
+            );
+        }
+    }
+
+    #[test]
+    fn active_effects_preserve_infinite_state_and_flags() {
+        let effects = ActiveEffects::new();
+        let effect = Effect {
+            effect_type: &StatusEffect::REGENERATION,
+            duration: -1,
+            amplifier: 3,
+            ambient: true,
+            show_particles: false,
+            show_icon: true,
+            blend: true,
+        };
+        assert!(effects.insert(effect.clone()).is_none());
+        let restored = effects.get(&StatusEffect::REGENERATION).unwrap();
+        assert_eq!(restored.duration, -1);
+        assert_eq!(restored.amplifier, 3);
+        assert!(restored.ambient);
+        assert!(!restored.show_particles);
+        assert!(restored.show_icon);
+        assert!(restored.blend);
+        let removed = effects.remove(&StatusEffect::REGENERATION).unwrap();
+        assert_eq!(removed.effect_type.id, StatusEffect::REGENERATION.id);
+        assert_eq!(removed.duration, -1);
+        assert!(effects.is_empty());
+    }
 
     // ── bypasses_armor_durability ─────────────────────────────────────
 

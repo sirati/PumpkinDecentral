@@ -55,6 +55,7 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 pub mod level_chunk;
 pub mod login;
+pub mod lobby;
 use self::level_chunk::CLevelChunk;
 use self::nethernet::NetherNetSession;
 use crate::{
@@ -608,9 +609,8 @@ impl BedrockClient {
         self.be_clients.lock().await.remove(&self.address);
     }
 
-    pub async fn await_tasks(&self) {
+    pub fn close_tasks(&self) {
         self.tasks.close();
-        self.tasks.wait().await;
     }
 
     pub fn is_closed(&self) -> bool {

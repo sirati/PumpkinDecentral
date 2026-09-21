@@ -4,7 +4,7 @@ use crate::ntp::{DEFAULT_NTP_SERVER, NtpHandle, with_default_port};
 use crate::time::{MILLIS_PER_TICK, TICKS_PER_WRAP, NtpDiscipline, TickStamp};
 
 pub const AUDIT_MILLIS_PER_TICK: i64 = 50;
-pub const AUDIT_TICKS_PER_WRAP: i64 = 65_536;
+pub const AUDIT_TICKS_PER_WRAP: i64 = 48_000;
 pub const AUDIT_HALF_TICK_MILLIS: i64 = 25;
 pub const AUDIT_NTP_PORT: u16 = 123;
 
@@ -41,13 +41,8 @@ pub fn audited_unix_millis_now() -> Option<i64> {
 pub fn audited_tick_at(
     unix_millis: i64,
     offset_millis: Option<i64>,
-    max_offset_millis: i64,
 ) -> Option<TickStamp> {
-    NtpDiscipline {
-        offset_millis,
-        max_offset_millis,
-    }
-    .tick_at(unix_millis)
+    NtpDiscipline { offset_millis }.tick_at(unix_millis)
 }
 
 #[must_use]
@@ -104,7 +99,7 @@ pub fn is_external_ntp_entry(entry: &str) -> bool {
 #[must_use]
 pub fn audit_ntp_wiring(
     configured: &[String],
-    max_offset_millis: i64,
+    max_precision_millis: i64,
     probe_unix_millis: i64,
 ) -> NtpAuditReport {
     let mut failures: Vec<String> = Vec::new();
@@ -129,7 +124,7 @@ pub fn audit_ntp_wiring(
         && TickStamp::from_disciplined_millis(full_wrap_millis, 0) == TickStamp(0)
         && TickStamp::from_disciplined_millis(full_wrap_millis.saturating_add(50), 0)
             == TickStamp(1)
-        && TickStamp(1).distance_since(TickStamp(0xFFFF)) == 2
+        && TickStamp(1).distance_since(TickStamp(47_999)) == 2
     {
         true
     } else {
@@ -139,28 +134,30 @@ pub fn audit_ntp_wiring(
         false
     };
 
-    let mut tolerance_ok = true;
-    if max_offset_millis < 0 || max_offset_millis > AUDIT_HALF_TICK_MILLIS {
+    let mut precision_ok = true;
+    if max_precision_millis < 0 || max_precision_millis > AUDIT_HALF_TICK_MILLIS {
         failures.push(format!(
-            "max offset {max_offset_millis} exceeds half-tick tolerance {AUDIT_HALF_TICK_MILLIS}"
+            "max precision {max_precision_millis} exceeds half-tick target {AUDIT_HALF_TICK_MILLIS}"
         ));
-        tolerance_ok = false;
+        precision_ok = false;
     }
-    let undisciplined = NtpDiscipline::unconfigured(max_offset_millis);
-    let mut healthy = NtpDiscipline::unconfigured(max_offset_millis);
+    let undisciplined = NtpDiscipline::unconfigured();
+    let mut healthy = NtpDiscipline::unconfigured();
     healthy.observe(0);
-    let mut stray = NtpDiscipline::unconfigured(max_offset_millis);
-    stray.observe(max_offset_millis.saturating_add(1).max(1));
+    let mut corrected = NtpDiscipline::unconfigured();
+    corrected.observe(10_000);
     let want = TickStamp::from_disciplined_millis(probe_unix_millis, 0);
-    let discipline_ok = if tolerance_ok && undisciplined.tick_at(probe_unix_millis).is_none()
+    let corrected_want = TickStamp::from_disciplined_millis(probe_unix_millis, 10_000);
+    let discipline_ok = if precision_ok && undisciplined.tick_at(probe_unix_millis).is_none()
         && healthy.tick_at(probe_unix_millis) == Some(want)
-        && stray.tick_at(probe_unix_millis).is_none()
-        && audited_tick_at(probe_unix_millis, None, max_offset_millis).is_none()
-        && audited_tick_at(probe_unix_millis, Some(0), max_offset_millis) == Some(want)
+        && corrected.tick_at(probe_unix_millis) == Some(corrected_want)
+        && audited_tick_at(probe_unix_millis, None).is_none()
+        && audited_tick_at(probe_unix_millis, Some(0)) == Some(want)
+        && audited_tick_at(probe_unix_millis, Some(10_000)) == Some(corrected_want)
     {
         true
     } else {
-        failures.push("discipline gating drift undisciplined or stray clock minted a stamp".to_owned());
+        failures.push("discipline failed to apply a sampled clock correction".to_owned());
         false
     };
 
@@ -220,26 +217,32 @@ mod tests {
     }
 
     #[test]
-    fn stamps_wrap_as_u16() {
-        assert_eq!(TICKS_PER_WRAP, 65_536);
-        let full = 65_536_i64.saturating_mul(50);
+    fn stamps_wrap_at_two_minecraft_days() {
+        assert_eq!(TICKS_PER_WRAP, 48_000);
+        let full = 48_000_i64.saturating_mul(50);
         assert_eq!(TickStamp::from_disciplined_millis(full, 0), TickStamp(0));
         assert_eq!(
             TickStamp::from_disciplined_millis(full.saturating_add(50), 0),
             TickStamp(1)
         );
-        assert_eq!(TickStamp(1).distance_since(TickStamp(0xFFFF)), 2);
+        assert_eq!(TickStamp(1).distance_since(TickStamp(47_999)), 2);
     }
 
     #[test]
     fn undisciplined_clocks_mint_nothing() {
-        assert_eq!(audited_tick_at(1_000, None, 25), None);
+        assert_eq!(audited_tick_at(1_000, None), None);
         assert_eq!(
-            audited_tick_at(1_000, Some(0), 25),
+            audited_tick_at(1_000, Some(0)),
             Some(TickStamp::from_disciplined_millis(1_000, 0))
         );
-        assert_eq!(audited_tick_at(1_000, Some(10_000), 25), None);
-        assert_eq!(audited_tick_at(1_000, Some(-10_000), 25), None);
+        assert_eq!(
+            audited_tick_at(1_000, Some(10_000)),
+            Some(TickStamp::from_disciplined_millis(1_000, 10_000))
+        );
+        assert_eq!(
+            audited_tick_at(1_000, Some(-10_000)),
+            Some(TickStamp::from_disciplined_millis(1_000, -10_000))
+        );
     }
 
     #[test]

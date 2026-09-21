@@ -1432,7 +1432,7 @@ impl VillagerEntity {
             using_economy_trade: true,
             data: Self::bedrock_trade_data(offers, villager_data.level.0),
         };
-        player.client.try_enqueue_packet_editioned(&java, &bedrock);
+        player.try_enqueue_packet_editioned(&java, &bedrock);
     }
 }
 

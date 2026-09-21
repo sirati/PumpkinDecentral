@@ -139,8 +139,8 @@ impl PortalType {
                         if let Some(player) =
                             current_level.get_player_by_id(caller.get_entity().entity_id)
                         {
-                            match player.client.as_ref() {
-                                crate::net::ClientPlatform::Java(client) => {
+                            match player.client.as_deref() {
+                                Some(crate::net::ClientPlatform::Java(client)) => {
                                     if let Ok(data) = client.serialize_packet(&pumpkin_protocol::java::client::play::CGameEvent::new(
                                         pumpkin_protocol::java::client::play::GameEvent::WinGame,
                                         1.0,
@@ -148,7 +148,7 @@ impl PortalType {
                                         client.try_enqueue_packet(data);
                                     }
                                 }
-                                crate::net::ClientPlatform::Bedrock(client) => {
+                                Some(crate::net::ClientPlatform::Bedrock(client)) => {
                                     if let Ok(data) = client.serialize_packet(
                                         &pumpkin_protocol::bedrock::client::CShowCredits {
                                             player_runtime_id: (caller.get_entity().entity_id
@@ -160,6 +160,7 @@ impl PortalType {
                                         client.try_enqueue_packet(data);
                                     }
                                 }
+                                None => {}
                             }
                         }
 

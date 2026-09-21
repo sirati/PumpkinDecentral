@@ -197,7 +197,7 @@ fn set_damage_amount(
         return Err(ERROR_SAME_DAMAGE_AMOUNT.create_without_context());
     }
 
-    border.set_damage_per_block(damage_per_block);
+    border.set_damage_per_block(&world, damage_per_block);
 
     source.send_feedback(
         TextComponent::translate_cross(
@@ -222,7 +222,7 @@ fn set_damage_buffer(source: &CommandSource, distance: f32) -> Result<i32, Comma
         return Err(ERROR_SAME_DAMAGE_BUFFER.create_without_context());
     }
 
-    border.set_damage_buffer(distance);
+    border.set_damage_buffer(&world, distance);
 
     source.send_feedback(
         TextComponent::translate_cross(

@@ -17,11 +17,13 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::identity::ServerId;
+use crate::identity::{GlobalPlayerId, ServerId};
+use crate::presence::{PresenceProperty, is_valid_presence_name, is_valid_presence_property};
+use crate::protocol::PlayerGameMode;
 use crate::time::TickStamp;
 
 pub use crate::protocol::{
-    ChunkAddr, EntityRef, FireProjectileUpdate, HitEntityUpdate, StreamKind,
+    ChunkAddr, EntityRef, FireProjectileUpdate, StreamKind,
 };
 
 /// Exactly one shared stream per entity update family.
@@ -69,14 +71,260 @@ impl EntityCombatUpdate {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemStackState {
+    pub item_id: u16,
+    pub count: u8,
+    pub nbt: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlayerEntityState {
+    pub velocity: [f64; 3],
+    pub on_ground: bool,
+    pub flags: u8,
+    pub fire_ticks: i32,
+    pub health_milli: u16,
+    pub absorption_milli: u16,
+    pub fall_distance_milli: i32,
+    pub food: u8,
+    pub saturation_milli: u16,
+    pub experience_level: i32,
+    pub experience_progress_milli: u16,
+    pub experience_points: i32,
+    pub entity_nbt: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlayerSpawnState {
+    pub gid: GlobalPlayerId,
+    pub uuid: [u8; 16],
+    pub name: String,
+    pub properties: Vec<PresenceProperty>,
+    pub gamemode: PlayerGameMode,
+    pub source_reserved_entity_id: i32,
+    pub world: String,
+    pub dimension: String,
+    pub entity: PlayerEntityState,
+}
+
+impl PlayerSpawnState {
+    #[must_use]
+    pub fn is_authenticated_for(&self, entity: EntityRef) -> bool {
+        self.gid.server == entity.origin
+            && entity.owner == entity.origin
+            && is_valid_presence_name(&self.name)
+            && self.properties.iter().all(is_valid_presence_property)
+            && !self.world.is_empty()
+            && !self.dimension.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum EntitySpawnState {
+    Entity {
+        nbt: Vec<u8>,
+    },
+    ItemDrop {
+        stack: ItemStackState,
+        entity_nbt: Vec<u8>,
+    },
+    Player(PlayerSpawnState),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EntitySpawn {
     pub entity: EntityRef,
     pub tick: TickStamp,
-    pub kind: u8,
+    pub kind: u16,
     pub pos: [f64; 3],
     pub yaw: f32,
     pub pitch: f32,
+    pub state: EntitySpawnState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntityCodecError {
+    pub message: String,
+}
+
+impl core::fmt::Display for EntityCodecError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for EntityCodecError {}
+
+fn entity_codec_error(context: &str, error: postcard::Error) -> EntityCodecError {
+    EntityCodecError {
+        message: format!("{context}: {error}"),
+    }
+}
+
+pub fn encode_entity_spawn(update: &EntitySpawn) -> Result<Vec<u8>, EntityCodecError> {
+    postcard::to_allocvec(update).map_err(|error| entity_codec_error("encode entity spawn", error))
+}
+
+pub fn decode_entity_spawn(bytes: &[u8]) -> Result<EntitySpawn, EntityCodecError> {
+    postcard::from_bytes(bytes).map_err(|error| entity_codec_error("decode entity spawn", error))
+}
+
+pub fn decode_entity_spawn_prefix(
+    bytes: &[u8],
+) -> Result<(EntitySpawn, &[u8]), EntityCodecError> {
+    postcard::take_from_bytes(bytes)
+        .map_err(|error| entity_codec_error("decode entity spawn", error))
+}
+
+pub fn encode_entity_spawn_into(
+    update: &EntitySpawn,
+    out: Vec<u8>,
+) -> Result<Vec<u8>, EntityCodecError> {
+    postcard::to_extend(update, out)
+        .map_err(|error| entity_codec_error("encode entity spawn", error))
+}
+
+pub fn encode_entity_spawn_to_slice<'out>(
+    update: &EntitySpawn,
+    out: &'out mut [u8],
+) -> Result<&'out mut [u8], EntityCodecError> {
+    postcard::to_slice(update, out).map_err(|error| entity_codec_error("encode entity spawn", error))
+}
+
+pub fn encoded_entity_spawn_len(update: &EntitySpawn) -> Result<usize, EntityCodecError> {
+    postcard::experimental::serialized_size(update)
+        .map_err(|error| entity_codec_error("size entity spawn", error))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EntityOrigin {
+    pub server: ServerId,
+    pub local_id: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EntityHandoff {
+    pub origin: EntityOrigin,
+    pub previous_owner: ServerId,
+    pub successor: ServerId,
+    pub spawn: EntitySpawn,
+    pub velocity: [f64; 3],
+}
+
+pub const ENTITY_BOUNDARY_HANDOFF_MAGIC: u32 = 0x4548_4f46;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum EntityBoundaryHandoff {
+    Prepare(EntityHandoff),
+    Confirm {
+        origin: EntityOrigin,
+        previous_owner: ServerId,
+        successor: ServerId,
+    },
+    Reject {
+        origin: EntityOrigin,
+        previous_owner: ServerId,
+        successor: ServerId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaggedEntityBoundaryHandoff {
+    pub magic: u32,
+    pub frame: EntityBoundaryHandoff,
+}
+
+pub fn encode_entity_boundary_handoff(
+    frame: &EntityBoundaryHandoff,
+) -> Result<Vec<u8>, EntityCodecError> {
+    postcard::to_allocvec(&TaggedEntityBoundaryHandoff {
+        magic: ENTITY_BOUNDARY_HANDOFF_MAGIC,
+        frame: frame.clone(),
+    })
+    .map_err(|error| entity_codec_error("encode entity boundary handoff", error))
+}
+
+pub fn decode_entity_boundary_handoff(
+    bytes: &[u8],
+) -> Result<EntityBoundaryHandoff, EntityCodecError> {
+    let tagged: TaggedEntityBoundaryHandoff = postcard::from_bytes(bytes)
+        .map_err(|error| entity_codec_error("decode entity boundary handoff", error))?;
+    if tagged.magic != ENTITY_BOUNDARY_HANDOFF_MAGIC {
+        return Err(EntityCodecError {
+            message: "decode entity boundary handoff: unexpected magic".to_owned(),
+        });
+    }
+    Ok(tagged.frame)
+}
+
+impl EntityHandoff {
+    #[must_use]
+    pub fn destination_ref(&self) -> EntityRef {
+        EntityRef {
+            origin: self.origin.server,
+            owner: self.successor,
+            local_id: self.origin.local_id,
+            chunk: self.spawn.entity.chunk,
+        }
+    }
+
+    #[must_use]
+    pub fn destination_spawn(&self) -> EntitySpawn {
+        let mut spawn = self.spawn.clone();
+        spawn.entity = self.destination_ref();
+        spawn
+    }
+
+    #[must_use]
+    pub fn is_consistent(&self) -> bool {
+        self.origin.server == self.spawn.entity.origin
+            && self.origin.local_id == self.spawn.entity.local_id
+            && self.previous_owner == self.spawn.entity.owner
+            && self.previous_owner != self.successor
+    }
+
+    #[must_use]
+    pub fn applies_to(&self, peer: ServerId) -> bool {
+        self.successor == peer
+    }
+}
+
+pub fn encode_entity_handoff(update: &EntityHandoff) -> Result<Vec<u8>, EntityCodecError> {
+    postcard::to_allocvec(update)
+        .map_err(|error| entity_codec_error("encode entity handoff", error))
+}
+
+pub fn decode_entity_handoff(bytes: &[u8]) -> Result<EntityHandoff, EntityCodecError> {
+    postcard::from_bytes(bytes).map_err(|error| entity_codec_error("decode entity handoff", error))
+}
+
+pub fn decode_entity_handoff_prefix(
+    bytes: &[u8],
+) -> Result<(EntityHandoff, &[u8]), EntityCodecError> {
+    postcard::take_from_bytes(bytes)
+        .map_err(|error| entity_codec_error("decode entity handoff", error))
+}
+
+pub fn encode_entity_handoff_into(
+    update: &EntityHandoff,
+    out: Vec<u8>,
+) -> Result<Vec<u8>, EntityCodecError> {
+    postcard::to_extend(update, out)
+        .map_err(|error| entity_codec_error("encode entity handoff", error))
+}
+
+pub fn encode_entity_handoff_to_slice<'out>(
+    update: &EntityHandoff,
+    out: &'out mut [u8],
+) -> Result<&'out mut [u8], EntityCodecError> {
+    postcard::to_slice(update, out)
+        .map_err(|error| entity_codec_error("encode entity handoff", error))
+}
+
+pub fn encoded_entity_handoff_len(update: &EntityHandoff) -> Result<usize, EntityCodecError> {
+    postcard::experimental::serialized_size(update)
+        .map_err(|error| entity_codec_error("size entity handoff", error))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,121 +368,6 @@ pub struct EntityCombatUpdate {
     pub amount: u16,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct GhostState {
-    pub chunk: ChunkAddr,
-    pub last_tick: TickStamp,
-    pub pos: [f64; 3],
-    pub yaw: f32,
-    pub pitch: f32,
-    pub kind: u8,
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct EntityGhosts {
-    pub by_ref: HashMap<EntityRef, GhostState>,
-}
-
-impl EntityGhosts {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.by_ref.is_empty()
-    }
-
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.by_ref.len()
-    }
-
-    #[must_use]
-    pub fn get(&self, entity: &EntityRef) -> Option<&GhostState> {
-        self.by_ref.get(entity)
-    }
-
-    #[must_use]
-    pub fn get_owned(&self, owner: ServerId, local_id: i32) -> Option<&GhostState> {
-        let key = self.locate_key(owner, local_id)?;
-        self.by_ref.get(&key)
-    }
-
-    #[must_use]
-    pub fn contains(&self, owner: ServerId, local_id: i32) -> bool {
-        self.locate_key(owner, local_id).is_some()
-    }
-
-    pub fn spawn(&mut self, update: &EntitySpawn) -> bool {
-        let previous = self.locate_key(update.entity.owner, update.entity.local_id);
-        if let Some(stale) = previous {
-            let _evicted: Option<GhostState> = self.by_ref.remove(&stale);
-        }
-        let fresh = previous.is_none();
-        self.by_ref.insert(
-            update.entity,
-            GhostState {
-                chunk: update.entity.chunk,
-                last_tick: update.tick,
-                pos: update.pos,
-                yaw: update.yaw,
-                pitch: update.pitch,
-                kind: update.kind,
-            },
-        );
-        fresh
-    }
-
-    pub fn apply_pos(&mut self, update: &EntityPosUpdate) -> bool {
-        let Some(state) = self.state_for(&update.entity, update.tick) else {
-            return false;
-        };
-        state.pos = update.pos;
-        state.yaw = update.yaw;
-        state.pitch = update.pitch;
-        true
-    }
-
-    pub fn apply_visual(&mut self, update: &EntityVisualUpdate) -> bool {
-        self.state_for(&update.entity, update.tick).is_some()
-    }
-
-    pub fn apply_transient(&mut self, update: &EntityTransientUpdate) -> bool {
-        self.state_for(&update.entity, update.tick).is_some()
-    }
-
-    pub fn apply_combat(&mut self, update: &EntityCombatUpdate) -> bool {
-        self.state_for(&update.entity, update.tick).is_some()
-    }
-
-    pub fn despawn(&mut self, update: &EntityDespawn) -> bool {
-        let previous = self.locate_key(update.entity.owner, update.entity.local_id);
-        let Some(stale) = previous else {
-            return false;
-        };
-        let _evicted: Option<GhostState> = self.by_ref.remove(&stale);
-        true
-    }
-
-    fn locate_key(&self, owner: ServerId, local_id: i32) -> Option<EntityRef> {
-        self.by_ref
-            .keys()
-            .find(|key| key.owner == owner && key.local_id == local_id)
-            .copied()
-    }
-
-    fn state_for(&mut self, entity: &EntityRef, tick: TickStamp) -> Option<&mut GhostState> {
-        let key = self.locate_key(entity.owner, entity.local_id)?;
-        let previous = self.by_ref.remove(&key)?;
-        let mut state = previous;
-        state.chunk = entity.chunk;
-        state.last_tick = tick;
-        Some(self.by_ref.entry(*entity).or_insert(state))
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct OwnerTable {
     pub local_peer: ServerId,
@@ -261,7 +394,11 @@ impl OwnerTable {
     }
 
     pub fn insert(&mut self, local_id: i32, chunk: ChunkAddr) {
-        self.entries.insert((self.local_peer, local_id), chunk);
+        self.insert_origin(self.local_peer, local_id, chunk);
+    }
+
+    pub fn insert_origin(&mut self, origin: ServerId, local_id: i32, chunk: ChunkAddr) {
+        self.entries.insert((origin, local_id), chunk);
     }
 
     #[must_use]
@@ -270,7 +407,11 @@ impl OwnerTable {
     }
 
     pub fn note_moved(&mut self, local_id: i32, chunk: ChunkAddr) -> bool {
-        let Some(entry) = self.entries.get_mut(&(self.local_peer, local_id)) else {
+        self.note_origin_moved(self.local_peer, local_id, chunk)
+    }
+
+    pub fn note_origin_moved(&mut self, origin: ServerId, local_id: i32, chunk: ChunkAddr) -> bool {
+        let Some(entry) = self.entries.get_mut(&(origin, local_id)) else {
             return false;
         };
         *entry = chunk;
@@ -286,12 +427,12 @@ impl OwnerTable {
     /// Entities without another holder are omitted: with no holder there is
     /// nobody to hand to, and handoff must not fall back to broadcast.
     #[must_use]
-    pub fn plan_handoff(
+    pub fn plan_handoff_targets(
         &self,
         holders: &dyn Fn(ChunkAddr) -> Vec<u16>,
-    ) -> Vec<EntityHandoff> {
+    ) -> Vec<EntityHandoffTarget> {
         let mut out = Vec::new();
-        for ((owner, local_id), chunk) in &self.entries {
+        for ((origin, local_id), chunk) in &self.entries {
             let mut candidates: Vec<u16> = holders(*chunk)
                 .into_iter()
                 .filter(|peer| *peer != self.local_peer.0)
@@ -299,9 +440,10 @@ impl OwnerTable {
             candidates.sort_unstable();
             candidates.dedup();
             if let Some(&target_peer) = candidates.first() {
-                out.push(EntityHandoff {
+                out.push(EntityHandoffTarget {
                     entity_ref: EntityRef {
-                        owner: *owner,
+                        origin: *origin,
+                        owner: self.local_peer,
                         local_id: *local_id,
                         chunk: *chunk,
                     },
@@ -310,15 +452,15 @@ impl OwnerTable {
             }
         }
         out.sort_by(|left, right| {
-            (left.entity_ref.owner, left.entity_ref.local_id)
-                .cmp(&(right.entity_ref.owner, right.entity_ref.local_id))
+            (left.entity_ref.origin, left.entity_ref.local_id)
+                .cmp(&(right.entity_ref.origin, right.entity_ref.local_id))
         });
         out
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct EntityHandoff {
+pub struct EntityHandoffTarget {
     pub entity_ref: EntityRef,
     pub target_peer: u16,
 }
@@ -400,6 +542,7 @@ pub fn fanout_to_holders(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::PlayerSlot;
 
     fn chunk(x: i32, z: i32) -> ChunkAddr {
         ChunkAddr { x, z }
@@ -407,135 +550,180 @@ mod tests {
 
     fn entity_ref(owner: u16, local_id: i32, x: i32, z: i32) -> EntityRef {
         EntityRef {
+            origin: ServerId(owner),
             owner: ServerId(owner),
             local_id,
             chunk: chunk(x, z),
         }
     }
 
-    fn spawn_update(owner: u16, local_id: i32, x: i32, z: i32) -> EntitySpawn {
-        EntitySpawn {
-            entity: entity_ref(owner, local_id, x, z),
-            tick: TickStamp(10),
-            kind: 3,
-            pos: [1.0, 2.0, 3.0],
-            yaw: 90.0,
-            pitch: 0.0,
-        }
-    }
-
-    fn pos_update(owner: u16, local_id: i32, x: i32, z: i32) -> EntityPosUpdate {
-        EntityPosUpdate {
-            entity: entity_ref(owner, local_id, x, z),
+    #[test]
+    fn item_spawn_state_roundtrips_in_reused_frame_storage() {
+        let update = EntitySpawn {
+            entity: entity_ref(2, 7, 3, 4),
             tick: TickStamp(11),
-            pos: [4.0, 5.0, 6.0],
-            vel: [0.1, 0.0, 0.0],
-            yaw: 180.0,
-            pitch: 5.0,
-        }
+            kind: 41,
+            pos: [1.0, 64.0, -2.0],
+            yaw: 90.0,
+            pitch: -15.0,
+            state: EntitySpawnState::ItemDrop {
+                stack: ItemStackState {
+                    item_id: 821,
+                    count: 27,
+                    nbt: vec![10, 0, 0, 1, 2, 3],
+                },
+                entity_nbt: vec![10, 0, 0, 4, 5, 6],
+            },
+        };
+        let len = encoded_entity_spawn_len(&update).expect("spawn has a size");
+        let mut storage = vec![0_u8; len];
+        let frame = encode_entity_spawn_to_slice(&update, &mut storage).expect("spawn encodes");
+        assert_eq!(frame.len(), len);
+        let (decoded, tail) = decode_entity_spawn_prefix(frame).expect("spawn decodes");
+        assert!(tail.is_empty());
+        assert_eq!(decoded, update);
     }
 
     #[test]
-    fn spawn_registers_ghost() {
-        let mut ghosts = EntityGhosts::new();
-        assert!(ghosts.spawn(&spawn_update(2, 7, 0, 0)));
-        assert!(!ghosts.spawn(&spawn_update(2, 7, 0, 0)));
-        assert_eq!(ghosts.len(), 1);
-        assert!(ghosts.contains(ServerId(2), 7));
-        let state = ghosts.get(&entity_ref(2, 7, 0, 0));
-        assert!(state.is_some());
-        assert_eq!(state.map(|state| state.kind), Some(3));
+    fn player_spawn_state_roundtrips_with_authenticated_profile_state() {
+        let update = EntitySpawn {
+            entity: entity_ref(2, 7, 3, 4),
+            tick: TickStamp(11),
+            kind: 142,
+            pos: [1.0, 64.0, -2.0],
+            yaw: 90.0,
+            pitch: -15.0,
+            state: EntitySpawnState::Player(PlayerSpawnState {
+                gid: GlobalPlayerId::new(ServerId(2), PlayerSlot(7)),
+                uuid: [9_u8; 16],
+                name: "holder_player".to_owned(),
+                properties: vec![PresenceProperty::new(
+                    "textures".to_owned(),
+                    "payload".to_owned(),
+                    Some("signature".to_owned()),
+                )],
+                gamemode: PlayerGameMode::Creative,
+                source_reserved_entity_id: 771,
+                world: "world".to_owned(),
+                dimension: "minecraft:overworld".to_owned(),
+                entity: PlayerEntityState {
+                    velocity: [0.1, 0.2, 0.3],
+                    on_ground: true,
+                    flags: 9,
+                    fire_ticks: 21,
+                    health_milli: 17_500,
+                    absorption_milli: 2_000,
+                    fall_distance_milli: 600,
+                    food: 18,
+                    saturation_milli: 3_500,
+                    experience_level: 30,
+                    experience_progress_milli: 250,
+                    experience_points: 1_234,
+                    entity_nbt: vec![10, 0, 0, 7, 8, 9],
+                },
+            }),
+        };
+        let len = encoded_entity_spawn_len(&update).expect("spawn has a size");
+        let mut storage = vec![0_u8; len];
+        let frame = encode_entity_spawn_to_slice(&update, &mut storage).expect("spawn encodes");
+        let (decoded, tail) = decode_entity_spawn_prefix(frame).expect("spawn decodes");
+        assert!(tail.is_empty());
+        assert_eq!(decoded, update);
+        let EntitySpawnState::Player(state) = &decoded.state else {
+            panic!("player spawn state expected");
+        };
+        assert!(state.is_authenticated_for(decoded.entity));
+        let mut wrong_server = state.clone();
+        wrong_server.gid = GlobalPlayerId::new(ServerId(3), PlayerSlot(7));
+        assert!(!wrong_server.is_authenticated_for(decoded.entity));
     }
 
     #[test]
-    fn pos_update_moves_ghost_across_chunks() {
-        let mut ghosts = EntityGhosts::new();
-        assert!(ghosts.spawn(&spawn_update(2, 7, 0, 0)));
-        assert!(ghosts.apply_pos(&pos_update(2, 7, 1, 1)));
-        assert!(ghosts.get(&entity_ref(2, 7, 0, 0)).is_none());
-        let owned = ghosts.get_owned(ServerId(2), 7);
-        assert!(owned.is_some());
-        assert_eq!(owned.map(|state| state.chunk), Some(chunk(1, 1)));
-        assert_eq!(owned.map(|state| state.pos), Some([4.0, 5.0, 6.0]));
+    fn handoff_carries_item_state_to_the_successor() {
+        let handoff = EntityHandoff {
+            origin: EntityOrigin {
+                server: ServerId(2),
+                local_id: 7,
+            },
+            previous_owner: ServerId(2),
+            successor: ServerId(5),
+            spawn: EntitySpawn {
+                entity: entity_ref(2, 7, 3, 4),
+                tick: TickStamp(11),
+                kind: 41,
+                pos: [1.0, 64.0, -2.0],
+                yaw: 90.0,
+                pitch: -15.0,
+                state: EntitySpawnState::ItemDrop {
+                    stack: ItemStackState {
+                        item_id: 821,
+                        count: 27,
+                        nbt: vec![10, 0, 0, 1, 2, 3],
+                    },
+                    entity_nbt: vec![10, 0, 0, 4, 5, 6],
+                },
+            },
+            velocity: [0.1, 0.2, 0.3],
+        };
+        assert!(handoff.is_consistent());
+        assert!(handoff.applies_to(ServerId(5)));
+        let len = encoded_entity_handoff_len(&handoff).expect("handoff has a size");
+        let mut storage = vec![0_u8; len];
+        let frame =
+            encode_entity_handoff_to_slice(&handoff, &mut storage).expect("handoff encodes");
+        let (decoded, tail) = decode_entity_handoff_prefix(frame).expect("handoff decodes");
+        assert!(tail.is_empty());
+        assert_eq!(decoded.destination_spawn().entity.owner, ServerId(5));
+        assert_eq!(decoded.destination_spawn().state, handoff.spawn.state);
     }
 
     #[test]
-    fn all_four_streams_refresh_liveness() {
-        let mut ghosts = EntityGhosts::new();
-        assert!(ghosts.spawn(&spawn_update(2, 7, 0, 0)));
-        let visual = EntityVisualUpdate {
-            entity: entity_ref(2, 7, 0, 0),
-            tick: TickStamp(12),
-            slot: 1,
-            item: 42,
-            flags: 0,
+    fn boundary_handoff_prepare_and_confirm_are_tagged_and_typed() {
+        let handoff = EntityHandoff {
+            origin: EntityOrigin { server: ServerId(2), local_id: 9 },
+            previous_owner: ServerId(2),
+            successor: ServerId(3),
+            spawn: EntitySpawn {
+                entity: entity_ref(2, 9, 4, 5),
+                tick: TickStamp(7),
+                kind: 1,
+                pos: [1.0, 2.0, 3.0],
+                yaw: 0.0,
+                pitch: 0.0,
+                state: EntitySpawnState::Entity { nbt: Vec::new() },
+            },
+            velocity: [0.0, 0.0, 0.0],
         };
-        let transient = EntityTransientUpdate {
-            entity: entity_ref(2, 7, 0, 0),
-            tick: TickStamp(13),
-            action: 2,
-            value: 9,
-        };
-        let combat = EntityCombatUpdate {
-            entity: entity_ref(2, 7, 0, 0),
-            tick: TickStamp(14),
-            kind: 1,
-            amount: 500,
-        };
-        assert!(ghosts.apply_visual(&visual));
-        assert!(ghosts.apply_transient(&transient));
-        assert!(ghosts.apply_combat(&combat));
-        assert!(ghosts.apply_pos(&pos_update(2, 7, 0, 0)));
+        let prepare = EntityBoundaryHandoff::Prepare(handoff.clone());
         assert_eq!(
-            ghosts
-                .get_owned(ServerId(2), 7)
-                .map(|state| state.last_tick),
-            Some(TickStamp(11))
+            decode_entity_boundary_handoff(&encode_entity_boundary_handoff(&prepare).expect("encode"))
+                .expect("decode"),
+            prepare
+        );
+        let confirm = EntityBoundaryHandoff::Confirm {
+            origin: handoff.origin,
+            previous_owner: handoff.previous_owner,
+            successor: handoff.successor,
+        };
+        assert_eq!(
+            decode_entity_boundary_handoff(&encode_entity_boundary_handoff(&confirm).expect("encode"))
+                .expect("decode"),
+            confirm
         );
     }
 
     #[test]
-    fn updates_for_unknown_ghost_fail() {
-        let mut ghosts = EntityGhosts::new();
-        assert!(!ghosts.apply_pos(&pos_update(2, 7, 0, 0)));
-        assert!(!ghosts.apply_visual(&EntityVisualUpdate {
-            entity: entity_ref(2, 7, 0, 0),
-            tick: TickStamp(12),
-            slot: 0,
-            item: 0,
-            flags: 0,
-        }));
-        assert!(!ghosts.apply_transient(&EntityTransientUpdate {
-            entity: entity_ref(2, 7, 0, 0),
-            tick: TickStamp(13),
-            action: 0,
-            value: 0,
-        }));
-        assert!(!ghosts.apply_combat(&EntityCombatUpdate {
-            entity: entity_ref(2, 7, 0, 0),
-            tick: TickStamp(14),
-            kind: 0,
-            amount: 0,
-        }));
-        assert!(!ghosts.despawn(&EntityDespawn {
-            entity: entity_ref(2, 7, 0, 0),
-            tick: TickStamp(15),
-        }));
-    }
-
-    #[test]
-    fn despawn_removes_ghost() {
-        let mut ghosts = EntityGhosts::new();
-        assert!(ghosts.spawn(&spawn_update(2, 7, 0, 0)));
-        assert!(ghosts.despawn(&EntityDespawn {
-            entity: entity_ref(2, 7, 0, 0),
-            tick: TickStamp(15),
-        }));
-        assert!(ghosts.is_empty());
-        assert!(!ghosts.despawn(&EntityDespawn {
-            entity: entity_ref(2, 7, 0, 0),
-            tick: TickStamp(16),
-        }));
+    fn boundary_handoff_rejects_other_control_frames() {
+        let unrelated = TaggedEntityBoundaryHandoff {
+            magic: ENTITY_BOUNDARY_HANDOFF_MAGIC.wrapping_add(1),
+            frame: EntityBoundaryHandoff::Reject {
+                origin: EntityOrigin { server: ServerId(2), local_id: 9 },
+                previous_owner: ServerId(2),
+                successor: ServerId(3),
+            },
+        };
+        let bytes = postcard::to_allocvec(&unrelated).expect("encode");
+        assert!(decode_entity_boundary_handoff(&bytes).is_err());
     }
 
     #[test]
@@ -567,7 +755,7 @@ mod tests {
                 Vec::new()
             }
         };
-        let plan = owners.plan_handoff(&holders);
+        let plan = owners.plan_handoff_targets(&holders);
         assert_eq!(plan.len(), 2);
         assert_eq!(plan[0].entity_ref.local_id, 7);
         assert_eq!(plan[0].target_peer, 2);

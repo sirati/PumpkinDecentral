@@ -3,7 +3,7 @@ use pumpkin_protocol::java::client::play::{
 };
 use pumpkin_world::level::SyncChunk;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{collections::VecDeque, io::Write, sync::Arc};
 
@@ -40,6 +40,7 @@ use pumpkin_protocol::{
 };
 use pumpkin_util::text::TextComponent;
 use pumpkin_util::version::JavaMinecraftVersion;
+use pumpkin_util::math::vector3::Vector3;
 use tokio::{
     io::{BufReader, BufWriter},
     net::tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -76,6 +77,9 @@ use crate::plugin::api::events::world::chunk_send::ChunkSend;
 use crate::plugin::player::player_custom_payload::PlayerCustomPayloadEvent;
 use crate::{error::PumpkinError, server::Server};
 
+pub(crate) type JavaNetworkReader = TCPNetworkDecoder<BufReader<OwnedReadHalf>>;
+pub(crate) type JavaNetworkWriter = TCPNetworkEncoder<BufWriter<OwnedWriteHalf>>;
+
 pub struct JavaClient {
     pub id: u64,
     pub version: AtomicCell<JavaMinecraftVersion>,
@@ -93,7 +97,8 @@ pub struct JavaClient {
     pub brand: ArcSwap<Option<String>>,
     /// Associated player reference. Lock-free `ArcSwap`.
     pub player: ArcSwap<Option<Arc<Player>>>,
-    /// A collection of tasks associated with this client. The tasks await completion when removing the client.
+    lobby_transition: ArcSwap<CancellationToken>,
+    /// A collection of tasks associated with this client. Closing it prevents new tasks.
     tasks: TaskTracker,
     rt_handle: tokio::runtime::Handle,
     /// An notifier that is triggered when this client is closed.
@@ -108,10 +113,6 @@ pub struct JavaClient {
     outgoing_packet_priority_recv: Option<UnboundedReceiver<OutgoingPacket>>,
     /// Tracks total buffered payload bytes in the outgoing queues.
     pub pending_bytes: Arc<AtomicUsize>,
-    /// The packet encoder for outgoing packets.
-    network_writer: std::sync::Mutex<Option<TCPNetworkEncoder<BufWriter<OwnedWriteHalf>>>>,
-    /// The packet decoder for incoming packets.
-    network_reader: std::sync::Mutex<Option<TCPNetworkDecoder<BufReader<OwnedReadHalf>>>>,
     /// Keep Alive:
     ///
     /// Whether we are waiting for a response after sending a keep alive packet.
@@ -127,9 +128,11 @@ pub struct JavaClient {
     /// The last time any packet was received from the client.
     pub last_packet_time: AtomicCell<Instant>,
     /// Recent in-flight keep alive IDs with their sent timestamps.
-    pub pending_keep_alives: std::sync::Mutex<Vec<(i64, Instant)>>,
+    pub pending_keep_alives: ArcSwap<Vec<(i64, Instant)>>,
 
     pub packet_sequence: AtomicI32,
+    chunk_batch_acknowledgements: AtomicU64,
+    handoff_teleport: ArcSwap<Option<HandoffTeleport>>,
     /// Packet rate limiter for incoming client packets.
     pub packet_limiter: PacketRateLimiter,
 }
@@ -142,6 +145,13 @@ pub enum OutgoingPacketType {
 struct OutgoingPacket {
     data: Bytes,
     completion: Option<oneshot::Sender<()>>,
+}
+
+struct HandoffTeleport {
+    acknowledgement: u64,
+    position: Vector3<f64>,
+    yaw: f32,
+    pitch: f32,
 }
 
 const MAX_FRAME_BATCH_DATA_SIZE: usize = MAX_PACKET_SIZE as usize;
@@ -229,59 +239,127 @@ impl OutgoingPacket {
 
 impl JavaClient {
     #[must_use]
-    pub fn from_pending(
+    pub(crate) fn from_pending(
         pending: PendingConnection,
         gameprofile: GameProfile,
         config: PlayerConfig,
-    ) -> Self {
+    ) -> (Self, JavaNetworkReader, JavaNetworkWriter) {
         let (send, recv) = tokio::sync::mpsc::unbounded_channel();
         let (priority_send, priority_recv) = tokio::sync::mpsc::unbounded_channel();
 
-        Self {
-            id: pending.id,
-            gameprofile,
-            config: ArcSwap::from_pointee(config),
-            server_address: pending.server_address,
-            address: pending.address,
-            connection_state: pending.connection_state,
-            close_token: pending.close_token,
-            tasks: TaskTracker::new(),
-            rt_handle: tokio::runtime::Handle::current(),
-            outgoing_packet_queue_send: send,
-            outgoing_packet_queue_recv: Some(recv),
-            outgoing_packet_priority_send: priority_send,
-            outgoing_packet_priority_recv: Some(priority_recv),
-            pending_bytes: Arc::new(AtomicUsize::new(0)),
-            version: pending.version,
-            network_writer: std::sync::Mutex::new(Some(pending.network_writer)),
-            network_reader: std::sync::Mutex::new(Some(pending.network_reader)),
-            brand: ArcSwap::from_pointee(pending.brand),
-            player: ArcSwap::from_pointee(None),
-            wait_for_keep_alive: AtomicBool::new(false),
-            received_movement_this_tick: AtomicBool::new(false),
-            keep_alive_id: AtomicCell::new(0),
-            last_keep_alive_time: AtomicCell::new(Instant::now()),
-            last_packet_time: AtomicCell::new(Instant::now()),
-            pending_keep_alives: std::sync::Mutex::new(Vec::new()),
-            packet_sequence: AtomicI32::new(-1),
-            packet_limiter: pending.packet_limiter,
-        }
+        let PendingConnection {
+            id,
+            address,
+            server_address,
+            version,
+            connection_state,
+            close_token,
+            network_writer,
+            network_reader,
+            brand,
+            packet_limiter,
+            ..
+        } = pending;
+
+        (
+            Self {
+                id,
+                gameprofile,
+                config: ArcSwap::from_pointee(config),
+                server_address,
+                address,
+                connection_state,
+                close_token,
+                tasks: TaskTracker::new(),
+                rt_handle: tokio::runtime::Handle::current(),
+                outgoing_packet_queue_send: send,
+                outgoing_packet_queue_recv: Some(recv),
+                outgoing_packet_priority_send: priority_send,
+                outgoing_packet_priority_recv: Some(priority_recv),
+                pending_bytes: Arc::new(AtomicUsize::new(0)),
+                version,
+                brand: ArcSwap::from_pointee(brand),
+                player: ArcSwap::from_pointee(None),
+                lobby_transition: ArcSwap::from_pointee(CancellationToken::new()),
+                wait_for_keep_alive: AtomicBool::new(false),
+                received_movement_this_tick: AtomicBool::new(false),
+                keep_alive_id: AtomicCell::new(0),
+                last_keep_alive_time: AtomicCell::new(Instant::now()),
+                last_packet_time: AtomicCell::new(Instant::now()),
+                pending_keep_alives: ArcSwap::from_pointee(Vec::new()),
+                packet_sequence: AtomicI32::new(-1),
+                chunk_batch_acknowledgements: AtomicU64::new(0),
+                handoff_teleport: ArcSwap::from_pointee(None),
+                packet_limiter,
+            },
+            network_reader,
+            network_writer,
+        )
     }
 
     pub fn set_player(&self, player: Arc<Player>) {
         self.player.store(Arc::new(Some(player)));
     }
 
-    pub async fn progress_player_packets(&self, player: &Arc<Player>, server: &Arc<Server>) {
-        let Some(mut network_reader) = self
-            .network_reader
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        else {
-            return;
-        };
+    pub fn clear_player(&self) {
+        self.player.store(Arc::new(None));
+    }
 
+    pub fn request_virtual_lobby(&self) {
+        self.lobby_transition.load().cancel();
+    }
+
+    pub fn note_chunk_batch_acknowledgement(&self) {
+        self.chunk_batch_acknowledgements
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[must_use]
+    pub fn chunk_batch_acknowledgements(&self) -> u64 {
+        self.chunk_batch_acknowledgements.load(Ordering::Acquire)
+    }
+
+    pub fn arm_handoff_teleport(
+        &self,
+        acknowledgement: u64,
+        position: Vector3<f64>,
+        yaw: f32,
+        pitch: f32,
+    ) {
+        self.handoff_teleport.store(Arc::new(Some(HandoffTeleport {
+            acknowledgement,
+            position,
+            yaw,
+            pitch,
+        })));
+    }
+
+    pub fn take_handoff_teleport(&self) -> Option<(Vector3<f64>, f32, f32)> {
+        let current = self.handoff_teleport.load_full();
+        let handoff = current.as_ref().as_ref()?;
+        if self.chunk_batch_acknowledgements() < handoff.acknowledgement {
+            return None;
+        }
+        let handoff = self.handoff_teleport.swap(Arc::new(None));
+        handoff
+            .as_ref()
+            .as_ref()
+            .map(|handoff| (handoff.position, handoff.yaw, handoff.pitch))
+    }
+
+    #[must_use]
+    pub fn take_virtual_lobby_request(&self) -> bool {
+        self.lobby_transition
+            .swap(Arc::new(CancellationToken::new()))
+            .is_cancelled()
+    }
+
+    pub async fn progress_player_packets(
+        &self,
+        network_reader: &mut JavaNetworkReader,
+        player: &Arc<Player>,
+        server: &Arc<Server>,
+    ) -> bool {
         let keep_alive_time = server.advanced_config.networking.java.keep_alive_time;
         let mut keep_alive_interval =
             tokio::time::interval(std::time::Duration::from_secs(keep_alive_time.max(1)));
@@ -291,23 +369,23 @@ impl JavaClient {
         // Skip the immediate first tick so we don't send a keep-alive the exact millisecond they join
         keep_alive_interval.tick().await;
 
-        loop {
+        let lobby_transition = self.lobby_transition.load_full();
+        let transition_requested = loop {
             tokio::select! {
                 // KEEP-ALIVE TIMER
                 _ = keep_alive_interval.tick() => {
                     // Check if the client has timed out on keep-alive responses or no packet activity
-                    let has_timed_out = {
-                        let pending = self
-                            .pending_keep_alives
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        pending.iter().any(|(_, send_time)| send_time.elapsed() > timeout_duration)
-                    } || (self.wait_for_keep_alive.load(Ordering::Relaxed) && self.last_keep_alive_time.load().elapsed() > timeout_duration)
+                    let has_timed_out = self
+                        .pending_keep_alives
+                        .load()
+                        .iter()
+                        .any(|(_, send_time)| send_time.elapsed() > timeout_duration)
+                    || (self.wait_for_keep_alive.load(Ordering::Relaxed) && self.last_keep_alive_time.load().elapsed() > timeout_duration)
                       || (self.last_packet_time.load().elapsed() > timeout_duration);
 
                     if has_timed_out {
                         self.kick(pumpkin_macros::translate_cross!(translation::java::DISCONNECT_TIMEOUT, translation::bedrock::DISCONNECT_TIMEOUT)).await;
-                        break;
+                        break false;
                     }
 
                     let keep_alive_id = i64::from(
@@ -320,28 +398,31 @@ impl JavaClient {
                     self.keep_alive_id.store(keep_alive_id);
                     self.wait_for_keep_alive.store(true, Ordering::Relaxed);
                     self.last_keep_alive_time.store(Instant::now());
-                    {
-                        let mut pending = self
-                            .pending_keep_alives
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        pending.push((keep_alive_id, Instant::now()));
+                    let sent_at = Instant::now();
+                    self.pending_keep_alives.rcu(|pending| {
+                        let mut pending = (**pending).clone();
+                        pending.push((keep_alive_id, sent_at));
                         if pending.len() > 16 {
                             pending.remove(0);
                         }
-                    }
+                        pending
+                    });
                     let packet = pumpkin_protocol::java::client::play::CKeepAlive::new(keep_alive_id);
                     self.enqueue_client_packet(&packet).await;
                 }
 
                 () = self.close_token.cancelled() => {
-                    break;
+                    break false;
+                }
+
+                () = lobby_transition.cancelled() => {
+                    break true;
                 }
 
                 // INCOMING PACKETS
-                packet_opt = self.get_packet_with_reader(&mut network_reader) => {
+                packet_opt = self.get_packet_with_reader(network_reader) => {
                     let Some(packet) = packet_opt else {
-                        break;
+                        break false;
                     };
                     self.last_packet_time.store(Instant::now());
 
@@ -362,18 +443,71 @@ impl JavaClient {
                                 .clone(),
                         ))
                         .await;
-                        break;
+                        break false;
                     }
 
                     player.inbound_packets.push(packet);
                 }
             }
-        }
+        };
+        transition_requested
     }
 
-    pub async fn await_tasks(&self) {
+    pub async fn progress_lobby_packets(
+        &self,
+        network_reader: &mut JavaNetworkReader,
+        server: &Arc<Server>,
+        waiter: Arc<crate::server::cluster_lobby::LobbyWaiter>,
+    ) -> bool {
+        let handoff = waiter.handoff_token();
+        let handoff_ready = loop {
+            tokio::select! {
+                () = handoff.cancelled() => break true,
+                () = self.close_token.cancelled() => break false,
+                packet = self.get_packet_with_reader(network_reader) => {
+                    let Some(packet) = packet else {
+                        break false;
+                    };
+                    self.last_packet_time.store(Instant::now());
+                    let version = self.version.load();
+                    let mut payload = &packet.payload[..];
+                    if packet.id == SChatCommand::to_id(version) {
+                        if let Ok(command) = SChatCommand::read(&mut payload, &version) {
+                            crate::server::cluster_lobby::execute_lobby_command(
+                                server,
+                                waiter.clone(),
+                                command.command.to_string(),
+                            );
+                        }
+                    } else if packet.id == SChatMessage::to_id(version)
+                        && let Ok(message) = SChatMessage::read(&mut payload, &version)
+                    {
+                        if let Some(command) = message.message.strip_prefix('/') {
+                            crate::server::cluster_lobby::execute_lobby_command(
+                                server,
+                                waiter.clone(),
+                                command.to_string(),
+                            );
+                        } else {
+                            crate::server::cluster_lobby::broadcast_lobby_chat(
+                                server,
+                                &waiter,
+                                message.message.to_string(),
+                            );
+                        }
+                    } else if packet.id == SChunkBatch::to_id(version)
+                        && SChunkBatch::read(&mut payload, &version).is_ok()
+                    {
+                        self.note_chunk_batch_acknowledgement();
+                    }
+                }
+            }
+        };
+        handoff_ready
+    }
+
+    pub fn close_tasks(&self) {
         self.tasks.close();
-        self.tasks.wait().await;
     }
 
     /// Spawns a task associated with this client. All tasks spawned with this method are awaited
@@ -492,6 +626,69 @@ impl JavaClient {
         }
     }
 
+    pub async fn send_virtual_handoff_chunks(&self, chunks: &[SyncChunk]) -> bool {
+        if chunks.is_empty() {
+            return true;
+        }
+        let version = self.version.load();
+        let chunks = chunks.to_vec();
+        let chunk_count = chunks.len();
+        let (tx, rx) = oneshot::channel();
+        rayon::spawn(move || {
+            let mut serialized = Vec::with_capacity(chunks.len());
+            for chunk in chunks {
+                let mut buf = Vec::with_capacity(32 * 1024);
+                if buf
+                    .write_var_int(&VarInt(CChunkData::to_id(version)))
+                    .is_err()
+                    || CChunkData(&chunk).write_packet_data(&mut buf, &version).is_err()
+                {
+                    let _ = tx.send(None);
+                    return;
+                }
+                let light = if version >= JavaMinecraftVersion::V_1_14
+                    && version < JavaMinecraftVersion::V_1_18
+                {
+                    let Ok(packet) = CLightUpdate::from_chunk(&chunk, version) else {
+                        let _ = tx.send(None);
+                        return;
+                    };
+                    let mut light_buf = Vec::new();
+                    if light_buf
+                        .write_var_int(&VarInt(CLightUpdate::to_id(version)))
+                        .is_err()
+                        || packet.write_packet_data(&mut light_buf, &version).is_err()
+                    {
+                        let _ = tx.send(None);
+                        return;
+                    }
+                    Some(Bytes::from(light_buf))
+                } else {
+                    None
+                };
+                serialized.push((Bytes::from(buf), light));
+            }
+            let _ = tx.send(Some(serialized));
+        });
+        let Ok(Some(serialized)) = rx.await else {
+            return false;
+        };
+        if version >= JavaMinecraftVersion::V_1_20_2 {
+            self.send_packet(&CChunkBatchStart).await;
+        }
+        for (chunk_data, light_data) in serialized {
+            self.send_packet_now_data(chunk_data).await;
+            if let Some(light_data) = light_data {
+                self.send_packet_now_data(light_data).await;
+            }
+        }
+        if version >= JavaMinecraftVersion::V_1_20_2 {
+            self.send_packet(&CChunkBatchEnd::new(chunk_count as u16))
+                .await;
+        }
+        !self.is_closed()
+    }
+
     #[allow(clippy::unused_async)]
     pub async fn enqueue_packet(&self, packet_data: Bytes) {
         self.try_enqueue_packet_data(packet_data);
@@ -551,7 +748,7 @@ impl JavaClient {
 
     pub async fn get_packet_with_reader(
         &self,
-        network_reader: &mut TCPNetworkDecoder<BufReader<OwnedReadHalf>>,
+        network_reader: &mut JavaNetworkReader,
     ) -> Option<RawPacket> {
         tokio::select! {
             () = self.await_close_interrupt() => {
@@ -739,7 +936,7 @@ impl JavaClient {
     /// - **Login/Transfer:** Handles login and transfer packets.
     /// - **Config:** Handles configuration packets.
     #[expect(clippy::too_many_lines)]
-    pub fn start_outgoing_packet_task(&mut self) {
+    pub fn start_outgoing_packet_task(&mut self, mut writer: JavaNetworkWriter) {
         const MAX_BATCH_SIZE: usize = 64;
 
         let Some(mut packet_receiver) = self.outgoing_packet_queue_recv.take() else {
@@ -750,14 +947,6 @@ impl JavaClient {
         };
         let close_token = self.close_token.clone();
         let pending_bytes = self.pending_bytes.clone();
-        let Some(mut writer) = self
-            .network_writer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        else {
-            return;
-        };
         let id = self.id;
         self.spawn_task(async move {
             loop {
@@ -919,7 +1108,7 @@ impl JavaClient {
                 let player_c = player.clone();
                 let server_c = server.clone();
                 server.spawn_task(async move {
-                    if let ClientPlatform::Java(client) = client_platform.as_ref() {
+                    if let Some(ClientPlatform::Java(client)) = client_platform.as_deref() {
                         let packet = SChatCommand { command: &cmd };
                         client
                             .handle_chat_command(&player_c, &server_c, &packet)
@@ -941,7 +1130,7 @@ impl JavaClient {
                 let player_c = player.clone();
                 let server_c = server.clone();
                 server.spawn_task(async move {
-                    if let ClientPlatform::Java(client) = client_platform.as_ref() {
+                    if let Some(ClientPlatform::Java(client)) = client_platform.as_deref() {
                         let packet = SChatCommand { command: &cmd };
                         client
                             .handle_chat_command(&player_c, &server_c, &packet)
@@ -962,7 +1151,7 @@ impl JavaClient {
                 let player_c = player.clone();
                 let server_c = server.clone();
                 server.spawn_task(async move {
-                    if let ClientPlatform::Java(client) = client_platform.as_ref() {
+                    if let Some(ClientPlatform::Java(client)) = client_platform.as_deref() {
                         let packet = SChatMessage {
                             message: &msg,
                             timestamp: ts,
@@ -1199,7 +1388,7 @@ impl JavaClient {
                 let player_c = player.clone();
                 let server_c = server.clone();
                 server.spawn_task(async move {
-                    if let ClientPlatform::Java(client) = client_platform.as_ref() {
+                    if let Some(ClientPlatform::Java(client)) = client_platform.as_deref() {
                         client
                             .handle_chat_session_update(&player_c, &server_c, session)
                             .await;

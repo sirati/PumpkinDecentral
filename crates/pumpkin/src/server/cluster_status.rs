@@ -1,8 +1,6 @@
-use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
 
 use pumpkin_data::packet::{CURRENT_MC_VERSION, LOWEST_SUPPORTED_MC_VERSION};
 use pumpkin_protocol::{Players, Sample, StatusResponse, Version};
@@ -40,6 +38,12 @@ fn live_status_players(server: &Server) -> (u32, Vec<Sample>) {
         sample.push(Sample {
             name: player.gameprofile.name.clone(),
             id: player.gameprofile.id.to_string(),
+        });
+    }
+    for waiter in server.lobby_waiters.load().iter() {
+        sample.push(Sample {
+            name: waiter.profile.name.clone(),
+            id: waiter.profile.id.to_string(),
         });
     }
     for (gid, entry) in super::cluster_presence::remote_presence_entries()
@@ -109,17 +113,6 @@ pub fn base_status_response(server: &Server, client_protocol: i32) -> StatusResp
 
 pub fn refresh_cluster_status(server: &Server) {
     ONLINE.store(live_status_players(server).0, Ordering::Relaxed);
-}
-
-pub fn spawn_cluster_status_poller(server: &Arc<Server>) {
-    refresh_cluster_status(server);
-    let task_server = Arc::clone(server);
-    server.spawn_task(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            refresh_cluster_status(&task_server);
-        }
-    });
 }
 
 #[cfg(test)]

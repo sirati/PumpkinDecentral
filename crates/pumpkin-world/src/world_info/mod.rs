@@ -93,6 +93,15 @@ pub struct LevelData {
     #[serde(skip_serializing, default)]
     pub day_time: i64,
 
+    #[serde(skip_serializing, default)]
+    pub double_day_counter: u16,
+
+    #[serde(skip_serializing, default)]
+    pub sync_time_offset: i16,
+
+    #[serde(skip_serializing, default = "default_time_model_loaded")]
+    pub time_model_loaded: bool,
+
     /// Remaining ticks of forced-clear weather.
     /// Persisted to `data/minecraft/weather.dat`.
     #[serde(rename = "clearWeatherTime", skip_serializing, default)]
@@ -112,6 +121,10 @@ const DEFAULT_WORLD_VERSION_SERIES: &str = "main";
 
 const fn default_border_damage_per_block() -> f64 {
     DEFAULT_BORDER_DAMAGE_PER_BLOCK
+}
+
+const fn default_time_model_loaded() -> bool {
+    true
 }
 const fn default_border_size() -> f64 {
     DEFAULT_BORDER_SIZE
@@ -556,6 +569,9 @@ impl LevelData {
             game_rules: GameRuleRegistry::default(),
             world_gen_settings: WorldGenSettings::new(seed),
             day_time: 0,
+            double_day_counter: 0,
+            sync_time_offset: 0,
+            time_model_loaded: true,
             clear_weather_time: -1,
         }
     }

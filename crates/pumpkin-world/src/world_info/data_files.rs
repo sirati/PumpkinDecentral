@@ -76,7 +76,9 @@ impl WorldGenSettingsData {
 
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct DimensionClock {
-    pub total_ticks: i64,
+    pub double_day_counter: u16,
+    pub sync_time_offset: i16,
+    pub legacy_total_ticks: Option<i64>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
@@ -523,10 +525,29 @@ fn world_clocks_from_nbt(root: &NbtCompound) -> WorldClocksData {
             continue;
         }
         if let NbtTag::Compound(dim_compound) = tag {
-            let total_ticks = dim_compound.get_long("total_ticks").unwrap_or(0);
+            let double_day_counter = dim_compound
+                .get_int("double_day_counter")
+                .and_then(|value| u16::try_from(value).ok());
+            let sync_time_offset = dim_compound
+                .get_int("sync_time_offset")
+                .and_then(|value| i16::try_from(value).ok());
             result
                 .clocks
-                .insert(key.to_string(), DimensionClock { total_ticks });
+                .insert(
+                    key.to_string(),
+                    match (double_day_counter, sync_time_offset) {
+                        (Some(double_day_counter), Some(sync_time_offset)) => DimensionClock {
+                            double_day_counter,
+                            sync_time_offset,
+                            legacy_total_ticks: None,
+                        },
+                        _ => DimensionClock {
+                            double_day_counter: 0,
+                            sync_time_offset: 0,
+                            legacy_total_ticks: dim_compound.get_long("total_ticks"),
+                        },
+                    },
+                );
         }
     }
 
@@ -543,7 +564,8 @@ pub fn write_world_clocks(
     let mut inner = NbtCompound::new();
     for (dim_name, clock) in &clocks.clocks {
         let mut dim_compound = NbtCompound::new();
-        dim_compound.put_long("total_ticks", clock.total_ticks);
+        dim_compound.put_int("double_day_counter", i32::from(clock.double_day_counter));
+        dim_compound.put_int("sync_time_offset", i32::from(clock.sync_time_offset));
         inner.put_compound(dim_name, dim_compound);
     }
     inner.put_int("DataVersion", clocks.data_version);

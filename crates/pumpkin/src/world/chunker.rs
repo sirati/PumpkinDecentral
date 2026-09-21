@@ -17,9 +17,10 @@ pub fn get_view_distance(player: &Player) -> NonZero<u8> {
     let Some(server) = player.world().server.upgrade() else {
         return fallback;
     };
-    let max_view_distance = match player.client.as_ref() {
-        ClientPlatform::Java(_) => server.advanced_config.networking.java.view_distance,
-        ClientPlatform::Bedrock(_) => server.advanced_config.networking.bedrock.view_distance,
+    let max_view_distance = match player.client.as_deref() {
+        Some(ClientPlatform::Java(_)) => server.advanced_config.networking.java.view_distance,
+        Some(ClientPlatform::Bedrock(_)) => server.advanced_config.networking.bedrock.view_distance,
+        None => fallback,
     };
     player
         .config
@@ -41,6 +42,9 @@ pub fn is_within_chebyshev_distance(
 
 #[allow(clippy::too_many_lines)]
 pub fn update_position(player: &Arc<Player>) {
+    let Some(client) = player.client.as_deref() else {
+        return;
+    };
     let entity = &player.get_entity();
     let new_chunk_center = entity.chunk_pos.load();
     let old_cylindrical = player.watched_section.load();
@@ -57,7 +61,7 @@ pub fn update_position(player: &Arc<Player>) {
         return;
     }
 
-    match player.client.as_ref() {
+    match client {
         ClientPlatform::Java(java_client) => {
             java_client.try_send_packet(&CCenterChunk {
                 chunk_x: new_chunk_center.x.into(),
@@ -136,7 +140,7 @@ pub fn update_position(player: &Arc<Player>) {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for pos in &unloading_chunks {
-            sender.unload_chunk(&player.client, *pos);
+            sender.unload_chunk(client, *pos);
         }
         for pos in &loading_chunks {
             sender.enqueue_chunk(*pos);

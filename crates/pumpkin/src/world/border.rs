@@ -2,11 +2,13 @@ use pumpkin_protocol::java::client::play::{
     CInitializeWorldBorder, CSetBorderCenter, CSetBorderLerpSize, CSetBorderSize,
     CSetBorderWarningDelay, CSetBorderWarningDistance,
 };
+use std::sync::Arc;
 
 use crate::net::java::JavaClient;
 
 use super::World;
 
+#[derive(Clone)]
 pub struct Worldborder {
     pub center_x: f64,
     pub center_z: f64,
@@ -62,6 +64,7 @@ impl Worldborder {
     pub fn set_center(&mut self, world: &World, x: f64, z: f64) {
         self.center_x = x;
         self.center_z = z;
+        world.worldborder_snapshot.store(Arc::new(self.clone()));
 
         world.broadcast_packet_all(&CSetBorderCenter::new(self.center_x, self.center_z));
     }
@@ -69,6 +72,7 @@ impl Worldborder {
     pub fn set_diameter(&mut self, world: &World, diameter: f64, speed: Option<i64>) {
         self.old_diameter = self.new_diameter;
         self.new_diameter = diameter;
+        world.worldborder_snapshot.store(Arc::new(self.clone()));
 
         match speed {
             Some(speed) => {
@@ -90,22 +94,26 @@ impl Worldborder {
 
     pub fn set_warning_delay(&mut self, world: &World, delay: i32) {
         self.warning_time = delay;
+        world.worldborder_snapshot.store(Arc::new(self.clone()));
 
         world.broadcast_packet_all(&CSetBorderWarningDelay::new(self.warning_time.into()));
     }
 
     pub fn set_warning_distance(&mut self, world: &World, distance: i32) {
         self.warning_blocks = distance;
+        world.worldborder_snapshot.store(Arc::new(self.clone()));
 
         world.broadcast_packet_all(&CSetBorderWarningDistance::new(self.warning_blocks.into()));
     }
 
-    pub const fn set_damage_buffer(&mut self, buffer: f32) {
+    pub fn set_damage_buffer(&mut self, world: &World, buffer: f32) {
         self.buffer = buffer;
+        world.worldborder_snapshot.store(Arc::new(self.clone()));
     }
 
-    pub const fn set_damage_per_block(&mut self, damage: f32) {
+    pub fn set_damage_per_block(&mut self, world: &World, damage: f32) {
         self.damage_per_block = damage;
+        world.worldborder_snapshot.store(Arc::new(self.clone()));
     }
 
     pub fn reset(&mut self, world: &World) {
@@ -119,6 +127,7 @@ impl Worldborder {
         self.warning_time = 15;
         self.damage_per_block = 0.2;
         self.buffer = 5.0;
+        world.worldborder_snapshot.store(Arc::new(self.clone()));
 
         world.broadcast_packet_all(&CInitializeWorldBorder::new(
             self.center_x,

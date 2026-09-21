@@ -1,11 +1,7 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 use crate::item::registry::should_try_block_placement;
-use crossbeam::queue::SegQueue;
-use pumpkin_cluster::identity::{GlobalPlayerId, PlayerSlot, ServerId};
 use pumpkin_cluster::place_emit::{capture_place, chunk_of_block, next_place_seq};
-use pumpkin_cluster::protocol::PlaceBlockUpdate;
-use pumpkin_cluster::time::TickStamp;
 
 impl JavaClient {
     #[allow(clippy::too_many_lines)]
@@ -25,7 +21,7 @@ impl JavaClient {
         let cursor_pos = use_item_on.cursor_pos;
 
         let mut should_try_decrement = false;
-        let mut placed: Option<(BlockPos, pumpkin_data::BlockStateId)> = None;
+        let mut placed: Option<(BlockPos, pumpkin_data::BlockStateId, pumpkin_data::BlockStateId)> = None;
 
         if !player.can_interact_with_block_at(&position, 1.0) {
             // TODO: maybe log?
@@ -155,7 +151,7 @@ impl JavaClient {
 
         let item_result = server
             .item_registry
-            .use_on_block(&mut item, player, position, face, cursor_pos, block, server);
+            .use_on_block(&mut item, player, position, face, cursor_pos, block, server, slot_index);
 
         if should_try_block_placement(&item_result) {
             // Check if the item is a block, because not every item can be placed :D
@@ -172,9 +168,9 @@ impl JavaClient {
             // Decrease block count
             let consume = player.gamemode.load() != GameMode::Creative;
             let mut consumed_atomically = false;
-            if let Some((final_pos, new_state)) = placed {
+            if let Some((final_pos, new_state, old_state)) = placed {
                 if let Some(refreshed) =
-                    Self::emit_cluster_place(player, server, hand, final_pos, new_state, consume)
+                    Self::emit_cluster_place(player, server, hand, final_pos, old_state, new_state, consume)
                 {
                     item = refreshed;
                     consumed_atomically = true;
@@ -277,17 +273,24 @@ impl JavaClient {
         use_item_on: &SUseItemOn,
         location: BlockPos,
         face: BlockDirection,
-    ) -> Result<Option<(BlockPos, pumpkin_data::BlockStateId)>, BlockPlacingError> {
+    ) -> Result<
+        Option<(
+            BlockPos,
+            pumpkin_data::BlockStateId,
+            pumpkin_data::BlockStateId,
+        )>,
+        BlockPlacingError,
+    > {
         match server
             .block_registry
             .place_block(player, block, server, use_item_on, location, face)
         {
-            Ok(Some((final_block_pos, new_state))) => {
+            Ok(Some((final_block_pos, new_state, old_state))) => {
                 player.try_send_client_packet(&CBlockUpdate::new(
                     final_block_pos,
                     VarInt(i32::from(new_state.as_u16())),
                 ));
-                Ok(Some((final_block_pos, new_state)))
+                Ok(Some((final_block_pos, new_state, old_state)))
             }
             Ok(None) => Ok(None),
             Err(crate::block::registry::BlockPlacingError::InvalidGamemode) => {
@@ -300,27 +303,13 @@ impl JavaClient {
     }
 }
 
-static PLACE_OUTBOX: SegQueue<PlaceBlockUpdate> = SegQueue::new();
-
 impl JavaClient {
-    pub fn drain_place_outbox() -> Vec<PlaceBlockUpdate> {
-        let mut drained = Vec::new();
-        while let Some(update) = PLACE_OUTBOX.pop() {
-            drained.push(update);
-        }
-        drained
-    }
-
-    #[cfg(test)]
-    pub fn stage_place_for_test(update: PlaceBlockUpdate) {
-        PLACE_OUTBOX.push(update);
-    }
-
     fn emit_cluster_place(
         player: &Player,
         server: &Server,
         hand: Hand,
         final_pos: BlockPos,
+        old_state: pumpkin_data::BlockStateId,
         new_state: pumpkin_data::BlockStateId,
         consume: bool,
     ) -> Option<ItemStack> {
@@ -328,11 +317,14 @@ impl JavaClient {
         if !cluster.enabled {
             return None;
         }
-        let gid = GlobalPlayerId::new(
-            ServerId(cluster.server_id),
-            PlayerSlot(Self::cluster_player_slot(player)),
-        );
-        let tick = Self::cluster_tick_stamp();
+        let Some(gid) = player.cluster_gid() else {
+            warn!(player = %player.gameprofile.name, "cluster place action dropped before global player id assignment");
+            return None;
+        };
+        let Some(tick) = crate::server::cluster::disciplined_tick_now() else {
+            warn!(player = %player.gameprofile.name, "cluster place action dropped before NTP discipline is available");
+            return None;
+        };
         let chunk = chunk_of_block(final_pos.0.x, final_pos.0.z);
         let update_pos = pumpkin_cluster::protocol::BlockPos {
             x: final_pos.0.x,
@@ -345,6 +337,14 @@ impl JavaClient {
         let before = inventory.get_stack_in_hand(hand);
         let before_item = before.item.id;
         let before_count = before.item_count;
+        let mut before_nbt = pumpkin_nbt::NbtCompound::new();
+        before.write_item_stack(&mut before_nbt);
+        let before_stack = pumpkin_cluster::inventory::InventoryStack {
+            item: before_item,
+            count: before_count,
+            nbt: pumpkin_nbt::Nbt::from(before_nbt).write_unnamed().to_vec(),
+        }
+        .normalized();
         let inv = match hand {
             Hand::Right => pumpkin_cluster::inventory::INV_MAIN,
             Hand::Left => pumpkin_cluster::inventory::INV_OFFHAND,
@@ -355,6 +355,7 @@ impl JavaClient {
                 seq,
                 tick,
                 update_pos,
+                old_state.as_u16(),
                 new_state_id,
                 inv,
                 slot,
@@ -363,7 +364,32 @@ impl JavaClient {
                 count_after,
                 chunk,
             );
-            PLACE_OUTBOX.push(update);
+            let mut batch = pumpkin_cluster::protocol::TickBatch::new(tick);
+            if consume {
+                let after_stack = pumpkin_cluster::inventory::InventoryStack {
+                    item: before_item,
+                    count: count_after,
+                    nbt: before_stack.nbt.clone(),
+                }
+                .normalized();
+                let Some(operation) = pumpkin_cluster::inventory::capture_semantic_inv_op(
+                    gid,
+                    pumpkin_cluster::inventory::next_inv_seq(gid),
+                    tick,
+                    pumpkin_cluster::inventory::InvOpKind::Consume,
+                    pumpkin_cluster::inventory::InvLoc::new(inv, u16::from(slot)),
+                    pumpkin_cluster::inventory::InvLoc::new(inv, u16::from(slot)),
+                    before_stack.clone(),
+                    after_stack,
+                    before_count.saturating_sub(count_after),
+                ) else {
+                    warn!(player = %player.gameprofile.name, "cluster place inventory action was not semantic");
+                    return;
+                };
+                batch.inv_ops.push(operation);
+            }
+            batch.place_block.push(update);
+            crate::server::cluster_world_apply::submit_local_optimistic_batch(batch);
         });
         if emitted {
             Some(inventory.get_stack_in_hand(hand))
@@ -372,11 +398,4 @@ impl JavaClient {
         }
     }
 
-    fn cluster_player_slot(player: &Player) -> u16 {
-        (player.gameprofile.id.as_u128() & 0xFFFF) as u16
-    }
-
-    fn cluster_tick_stamp() -> TickStamp {
-        TickStamp::now()
-    }
 }

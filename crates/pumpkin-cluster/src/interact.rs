@@ -4,7 +4,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::buckets::BucketTable;
+use crate::dependent::DependentCause;
 use crate::identity::{GlobalPlayerId, PlayerSeq};
+use crate::inventory::{
+    InvCells, InvLoc, InvOpKind, InvVerdict, InventoryOp, InventoryStack, replay,
+};
 use crate::order::order_players;
 use crate::protocol::{BlockPos, BlockUndo, ChunkAddr, StreamKind};
 use crate::reconcile::ReconcilePlan;
@@ -15,7 +19,371 @@ pub const INTERACT_KIND_DOOR: u8 = 1;
 pub const INTERACT_KIND_TRAPDOOR: u8 = 2;
 pub const INTERACT_KIND_END_EYE: u8 = 3;
 pub const INTERACT_KIND_ANCHOR: u8 = 4;
+pub const INTERACT_KIND_ATOMIC: u8 = 5;
 pub const INTERACT_MAX_UPDATES: usize = 256;
+pub const INTERACT_MAX_LINKED_EDITS: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InteractGroup {
+    pub gid: GlobalPlayerId,
+    pub seq: PlayerSeq,
+    pub tick: TickStamp,
+    pub anchor: BlockPos,
+}
+
+impl InteractGroup {
+    #[must_use]
+    pub const fn new(gid: GlobalPlayerId, seq: PlayerSeq, tick: TickStamp, anchor: BlockPos) -> Self {
+        Self {
+            gid,
+            seq,
+            tick,
+            anchor,
+        }
+    }
+
+    #[must_use]
+    pub const fn dependent_cause(self) -> DependentCause {
+        DependentCause::new(self.gid, self.seq, self.tick, self.anchor)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct InteractEdit {
+    pub pos: BlockPos,
+    pub expected_old_state: u16,
+    pub new_state: u16,
+}
+
+impl InteractEdit {
+    #[must_use]
+    pub const fn new(pos: BlockPos, expected_old_state: u16, new_state: u16) -> Self {
+        Self {
+            pos,
+            expected_old_state,
+            new_state,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_noop(self) -> bool {
+        self.expected_old_state == self.new_state
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AtomicInteractKind {
+    Door,
+    Trapdoor,
+    EndEye,
+    Anchor,
+}
+
+impl AtomicInteractKind {
+    #[must_use]
+    pub const fn tag(self) -> u8 {
+        match self {
+            Self::Door => INTERACT_KIND_DOOR,
+            Self::Trapdoor => INTERACT_KIND_TRAPDOOR,
+            Self::EndEye => INTERACT_KIND_END_EYE,
+            Self::Anchor => INTERACT_KIND_ANCHOR,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryPrecondition {
+    pub loc: InvLoc,
+    pub stack: InventoryStack,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticInventoryUse {
+    pub precondition: InventoryPrecondition,
+    pub op: InventoryOp,
+}
+
+impl SemanticInventoryUse {
+    #[must_use]
+    pub fn is_valid_for(&self, group: InteractGroup) -> bool {
+        self.precondition.stack == self.precondition.stack.clone().normalized()
+            && !self.precondition.stack.is_empty()
+            && self.op.gid == group.gid
+            && self.op.seq == group.seq
+            && self.op.tick == group.tick
+            && self.op.kind == InvOpKind::Consume
+            && self.op.src == self.precondition.loc
+            && self.op.dst == self.precondition.loc
+            && self
+                .op
+                .preconditions
+                .as_ref()
+                .is_some_and(|preconditions| {
+                    preconditions.source_before == self.precondition.stack
+                        && preconditions.destination_before == self.precondition.stack
+                })
+            && self.op.item == self.precondition.stack.item
+            && self.op.nbt == self.precondition.stack.nbt
+            && self.op.count != 0
+            && self.precondition.stack.count >= self.op.count
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AtomicInteractUpdate {
+    pub group: InteractGroup,
+    pub kind: AtomicInteractKind,
+    pub chunk: ChunkAddr,
+    pub edits: Vec<InteractEdit>,
+    pub inventory: Option<SemanticInventoryUse>,
+}
+
+impl AtomicInteractUpdate {
+    #[must_use]
+    pub const fn stream_kind() -> StreamKind {
+        StreamKind::PlayerWorld
+    }
+
+    #[must_use]
+    pub const fn chunk(&self) -> ChunkAddr {
+        self.chunk
+    }
+
+    #[must_use]
+    pub const fn tick(&self) -> TickStamp {
+        self.group.tick
+    }
+
+    #[must_use]
+    pub const fn gid(&self) -> GlobalPlayerId {
+        self.group.gid
+    }
+
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        let linked = match self.kind {
+            AtomicInteractKind::Door => {
+                self.edits.len() == 2
+                    && self.edits[0].pos.x == self.edits[1].pos.x
+                    && self.edits[0].pos.z == self.edits[1].pos.z
+                    && self.edits[0].pos.y.abs_diff(self.edits[1].pos.y) == 1
+            }
+            AtomicInteractKind::Trapdoor => (1..=INTERACT_MAX_LINKED_EDITS).contains(&self.edits.len()),
+            AtomicInteractKind::EndEye | AtomicInteractKind::Anchor => self.edits.len() == 1,
+        };
+        linked
+            && self.edits.iter().all(|edit| {
+                !edit.is_noop()
+                    && chunk_of_block(edit.pos.x, edit.pos.z) == self.chunk
+            })
+            && match self.kind {
+                AtomicInteractKind::Door | AtomicInteractKind::Trapdoor => self.inventory.is_none(),
+                AtomicInteractKind::EndEye | AtomicInteractKind::Anchor => self
+                    .inventory
+                    .as_ref()
+                    .is_none_or(|inventory| inventory.is_valid_for(self.group)),
+            }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtomicInteractUndo {
+    pub edits: Vec<(BlockPos, BlockUndo)>,
+    pub inventory: Option<InventoryPrecondition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AtomicInteractDecision {
+    Accept { undo: AtomicInteractUndo },
+    RejectInvalid,
+    RejectBlock {
+        pos: BlockPos,
+        expected: u16,
+        current: Option<u16>,
+    },
+    RejectInventory {
+        expected: InventoryPrecondition,
+        current: Option<InventoryStack>,
+    },
+}
+
+#[must_use]
+pub fn capture_atomic_interact(
+    group: InteractGroup,
+    kind: AtomicInteractKind,
+    chunk: ChunkAddr,
+    edits: Vec<InteractEdit>,
+    inventory: Option<SemanticInventoryUse>,
+) -> Option<AtomicInteractUpdate> {
+    let update = AtomicInteractUpdate {
+        group,
+        kind,
+        chunk,
+        edits,
+        inventory,
+    };
+    update.is_valid().then_some(update)
+}
+
+#[must_use]
+pub fn capture_linked_door_toggle(
+    group: InteractGroup,
+    chunk: ChunkAddr,
+    lower: InteractEdit,
+    upper: InteractEdit,
+) -> Option<AtomicInteractUpdate> {
+    capture_atomic_interact(
+        group,
+        AtomicInteractKind::Door,
+        chunk,
+        vec![lower, upper],
+        None,
+    )
+}
+
+#[must_use]
+pub fn capture_linked_trapdoor_toggle(
+    group: InteractGroup,
+    chunk: ChunkAddr,
+    edits: Vec<InteractEdit>,
+) -> Option<AtomicInteractUpdate> {
+    capture_atomic_interact(group, AtomicInteractKind::Trapdoor, chunk, edits, None)
+}
+
+#[must_use]
+pub fn capture_end_eye_insert(
+    group: InteractGroup,
+    chunk: ChunkAddr,
+    frame: InteractEdit,
+    inventory: SemanticInventoryUse,
+) -> Option<AtomicInteractUpdate> {
+    capture_atomic_interact(
+        group,
+        AtomicInteractKind::EndEye,
+        chunk,
+        vec![frame],
+        Some(inventory),
+    )
+}
+
+#[must_use]
+pub fn capture_anchor_charge_action(
+    group: InteractGroup,
+    chunk: ChunkAddr,
+    anchor: InteractEdit,
+    inventory: SemanticInventoryUse,
+) -> Option<AtomicInteractUpdate> {
+    capture_atomic_interact(
+        group,
+        AtomicInteractKind::Anchor,
+        chunk,
+        vec![anchor],
+        Some(inventory),
+    )
+}
+
+#[must_use]
+pub fn judge_atomic_interact(
+    update: &AtomicInteractUpdate,
+    mut state_at: impl FnMut(BlockPos) -> Option<u16>,
+    inventory: Option<&dyn InvCells>,
+) -> AtomicInteractDecision {
+    if !update.is_valid() {
+        return AtomicInteractDecision::RejectInvalid;
+    }
+    let mut undo = Vec::with_capacity(update.edits.len());
+    for edit in &update.edits {
+        let current = state_at(edit.pos);
+        if current != Some(edit.expected_old_state) {
+            return AtomicInteractDecision::RejectBlock {
+                pos: edit.pos,
+                expected: edit.expected_old_state,
+                current,
+            };
+        }
+        undo.push((edit.pos, make_interact_undo(edit.expected_old_state)));
+    }
+    if let Some(use_inventory) = &update.inventory {
+        let current = inventory.and_then(|cells| cells.stack(use_inventory.precondition.loc));
+        let expected = &use_inventory.precondition;
+        if current.as_ref() != Some(&expected.stack) {
+            return AtomicInteractDecision::RejectInventory {
+                expected: expected.clone(),
+                current,
+            };
+        }
+    }
+    AtomicInteractDecision::Accept {
+        undo: AtomicInteractUndo {
+            edits: undo,
+            inventory: update
+                .inventory
+                .as_ref()
+                .map(|use_inventory| use_inventory.precondition.clone()),
+        },
+    }
+}
+
+pub fn apply_atomic_interact_to_map(
+    states: &mut HashMap<BlockPos, u16>,
+    inventory: &mut impl InvCells,
+    update: &AtomicInteractUpdate,
+) -> AtomicInteractDecision {
+    let decision = judge_atomic_interact(update, |pos| states.get(&pos).copied(), Some(inventory));
+    let AtomicInteractDecision::Accept { undo } = decision else {
+        return decision;
+    };
+    if let Some(use_inventory) = &update.inventory {
+        if replay(inventory, &use_inventory.op) != InvVerdict::Applied {
+            return AtomicInteractDecision::RejectInventory {
+                expected: use_inventory.precondition.clone(),
+                current: inventory.stack(use_inventory.precondition.loc),
+            };
+        }
+    }
+    for edit in &update.edits {
+        states.insert(edit.pos, edit.new_state);
+    }
+    AtomicInteractDecision::Accept { undo }
+}
+
+pub fn revert_atomic_interact_to_map(
+    states: &mut HashMap<BlockPos, u16>,
+    inventory: &mut impl InvCells,
+    undo: &AtomicInteractUndo,
+) {
+    for (pos, block_undo) in undo.edits.iter().rev() {
+        states.insert(*pos, block_undo.old_state);
+    }
+    if let Some(precondition) = &undo.inventory {
+        let _ = inventory.set_stack(precondition.loc, precondition.stack.clone());
+    }
+}
+
+#[must_use]
+pub fn atomic_interact_order(
+    cluster_seed: u64,
+    left: &AtomicInteractUpdate,
+    right: &AtomicInteractUpdate,
+) -> core::cmp::Ordering {
+    order_players(cluster_seed, left.tick(), left.gid(), right.gid())
+        .then_with(|| left.group.seq.0.cmp(&right.group.seq.0))
+        .then_with(|| left.kind.tag().cmp(&right.kind.tag()))
+        .then_with(|| {
+            (left.group.anchor.x, left.group.anchor.y, left.group.anchor.z).cmp(&(
+                right.group.anchor.x,
+                right.group.anchor.y,
+                right.group.anchor.z,
+            ))
+        })
+}
+
+pub fn sort_atomic_interacts_for_tick(
+    cluster_seed: u64,
+    updates: &mut [AtomicInteractUpdate],
+) {
+    updates.sort_by(|left, right| atomic_interact_order(cluster_seed, left, right));
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DoorToggleUpdate {
@@ -130,12 +498,13 @@ impl AnchorChargeUpdate {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InteractUpdate {
     Door(DoorToggleUpdate),
     Trapdoor(TrapdoorToggleUpdate),
     EndEye(EndEyePlaceUpdate),
     Anchor(AnchorChargeUpdate),
+    Atomic(AtomicInteractUpdate),
 }
 
 impl InteractUpdate {
@@ -146,77 +515,101 @@ impl InteractUpdate {
 
     #[must_use]
     pub fn chunk(&self) -> ChunkAddr {
-        match *self {
+        match self {
             Self::Door(update) => update.chunk,
             Self::Trapdoor(update) => update.chunk,
             Self::EndEye(update) => update.chunk,
             Self::Anchor(update) => update.chunk,
+            Self::Atomic(update) => update.chunk,
         }
     }
 
     #[must_use]
     pub fn tick(&self) -> TickStamp {
-        match *self {
+        match self {
             Self::Door(update) => update.tick,
             Self::Trapdoor(update) => update.tick,
             Self::EndEye(update) => update.tick,
             Self::Anchor(update) => update.tick,
+            Self::Atomic(update) => update.tick(),
         }
     }
 
     #[must_use]
     pub fn gid(&self) -> GlobalPlayerId {
-        match *self {
+        match self {
             Self::Door(update) => update.gid,
             Self::Trapdoor(update) => update.gid,
             Self::EndEye(update) => update.gid,
             Self::Anchor(update) => update.gid,
+            Self::Atomic(update) => update.gid(),
+        }
+    }
+
+    #[must_use]
+    pub fn seq(&self) -> PlayerSeq {
+        match self {
+            Self::Door(update) => update.seq,
+            Self::Trapdoor(update) => update.seq,
+            Self::EndEye(update) => update.seq,
+            Self::Anchor(update) => update.seq,
+            Self::Atomic(update) => update.group.seq,
         }
     }
 
     #[must_use]
     pub fn pos(&self) -> BlockPos {
-        match *self {
+        match self {
             Self::Door(update) => update.pos,
             Self::Trapdoor(update) => update.pos,
             Self::EndEye(update) => update.pos,
             Self::Anchor(update) => update.pos,
+            Self::Atomic(update) => update.group.anchor,
         }
     }
 
     #[must_use]
     pub fn expected_old_state(&self) -> u16 {
-        match *self {
+        match self {
             Self::Door(update) => update.expected_old_state,
             Self::Trapdoor(update) => update.expected_old_state,
             Self::EndEye(update) => update.expected_old_state,
             Self::Anchor(update) => update.expected_old_state,
+            Self::Atomic(update) => update
+                .edits
+                .first()
+                .map_or(0, |edit| edit.expected_old_state),
         }
     }
 
     #[must_use]
     pub fn new_state(&self) -> u16 {
-        match *self {
+        match self {
             Self::Door(update) => update.new_state,
             Self::Trapdoor(update) => update.new_state,
             Self::EndEye(update) => update.new_state,
             Self::Anchor(update) => update.new_state,
+            Self::Atomic(update) => update.edits.first().map_or(0, |edit| edit.new_state),
         }
     }
 
     #[must_use]
     pub fn kind_tag(&self) -> u8 {
-        match *self {
+        match self {
             Self::Door(_) => INTERACT_KIND_DOOR,
             Self::Trapdoor(_) => INTERACT_KIND_TRAPDOOR,
             Self::EndEye(_) => INTERACT_KIND_END_EYE,
             Self::Anchor(_) => INTERACT_KIND_ANCHOR,
+            Self::Atomic(_) => INTERACT_KIND_ATOMIC,
         }
     }
 
     #[must_use]
     pub fn is_noop(&self) -> bool {
-        self.expected_old_state() == self.new_state()
+        match self {
+            Self::Atomic(update) => !update.is_valid(),
+            _ => self.expected_old_state() == self.new_state(),
+        }
     }
 }
 
@@ -244,6 +637,12 @@ impl From<AnchorChargeUpdate> for InteractUpdate {
     }
 }
 
+impl From<AtomicInteractUpdate> for InteractUpdate {
+    fn from(update: AtomicInteractUpdate) -> Self {
+        Self::Atomic(update)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InteractBatch {
     pub tick: TickStamp,
@@ -251,6 +650,7 @@ pub struct InteractBatch {
     pub trapdoors: Vec<TrapdoorToggleUpdate>,
     pub end_eyes: Vec<EndEyePlaceUpdate>,
     pub anchors: Vec<AnchorChargeUpdate>,
+    pub atomic: Vec<AtomicInteractUpdate>,
 }
 
 impl InteractBatch {
@@ -262,6 +662,7 @@ impl InteractBatch {
             trapdoors: Vec::new(),
             end_eyes: Vec::new(),
             anchors: Vec::new(),
+            atomic: Vec::new(),
         }
     }
 
@@ -276,6 +677,7 @@ impl InteractBatch {
             && self.trapdoors.is_empty()
             && self.end_eyes.is_empty()
             && self.anchors.is_empty()
+            && self.atomic.is_empty()
     }
 
     #[must_use]
@@ -284,6 +686,7 @@ impl InteractBatch {
             + self.trapdoors.len()
             + self.end_eyes.len()
             + self.anchors.len()
+            + self.atomic.len()
     }
 
     pub fn push(&mut self, update: InteractUpdate) {
@@ -292,6 +695,7 @@ impl InteractBatch {
             InteractUpdate::Trapdoor(inner) => self.trapdoors.push(inner),
             InteractUpdate::EndEye(inner) => self.end_eyes.push(inner),
             InteractUpdate::Anchor(inner) => self.anchors.push(inner),
+            InteractUpdate::Atomic(inner) => self.atomic.push(inner),
         }
     }
 
@@ -309,6 +713,10 @@ impl InteractBatch {
 
     pub fn push_anchor(&mut self, update: AnchorChargeUpdate) {
         self.anchors.push(update);
+    }
+
+    pub fn push_atomic(&mut self, update: AtomicInteractUpdate) {
+        self.atomic.push(update);
     }
 
     pub fn normalize(&mut self) {
@@ -332,6 +740,29 @@ impl InteractBatch {
         });
         self.anchors.dedup_by_key(|update| update.pos);
         self.anchors.truncate(INTERACT_MAX_UPDATES);
+        self.atomic.retain(AtomicInteractUpdate::is_valid);
+        self.atomic.sort_by(|left, right| {
+            (
+                left.group.tick.0,
+                left.group.gid,
+                left.group.seq,
+                left.kind.tag(),
+                left.group.anchor.x,
+                left.group.anchor.y,
+                left.group.anchor.z,
+            )
+                .cmp(&(
+                    right.group.tick.0,
+                    right.group.gid,
+                    right.group.seq,
+                    right.kind.tag(),
+                    right.group.anchor.x,
+                    right.group.anchor.y,
+                    right.group.anchor.z,
+                ))
+        });
+        self.atomic.dedup_by_key(|update| update.group);
+        self.atomic.truncate(INTERACT_MAX_UPDATES);
     }
 }
 
@@ -649,6 +1080,44 @@ pub fn encoded_interact_len(update: &InteractUpdate) -> Result<usize, InteractCo
         .map_err(|error| interact_codec_error("size interact", error))
 }
 
+pub fn encode_atomic_interact(
+    update: &AtomicInteractUpdate,
+) -> Result<Vec<u8>, InteractCodecError> {
+    postcard::to_allocvec(update).map_err(|error| interact_codec_error("encode atomic interact", error))
+}
+
+pub fn decode_atomic_interact(bytes: &[u8]) -> Result<AtomicInteractUpdate, InteractCodecError> {
+    postcard::from_bytes(bytes).map_err(|error| interact_codec_error("decode atomic interact", error))
+}
+
+pub fn decode_atomic_interact_prefix(
+    bytes: &[u8],
+) -> Result<(AtomicInteractUpdate, &[u8]), InteractCodecError> {
+    postcard::take_from_bytes(bytes)
+        .map_err(|error| interact_codec_error("decode atomic interact", error))
+}
+
+pub fn encode_atomic_interact_into(
+    update: &AtomicInteractUpdate,
+    out: Vec<u8>,
+) -> Result<Vec<u8>, InteractCodecError> {
+    postcard::to_extend(update, out).map_err(|error| interact_codec_error("encode atomic interact", error))
+}
+
+pub fn encode_atomic_interact_to_slice<'out>(
+    update: &AtomicInteractUpdate,
+    out: &'out mut [u8],
+) -> Result<&'out mut [u8], InteractCodecError> {
+    postcard::to_slice(update, out).map_err(|error| interact_codec_error("encode atomic interact", error))
+}
+
+pub fn encoded_atomic_interact_len(
+    update: &AtomicInteractUpdate,
+) -> Result<usize, InteractCodecError> {
+    postcard::experimental::serialized_size(update)
+        .map_err(|error| interact_codec_error("size atomic interact", error))
+}
+
 pub fn encode_interact_batch(batch: &InteractBatch) -> Result<Vec<u8>, InteractCodecError> {
     postcard::to_allocvec(batch).map_err(|error| interact_codec_error("encode batch", error))
 }
@@ -686,6 +1155,7 @@ pub fn encoded_interact_batch_len(batch: &InteractBatch) -> Result<usize, Intera
 pub enum InteractDecision {
     Accept { undo: BlockUndo },
     RejectStale { expected: u16, current: u16 },
+    RejectAtomic,
 }
 
 #[must_use]
@@ -742,6 +1212,9 @@ pub fn apply_remote_interact(
     update: &InteractUpdate,
     metrics: &InteractMetrics,
 ) -> InteractDecision {
+    if matches!(update, InteractUpdate::Atomic(_)) {
+        return InteractDecision::RejectAtomic;
+    }
     let decision = apply_interact_edit(current_state, update.expected_old_state());
     match decision {
         InteractDecision::Accept { .. } => {
@@ -750,6 +1223,7 @@ pub fn apply_remote_interact(
         InteractDecision::RejectStale { .. } => {
             metrics.rejected_stale.fetch_add(1, Ordering::Relaxed);
         }
+        InteractDecision::RejectAtomic => {}
     }
     decision
 }
@@ -758,6 +1232,9 @@ pub fn apply_interact_to_map(
     states: &mut HashMap<BlockPos, u16>,
     update: &InteractUpdate,
 ) -> Option<(BlockPos, BlockUndo)> {
+    if matches!(update, InteractUpdate::Atomic(_)) {
+        return None;
+    }
     let pos = update.pos();
     let current = states.get(&pos).copied().unwrap_or(update.expected_old_state());
     match apply_interact_edit(current, update.expected_old_state()) {
@@ -766,6 +1243,7 @@ pub fn apply_interact_to_map(
             Some((pos, undo))
         }
         InteractDecision::RejectStale { .. } => None,
+        InteractDecision::RejectAtomic => None,
     }
 }
 
@@ -786,6 +1264,7 @@ fn apply_one_to_map(
         InteractDecision::RejectStale { expected, current } => {
             conflicts.push((pos, expected, current));
         }
+        InteractDecision::RejectAtomic => {}
     }
 }
 
@@ -971,6 +1450,7 @@ pub fn interact_loser_revert_plan(losers: &[(BlockPos, BlockUndo)]) -> Reconcile
 mod tests {
     use super::*;
     use crate::identity::{PlayerSlot, ServerId};
+    use crate::inventory::{INV_MAIN, MemCells, capture_semantic_inv_op};
 
     fn gid(server: u16, player: u16) -> GlobalPlayerId {
         GlobalPlayerId::new(ServerId(server), PlayerSlot(player))
@@ -1035,6 +1515,37 @@ mod tests {
             chunk(0, 0),
         )
         .unwrap()
+    }
+
+    fn group() -> InteractGroup {
+        InteractGroup::new(gid(2, 2), PlayerSeq(4), TickStamp(11), pos(7, 64, 7))
+    }
+
+    fn consume(group: InteractGroup, slot: u16, item: u16, count_before: u8) -> SemanticInventoryUse {
+        let loc = InvLoc::new(INV_MAIN, slot);
+        let stack = InventoryStack {
+            item,
+            count: count_before,
+            nbt: vec![4, 2],
+        };
+        SemanticInventoryUse {
+            precondition: InventoryPrecondition {
+                loc,
+                stack: stack.clone(),
+            },
+            op: capture_semantic_inv_op(
+                group.gid,
+                group.seq,
+                group.tick,
+                InvOpKind::Consume,
+                loc,
+                loc,
+                stack.clone(),
+                stack,
+                1,
+            )
+            .unwrap(),
+        }
     }
 
     #[test]
@@ -1328,5 +1839,120 @@ mod tests {
         assert_eq!(chunk_of_block(15, 15), chunk(0, 0));
         assert_eq!(chunk_of_block(16, -1), chunk(1, -1));
         assert_eq!(chunk_of_block(-17, -17), chunk(-2, -2));
+    }
+
+    #[test]
+    fn linked_door_requires_both_exact_halves() {
+        let lower = InteractEdit::new(pos(7, 64, 7), 51, 52);
+        let upper = InteractEdit::new(pos(7, 65, 7), 61, 62);
+        let update = capture_linked_door_toggle(group(), chunk(0, 0), lower, upper).unwrap();
+        assert_eq!(update.group.dependent_cause(), DependentCause::new(gid(2, 2), PlayerSeq(4), TickStamp(11), pos(7, 64, 7)));
+        let mut states = HashMap::from([(lower.pos, 51), (upper.pos, 61)]);
+        let mut cells = MemCells::new();
+        let decision = apply_atomic_interact_to_map(&mut states, &mut cells, &update);
+        let AtomicInteractDecision::Accept { undo } = decision else {
+            panic!("linked door was rejected");
+        };
+        assert_eq!(states.get(&lower.pos), Some(&52));
+        assert_eq!(states.get(&upper.pos), Some(&62));
+        revert_atomic_interact_to_map(&mut states, &mut cells, &undo);
+        assert_eq!(states.get(&lower.pos), Some(&51));
+        assert_eq!(states.get(&upper.pos), Some(&61));
+
+        states.insert(upper.pos, 99);
+        let decision = apply_atomic_interact_to_map(&mut states, &mut cells, &update);
+        assert!(matches!(decision, AtomicInteractDecision::RejectBlock { pos, .. } if pos == upper.pos));
+        assert_eq!(states.get(&lower.pos), Some(&51));
+    }
+
+    #[test]
+    fn end_eye_and_anchor_consume_exact_inventory_with_their_state() {
+        let frame = InteractEdit::new(pos(7, 64, 7), 71, 72);
+        let eye = capture_end_eye_insert(group(), chunk(0, 0), frame, consume(group(), 3, 120, 3)).unwrap();
+        let bytes = encode_atomic_interact(&eye).unwrap();
+        assert_eq!(decode_atomic_interact(&bytes).unwrap(), eye);
+        assert_eq!(encode_atomic_interact_into(&eye, Vec::new()).unwrap(), bytes);
+        assert_eq!(encoded_atomic_interact_len(&eye).unwrap(), bytes.len());
+        let mut slice = vec![0; bytes.len()];
+        let used = encode_atomic_interact_to_slice(&eye, &mut slice).unwrap().len();
+        assert_eq!(&slice[..used], bytes);
+        let (back, rest) = decode_atomic_interact_prefix(&bytes).unwrap();
+        assert_eq!(back, eye);
+        assert!(rest.is_empty());
+
+        let mut states = HashMap::from([(frame.pos, 71)]);
+        let mut cells = MemCells::new();
+        let loc = InvLoc::new(INV_MAIN, 3);
+        cells.seed_stack(
+            loc,
+            InventoryStack {
+                item: 120,
+                count: 3,
+                nbt: vec![9],
+            },
+        );
+        assert!(matches!(
+            judge_atomic_interact(&eye, |position| states.get(&position).copied(), Some(&cells)),
+            AtomicInteractDecision::RejectInventory { .. }
+        ));
+        cells.seed_stack(
+            loc,
+            InventoryStack {
+                item: 120,
+                count: 3,
+                nbt: vec![4, 2],
+            },
+        );
+        let decision = apply_atomic_interact_to_map(&mut states, &mut cells, &eye);
+        let AtomicInteractDecision::Accept { undo } = decision else {
+            panic!("eye insertion was rejected");
+        };
+        assert_eq!(states.get(&frame.pos), Some(&72));
+        assert_eq!(
+            cells.stack(loc),
+            Some(InventoryStack {
+                item: 120,
+                count: 2,
+                nbt: vec![4, 2],
+            })
+        );
+        revert_atomic_interact_to_map(&mut states, &mut cells, &undo);
+        assert_eq!(states.get(&frame.pos), Some(&71));
+        assert_eq!(
+            cells.stack(loc),
+            Some(InventoryStack {
+                item: 120,
+                count: 3,
+                nbt: vec![4, 2],
+            })
+        );
+
+        let anchor = InteractEdit::new(pos(7, 64, 7), 81, 82);
+        let update = capture_anchor_charge_action(group(), chunk(0, 0), anchor, consume(group(), 4, 121, 2)).unwrap();
+        let wrong = judge_atomic_interact(&update, |_| Some(81), Some(&cells));
+        assert!(matches!(wrong, AtomicInteractDecision::RejectInventory { .. }));
+    }
+
+    #[test]
+    fn atomic_order_is_arrival_independent() {
+        let left_group = InteractGroup::new(gid(1, 1), PlayerSeq(1), TickStamp(12), pos(1, 64, 1));
+        let right_group = InteractGroup::new(gid(2, 1), PlayerSeq(1), TickStamp(12), pos(2, 64, 1));
+        let left = capture_linked_trapdoor_toggle(
+            left_group,
+            chunk(0, 0),
+            vec![InteractEdit::new(pos(1, 64, 1), 1, 2)],
+        )
+        .unwrap();
+        let right = capture_linked_trapdoor_toggle(
+            right_group,
+            chunk(0, 0),
+            vec![InteractEdit::new(pos(2, 64, 1), 3, 4)],
+        )
+        .unwrap();
+        let mut forward = vec![left.clone(), right.clone()];
+        let mut reverse = vec![right, left];
+        sort_atomic_interacts_for_tick(44, &mut forward);
+        sort_atomic_interacts_for_tick(44, &mut reverse);
+        assert_eq!(forward, reverse);
     }
 }

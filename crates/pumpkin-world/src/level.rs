@@ -22,8 +22,10 @@ use crossbeam::queue::SegQueue;
 use dashmap::{DashMap, Entry};
 use pumpkin_config::{chunk::ChunkConfig, lighting::LightingEngineConfig, world::LevelConfig};
 use pumpkin_data::biome::Biome;
+use pumpkin_data::chunk::ChunkStatus;
 use pumpkin_data::dimension::Dimension;
 use pumpkin_data::{Block, BlockStateId, block_properties::has_random_ticks, fluid::Fluid};
+use pumpkin_nbt::compound::NbtCompound;
 use pumpkin_util::math::{position::BlockPos, vector2::Vector2};
 use pumpkin_util::world_seed::Seed;
 use rustc_hash::FxHashSet;
@@ -89,6 +91,7 @@ pub struct Level {
     pub loaded_chunks: Arc<DashMap<Vector2<i32>, SyncChunk>>,
     pub cluster_snapshots: Arc<DashMap<Vector2<i32>, SyncChunk>>,
     pub cluster_pinned: Arc<dashmap::DashSet<Vector2<i32>>>,
+    pub cluster_load_requested: Arc<dashmap::DashSet<Vector2<i32>>>,
     pub cluster_fetch_wanted: Arc<dashmap::DashSet<Vector2<i32>>>,
     pub cluster_dual: ClusterDualState,
     pub(crate) loaded_chunk_changes: Arc<SegQueue<LoadedChunkChange>>,
@@ -167,7 +170,9 @@ impl Level {
         let canonical_dim_folder = root_folder.join("dimensions").join(namespace).join(name);
 
         // Check if canonical 26.2 folder exists, or fall back to pre-26.2 legacy folders
-        let dim_folder = if canonical_dim_folder.exists() {
+        let dim_folder = if is_cluster_secondary() {
+            canonical_dim_folder
+        } else if canonical_dim_folder.exists() {
             canonical_dim_folder
         } else if dimension.minecraft_name == Dimension::OVERWORLD.minecraft_name
             && root_folder.join("region").exists()
@@ -212,7 +217,8 @@ impl Level {
         let mut biome_source: Option<crate::world_info::BiomeSource> = None;
         let mut structure_overrides: Option<Vec<String>> = None;
 
-        if let Some(wgs) = crate::world_info::data_files::read_world_gen_settings(main_folder)
+        if !is_cluster_secondary()
+            && let Some(wgs) = crate::world_info::data_files::read_world_gen_settings(main_folder)
             && let Some(dim_settings) = wgs.dimensions.get(dimension.minecraft_name)
         {
             biome_source.clone_from(&dim_settings.generator.biome_source);
@@ -287,6 +293,7 @@ impl Level {
             loaded_chunks: Arc::new(DashMap::new()),
             cluster_snapshots: Arc::new(DashMap::new()),
             cluster_pinned: Arc::new(dashmap::DashSet::new()),
+            cluster_load_requested: Arc::new(dashmap::DashSet::new()),
             cluster_fetch_wanted: Arc::new(dashmap::DashSet::new()),
             cluster_dual: ClusterDualState::new(),
             loaded_chunk_changes: Arc::new(SegQueue::new()),
@@ -343,7 +350,7 @@ impl Level {
             let arc_chunk = Arc::new(ChunkEntityData {
                 x: pos.x,
                 z: pos.y,
-                data: std::sync::Mutex::new(Vec::new()),
+                data: ArcSwap::from_pointee(Vec::new()),
                 dirty: AtomicBool::new(false),
             });
 
@@ -673,6 +680,9 @@ impl Level {
         if self.loaded_chunks.insert(pos, chunk.clone()).is_none() {
             self.loaded_chunk_changes
                 .push(LoadedChunkChange::Loaded(pos));
+            if chunk.status == ChunkStatus::Full {
+                note_cluster_chunk_full(pos);
+            }
         }
         f(&chunk)
     }
@@ -825,7 +835,7 @@ impl Level {
             Arc::new(ChunkEntityData {
                 x: pos.x,
                 z: pos.y,
-                data: std::sync::Mutex::new(Vec::new()),
+                data: ArcSwap::from_pointee(Vec::new()),
                 dirty: AtomicBool::new(false),
             })
         } else {
@@ -843,7 +853,7 @@ impl Level {
                 Arc::new(ChunkEntityData {
                     x: pos.x,
                     z: pos.y,
-                    data: std::sync::Mutex::new(Vec::new()),
+                    data: ArcSwap::from_pointee(Vec::new()),
                     dirty: AtomicBool::new(false),
                 })
             })
@@ -919,6 +929,48 @@ impl Level {
 
     pub fn is_cluster_held(&self, pos: &Vector2<i32>) -> bool {
         self.loaded_chunks.contains_key(pos)
+    }
+
+    pub fn is_cluster_full(&self, pos: &Vector2<i32>) -> bool {
+        self.loaded_chunks
+            .get(pos)
+            .is_some_and(|chunk| chunk.status == ChunkStatus::Full)
+    }
+
+    pub fn request_cluster_full_chunk(&self, pos: Vector2<i32>) {
+        if is_cluster_secondary() {
+            error!(
+                chunk_x = pos.x,
+                chunk_z = pos.y,
+                "cluster secondary refused primary chunk materialization request"
+            );
+            return;
+        }
+        if self.is_cluster_full(&pos) {
+            note_cluster_chunk_full(pos);
+            return;
+        }
+        if !self.cluster_load_requested.insert(pos) {
+            return;
+        }
+        let mut loading = self
+            .chunk_loading
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loading.add_force_ticket(pos);
+        loading.send_change();
+    }
+
+    pub fn finish_cluster_full_chunk_request(&self, pos: Vector2<i32>) {
+        if self.cluster_load_requested.remove(&pos).is_none() {
+            return;
+        }
+        let mut loading = self
+            .chunk_loading
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loading.remove_force_ticket(pos);
+        loading.send_change();
     }
 
     pub fn prefetch_cluster_chunk(&self, pos: Vector2<i32>) {
@@ -1002,10 +1054,18 @@ static CLUSTER_HAS_PEERS: AtomicBool = AtomicBool::new(false);
 static CLUSTER_FETCH_SENDER: OnceLock<mpsc::Sender<ClusterFetchRequest>> = OnceLock::new();
 static CLUSTER_UNWANT_SENDER: OnceLock<mpsc::Sender<ClusterFetchRequest>> = OnceLock::new();
 static CLUSTER_LOGOUT_SENDER: OnceLock<mpsc::Sender<ClusterLogoutGrace>> = OnceLock::new();
+static CLUSTER_CHUNK_AVAILABILITY_SENDER: OnceLock<mpsc::Sender<ClusterChunkAvailability>> =
+    OnceLock::new();
 
 pub struct ClusterLogoutGrace {
     pub chunks: Vec<Vector2<i32>>,
     pub expires_millis: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClusterChunkAvailability {
+    Full(Vector2<i32>),
+    Drop(Vector2<i32>),
 }
 static CLUSTER_CHUNK_FETCHED: AtomicU64 = AtomicU64::new(0);
 static CLUSTER_CHUNK_GENERATED: AtomicU64 = AtomicU64::new(0);
@@ -1054,6 +1114,26 @@ pub fn set_cluster_unwant_sender(sender: mpsc::Sender<ClusterFetchRequest>) {
 
 pub fn set_cluster_logout_sender(sender: mpsc::Sender<ClusterLogoutGrace>) {
     let _ = CLUSTER_LOGOUT_SENDER.set(sender);
+}
+
+pub fn set_cluster_chunk_availability_sender(sender: mpsc::Sender<ClusterChunkAvailability>) {
+    let _ = CLUSTER_CHUNK_AVAILABILITY_SENDER.set(sender);
+}
+
+pub fn note_cluster_chunk_full(pos: Vector2<i32>) {
+    if let Some(sender) = CLUSTER_CHUNK_AVAILABILITY_SENDER.get()
+        && sender.try_send(ClusterChunkAvailability::Full(pos)).is_err()
+    {
+        warn!(chunk_x = pos.x, chunk_z = pos.y, "cluster full chunk availability event dropped");
+    }
+}
+
+pub fn note_cluster_chunk_drop(pos: Vector2<i32>) {
+    if let Some(sender) = CLUSTER_CHUNK_AVAILABILITY_SENDER.get()
+        && sender.try_send(ClusterChunkAvailability::Drop(pos)).is_err()
+    {
+        warn!(chunk_x = pos.x, chunk_z = pos.y, "cluster dropped chunk availability event dropped");
+    }
 }
 
 #[must_use]
@@ -1471,6 +1551,26 @@ impl Level {
         {
             error!("Failed writing Chunk to disk {error}");
         }
+    }
+
+    pub async fn persist_cluster_entity_nbt(
+        self: &Arc<Self>,
+        pos: Vector2<i32>,
+        nbt: NbtCompound,
+    ) -> bool {
+        if is_cluster_secondary() {
+            return false;
+        }
+        let chunk = self.get_entity_chunk(pos).await;
+        chunk.data.rcu(|current| {
+            let mut next = current.as_ref().clone();
+            next.push(nbt.clone());
+            Arc::new(next)
+        });
+        chunk.mark_dirty(true);
+        self.write_entity_chunks(vec![(pos, chunk.clone())]).await;
+        self.loaded_entity_chunks.remove(&pos);
+        true
     }
 
     pub fn is_chunk_loaded(&self, coordinates: &Vector2<i32>) -> bool {

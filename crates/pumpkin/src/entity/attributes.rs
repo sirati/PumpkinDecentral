@@ -111,13 +111,8 @@ pub fn send_attribute_updates_for_living(
 
         // Pull modifiers for this attribute
         let mut modifiers = Vec::new();
-        if let Some(inst) = living
-            .attributes
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&attribute.id)
-        {
-            for mod_inst in &inst.modifiers {
+        if let Some(inst_modifiers) = living.attribute_modifiers(&attribute) {
+            for mod_inst in &inst_modifiers {
                 modifiers.push(JeAttrMod::new(
                     mod_inst.id.clone(),
                     mod_inst.amount,

@@ -1,11 +1,13 @@
 use crate::entity::player::statistics::StatisticCategory;
 use crate::server::Server;
+use arc_swap::ArcSwap;
 use core::f32;
 use pumpkin_data::damage::DamageType;
 use pumpkin_data::data_component_impl::DamageResistantImpl;
 use pumpkin_data::data_component_impl::DamageResistantType;
 use pumpkin_data::item_stack::ItemStack;
-use pumpkin_nbt::compound::NbtCompound;
+use pumpkin_nbt::{Nbt, compound::NbtCompound};
+use pumpkin_nbt::deserializer::NbtReadHelperJava;
 use pumpkin_protocol::bedrock::client::CAddItemActor;
 use pumpkin_protocol::bedrock::network_item::ItemStackWrapper;
 use pumpkin_protocol::codec::item_stack_seralizer::ItemStackSerializer;
@@ -24,6 +26,7 @@ use std::sync::{
         Ordering::{self},
     },
 };
+use std::io::Cursor;
 
 use super::{Entity, EntityBase, living::LivingEntity, player::Player};
 
@@ -33,6 +36,7 @@ pub struct ItemEntity {
     // These cannot be atomic values because we mutate their state based on what they are; we run
     // into the ABA problem
     item_stack: Mutex<ItemStack>,
+    cluster_stack: ArcSwap<pumpkin_cluster::inventory::InventoryStack>,
     pickup_delay: AtomicU8,
     health: AtomicF32,
     never_despawn: AtomicBool,
@@ -84,6 +88,142 @@ const ITEM_UPDATE_INTERVAL: u32 = 20;
 impl ItemEntity {
     pub const DEFAULT_PICKUP_DELAY: u8 = 10;
 
+    pub fn cluster_stack_from_item_stack(
+        stack: &ItemStack,
+    ) -> pumpkin_cluster::inventory::InventoryStack {
+        let mut nbt = NbtCompound::new();
+        stack.write_item_stack(&mut nbt);
+        pumpkin_cluster::inventory::InventoryStack {
+            item: stack.item.id,
+            count: stack.item_count,
+            nbt: Nbt::from(nbt).write_unnamed().to_vec(),
+        }
+    }
+
+    fn cluster_stack(stack: &ItemStack) -> pumpkin_cluster::inventory::InventoryStack {
+        Self::cluster_stack_from_item_stack(stack)
+    }
+
+    pub fn cluster_stack_snapshot(&self) -> pumpkin_cluster::inventory::InventoryStack {
+        (*self.cluster_stack.load_full()).clone()
+    }
+
+    pub fn set_cluster_stack_snapshot(&self, stack: pumpkin_cluster::inventory::InventoryStack) {
+        self.cluster_stack.store(Arc::new(stack));
+    }
+
+    pub fn apply_cluster_full_nbt(
+        &self,
+        nbt: &NbtCompound,
+        expected: &pumpkin_cluster::inventory::InventoryStack,
+    ) -> bool {
+        let Some(item_nbt) = nbt.get_compound("Item") else {
+            return false;
+        };
+        let Some(stack) = ItemStack::read_item_stack(item_nbt) else {
+            return false;
+        };
+        if Self::cluster_stack_from_item_stack(&stack) != *expected {
+            return false;
+        }
+        self.entity.read_nbt_non_mut(nbt);
+        self.cluster_stack.store(Arc::new(expected.clone()));
+        self.item_age.store(
+            nbt.get_short("Age").unwrap_or(0).max(0) as u32,
+            Ordering::Relaxed,
+        );
+        self.pickup_delay.store(
+            nbt.get_short("PickupDelay").unwrap_or(Self::DEFAULT_PICKUP_DELAY.into())
+                .clamp(0, i16::from(u8::MAX)) as u8,
+            Ordering::Relaxed,
+        );
+        self.health
+            .store(f32::from(nbt.get_short("Health").unwrap_or(5)), Relaxed);
+        self.init_data_tracker();
+        true
+    }
+
+    pub fn cluster_attack_health_bits(&self) -> u32 {
+        self.health.load(Relaxed).to_bits()
+    }
+
+    pub fn cluster_set_attack_state(
+        &self,
+        stack: pumpkin_cluster::inventory::InventoryStack,
+        health_bits: u32,
+    ) -> bool {
+        let Some(item_stack) = Self::item_stack_from_cluster_snapshot(&stack) else {
+            return false;
+        };
+        let mut item_nbt = NbtCompound::new();
+        item_stack.write_item_stack(&mut item_nbt);
+        let mut nbt = NbtCompound::new();
+        nbt.put_compound("Item", item_nbt);
+        nbt.put_short("Health", f32::from_bits(health_bits) as i16);
+        self.read_custom_nbt(&nbt);
+        self.init_data_tracker();
+        true
+    }
+
+    pub fn item_stack_from_cluster_snapshot(
+        snapshot: &pumpkin_cluster::inventory::InventoryStack,
+    ) -> Option<ItemStack> {
+        let mut cursor = Cursor::new(snapshot.nbt.as_slice());
+        let mut reader = NbtReadHelperJava::new(&mut cursor);
+        let Some(stack) = Nbt::read_unnamed(&mut reader)
+            .ok()
+            .and_then(|nbt| ItemStack::read_item_stack(&nbt.root_tag))
+        else {
+            return None;
+        };
+        if stack.item.id != snapshot.item || stack.item_count != snapshot.count {
+            return None;
+        }
+        Some(stack)
+    }
+
+    fn item_stack_from_cluster(&self) -> ItemStack {
+        let snapshot = self.cluster_stack.load();
+        Self::item_stack_from_cluster_snapshot(&snapshot)
+            .unwrap_or_else(|| ItemStack::new(1, &pumpkin_data::item::Item::AIR))
+    }
+
+    pub fn capture_cluster_pickup(
+        gid: pumpkin_cluster::identity::GlobalPlayerId,
+        tick: pumpkin_cluster::time::TickStamp,
+        entity: pumpkin_cluster::protocol::EntityRef,
+        dst: pumpkin_cluster::inventory::InvLoc,
+        source_before: pumpkin_cluster::inventory::InventoryStack,
+        destination_before: pumpkin_cluster::inventory::InventoryStack,
+        moved: u8,
+    ) -> bool {
+        let Some(after_count) = source_before.count.checked_sub(moved) else {
+            return false;
+        };
+        let source_after = if after_count == 0 {
+            pumpkin_cluster::inventory::InventoryStack::empty()
+        } else {
+            pumpkin_cluster::inventory::InventoryStack {
+                item: source_before.item,
+                count: after_count,
+                nbt: source_before.nbt.clone(),
+            }
+        };
+        let Some(op) = pumpkin_cluster::inventory::capture_item_pickup(
+            gid,
+            pumpkin_cluster::inventory::next_inv_seq(gid),
+            tick,
+            dst,
+            entity,
+            source_before,
+            source_after,
+            destination_before,
+        ) else {
+            return false;
+        };
+        crate::server::cluster_world_apply::submit_local_inventory_op(op)
+    }
+
     pub fn new(entity: Entity, item_stack: ItemStack) -> Self {
         entity.velocity.store(Vector3::new(
             rand::random::<f64>().mul_add(0.2, -0.1),
@@ -99,9 +239,11 @@ impl ItemEntity {
             entity.fire_immune.store(true, Ordering::Relaxed);
         }
 
+        let cluster_stack = ArcSwap::from_pointee(Self::cluster_stack(&item_stack));
         Self {
             entity,
             item_stack: Mutex::new(item_stack),
+            cluster_stack,
             item_age: AtomicU32::new(0),
             pickup_delay: AtomicU8::new(Self::DEFAULT_PICKUP_DELAY),
             health: AtomicF32::new(5.0),
@@ -127,9 +269,11 @@ impl ItemEntity {
             entity.fire_immune.store(true, Ordering::Relaxed);
         }
 
+        let cluster_stack = ArcSwap::from_pointee(Self::cluster_stack(&item_stack));
         Self {
             entity,
             item_stack: Mutex::new(item_stack),
+            cluster_stack,
             item_age: AtomicU32::new(0),
             pickup_delay: AtomicU8::new(pickup_delay), // Vanilla pickup delay is 10 ticks
             health: AtomicF32::new(5.0),
@@ -142,9 +286,11 @@ impl ItemEntity {
     /// Creates an `ItemEntity` for restoring from NBT without random velocity.
     /// The velocity and position will be set by `Entity::read_nbt_non_mut`.
     pub fn new_empty(entity: Entity) -> Self {
+        let item_stack = ItemStack::new(1, &pumpkin_data::item::Item::AIR);
         Self {
             entity,
-            item_stack: Mutex::new(ItemStack::new(1, &pumpkin_data::item::Item::AIR)),
+            cluster_stack: ArcSwap::from_pointee(Self::cluster_stack(&item_stack)),
+            item_stack: Mutex::new(item_stack),
             item_age: AtomicU32::new(0),
             pickup_delay: AtomicU8::new(0),
             health: AtomicF32::new(5.0),
@@ -328,9 +474,17 @@ impl ItemEntity {
 
         let empty2 = stack2.item_count == 0;
 
+        let target_stack = Self::cluster_stack(&stack1);
+
+        let source_stack = Self::cluster_stack(&stack2);
+
         drop(stack1);
 
         drop(stack2);
+
+        target.cluster_stack.store(Arc::new(target_stack));
+
+        source.cluster_stack.store(Arc::new(source_stack));
 
         let never_despawn = source.never_despawn.load(Ordering::Relaxed);
 
@@ -564,12 +718,7 @@ impl EntityBase for ItemEntity {
     fn init_data_tracker(&self) {
         self.entity.set_synced_data(
             pumpkin_data::tracked_data::item::ITEM,
-            ItemStackSerializer::from(
-                self.item_stack
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone(),
-            ),
+            ItemStackSerializer::from(self.item_stack_from_cluster()),
         );
     }
 
@@ -630,6 +779,8 @@ impl EntityBase for ItemEntity {
         let inserted = player.inventory.insert_stack_anywhere(&mut local_stack);
         let count_after = local_stack.item_count;
         let is_empty = local_stack.is_empty();
+        self.cluster_stack
+            .store(Arc::new(Self::cluster_stack(&local_stack)));
         *self
             .item_stack
             .lock()
@@ -710,6 +861,8 @@ impl EntityBase for ItemEntity {
         if let Some(item_compound) = nbt.get_compound("Item")
             && let Some(stack) = ItemStack::read_item_stack(item_compound)
         {
+            self.cluster_stack
+                .store(Arc::new(Self::cluster_stack(&stack)));
             *self
                 .item_stack
                 .lock()
@@ -738,15 +891,12 @@ impl EntityBase for ItemEntity {
     fn send_bedrock_spawn_packet(&self, client: &crate::net::bedrock::BedrockClient) {
         let entity = &self.entity;
         let runtime_id = entity.entity_id as u64;
+        let item_stack = self.item_stack_from_cluster();
         let data = {
-            let item_stack = self
-                .item_stack
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let packet = CAddItemActor {
                 target_actor_id: VarLong(runtime_id as i64),
                 target_runtime_id: VarULong(runtime_id),
-                item: ItemStackWrapper::from(&*item_stack),
+                item: ItemStackWrapper::from(&item_stack),
                 position: entity.pos.load().to_f32_lossy(),
                 velocity: entity.velocity.load().to_f32_lossy(),
                 entity_data: entity.bedrock_metadata(),
@@ -768,12 +918,7 @@ impl EntityBase for ItemEntity {
         if client.version.load() >= JavaMinecraftVersion::V_1_21 {
             let metadata = Metadata::new(
                 pumpkin_data::tracked_data::item::ITEM,
-                ItemStackSerializer::from(
-                    self.item_stack
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clone(),
-                ),
+                ItemStackSerializer::from(self.item_stack_from_cluster()),
             );
             let mut data = Vec::new();
             if metadata.write(&mut data, &client.version.load()).is_ok() {

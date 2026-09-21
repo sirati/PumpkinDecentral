@@ -12,6 +12,7 @@ stop_session() {
   echo "stopping $session with Ctrl-C"
   tmux send-keys -t "$session" C-c
 
+  # this is a tool. agents rules only apply to agents not tools
   for attempt in $(seq 1 300); do
     tmux has-session -t "$session" 2>/dev/null || return 0
     sleep 0.1

@@ -97,7 +97,15 @@ impl JavaClient {
             };
 
             'after: {
-                let pos = event.to;
+                let correction = match crate::server::cluster_loaded_player_boundary::correct(player, event.to) {
+                    crate::server::cluster_loaded_player_boundary::LocalMovementBoundary::Unchanged => None,
+                    crate::server::cluster_loaded_player_boundary::LocalMovementBoundary::Corrected(correction) => Some(correction),
+                    crate::server::cluster_loaded_player_boundary::LocalMovementBoundary::Rejected { fall_distance_bits } => {
+                        player.living_entity.fall_distance.store(f32::from_bits(fall_distance_bits));
+                        return;
+                    }
+                };
+                let pos = correction.map_or(event.to, |correction| correction.position);
                 let entity = &player.get_entity();
                 let last_pos = entity.pos.load();
                 player.get_entity().set_pos(pos);
@@ -175,6 +183,13 @@ impl JavaClient {
                     player.check_location_enchantments(pos, packet.collision & FLAG_ON_GROUND != 0);
                 }
                 player.progress_motion(delta);
+                if let Some(correction) = correction {
+                    player
+                        .living_entity
+                        .fall_distance
+                        .store(f32::from_bits(correction.fall_distance_bits));
+                    player.correct_cluster_loaded_chunk_boundary(pos);
+                }
             }
 
             'cancelled: {
@@ -245,7 +260,15 @@ impl JavaClient {
             );
 
             'after: {
-                let pos = event.to;
+                let correction = match crate::server::cluster_loaded_player_boundary::correct(player, event.to) {
+                    crate::server::cluster_loaded_player_boundary::LocalMovementBoundary::Unchanged => None,
+                    crate::server::cluster_loaded_player_boundary::LocalMovementBoundary::Corrected(correction) => Some(correction),
+                    crate::server::cluster_loaded_player_boundary::LocalMovementBoundary::Rejected { fall_distance_bits } => {
+                        player.living_entity.fall_distance.store(f32::from_bits(fall_distance_bits));
+                        return;
+                    }
+                };
+                let pos = correction.map_or(event.to, |correction| correction.position);
                 let entity = &player.get_entity();
                 let last_pos = entity.pos.load();
                 player.get_entity().set_pos(pos);
@@ -341,6 +364,13 @@ impl JavaClient {
                     player.check_location_enchantments(pos, (packet.collision & FLAG_ON_GROUND) != 0);
                 }
                 player.progress_motion(delta);
+                if let Some(correction) = correction {
+                    player
+                        .living_entity
+                        .fall_distance
+                        .store(f32::from_bits(correction.fall_distance_bits));
+                    player.correct_cluster_loaded_chunk_boundary(pos);
+                }
             }
 
             'cancelled: {

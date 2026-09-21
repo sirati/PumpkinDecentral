@@ -1,18 +1,41 @@
-use std::sync::atomic::Ordering;
-
 use pumpkin_util::PermissionLvl;
 use pumpkin_util::permission::{Permission, PermissionDefault, PermissionRegistry};
 use pumpkin_util::text::TextComponent;
 
 use crate::command::argument_builder::{ArgumentBuilder, argument, command};
 use crate::command::argument_types::core::string::StringArgumentType;
-use crate::command::argument_types::entity::EntityArgumentType;
 use crate::command::context::command_context::CommandContext;
 use crate::command::node::dispatcher::CommandDispatcher;
 use crate::command::node::{CommandExecutor, CommandExecutorResult};
 use crate::server::cluster_lobby::{
-    EXIT_LOBBY_OTHERS_PERMISSION, FORCED_LOBBY_PERMISSION, lobby_enter_manual, lobby_exit_manual,
+    EXIT_LOBBY_OTHERS_PERMISSION, FORCED_LOBBY_PERMISSION,
 };
+
+fn resolve_lobby_target(
+    server: &crate::server::Server,
+    name: &str,
+) -> Option<(pumpkin_cluster::identity::GlobalPlayerId, bool)> {
+    if let Some(waiter) = server
+        .lobby_waiters
+        .load()
+        .iter()
+        .find(|waiter| waiter.profile.name.eq_ignore_ascii_case(name))
+    {
+        return Some((waiter.gid, true));
+    }
+    if let Some(player) = server
+        .get_all_players()
+        .into_iter()
+        .find(|player| player.gameprofile.name.eq_ignore_ascii_case(name))
+        && let Some(gid) = player.cluster_gid()
+    {
+        return Some((gid, false));
+    }
+    crate::server::cluster_presence::remote_presence_entries()
+        .into_iter()
+        .find(|(_, entry)| entry.name.eq_ignore_ascii_case(name))
+        .map(|(gid, entry)| (gid, entry.in_lobby))
+}
 
 const DESCRIPTION: &str = "Moves you into the lobby wait room.";
 const FORCE_DESCRIPTION: &str = "Moves another player into the lobby wait room.";
@@ -22,23 +45,31 @@ struct LobbyExecutor;
 
 impl CommandExecutor for LobbyExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
-        let Some(player) = context.source.as_player() else {
-            context
-                .source
-                .send_error(TextComponent::text("Only players can use /lobby."));
-            return Ok(0);
-        };
-        if lobby_enter_manual(&player) {
-            context.source.send_feedback(
-                TextComponent::text("You are now waiting in the lobby."),
-                false,
-            );
-            Ok(1)
-        } else {
-            context
-                .source
-                .send_error(TextComponent::text("You are already waiting in the lobby."));
-            Ok(0)
+        match &context.source.output {
+            crate::command::CommandSender::Lobby(waiter) => {
+                waiter.hold();
+                context.source.send_feedback(TextComponent::text("You are held in the lobby."), false);
+                Ok(1)
+            }
+            crate::command::CommandSender::Player(player) => {
+                let Some(target) = player.cluster_gid() else {
+                    context.source.send_error(TextComponent::text("The lobby is unavailable."));
+                    return Ok(0);
+                };
+                if !crate::server::cluster_lobby_control::route_lobby_control(
+                    context.source.server(),
+                    pumpkin_cluster::lobby_control::LobbyControl::Hold { target },
+                ) {
+                    context.source.send_error(TextComponent::text("The lobby host is unavailable."));
+                    return Ok(0);
+                }
+                context.source.send_feedback(TextComponent::text("Entering the lobby."), false);
+                Ok(1)
+            }
+            _ => {
+                context.source.send_error(TextComponent::text("This command requires a player."));
+                Ok(0)
+            }
         }
     }
 }
@@ -47,32 +78,25 @@ struct ForceLobbyExecutor;
 
 impl CommandExecutor for ForceLobbyExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
-        let target = EntityArgumentType::get_player(context, "target")?;
-        if target.is_in_cluster_lobby() {
-            context.source.send_error(TextComponent::text(
-                "That player is already waiting in the lobby.",
-            ));
+        let name = StringArgumentType::get(context, "target")?;
+        let server = context.source.server();
+        let Some((target, _)) = resolve_lobby_target(server, name)
+        else {
+            context.source.send_error(TextComponent::text("No such player is online."));
+            return Ok(0);
+        };
+        if !crate::server::cluster_lobby_control::route_lobby_control(
+            server,
+            pumpkin_cluster::lobby_control::LobbyControl::Hold { target },
+        ) {
+            context.source.send_error(TextComponent::text("The player lobby host is unavailable."));
             return Ok(0);
         }
-        if lobby_enter_manual(&target) {
-            target.lobby_forced.store(true, Ordering::Relaxed);
-            target.send_system_message(&TextComponent::text(
-                "You were moved to the lobby wait room.",
-            ));
-            context.source.send_feedback(
-                TextComponent::text(format!(
-                    "Moved {} to the lobby.",
-                    target.gameprofile.name
-                )),
-                true,
-            );
-            Ok(1)
-        } else {
-            context.source.send_error(TextComponent::text(
-                "That player is already waiting in the lobby.",
-            ));
-            Ok(0)
-        }
+        context.source.send_feedback(
+            TextComponent::text(format!("Held {name} in the lobby.")),
+            true,
+        );
+        Ok(1)
     }
 }
 
@@ -80,13 +104,11 @@ struct ExitLobbyExecutor;
 
 impl CommandExecutor for ExitLobbyExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
-        let Some(player) = context.source.as_player() else {
-            context
-                .source
-                .send_error(TextComponent::text("Only players can use /exitlobby."));
+        let crate::command::CommandSender::Lobby(waiter) = &context.source.output else {
+            context.source.send_error(TextComponent::text("You are not waiting in the lobby."));
             return Ok(0);
         };
-        if player.lobby_forced.load(Ordering::Relaxed)
+        if waiter.forced.load(std::sync::atomic::Ordering::Relaxed)
             && !context.source.has_permission(FORCED_LOBBY_PERMISSION)
         {
             context.source.send_error(TextComponent::text(
@@ -94,18 +116,12 @@ impl CommandExecutor for ExitLobbyExecutor {
             ));
             return Ok(0);
         }
-        if lobby_exit_manual(&player) {
-            context.source.send_feedback(
-                TextComponent::text("You left the lobby wait room."),
-                false,
-            );
-            Ok(1)
-        } else {
-            context
-                .source
-                .send_error(TextComponent::text("You are not waiting in the lobby."));
-            Ok(0)
-        }
+        waiter.release();
+        context.source.send_feedback(
+            TextComponent::text("You left the lobby wait room."),
+            false,
+        );
+        Ok(1)
     }
 }
 
@@ -117,32 +133,29 @@ impl CommandExecutor for ExitLobbyOtherExecutor {
         let Some(server) = context.source.server.clone() else {
             return Ok(0);
         };
-        let Some(target) = server
-            .get_all_players()
-            .into_iter()
-            .find(|candidate| candidate.gameprofile.name.eq_ignore_ascii_case(name))
+        let Some((target, in_lobby)) = resolve_lobby_target(&server, name)
         else {
             context
                 .source
                 .send_error(TextComponent::text("No such player is online."));
             return Ok(0);
         };
-        if lobby_exit_manual(&target) {
-            target.send_system_message(&TextComponent::text("You left the lobby wait room."));
-            context.source.send_feedback(
-                TextComponent::text(format!(
-                    "Brought {} out of the lobby.",
-                    target.gameprofile.name
-                )),
-                true,
-            );
-            Ok(1)
-        } else {
-            context.source.send_error(TextComponent::text(
-                "That player is not waiting in the lobby.",
-            ));
-            Ok(0)
+        if !in_lobby {
+            context.source.send_error(TextComponent::text("That player is not waiting in the lobby."));
+            return Ok(0);
         }
+        if !crate::server::cluster_lobby_control::route_lobby_control(
+            &server,
+            pumpkin_cluster::lobby_control::LobbyControl::Release { target },
+        ) {
+            context.source.send_error(TextComponent::text("The player lobby host is unavailable."));
+            return Ok(0);
+        }
+        context.source.send_feedback(
+            TextComponent::text(format!("Brought {name} out of the lobby.")),
+            true,
+        );
+        Ok(1)
     }
 }
 
@@ -162,7 +175,7 @@ pub fn register(dispatcher: &mut CommandDispatcher, registry: &PermissionRegistr
     dispatcher.register(
         command("forcelobby", FORCE_DESCRIPTION)
             .requires(FORCED_LOBBY_PERMISSION)
-            .then(argument("target", EntityArgumentType::Player).executes(ForceLobbyExecutor)),
+            .then(argument("target", StringArgumentType::SingleWord).executes(ForceLobbyExecutor)),
     );
     dispatcher.register(
         command("exitlobby", EXIT_DESCRIPTION)

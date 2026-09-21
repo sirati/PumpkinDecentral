@@ -18,12 +18,7 @@ pub struct GiantEntity {
 impl GiantEntity {
     pub fn new(entity: Entity) -> Arc<Self> {
         let mob_entity = MobEntity::new(entity);
-        {
-            let mut attributes = mob_entity
-                .living_entity
-                .attributes
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        mob_entity.living_entity.update_attributes(|attributes| {
             if let Some(health) =
                 attributes.get_mut(&pumpkin_data::attributes::Attributes::MAX_HEALTH.id)
             {
@@ -48,7 +43,7 @@ impl GiantEntity {
                     .dirty
                     .store(true, std::sync::atomic::Ordering::Relaxed);
             }
-        }
+        });
         mob_entity.living_entity.health.store(100.0);
 
         let giant = Self { mob_entity };

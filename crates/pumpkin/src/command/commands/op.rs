@@ -33,11 +33,9 @@ impl CommandExecutor for OpCommandExecutor {
         let mut granted: Vec<(uuid::Uuid, String, pumpkin_util::PermissionLvl, bool)> = Vec::new();
 
         {
-            let mut config = server
-                .data
-                .operator_config
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Ok(mut config) = server.data.operator_config.try_write() else {
+                return Err(ALREADY_OP_ERROR_TYPE.create_without_context());
+            };
 
             for profile in profiles {
                 let maybe_existing_entry = config.ops.iter_mut().find(|o| o.uuid == profile.id);
@@ -57,7 +55,9 @@ impl CommandExecutor for OpCommandExecutor {
                 granted.push((profile.id, profile.name.clone(), new_level, false));
             }
 
-            if !granted.is_empty() {
+            if !granted.is_empty()
+                && crate::server::cluster_admin_apply::persists_admin_state(server)
+            {
                 config.save();
             }
         }

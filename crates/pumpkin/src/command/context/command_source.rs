@@ -5,7 +5,7 @@ use crate::entity::player::Player;
 use crate::server::Server;
 use crate::world::World;
 use pumpkin_command::errors::command_syntax_error::CommandSyntaxError;
-use pumpkin_command::errors::error_types::CommandErrorType;
+use pumpkin_command::errors::error_types::{CommandErrorType, LiteralCommandErrorType};
 pub use pumpkin_command::source::{
     ResultValueTaker, ReturnValue, ReturnValueCallable, ReturnValueCallback,
 };
@@ -26,6 +26,8 @@ pub const REQUIRES_ENTITY: CommandErrorType<0> = CommandErrorType::new(
     translation::java::PERMISSIONS_REQUIRES_ENTITY,
     translation::java::PERMISSIONS_REQUIRES_ENTITY,
 );
+pub const CLUSTER_LOBBY_REQUIRES_ENTITY: LiteralCommandErrorType =
+    LiteralCommandErrorType::new("You are still in the cluster lobby and have no game entity");
 
 /// Represents a source of a command, which
 /// contains its own state, which could keep track of its:
@@ -311,9 +313,13 @@ impl CommandSource {
     /// - If this source actually contains an entity, it returns that wrapped in an [`Ok`].
     /// - If it doesn't, a command error is provided instead, wrapped in an [`Err`].
     pub fn entity_or_err(&self) -> Result<Arc<dyn EntityBase>, CommandSyntaxError> {
-        self.entity
-            .clone()
-            .ok_or(REQUIRES_ENTITY.create_without_context())
+        self.entity.clone().ok_or_else(|| {
+            if matches!(&self.output, CommandSender::Lobby(_)) {
+                CLUSTER_LOBBY_REQUIRES_ENTITY.create_without_context()
+            } else {
+                REQUIRES_ENTITY.create_without_context()
+            }
+        })
     }
 
     /// Gets the world as a result:

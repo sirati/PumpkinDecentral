@@ -615,7 +615,7 @@ impl BlockRegistry {
         use_item_on: &SUseItemOn,
         location: BlockPos,
         face: BlockDirection,
-    ) -> Result<Option<(BlockPos, BlockStateId)>, BlockPlacingError> {
+    ) -> Result<Option<(BlockPos, BlockStateId, BlockStateId)>, BlockPlacingError> {
         let entity = &player.get_entity();
 
         match player.gamemode.load() {
@@ -786,7 +786,7 @@ impl BlockRegistry {
             return Ok(None);
         }
 
-        let _replaced_id =
+        let replaced_id =
             world.set_block_state(&final_block_pos, new_state, BlockFlags::NOTIFY_ALL);
 
         world.play_bedrock_level_sound(
@@ -817,7 +817,7 @@ impl BlockRegistry {
             },
         );
 
-        Ok(Some((final_block_pos, new_state)))
+        Ok(Some((final_block_pos, new_state, replaced_id)))
     }
     #[allow(clippy::expect_used)]
     pub fn register<T: BlockBehaviour + BlockMetadata + 'static>(&mut self, block: T) {

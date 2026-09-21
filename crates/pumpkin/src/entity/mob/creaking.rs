@@ -74,13 +74,10 @@ impl CreakingEntity {
         };
 
         // Initialize attributes
-        {
-            let mut attributes = creaking
-                .mob_entity
-                .living_entity
-                .attributes
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        creaking
+            .mob_entity
+            .living_entity
+            .update_attributes(|attributes| {
 
             if let Some(health) = attributes.get_mut(&Attributes::MAX_HEALTH.id) {
                 health.base_value = f64::from(MAX_HEALTH);
@@ -102,7 +99,7 @@ impl CreakingEntity {
                 step.base_value = 1.0625;
                 step.dirty.store(true, Ordering::Relaxed);
             }
-        }
+            });
         creaking.mob_entity.living_entity.health.store(MAX_HEALTH);
 
         let mob_arc = Arc::new(creaking);

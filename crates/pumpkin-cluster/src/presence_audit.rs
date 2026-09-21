@@ -178,6 +178,7 @@ pub fn login_for_unhidden(entry: &VisiblePlayer) -> PresenceLogin {
         entry.uuid,
         entry.name.clone(),
         Vec::new(),
+        crate::protocol::PlayerGameMode::Survival,
         false,
     )
 }
@@ -434,6 +435,7 @@ mod tests {
                 [*player as u8; 16],
                 (*name).to_string(),
                 Vec::new(),
+                crate::protocol::PlayerGameMode::Survival,
                 false,
             );
             assert!(table.apply_login(&login, 100));

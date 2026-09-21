@@ -263,7 +263,7 @@ impl Context {
     /// - `player`: The player for which the commands will be reloaded.
     pub fn reload_commands_for(&self, player: &Arc<Player>) {
         let command_dispatcher = self.server.command_dispatcher.load();
-        if let ClientPlatform::Bedrock(_) = player.client.as_ref() {
+        if matches!(player.client.as_deref(), Some(ClientPlatform::Bedrock(_))) {
             client_suggestions::send_bedrock_commands_packet(
                 player,
                 &self.server,

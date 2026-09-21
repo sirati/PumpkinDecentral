@@ -60,7 +60,7 @@ impl BedrockClient {
         player.inventory.set_selected_slot(target_hotbar_slot as u8);
 
         // Send hotbar updates
-        player.client.try_enqueue_packet_editioned(
+        player.try_enqueue_packet_editioned(
             &CSetSelectedSlot::new(player.inventory.get_selected_slot() as i8),
             &CPlayerHotbar {
                 selected_slot: VarUInt(player.inventory.get_selected_slot() as u32),

@@ -4,7 +4,7 @@
 //! offset, smooth it through a divide-by-4 low-pass filter, then publish it
 //! over a [`tokio::sync::watch`] channel. [`NtpHandle`] clones share that
 //! channel, so [`NtpHandle::tick_now`] mints the same [`TickStamp`] on every
-//! peer whose offset is fresh and within tolerance (see [`crate::time`]).
+//! peer with a sampled offset (see [`crate::time`]).
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -33,7 +33,15 @@ pub const POLL_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 pub const QUERY_ADDR_TIMEOUT: Duration = Duration::from_millis(800);
 pub const QUERY_RECV_LEN: usize = 512;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NtpSample {
+    pub offset_millis: i64,
+    pub precision_millis: i64,
+}
+
 static SHARED_OFFSET_MILLIS: AtomicI64 = AtomicI64::new(i64::MAX);
+static SHARED_PRECISION_MILLIS: AtomicI64 = AtomicI64::new(i64::MAX);
+static SHARED_PRECISION_TARGET_MILLIS: AtomicI64 = AtomicI64::new(i64::MAX);
 
 #[cfg(test)]
 pub(crate) static SHARED_OFFSET_SERIAL: std::sync::Mutex<()> =
@@ -51,26 +59,48 @@ pub fn publish_shared_offset(offset: i64) {
     SHARED_OFFSET_MILLIS.store(offset, Ordering::Relaxed);
 }
 
-pub fn withdraw_shared_offset() {
-    SHARED_OFFSET_MILLIS.store(i64::MAX, Ordering::Relaxed);
+pub fn publish_shared_sample(offset: i64, precision: i64) {
+    publish_shared_offset(offset);
+    SHARED_PRECISION_MILLIS.store(precision, Ordering::Relaxed);
 }
 
-/// Which NTP servers to poll and how much skew shared stamps tolerate.
+#[must_use]
+pub fn shared_precision_millis() -> Option<i64> {
+    match SHARED_PRECISION_MILLIS.load(Ordering::Relaxed) {
+        i64::MAX => None,
+        precision => Some(precision),
+    }
+}
+
+#[must_use]
+pub fn shared_precision_target_millis() -> Option<i64> {
+    match SHARED_PRECISION_TARGET_MILLIS.load(Ordering::Relaxed) {
+        i64::MAX => None,
+        target => Some(target),
+    }
+}
+
+pub fn withdraw_shared_offset() {
+    SHARED_OFFSET_MILLIS.store(i64::MAX, Ordering::Relaxed);
+    SHARED_PRECISION_MILLIS.store(i64::MAX, Ordering::Relaxed);
+}
+
+/// Which NTP servers to poll and the target sample precision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NtpConfig {
     /// Hostnames or `host:port` endpoints polled every [`POLL_INTERVAL`].
     pub servers: Vec<String>,
-    /// Maximum accepted `|offset|` in millis before stamps gate to `None`.
-    pub max_offset_millis: i64,
+    /// Maximum half-round-trip in millis for a precise sample.
+    pub max_precision_millis: i64,
 }
 
 impl NtpConfig {
-    /// Configures the server list plus the shared-stamp skew tolerance.
+    /// Configures the server list plus the sample-precision target.
     #[must_use]
-    pub fn new(servers: Vec<String>, max_offset_millis: i64) -> Self {
+    pub fn new(servers: Vec<String>, max_precision_millis: i64) -> Self {
         Self {
             servers,
-            max_offset_millis,
+            max_precision_millis,
         }
     }
 }
@@ -82,31 +112,39 @@ impl NtpConfig {
 /// same instant with the same wrapping [`u16`] (see [`crate::time::TickStamp`]).
 #[derive(Debug, Clone)]
 pub struct NtpHandle {
-    offsets: watch::Receiver<Option<i64>>,
-    max_offset_millis: i64,
+    samples: watch::Receiver<Option<NtpSample>>,
+    max_precision_millis: i64,
 }
 
 impl NtpHandle {
     /// Starts undisciplined (`offset() == None`): stamps gate to `None`.
     #[must_use]
-    pub fn undisciplined(max_offset_millis: i64) -> Self {
+    pub fn undisciplined(max_precision_millis: i64) -> Self {
         let (_, receiver) = watch::channel(None);
         Self {
-            offsets: receiver,
-            max_offset_millis,
+            samples: receiver,
+            max_precision_millis,
         }
     }
 
     /// Latest filtered offset in millis (`server - local`), if disciplined.
     #[must_use]
     pub fn offset(&self) -> Option<i64> {
-        *self.offsets.borrow()
+        self.samples.borrow().as_ref().map(|sample| sample.offset_millis)
     }
 
-    /// Maximum accepted `|offset|` in millis before stamps gate to `None`.
     #[must_use]
-    pub fn max_offset_millis(&self) -> i64 {
-        self.max_offset_millis
+    pub fn precision_millis(&self) -> Option<i64> {
+        self.samples
+            .borrow()
+            .as_ref()
+            .map(|sample| sample.precision_millis)
+    }
+
+    /// Maximum half-round-trip in millis for a precise sample.
+    #[must_use]
+    pub fn max_precision_millis(&self) -> i64 {
+        self.max_precision_millis
     }
 
     /// Stamps `unix_millis` with the live offset, or `None` when undisciplined/unhealthy.
@@ -114,22 +152,17 @@ impl NtpHandle {
     pub fn tick_now(&self, unix_millis: i64) -> Option<TickStamp> {
         NtpDiscipline {
             offset_millis: self.offset(),
-            max_offset_millis: self.max_offset_millis,
         }
         .tick_at(unix_millis)
     }
 
-    /// True once an offset exists and `|offset| <= max_offset_millis`.
+    /// True once an NTP sample exists within the configured precision target.
     #[must_use]
-    pub fn is_healthy(&self) -> bool {
-        match self.offset() {
-            None => false,
-            Some(offset) => {
-                offset.unsigned_abs() <= u64::try_from(self.max_offset_millis).unwrap_or(0)
-            }
-        }
+    pub fn is_precise(&self) -> bool {
+        self.precision_millis().is_some_and(|precision| {
+            precision <= self.max_precision_millis && self.max_precision_millis >= 0
+        })
     }
-
 }
 
 /// Polling half of the discipline pair: owns the servers and the watch sender.
@@ -140,7 +173,7 @@ impl NtpHandle {
 #[derive(Debug)]
 pub struct NtpSync {
     servers: Vec<String>,
-    sender: watch::Sender<Option<i64>>,
+    sender: watch::Sender<Option<NtpSample>>,
     discipline: NtpDiscipline,
     filtered: Option<i64>,
 }
@@ -149,17 +182,18 @@ impl NtpSync {
     /// Splits a fresh undisciplined poller/handle pair from one config.
     #[must_use]
     pub fn new(config: NtpConfig) -> (Self, NtpHandle) {
-        let max_offset_millis = config.max_offset_millis;
+        let max_precision_millis = config.max_precision_millis;
+        SHARED_PRECISION_TARGET_MILLIS.store(max_precision_millis, Ordering::Relaxed);
         let (sender, receiver) = watch::channel(None);
         let sync = Self {
             servers: config.servers,
             sender,
-            discipline: NtpDiscipline::unconfigured(max_offset_millis),
+            discipline: NtpDiscipline::unconfigured(),
             filtered: None,
         };
         let handle = NtpHandle {
-            offsets: receiver,
-            max_offset_millis,
+            samples: receiver,
+            max_precision_millis,
         };
         (sync, handle)
     }
@@ -184,8 +218,8 @@ impl NtpSync {
     pub async fn refresh(&mut self) -> bool {
         let mut samples = Vec::with_capacity(self.servers.len());
         for server in self.servers.clone() {
-            if let Some(offset) = query_server(&server, QUERY_TIMEOUT).await {
-                samples.push(offset);
+            if let Some(sample) = query_server(&server, QUERY_TIMEOUT).await {
+                samples.push(sample);
             }
         }
         match median_offset(&mut samples) {
@@ -197,19 +231,22 @@ impl NtpSync {
                 false
             }
             Some(median) => {
-                let next = low_pass_filter(self.filtered, median);
+                let next = low_pass_filter(self.filtered, median.offset_millis);
                 self.filtered = Some(next);
-                let bound = u64::try_from(self.discipline.max_offset_millis).unwrap_or(0);
-                if next.unsigned_abs() <= bound {
-                    publish_shared_offset(next);
-                } else {
-                    withdraw_shared_offset();
-                }
+                publish_shared_sample(next, median.precision_millis);
                 self.discipline.observe(next);
-                if self.sender.send(Some(next)).is_err() {
+                let sample = NtpSample {
+                    offset_millis: next,
+                    precision_millis: median.precision_millis,
+                };
+                if self.sender.send(Some(sample)).is_err() {
                     tracing::debug!("ntp offset updated with no listeners");
                 } else {
-                    tracing::debug!(offset_millis = next, "ntp offset updated");
+                    tracing::debug!(
+                        offset_millis = next,
+                        precision_millis = median.precision_millis,
+                        "ntp offset updated"
+                    );
                 }
                 true
             }
@@ -344,16 +381,21 @@ pub fn compute_offset(
 /// `None` on zero samples, which tells [`NtpSync::refresh`] to hold the last
 /// offset. The median rejects a single stray server so peers converge.
 #[must_use]
-pub fn median_offset(values: &mut [i64]) -> Option<i64> {
+pub fn median_offset(values: &mut [NtpSample]) -> Option<NtpSample> {
     if values.is_empty() {
         return None;
     }
-    values.sort_unstable();
+    values.sort_unstable_by_key(|sample| sample.offset_millis);
     let middle = values.len() / 2;
     if values.len() == middle.saturating_mul(2) {
         let upper = values.get(middle).copied()?;
         let lower = values.get(middle.saturating_sub(1)).copied()?;
-        Some(lower.saturating_add(upper.saturating_sub(lower) / 2))
+        Some(NtpSample {
+            offset_millis: lower
+                .offset_millis
+                .saturating_add(upper.offset_millis.saturating_sub(lower.offset_millis) / 2),
+            precision_millis: lower.precision_millis.max(upper.precision_millis),
+        })
     } else {
         values.get(middle).copied()
     }
@@ -379,15 +421,17 @@ fn unix_millis_now() -> Option<i64> {
 }
 
 /// One bounded UDP exchange against a single server (never panics, `None` on any failure).
-async fn query_server(server: &str, timeout: Duration) -> Option<i64> {
+async fn query_server(server: &str, timeout: Duration) -> Option<NtpSample> {
     time::timeout(timeout, exchange(server)).await.ok()?
 }
 
 /// Sends one request and solves the offset from the four timestamps.
-async fn exchange(server: &str) -> Option<i64> {
+async fn exchange(server: &str) -> Option<NtpSample> {
     let target = with_default_port(server);
-    let resolved = tokio::net::lookup_host(target).await.ok()?;
-    let addrs: Vec<SocketAddr> = resolved.collect();
+    let addrs: Vec<SocketAddr> = match target.parse() {
+        Ok(addr) => vec![addr],
+        Err(_) => tokio::net::lookup_host(target).await.ok()?.collect(),
+    };
     if addrs.is_empty() {
         return None;
     }
@@ -400,7 +444,7 @@ async fn exchange(server: &str) -> Option<i64> {
     median_offset(&mut samples)
 }
 
-async fn exchange_with(target: SocketAddr) -> Option<i64> {
+async fn exchange_with(target: SocketAddr) -> Option<NtpSample> {
     let bind = if target.is_ipv4() {
         "0.0.0.0:0"
     } else {
@@ -418,12 +462,15 @@ async fn exchange_with(target: SocketAddr) -> Option<i64> {
     }
     let received_millis = unix_millis_now()?;
     let (server_recv, server_tx) = parse_server_times(&buffer)?;
-    Some(compute_offset(
-        sent_millis,
-        server_recv,
-        server_tx,
-        received_millis,
-    ))
+    let offset_millis = compute_offset(sent_millis, server_recv, server_tx, received_millis);
+    let round_trip = received_millis
+        .saturating_sub(sent_millis)
+        .saturating_sub(server_tx.saturating_sub(server_recv))
+        .max(0);
+    Some(NtpSample {
+        offset_millis,
+        precision_millis: round_trip.saturating_add(1) / 2,
+    })
 }
 
 #[cfg(test)]
@@ -487,13 +534,23 @@ mod tests {
 
     #[test]
     fn median_picks_middle() {
-        let mut values = [30_i64, 10, 20];
-        assert_eq!(median_offset(&mut values), Some(20));
-        let mut even = [40_i64, 10, 30, 20];
-        assert_eq!(median_offset(&mut even), Some(25));
-        let mut single = [7_i64];
-        assert_eq!(median_offset(&mut single), Some(7));
-        let mut empty: [i64; 0] = [];
+        let sample = |offset_millis| NtpSample {
+            offset_millis,
+            precision_millis: 3,
+        };
+        let mut values = [sample(30), sample(10), sample(20)];
+        assert_eq!(median_offset(&mut values), Some(sample(20)));
+        let mut even = [sample(40), sample(10), sample(30), sample(20)];
+        assert_eq!(
+            median_offset(&mut even),
+            Some(NtpSample {
+                offset_millis: 25,
+                precision_millis: 3,
+            })
+        );
+        let mut single = [sample(7)];
+        assert_eq!(median_offset(&mut single), Some(sample(7)));
+        let mut empty: [NtpSample; 0] = [];
         assert_eq!(median_offset(&mut empty), None);
     }
 
@@ -515,7 +572,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_beyond_tolerance_withdraws_shared_offset() {
+    async fn refresh_large_offset_publishes_the_correction() {
         let _serial = SHARED_OFFSET_SERIAL.lock().unwrap();
         publish_shared_offset(40);
         let responder = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -553,9 +610,14 @@ mod tests {
         let (mut sync, handle) =
             NtpSync::new(NtpConfig::new(vec![format!("{addr}")], 250));
         sync.refresh().await;
-        assert!(!handle.is_healthy());
-        assert_eq!(shared_offset_millis(), None);
-        assert!(!handle.tick_now(1_000).is_some());
+        let offset = handle.offset().unwrap();
+        assert!(offset > 9_000_000);
+        assert_eq!(shared_offset_millis(), Some(offset));
+        assert_eq!(
+            handle.tick_now(1_000),
+            Some(TickStamp::from_disciplined_millis(1_000, offset))
+        );
+        assert!(handle.is_precise());
     }
 
     #[test]
@@ -568,7 +630,7 @@ mod tests {
     fn undisciplined_handle_yields_nothing() {
         let handle = NtpHandle::undisciplined(250);
         assert_eq!(handle.offset(), None);
-        assert!(!handle.is_healthy());
+        assert!(!handle.is_precise());
         assert_eq!(handle.tick_now(1_000), None);
     }
 
@@ -577,7 +639,7 @@ mod tests {
         let (sync, handle) = NtpSync::new(NtpConfig::new(Vec::new(), 250));
         assert_eq!(sync.offset(), None);
         assert_eq!(handle.offset(), None);
-        assert!(!handle.is_healthy());
+        assert!(!handle.is_precise());
     }
 
     #[tokio::test]
@@ -621,7 +683,7 @@ mod tests {
             offset.unsigned_abs() <= 5_000,
             "local offset out of range: {offset}"
         );
-        assert!(handle.is_healthy());
+        assert!(handle.is_precise());
         assert!(handle.tick_now(1_000).is_some());
     }
 }

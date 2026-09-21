@@ -56,15 +56,14 @@ fn toggle_door(player: &Player, world: &Arc<World>, block_pos: &BlockPos) {
         *block_pos,
     );
 
-    world.set_block_state(
-        block_pos,
-        door_props.to_state_id(block),
-        BlockFlags::NOTIFY_LISTENERS,
-    );
-    world.set_block_state(
-        &other_pos,
-        other_door_props.to_state_id(other_block),
-        BlockFlags::NOTIFY_LISTENERS,
+    let lower_new = door_props.to_state_id(block);
+    let upper_new = other_door_props.to_state_id(other_block);
+    world.set_block_state(block_pos, lower_new, BlockFlags::NOTIFY_LISTENERS);
+    world.set_block_state(&other_pos, upper_new, BlockFlags::NOTIFY_LISTENERS);
+    crate::server::cluster_world_delta::emit_linked_door_toggle(
+        player,
+        (block_pos, block_state.as_u16(), lower_new.as_u16()),
+        (&other_pos, other_state_id.as_u16(), upper_new.as_u16()),
     );
 }
 

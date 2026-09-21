@@ -58,13 +58,9 @@ impl JavaClient {
                     Hand::Right => 0,
                     Hand::Left => 1,
                 };
-                pumpkin_cluster::visual::emit_swing(
-                    player.cluster_gid(),
-                    pumpkin_cluster::visual::tick_from_counter(
-                        player.tick_counter.load(Ordering::Relaxed),
-                    ),
-                    visual_hand,
-                );
+                if let Some(tick) = crate::server::cluster::disciplined_tick_now() {
+                    pumpkin_cluster::visual::emit_swing(player.cluster_gid(), tick, visual_hand);
+                }
             }
         }}
     }

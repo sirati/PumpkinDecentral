@@ -24,7 +24,9 @@ const ERROR_BAN_FAILED: CommandErrorType<0> = CommandErrorType::new(
 
 fn ban_profile(context: &CommandContext, profile: &GameProfile, reason: Option<String>) -> bool {
     let server = context.source.server();
-    let mut banned_players = server.data.banned_player_list.write().unwrap();
+    let Ok(mut banned_players) = server.data.banned_player_list.try_write() else {
+        return false;
+    };
 
     let reason = reason.unwrap_or_else(|| "Banned by an operator.".to_string());
 
@@ -35,7 +37,9 @@ fn ban_profile(context: &CommandContext, profile: &GameProfile, reason: Option<S
     {
         if entry.name != profile.name {
             entry.name.clone_from(&profile.name);
-            banned_players.save();
+            if crate::server::cluster_admin_apply::persists_admin_state(server) {
+                banned_players.save();
+            }
         }
         return false;
     }
@@ -48,7 +52,9 @@ fn ban_profile(context: &CommandContext, profile: &GameProfile, reason: Option<S
         reason.clone(),
     ));
 
-    banned_players.save();
+    if crate::server::cluster_admin_apply::persists_admin_state(server) {
+        banned_players.save();
+    }
     drop(banned_players);
     crate::server::cluster_admin_apply::publish_ban_add(
         server,

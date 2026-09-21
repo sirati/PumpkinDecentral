@@ -356,6 +356,7 @@ impl pumpkin::plugin::command::HostCommandSender for PluginHostState {
             crate::command::CommandSender::Player(player) => {
                 Ok(CommandSenderType::Player(self.add_player(player)?))
             }
+            crate::command::CommandSender::Lobby(_) => Ok(CommandSenderType::Dummy),
             crate::command::CommandSender::CommandBlock(block_entity, world) => {
                 Ok(CommandSenderType::CommandBlock((
                     self.add_block_entity(block_entity)?,

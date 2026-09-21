@@ -29,11 +29,9 @@ impl CommandExecutor for DeopExecutor {
 
         let mut revoked: Vec<(uuid::Uuid, String)> = Vec::new();
         {
-            let mut config = server
-                .data
-                .operator_config
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Ok(mut config) = server.data.operator_config.try_write() else {
+                return Err(ERROR_DEOP_FAILED.create_without_context());
+            };
 
             for profile in &targets {
                 if let Some(op_index) = config.ops.iter().position(|o| o.uuid == profile.id) {
@@ -42,7 +40,9 @@ impl CommandExecutor for DeopExecutor {
                 }
             }
 
-            if !revoked.is_empty() {
+            if !revoked.is_empty()
+                && crate::server::cluster_admin_apply::persists_admin_state(server)
+            {
                 config.save();
             }
         }
@@ -98,12 +98,9 @@ impl SuggestionProvider for DeopSuggestionProvider {
         context: &CommandContext,
         mut builder: SuggestionsBuilder,
     ) -> SuggestionProviderResult {
-        let ops = context
-            .server()
-            .data
-            .operator_config
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Ok(ops) = context.server().data.operator_config.try_read() else {
+            return builder.build();
+        };
         for name in operator_completion_names(&ops.ops) {
             // `ops.json` is cluster-replicated, so this is the complete
             // cluster-visible operator set, including operators hosted by a

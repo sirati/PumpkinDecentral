@@ -29,6 +29,34 @@ pub struct Weather {
     pub weather_cycle_enabled: bool,
 }
 
+#[derive(Clone, Copy)]
+pub struct ClusterWeatherState {
+    pub clear_weather_time: i32,
+    pub rain_time: i32,
+    pub thunder_time: i32,
+    pub raining: bool,
+    pub thundering: bool,
+}
+
+impl ClusterWeatherState {
+    #[must_use]
+    pub const fn new(
+        clear_weather_time: i32,
+        rain_time: i32,
+        thunder_time: i32,
+        raining: bool,
+        thundering: bool,
+    ) -> Self {
+        Self {
+            clear_weather_time,
+            rain_time,
+            thunder_time,
+            raining,
+            thundering,
+        }
+    }
+}
+
 impl Default for Weather {
     fn default() -> Self {
         Self::new()
@@ -52,6 +80,25 @@ impl Weather {
         }
     }
 
+    #[must_use]
+    pub const fn cluster_state(&self) -> ClusterWeatherState {
+        ClusterWeatherState::new(
+            self.clear_weather_time,
+            self.rain_time,
+            self.thunder_time,
+            self.raining,
+            self.thundering,
+        )
+    }
+
+    pub const fn install_cluster_state(&mut self, state: ClusterWeatherState) {
+        self.clear_weather_time = state.clear_weather_time;
+        self.rain_time = state.rain_time;
+        self.thunder_time = state.thunder_time;
+        self.raining = state.raining;
+        self.thundering = state.thundering;
+    }
+
     pub fn set_weather_parameters(
         &mut self,
         world: &World,
@@ -69,23 +116,10 @@ impl Weather {
         self.thundering = thundering;
 
         if was_raining != raining {
-            let lobby_waiters: Vec<_> = world
-                .players
-                .load()
-                .iter()
-                .filter(|player| player.is_in_cluster_lobby())
-                .map(|player| player.gameprofile.id)
-                .collect();
             if was_raining {
-                world.broadcast_packet_except(
-                    &lobby_waiters,
-                    &CGameEvent::new(GameEvent::EndRaining, 0.0),
-                );
+                world.broadcast_packet_all(&CGameEvent::new(GameEvent::EndRaining, 0.0));
             } else {
-                world.broadcast_packet_except(
-                    &lobby_waiters,
-                    &CGameEvent::new(GameEvent::BeginRaining, 0.0),
-                );
+                world.broadcast_packet_all(&CGameEvent::new(GameEvent::BeginRaining, 0.0));
             }
         }
     }
@@ -112,25 +146,12 @@ impl Weather {
         }
 
         // Broadcast level changes if needed
-        let lobby_waiters: Vec<_> = world
-            .players
-            .load()
-            .iter()
-            .filter(|player| player.is_in_cluster_lobby())
-            .map(|player| player.gameprofile.id)
-            .collect();
         if (self.old_rain_level - self.rain_level).abs() > f32::EPSILON {
-            world.broadcast_packet_except(
-                &lobby_waiters,
-                &CGameEvent::new(GameEvent::RainLevelChange, self.rain_level),
-            );
+            world.broadcast_packet_all(&CGameEvent::new(GameEvent::RainLevelChange, self.rain_level));
         }
 
         if (self.old_thunder_level - self.thunder_level).abs() > f32::EPSILON {
-            world.broadcast_packet_except(
-                &lobby_waiters,
-                &CGameEvent::new(GameEvent::ThunderLevelChange, self.thunder_level),
-            );
+            world.broadcast_packet_all(&CGameEvent::new(GameEvent::ThunderLevelChange, self.thunder_level));
         }
     }
 

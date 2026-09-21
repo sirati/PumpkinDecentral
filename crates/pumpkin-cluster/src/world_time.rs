@@ -6,8 +6,6 @@ use crate::protocol::StreamKind;
 use crate::time::TickStamp;
 
 pub const WORLD_TIME_MAX_DIMENSION_LEN: usize = 64;
-pub const WORLD_TIME_MIN_RATE: f32 = 1.0e-5;
-pub const WORLD_TIME_MAX_RATE: f32 = 1000.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorldTimeError {
@@ -25,27 +23,21 @@ impl std::error::Error for WorldTimeError {}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TimeUpdate {
     pub dimension: String,
-    pub time_of_day: i64,
-    pub partial_tick: f32,
-    pub rate: f32,
-    pub paused: bool,
+    pub double_day_counter: u16,
+    pub sync_time_offset: i16,
 }
 
 impl TimeUpdate {
     #[must_use]
     pub fn new(
         dimension: String,
-        time_of_day: i64,
-        partial_tick: f32,
-        rate: f32,
-        paused: bool,
+        double_day_counter: u16,
+        sync_time_offset: i16,
     ) -> Self {
         Self {
             dimension,
-            time_of_day,
-            partial_tick,
-            rate,
-            paused,
+            double_day_counter,
+            sync_time_offset,
         }
     }
 }
@@ -84,6 +76,7 @@ impl WeatherUpdate {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum WorldTimeControl {
     Time(TimeUpdate),
+    Bootstrap(TimeUpdate),
     Weather(WeatherUpdate),
 }
 
@@ -114,20 +107,8 @@ pub fn is_valid_dimension(dimension: &str) -> bool {
 }
 
 #[must_use]
-pub fn is_valid_rate(rate: f32) -> bool {
-    rate.is_finite() && rate >= WORLD_TIME_MIN_RATE && rate <= WORLD_TIME_MAX_RATE
-}
-
-#[must_use]
-pub fn is_valid_partial_tick(partial_tick: f32) -> bool {
-    partial_tick.is_finite() && (0.0..1.0).contains(&partial_tick)
-}
-
-#[must_use]
 pub fn is_valid_time_update(update: &TimeUpdate) -> bool {
     is_valid_dimension(&update.dimension)
-        && is_valid_rate(update.rate)
-        && is_valid_partial_tick(update.partial_tick)
 }
 
 #[must_use]
@@ -141,7 +122,9 @@ pub fn is_valid_weather_update(update: &WeatherUpdate) -> bool {
 #[must_use]
 pub fn is_valid_control(control: &WorldTimeControl) -> bool {
     match control {
-        WorldTimeControl::Time(update) => is_valid_time_update(update),
+        WorldTimeControl::Time(update) | WorldTimeControl::Bootstrap(update) => {
+            is_valid_time_update(update)
+        }
         WorldTimeControl::Weather(update) => is_valid_weather_update(update),
     }
 }
@@ -222,7 +205,7 @@ mod tests {
     use super::*;
 
     fn time_update() -> TimeUpdate {
-        TimeUpdate::new(String::from("minecraft:overworld"), 1000, 0.0, 1.0, false)
+        TimeUpdate::new(String::from("minecraft:overworld"), 2, -12_000)
     }
 
     fn weather_update() -> WeatherUpdate {
@@ -232,6 +215,9 @@ mod tests {
     #[test]
     fn roundtrips() {
         let control = WorldTimeControl::Time(time_update());
+        let bytes = encode_control(&control).unwrap();
+        assert_eq!(decode_control(&bytes).unwrap(), control);
+        let control = WorldTimeControl::Bootstrap(time_update());
         let bytes = encode_control(&control).unwrap();
         assert_eq!(decode_control(&bytes).unwrap(), control);
         let control = WorldTimeControl::Weather(weather_update());
@@ -252,17 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_rates_and_partials() {
-        let mut bad = time_update();
-        bad.rate = f32::NAN;
-        assert!(!is_valid_time_update(&bad));
-        bad.rate = 0.0;
-        assert!(!is_valid_time_update(&bad));
-        bad.rate = 1.0;
-        bad.partial_tick = 1.0;
-        assert!(!is_valid_time_update(&bad));
-        bad.partial_tick = -0.5;
-        assert!(!is_valid_time_update(&bad));
+    fn rejects_invalid_weather() {
         let mut bad_weather = weather_update();
         bad_weather.clear_weather_time = -5;
         assert!(!is_valid_weather_update(&bad_weather));

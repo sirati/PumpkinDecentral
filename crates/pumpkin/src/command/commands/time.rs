@@ -2,6 +2,7 @@ use pumpkin_data::translation;
 use pumpkin_util::PermissionLvl;
 use pumpkin_util::permission::{Permission, PermissionDefault, PermissionRegistry};
 use pumpkin_util::text::TextComponent;
+use pumpkin_cluster::time::TickStamp;
 
 use crate::command::argument_builder::{ArgumentBuilder, argument, command, literal};
 use crate::command::argument_types::core::float::FloatArgumentType;
@@ -15,6 +16,14 @@ const DESCRIPTION: &str = "Query or modify the world time and clocks.";
 const PERMISSION: &str = "minecraft:command.time";
 
 const DEFAULT_CLOCK: &str = "minecraft:overworld";
+
+fn current_sync_tick(server: &crate::server::Server) -> Option<TickStamp> {
+    if server.advanced_config.cluster.enabled {
+        crate::server::cluster::disciplined_tick_now()
+    } else {
+        Some(TickStamp::now())
+    }
+}
 
 #[derive(Clone, Copy)]
 enum PresetTime {
@@ -148,6 +157,12 @@ impl CommandExecutor for ActionExecutor {
 
         let world = context.source.world();
         let server = context.server();
+        let Some(sync_tick) = current_sync_tick(server) else {
+            context
+                .source
+                .send_feedback(TextComponent::text("Shared clock unavailable."), false);
+            return Ok(0);
+        };
 
         match self.action {
             Action::Set(preset) => {
@@ -161,9 +176,13 @@ impl CommandExecutor for ActionExecutor {
                         .level_time
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    guard.set_time(time_count.into());
+                    guard.set_time_from_sync(time_count.into(), sync_tick);
                     guard.clone()
                 };
+                world.store_cluster_time_model(
+                    level_time.double_day_counter,
+                    level_time.sync_time_offset,
+                );
                 level_time.send_time(world);
                 crate::server::cluster_world_time::publish_time_for_world(server, world);
                 context.source.send_feedback(
@@ -184,10 +203,15 @@ impl CommandExecutor for ActionExecutor {
                         .level_time
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    guard.add_time(time_count.into());
+                    let target = guard.time_at(sync_tick).saturating_add(i64::from(time_count));
+                    guard.set_time_from_sync(target.max(0), sync_tick);
                     let total_ticks = guard.time_of_day;
                     (guard.clone(), total_ticks)
                 };
+                world.store_cluster_time_model(
+                    level_time.double_day_counter,
+                    level_time.sync_time_offset,
+                );
                 level_time.send_time(world);
                 crate::server::cluster_world_time::publish_time_for_world(server, world);
                 context.source.send_feedback(
@@ -207,7 +231,9 @@ impl CommandExecutor for ActionExecutor {
                         .level_time
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    guard.set_paused(true);
+                    if !server.advanced_config.cluster.enabled {
+                        guard.set_paused(true);
+                    }
                     guard.clone()
                 };
                 level_time.send_time(world);
@@ -228,7 +254,9 @@ impl CommandExecutor for ActionExecutor {
                         .level_time
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    guard.set_paused(false);
+                    if !server.advanced_config.cluster.enabled {
+                        guard.set_paused(false);
+                    }
                     guard.clone()
                 };
                 level_time.send_time(world);
@@ -250,7 +278,9 @@ impl CommandExecutor for ActionExecutor {
                         .level_time
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    guard.set_rate(rate);
+                    if !server.advanced_config.cluster.enabled {
+                        guard.set_rate(rate);
+                    }
                     guard.clone()
                 };
                 level_time.send_time(world);

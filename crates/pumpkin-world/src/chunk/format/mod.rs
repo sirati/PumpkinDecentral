@@ -769,7 +769,7 @@ impl ChunkEntityData {
         Ok(Self {
             x: position.x,
             z: position.y,
-            data: std::sync::Mutex::new(entities),
+            data: arc_swap::ArcSwap::from_pointee(entities),
             dirty: AtomicBool::new(false),
         })
     }
@@ -781,10 +781,8 @@ impl ChunkEntityData {
             "Position",
             pumpkin_nbt::tag::NbtTag::IntArray(vec![self.x, self.z]),
         );
-        let entities_tag: Vec<pumpkin_nbt::tag::NbtTag> = self
-            .data
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        let entities = self.data.load();
+        let entities_tag: Vec<pumpkin_nbt::tag::NbtTag> = entities
             .iter()
             .map(|c| pumpkin_nbt::tag::NbtTag::Compound(c.clone()))
             .collect();
@@ -980,6 +978,26 @@ mod tests {
             pumpkin_data::biome::Biome::from_name("the_void")
                 .unwrap()
                 .id
+        );
+    }
+
+    #[test]
+    fn entity_chunk_snapshot_roundtrips() {
+        let mut entity = NbtCompound::new();
+        entity.put_string("id", "minecraft:item".to_owned());
+        let chunk = ChunkEntityData {
+            x: 3,
+            z: -2,
+            data: arc_swap::ArcSwap::from_pointee(vec![entity]),
+            dirty: AtomicBool::new(false),
+        };
+        let bytes = chunk.internal_to_bytes();
+        let decoded = ChunkEntityData::internal_from_bytes(&bytes, Vector2::new(3, -2))
+            .expect("entity chunk decodes");
+        assert_eq!(decoded.data.load().len(), 1);
+        assert_eq!(
+            decoded.data.load()[0].get_string("id"),
+            Some("minecraft:item")
         );
     }
 }

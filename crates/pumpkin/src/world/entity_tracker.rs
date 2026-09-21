@@ -98,7 +98,7 @@ impl TrackedEntity {
     }
 
     pub fn update_player(&self, player: &Arc<Player>, _world: &World) {
-        if player.get_entity().entity_id == self.entity_id {
+        if player.client.is_none() || player.get_entity().entity_id == self.entity_id {
             return;
         }
 
@@ -123,6 +123,7 @@ impl TrackedEntity {
         // Vanilla `isChunkTracked`: never spawn before the chunk packet.
         let is_visible = dist_sq <= range_sq
             && self.broadcast_to_player(player)
+            && crate::server::cluster_hide::entity_visible_to(player, self.entity.as_ref())
             && in_view
             && player
                 .chunk_sender
@@ -147,7 +148,10 @@ impl TrackedEntity {
 
     #[allow(clippy::too_many_lines)]
     pub fn add_pairing(&self, player: &Arc<Player>) {
-        player.client.try_enqueue_spawn_packet(&self.entity);
+        let Some(player_client) = player.client.as_deref() else {
+            return;
+        };
+        player_client.try_enqueue_spawn_packet(&self.entity);
         player.try_restore_vehicle(&self.entity);
 
         if let Some(target_player) = self.entity.get_player() {
@@ -155,7 +159,7 @@ impl TrackedEntity {
             let target_entity = target_player.get_entity();
             let target_id = target_entity.entity_id;
 
-            if let ClientPlatform::Java(client) = player.client.as_ref() {
+            if let Some(ClientPlatform::Java(client)) = player.client.as_deref() {
                 let version = client.version.load();
                 if version >= JavaMinecraftVersion::V_1_21 {
                     let mut buf = Vec::new();
@@ -190,7 +194,7 @@ impl TrackedEntity {
                 }
             }
         } else if self.entity.get_living_entity().is_some()
-            && let ClientPlatform::Java(client) = player.client.as_ref()
+            && let Some(ClientPlatform::Java(client)) = player.client.as_deref()
         {
             let head_yaw = self.entity.get_entity().head_yaw.load();
             let head_rot_packet = CHeadRot::new(
@@ -204,7 +208,7 @@ impl TrackedEntity {
 
         let vel = self.entity.get_entity().velocity.load();
         if vel.length_squared() > 1e-4
-            && let ClientPlatform::Java(client) = player.client.as_ref()
+            && let Some(ClientPlatform::Java(client)) = player.client.as_deref()
         {
             let motion = CEntityVelocity::new(self.entity_id.into(), vel);
             if let Ok(data) = client.serialize_packet(&motion) {
@@ -212,7 +216,7 @@ impl TrackedEntity {
             }
         }
 
-        if let ClientPlatform::Java(client) = player.client.as_ref() {
+        if let Some(ClientPlatform::Java(client)) = player.client.as_deref() {
             let version = client.version.load();
             // TODO: Support older versions
             if version >= JavaMinecraftVersion::V_1_21
@@ -245,7 +249,7 @@ impl TrackedEntity {
                     .map(|(slot, stack)| (*slot, ItemStackSerializer::from(stack.clone())))
                     .collect();
                 let packet = CSetEquipment::new(self.entity_id.into(), equipment);
-                if let ClientPlatform::Java(client) = player.client.as_ref()
+                if let Some(ClientPlatform::Java(client)) = player.client.as_deref()
                     && let Ok(data) = client.serialize_packet(&packet)
                 {
                     client.try_enqueue_packet(data);
@@ -261,7 +265,7 @@ impl TrackedEntity {
                 .map(|p| VarInt(p.get_entity().entity_id))
                 .collect();
             let packet = CSetPassengers::new(VarInt(self.entity_id), &passenger_ids);
-            if let ClientPlatform::Java(client) = player.client.as_ref()
+            if let Some(ClientPlatform::Java(client)) = player.client.as_deref()
                 && let Ok(data) = client.serialize_packet(&packet)
             {
                 client.try_enqueue_packet(data);
@@ -278,7 +282,7 @@ impl TrackedEntity {
                 .collect();
             let packet =
                 CSetPassengers::new(VarInt(vehicle.get_entity().entity_id), &passenger_ids);
-            if let ClientPlatform::Java(client) = player.client.as_ref()
+            if let Some(ClientPlatform::Java(client)) = player.client.as_deref()
                 && let Ok(data) = client.serialize_packet(&packet)
             {
                 client.try_enqueue_packet(data);
@@ -288,19 +292,20 @@ impl TrackedEntity {
 
     pub fn remove_pairing(&self, player: &Player) {
         let entity_ids = [self.entity_id.into()];
-        match player.client.as_ref() {
-            ClientPlatform::Java(client) => {
+        match player.client.as_deref() {
+            Some(ClientPlatform::Java(client)) => {
                 let packet = CRemoveEntities::new(&entity_ids);
                 if let Ok(data) = client.serialize_packet(&packet) {
                     client.try_enqueue_packet(data);
                 }
             }
-            ClientPlatform::Bedrock(client) => {
+            Some(ClientPlatform::Bedrock(client)) => {
                 let packet = CRemoveActor::new(VarLong(i64::from(self.entity_id)));
                 if let Ok(data) = client.serialize_packet(&packet) {
                     client.try_enqueue_packet(data);
                 }
             }
+            None => {}
         }
     }
 
@@ -317,9 +322,10 @@ impl TrackedEntity {
         let mut java_recipients = Vec::new();
         let mut bedrock_recipients = Vec::new();
         for p in recipients {
-            match p.client.as_ref() {
-                ClientPlatform::Java(_) => java_recipients.push(p),
-                ClientPlatform::Bedrock(be_client) => bedrock_recipients.push(be_client),
+            match p.client.as_deref() {
+                Some(ClientPlatform::Java(_)) => java_recipients.push(p),
+                Some(ClientPlatform::Bedrock(be_client)) => bedrock_recipients.push(be_client),
+                None => {}
             }
         }
         let recipients_by_version =
@@ -354,7 +360,7 @@ impl TrackedEntity {
         let players = world.players.load();
         let recipients = players.iter().filter_map(|p| {
             if self.seen_by.contains(&p.gameprofile.id)
-                && let ClientPlatform::Bedrock(client) = p.client.as_ref()
+                && let Some(ClientPlatform::Bedrock(client)) = p.client.as_deref()
             {
                 return Some(client);
             }
@@ -377,9 +383,10 @@ impl TrackedEntity {
         let mut java_recipients = Vec::new();
         let mut bedrock_recipients = Vec::new();
         for p in recipients {
-            match p.client.as_ref() {
-                ClientPlatform::Java(_) => java_recipients.push(p),
-                ClientPlatform::Bedrock(be_client) => bedrock_recipients.push(be_client),
+            match p.client.as_deref() {
+                Some(ClientPlatform::Java(_)) => java_recipients.push(p),
+                Some(ClientPlatform::Bedrock(be_client)) => bedrock_recipients.push(be_client),
+                None => {}
             }
         }
         let recipients_by_version =
@@ -447,9 +454,10 @@ impl TrackedEntity {
         let mut java_recipients = Vec::new();
         let mut bedrock_recipients = Vec::new();
         for p in recipients {
-            match p.client.as_ref() {
-                ClientPlatform::Java(_) => java_recipients.push(p),
-                ClientPlatform::Bedrock(be_client) => bedrock_recipients.push(be_client),
+            match p.client.as_deref() {
+                Some(ClientPlatform::Java(_)) => java_recipients.push(p),
+                Some(ClientPlatform::Bedrock(be_client)) => bedrock_recipients.push(be_client),
+                None => {}
             }
         }
         let recipients_by_version =
@@ -601,6 +609,14 @@ impl EntityTracker {
             let players = world.players.load();
             tracked.update_players(players.as_ref(), world);
         }
+    }
+
+    pub fn reconcile_entity_visibility(&self, entity_id: i32, world: &World) {
+        let Some(tracked) = self.get_tracked_entity(entity_id) else {
+            return;
+        };
+        let players = world.players.load();
+        tracked.update_players(players.as_ref(), world);
     }
 
     pub fn update_all(&self, world: &World) {

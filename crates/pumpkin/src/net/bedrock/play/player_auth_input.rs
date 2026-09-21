@@ -22,12 +22,21 @@ impl BedrockClient {
         let on_ground = packet.input_data.get(InputData::VerticalCollision as usize)
             && packet.delta.y < 0.0
             && !entity.has_vehicle();
-        entity.on_ground.store(on_ground, Ordering::Relaxed);
 
-        let new_pos = packet
+        let requested_pos = packet
             .position
             .add_raw(0.0, -entity.entity_type.eye_height, 0.0)
             .to_f64();
+        let correction = match crate::server::cluster_loaded_player_boundary::correct(player, requested_pos) {
+            crate::server::cluster_loaded_player_boundary::LocalMovementBoundary::Unchanged => None,
+            crate::server::cluster_loaded_player_boundary::LocalMovementBoundary::Corrected(correction) => Some(correction),
+            crate::server::cluster_loaded_player_boundary::LocalMovementBoundary::Rejected { fall_distance_bits } => {
+                player.living_entity.fall_distance.store(f32::from_bits(fall_distance_bits));
+                return;
+            }
+        };
+        let new_pos = correction.map_or(requested_pos, |correction| correction.position);
+        entity.on_ground.store(on_ground, Ordering::Relaxed);
         let old_pos = player.position();
 
         let new_pitch = packet.pitch;
@@ -148,6 +157,13 @@ impl BedrockClient {
                 player.check_location_enchantments(new_pos, on_ground);
                 player.progress_motion(delta);
             }
+        }
+        if let Some(correction) = correction {
+            player
+                .living_entity
+                .fall_distance
+                .store(f32::from_bits(correction.fall_distance_bits));
+            player.correct_cluster_loaded_chunk_boundary(new_pos);
         }
 
         let input_data = packet.input_data;

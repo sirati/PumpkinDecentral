@@ -6,7 +6,7 @@ use crate::command::argument_types::entity_selector::parser::{
 use crate::command::context::command_context::CommandContext;
 use crate::command::context::command_source::CommandSource;
 use crate::command::errors::command_syntax_error::CommandSyntaxError;
-use crate::command::errors::error_types::CommandErrorType;
+use crate::command::errors::error_types::{CommandErrorType, LiteralCommandErrorType};
 use crate::command::string_reader::StringReader;
 use crate::command::suggestion::suggestions::{Suggestions, SuggestionsBuilder};
 use crate::entity::EntityBase;
@@ -44,6 +44,9 @@ pub const NOT_SINGLE_PLAYER_ERROR_TYPE: CommandErrorType<0> = CommandErrorType::
     translation::java::ARGUMENT_PLAYER_TOOMANY,
 );
 
+pub const CLUSTER_LOBBY_ENTITY_ERROR_TYPE: LiteralCommandErrorType =
+    LiteralCommandErrorType::new("That player is still in the cluster lobby and has no game entity");
+
 pub const ENTITY_SELECTOR_PERMISSION: &str = "minecraft:command.selector";
 
 /// Represents an argument type used to select entities.
@@ -70,6 +73,18 @@ pub enum EntityArgumentType {
 }
 
 impl EntityArgumentType {
+    fn lobby_entity_error(
+        context: &CommandContext<'_>,
+        name: &str,
+    ) -> Option<CommandSyntaxError> {
+        context
+            .source
+            .server
+            .as_ref()
+            .is_some_and(|server| server.player_in_cluster_lobby(name))
+            .then(|| CLUSTER_LOBBY_ENTITY_ERROR_TYPE.create_without_context())
+    }
+
     const fn is_single(self) -> bool {
         matches!(self, Self::Entity | Self::Player)
     }
@@ -154,9 +169,15 @@ impl EntityArgumentType {
         context: &CommandContext<'_>,
         name: &str,
     ) -> Result<Arc<dyn EntityBase>, CommandSyntaxError> {
-        context
-            .get_argument::<EntitySelector>(name)?
-            .find_single_entity(context.source.as_ref())
+        let selector = context.get_argument::<EntitySelector>(name)?;
+        match selector.find_single_entity(context.source.as_ref()) {
+            Ok(entity) => Ok(entity),
+            Err(error) => selector
+                .player_name
+                .as_deref()
+                .and_then(|player_name| Self::lobby_entity_error(context, player_name))
+                .map_or(Err(error), Err),
+        }
     }
 
     /// Tries to get at least 1 entity from a parsed argument of the provided [`CommandContext`].
@@ -166,7 +187,15 @@ impl EntityArgumentType {
     ) -> Result<Vec<Arc<dyn EntityBase>>, CommandSyntaxError> {
         let entities = Self::get_optional_entities(context, name)?;
         if entities.is_empty() {
-            Err(NO_ENTITIES_ERROR_TYPE.create_without_context())
+            let selector = context.get_argument::<EntitySelector>(name)?;
+            selector
+                .player_name
+                .as_deref()
+                .and_then(|player_name| Self::lobby_entity_error(context, player_name))
+                .map_or_else(
+                    || Err(NO_ENTITIES_ERROR_TYPE.create_without_context()),
+                    Err,
+                )
         } else {
             Ok(entities)
         }
@@ -187,9 +216,15 @@ impl EntityArgumentType {
         context: &CommandContext<'_>,
         name: &str,
     ) -> Result<Arc<Player>, CommandSyntaxError> {
-        context
-            .get_argument::<EntitySelector>(name)?
-            .find_single_player(context.source.as_ref())
+        let selector = context.get_argument::<EntitySelector>(name)?;
+        match selector.find_single_player(context.source.as_ref()) {
+            Ok(player) => Ok(player),
+            Err(error) => selector
+                .player_name
+                .as_deref()
+                .and_then(|player_name| Self::lobby_entity_error(context, player_name))
+                .map_or(Err(error), Err),
+        }
     }
 
     /// Tries to get at least 1 player from a parsed argument of the provided [`CommandContext`].
@@ -199,7 +234,15 @@ impl EntityArgumentType {
     ) -> Result<Vec<Arc<Player>>, CommandSyntaxError> {
         let players = Self::get_optional_players(context, name)?;
         if players.is_empty() {
-            Err(NO_PLAYERS_ERROR_TYPE.create_without_context())
+            let selector = context.get_argument::<EntitySelector>(name)?;
+            selector
+                .player_name
+                .as_deref()
+                .and_then(|player_name| Self::lobby_entity_error(context, player_name))
+                .map_or_else(
+                    || Err(NO_PLAYERS_ERROR_TYPE.create_without_context()),
+                    Err,
+                )
         } else {
             Ok(players)
         }

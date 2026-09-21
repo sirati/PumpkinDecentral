@@ -1,6 +1,30 @@
+use pumpkin_cluster::time::{TICKS_PER_WRAP, TickStamp};
 use pumpkin_protocol::{bedrock::client::set_time::CSetTime, java::client::play::CUpdateTime};
 
 use super::World;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClusterTimeModel {
+    pub double_day_counter: u16,
+    pub sync_time_offset: i16,
+}
+
+impl ClusterTimeModel {
+    #[must_use]
+    pub const fn new(double_day_counter: u16, sync_time_offset: i16) -> Self {
+        Self {
+            double_day_counter,
+            sync_time_offset,
+        }
+    }
+
+    #[must_use]
+    pub const fn time_at(self, sync_tick: TickStamp) -> i64 {
+        self.double_day_counter as i64 * TICKS_PER_WRAP
+            + sync_tick.0 as i64
+            + self.sync_time_offset as i64
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClockInstance {
@@ -81,6 +105,10 @@ pub struct LevelTime {
     pub partial_tick: f32,
     pub rate: f32,
     pub paused: bool,
+    pub double_day_counter: u16,
+    pub sync_time_offset: i16,
+    legacy_time_of_day: Option<i64>,
+    last_sync_tick: Option<TickStamp>,
 }
 
 impl Default for LevelTime {
@@ -98,6 +126,10 @@ impl LevelTime {
             partial_tick: 0.0,
             rate: 1.0,
             paused: false,
+            double_day_counter: 0,
+            sync_time_offset: 0,
+            legacy_time_of_day: None,
+            last_sync_tick: None,
         }
     }
 
@@ -106,14 +138,75 @@ impl LevelTime {
         self.world_age = world_age;
     }
 
-    pub fn tick(&mut self, advance_time: bool) {
+    #[must_use]
+    pub fn from_persisted(
+        double_day_counter: u16,
+        sync_time_offset: i16,
+        legacy_time_of_day: Option<i64>,
+    ) -> Self {
+        let mut time = Self::new();
+        time.double_day_counter = double_day_counter;
+        time.sync_time_offset = sync_time_offset;
+        time.legacy_time_of_day = legacy_time_of_day;
+        time.time_of_day = time.time_at(TickStamp(0));
+        time
+    }
+
+    pub fn tick(
+        &mut self,
+        advance_time: bool,
+        sync_tick: Option<TickStamp>,
+        sync_driven: bool,
+    ) -> bool {
         self.world_age += 1;
+        if sync_driven {
+            let Some(sync_tick) = sync_tick else {
+                return false;
+            };
+            let migrated = self.legacy_time_of_day.take().is_some_and(|time_of_day| {
+                self.set_time_from_sync(time_of_day, sync_tick);
+                true
+            });
+            let advanced = self.last_sync_tick.is_some_and(|previous| {
+                sync_tick.0 < previous.0
+                    && sync_tick.distance_since(previous) < (TICKS_PER_WRAP as u16 / 2)
+            });
+            if advanced {
+                self.double_day_counter = self.double_day_counter.wrapping_add(1);
+            }
+            self.last_sync_tick = Some(sync_tick);
+            self.time_of_day = self.time_at(sync_tick);
+            self.partial_tick = 0.0;
+            self.rate = 1.0;
+            self.paused = false;
+            return migrated || advanced;
+        }
         if advance_time && !self.paused {
             self.partial_tick += self.rate;
             let full_ticks = self.partial_tick.floor() as i32;
             self.partial_tick -= full_ticks as f32;
             self.time_of_day += full_ticks as i64;
         }
+        false
+    }
+
+    #[must_use]
+    pub const fn time_at(&self, sync_tick: TickStamp) -> i64 {
+        ClusterTimeModel::new(self.double_day_counter, self.sync_time_offset).time_at(sync_tick)
+    }
+
+    pub fn set_time_from_sync(&mut self, time_of_day: i64, sync_tick: TickStamp) {
+        let relative = time_of_day.saturating_sub(sync_tick.0 as i64);
+        let double_days = relative
+            .saturating_add(TICKS_PER_WRAP / 2)
+            .div_euclid(TICKS_PER_WRAP);
+        let offset = relative.saturating_sub(double_days.saturating_mul(TICKS_PER_WRAP));
+        self.double_day_counter = double_days.rem_euclid(u16::MAX as i64 + 1) as u16;
+        self.sync_time_offset = offset as i16;
+        self.legacy_time_of_day = None;
+        self.last_sync_tick = Some(sync_tick);
+        self.time_of_day = self.time_at(sync_tick);
+        self.partial_tick = 0.0;
     }
 
     pub fn send_time(&self, world: &World) {
@@ -122,19 +215,21 @@ impl LevelTime {
             lock.game_rules.advance_time
         };
 
-        let (total_ticks, partial_tick, rate) = self.pack_network_state(advance_time);
+        let synced_time = world
+            .server
+            .upgrade()
+            .filter(|server| server.advanced_config.cluster.enabled)
+            .and_then(|_| crate::server::cluster::disciplined_tick_now())
+            .map(|sync_tick| self.time_at(sync_tick));
+        let (total_ticks, partial_tick, rate) = synced_time.map_or_else(
+            || self.pack_network_state(advance_time),
+            |time_of_day| (time_of_day, 0.0, 1.0),
+        );
 
-        let lobby_waiters: Vec<_> = world
-            .players
-            .load()
-            .iter()
-            .filter(|player| player.is_in_cluster_lobby())
-            .map(|player| player.gameprofile.id)
-            .collect();
         world.broadcast_packet_except_editioned(
-            &lobby_waiters,
+            &[],
             &CUpdateTime::new_clock(self.world_age, 0, total_ticks, partial_tick, rate),
-            &CSetTime::new(self.time_of_day as _), // TODO do we need to tell bedrock that time is frozen?
+            &CSetTime::new(total_ticks as _), // TODO do we need to tell bedrock that time is frozen?
         );
     }
 
@@ -180,6 +275,43 @@ impl LevelTime {
     #[must_use]
     pub const fn is_night(&self) -> bool {
         (self.time_of_day % 24000) >= 12000 && (self.time_of_day % 24000) <= 23999
+    }
+}
+
+impl World {
+    pub fn store_cluster_time_model(&self, double_day_counter: u16, sync_time_offset: i16) {
+        self.cluster_time_model.store(std::sync::Arc::new(ClusterTimeModel::new(
+            double_day_counter,
+            sync_time_offset,
+        )));
+    }
+
+    #[must_use]
+    pub fn cluster_time_model(&self) -> ClusterTimeModel {
+        **self.cluster_time_model.load()
+    }
+
+    pub fn send_cluster_time(&self) {
+        let Some(sync_tick) = self
+            .server
+            .upgrade()
+            .filter(|server| server.advanced_config.cluster.enabled)
+            .and_then(|_| crate::server::cluster::disciplined_tick_now())
+        else {
+            return;
+        };
+        let time_of_day = self.cluster_time_model().time_at(sync_tick);
+        self.broadcast_packet_except_editioned(
+            &[],
+            &CUpdateTime::new_clock(
+                self.cluster_world_age.load(std::sync::atomic::Ordering::Acquire),
+                0,
+                time_of_day,
+                0.0,
+                1.0,
+            ),
+            &CSetTime::new(time_of_day as _),
+        );
     }
 }
 
@@ -233,5 +365,36 @@ mod tests {
 
         time.add_time(-2000);
         assert_eq!(time.time_of_day, 0);
+    }
+
+    #[test]
+    fn sync_time_uses_double_day_counter_and_offset() {
+        let time = LevelTime::from_persisted(3, -1200, None);
+        assert_eq!(time.time_at(TickStamp(2400)), 145_200);
+    }
+
+    #[test]
+    fn setting_sync_time_keeps_the_requested_time() {
+        let mut time = LevelTime::new();
+        let tick = TickStamp(47_500);
+        time.set_time_from_sync(123_456, tick);
+        assert_eq!(time.time_at(tick), 123_456);
+        assert!((-24_000..24_000).contains(&i32::from(time.sync_time_offset)));
+    }
+
+    #[test]
+    fn legacy_time_is_migrated_on_first_sync_tick() {
+        let mut time = LevelTime::from_persisted(0, 0, Some(96_123));
+        assert!(time.tick(true, Some(TickStamp(123)), true));
+        assert_eq!(time.time_at(TickStamp(123)), 96_123);
+    }
+
+    #[test]
+    fn sync_wrap_advances_the_persisted_double_day() {
+        let mut time = LevelTime::from_persisted(4, 0, None);
+        assert!(!time.tick(true, Some(TickStamp(47_999)), true));
+        assert!(time.tick(true, Some(TickStamp(0)), true));
+        assert_eq!(time.double_day_counter, 5);
+        assert_eq!(time.time_of_day, 240_000);
     }
 }

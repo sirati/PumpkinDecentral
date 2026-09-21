@@ -1,5 +1,6 @@
 use crate::chunk::format::LightContainer;
 use crate::tick::scheduler::ChunkTickScheduler;
+use arc_swap::ArcSwap;
 use palette::{BiomePalette, BlockPalette, has_random_ticking_fluid};
 use pumpkin_data::block_properties::{blocks_movement, has_random_ticks, is_air};
 use pumpkin_data::chunk::ChunkStatus;
@@ -89,7 +90,7 @@ pub struct ChunkEntityData {
     pub x: i32,
     /// Chunk Z
     pub z: i32,
-    pub data: std::sync::Mutex<Vec<NbtCompound>>,
+    pub data: ArcSwap<Vec<NbtCompound>>,
 
     pub dirty: AtomicBool,
 }

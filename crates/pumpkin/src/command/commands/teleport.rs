@@ -11,7 +11,6 @@ use crate::command::argument_builder::{ArgumentBuilder, argument, command, liter
 use crate::command::argument_types::coordinates::rotation::RotationArgumentType;
 use crate::command::argument_types::coordinates::vec3::Vec3ArgumentType;
 use crate::command::argument_types::entity::EntityArgumentType;
-use crate::command::argument_types::entity_selector::EntitySelector;
 use crate::command::argument_types::entity_anchor::{
     EntityAnchor, EntityAnchorArgumentType, EntityAnchorExt,
 };
@@ -65,21 +64,6 @@ struct TeleportDestination {
     display_name: TextComponent,
 }
 
-fn destination_or_lobby_error(
-    context: &CommandContext,
-    argument: &str,
-) -> Option<CommandExecutorResult> {
-    let selector = context.get_argument::<EntitySelector>(argument).ok()?;
-    let name = selector.player_name.as_deref()?;
-    if !crate::server::cluster_presence::remote_player_in_lobby(name) {
-        return None;
-    }
-    context.source.send_error(TextComponent::text(format!(
-        "{name} is currently in the lobby, and not in the game world"
-    )));
-    Some(Ok(0))
-}
-
 struct SelfToPosExecutor;
 
 impl CommandExecutor for SelfToPosExecutor {
@@ -120,24 +104,16 @@ impl CommandExecutor for SelfToEntityExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let entity = context.source.entity_or_err()?;
 
-        let destination = match EntityArgumentType::get_entity(context, "destination") {
-            Ok(destination) => {
-                let entity = destination.get_entity();
-                TeleportDestination {
-                    pos: entity.pos.load(),
-                    yaw: entity.yaw.load(),
-                    pitch: entity.pitch.load(),
-                    world: entity.world.load_full(),
-                    display_name: entity.get_display_name(),
-                }
+        let destination = EntityArgumentType::get_entity(context, "destination").map(|destination| {
+            let entity = destination.get_entity();
+            TeleportDestination {
+                pos: entity.pos.load(),
+                yaw: entity.yaw.load(),
+                pitch: entity.pitch.load(),
+                world: entity.world.load_full(),
+                display_name: entity.get_display_name(),
             }
-            Err(error) => {
-                if let Some(result) = destination_or_lobby_error(context, "destination") {
-                    return result;
-                }
-                return Err(error);
-            }
-        };
+        })?;
         let pos = destination.pos;
 
         if !World::is_valid(BlockPos(pos.floor_to_i32())) {
@@ -172,24 +148,16 @@ struct EntitiesToEntityExecutor;
 impl CommandExecutor for EntitiesToEntityExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let targets = EntityArgumentType::get_entities(context, "targets")?;
-        let destination = match EntityArgumentType::get_entity(context, "destination") {
-            Ok(destination) => {
-                let entity = destination.get_entity();
-                TeleportDestination {
-                    pos: entity.pos.load(),
-                    yaw: entity.yaw.load(),
-                    pitch: entity.pitch.load(),
-                    world: entity.world.load_full(),
-                    display_name: entity.get_display_name(),
-                }
+        let destination = EntityArgumentType::get_entity(context, "destination").map(|destination| {
+            let entity = destination.get_entity();
+            TeleportDestination {
+                pos: entity.pos.load(),
+                yaw: entity.yaw.load(),
+                pitch: entity.pitch.load(),
+                world: entity.world.load_full(),
+                display_name: entity.get_display_name(),
             }
-            Err(error) => {
-                if let Some(result) = destination_or_lobby_error(context, "destination") {
-                    return result;
-                }
-                return Err(error);
-            }
-        };
+        })?;
         let pos = destination.pos;
 
         if !World::is_valid(BlockPos(pos.floor_to_i32())) {

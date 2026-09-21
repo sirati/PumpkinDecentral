@@ -21,6 +21,7 @@ use pumpkin_util::math::position::BlockPos;
 use pumpkin_util::math::vector3::Vector3;
 use pumpkin_world::generation::generator::structure_finder::find_nearest_structure;
 use pumpkin_world::world::BlockFlags;
+use pumpkin_util::GameMode;
 
 use crate::entity::player::Player;
 
@@ -43,30 +44,21 @@ impl ItemBehaviour for EnderEyeItem {
         block: &Block,
         _server: &Server,
     ) -> BlockActionResult {
-        if block.id != BlockId::END_PORTAL_FRAME {
-            return BlockActionResult::Pass;
-        }
+        insert_eye(item, player, location, block, None)
+    }
 
-        let world = player.world();
-        let state_id = world.get_block_state_id(&location);
-
-        // Skip if the frame already holds an eye.
-        let mut props = EndPortalFrameLikeProperties::from_state_id(state_id);
-        if props.eye {
-            return BlockActionResult::Pass;
-        }
-        props.eye = true;
-        let new_state_id = props.to_state_id(block);
-
-        world.set_block_state(&location, new_state_id, BlockFlags::NOTIFY_LISTENERS);
-        // Consume one item.
-        item.decrement_unless_creative(player.gamemode.load(), 1);
-        world.sync_world_event(WorldEvent::EndPortalFrameFill, location, 0);
-
-        // Try to complete the portal.
-        EndPortal::get_new_portal(&world, location);
-
-        BlockActionResult::Success
+    fn use_on_block_from_slot(
+        &self,
+        item: &mut ItemStack,
+        player: &Player,
+        location: BlockPos,
+        _face: BlockDirection,
+        _cursor_pos: Vector3<f32>,
+        block: &Block,
+        _server: &Server,
+        slot: usize,
+    ) -> BlockActionResult {
+        insert_eye(item, player, location, block, Some(slot))
     }
 
     fn normal_use(&self, _item: &Item, player: &Player) {
@@ -128,6 +120,43 @@ impl ItemBehaviour for EnderEyeItem {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+}
+
+fn insert_eye(
+    item: &mut ItemStack,
+    player: &Player,
+    location: BlockPos,
+    block: &Block,
+    slot: Option<usize>,
+) -> BlockActionResult {
+    if block.id != BlockId::END_PORTAL_FRAME {
+        return BlockActionResult::Pass;
+    }
+    let world = player.world();
+    let state_id = world.get_block_state_id(&location);
+    let mut props = EndPortalFrameLikeProperties::from_state_id(state_id);
+    if props.eye {
+        return BlockActionResult::Pass;
+    }
+    props.eye = true;
+    let new_state_id = props.to_state_id(block);
+    let before = item.clone();
+    world.set_block_state(&location, new_state_id, BlockFlags::NOTIFY_LISTENERS);
+    if let Some(slot) = slot {
+        crate::server::cluster_world_delta::emit_end_eye_insert(
+            player,
+            &location,
+            state_id.as_u16(),
+            new_state_id.as_u16(),
+            slot,
+            &before,
+            player.gamemode.load() != GameMode::Creative,
+        );
+    }
+    item.decrement_unless_creative(player.gamemode.load(), 1);
+    world.sync_world_event(WorldEvent::EndPortalFrameFill, location, 0);
+    EndPortal::get_new_portal(&world, location);
+    BlockActionResult::Success
 }
 
 fn find_stronghold(world: &Arc<World>, origin: BlockPos) -> Option<BlockPos> {

@@ -40,7 +40,7 @@ fn parse_ip(target: &str, server: &Server) -> Option<IpAddr> {
                     player.gameprofile.name.eq_ignore_ascii_case(target)
                 })
             })
-            .map(|player| player.client.address().ip())
+            .and_then(|player| player.client.as_deref().map(|client| client.address().ip()))
     })
 }
 
@@ -82,7 +82,12 @@ fn ban_ip(context: &CommandContext, target: &str, reason: Option<String>) -> Com
     let players_to_kick: Vec<_> = server
         .get_all_players()
         .iter()
-        .filter(|player| player.client.address().ip() == target_ip)
+        .filter(|player| {
+            player
+                .client
+                .as_deref()
+                .is_some_and(|client| client.address().ip() == target_ip)
+        })
         .cloned()
         .collect();
 

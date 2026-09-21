@@ -7,7 +7,7 @@ use pumpkin_cluster::chat_sync::{
     encode_control_message, is_valid_chat_body, is_valid_chat_name, private_parcel_for_host,
     say_parcels_for_peers, team_parcels_for_peers,
 };
-use pumpkin_cluster::identity::{GlobalPlayerId, PlayerSlot, ServerId};
+use pumpkin_cluster::identity::{GlobalPlayerId, ServerId};
 use pumpkin_cluster::streams::{OutboundParcel, StreamHeader};
 use tokio::sync::mpsc;
 
@@ -73,11 +73,10 @@ pub fn broadcast_public_chat(sender: GlobalPlayerId, sender_name: &str, body: &s
     }
 }
 
-pub fn broadcast_public_chat_from_player(server: &Server, player: &Player, body: &str) {
-    let local = ServerId(server.advanced_config.cluster.server_id);
-    let sender = player
-        .cluster_gid()
-        .unwrap_or(GlobalPlayerId::new(local, PlayerSlot(0)));
+pub fn broadcast_public_chat_from_player(_server: &Server, player: &Player, body: &str) {
+    let Some(sender) = player.cluster_gid() else {
+        return;
+    };
     broadcast_public_chat(sender, &player.gameprofile.name, body);
 }
 
@@ -111,23 +110,16 @@ pub fn broadcast_emote_chat(broadcast: &EmoteChatBroadcast) -> u64 {
     sent
 }
 
-pub fn broadcast_emote_from_player(server: &Server, player: &Player, body: &str) {
-    let local = ServerId(server.advanced_config.cluster.server_id);
-    let sender = player
-        .cluster_gid()
-        .unwrap_or(GlobalPlayerId::new(local, PlayerSlot(0)));
+pub fn broadcast_emote_from_player(_server: &Server, player: &Player, body: &str) {
+    let Some(sender) = player.cluster_gid() else {
+        return;
+    };
     let broadcast = EmoteChatBroadcast::new(sender, player.gameprofile.name.clone(), body.to_string());
     broadcast_emote_chat(&broadcast);
 }
 
 pub fn broadcast_emote_from_console(server: &Server, sender_name: &str, body: &str) {
-    let local = ServerId(server.advanced_config.cluster.server_id);
-    let broadcast = EmoteChatBroadcast::new(
-        GlobalPlayerId::new(local, PlayerSlot(0)),
-        sender_name.to_string(),
-        body.to_string(),
-    );
-    broadcast_emote_chat(&broadcast);
+    let _ = (server, sender_name, body);
 }
 
 pub fn broadcast_say_chat(broadcast: &SayChatBroadcast) -> u64 {
@@ -160,23 +152,16 @@ pub fn broadcast_say_chat(broadcast: &SayChatBroadcast) -> u64 {
     sent
 }
 
-pub fn broadcast_say_from_player(server: &Server, player: &Player, body: &str) {
-    let local = ServerId(server.advanced_config.cluster.server_id);
-    let sender = player
-        .cluster_gid()
-        .unwrap_or(GlobalPlayerId::new(local, PlayerSlot(0)));
+pub fn broadcast_say_from_player(_server: &Server, player: &Player, body: &str) {
+    let Some(sender) = player.cluster_gid() else {
+        return;
+    };
     let broadcast = SayChatBroadcast::new(sender, player.gameprofile.name.clone(), body.to_string());
     broadcast_say_chat(&broadcast);
 }
 
 pub fn broadcast_say_from_console(server: &Server, sender_name: &str, body: &str) {
-    let local = ServerId(server.advanced_config.cluster.server_id);
-    let broadcast = SayChatBroadcast::new(
-        GlobalPlayerId::new(local, PlayerSlot(0)),
-        sender_name.to_string(),
-        body.to_string(),
-    );
-    broadcast_say_chat(&broadcast);
+    let _ = (server, sender_name, body);
 }
 
 #[must_use]
@@ -246,6 +231,7 @@ pub fn broadcast_team_chat(broadcast: &TeamChatBroadcast) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pumpkin_cluster::identity::PlayerSlot;
 
     #[test]
     fn broadcast_without_outbox_is_noop() {

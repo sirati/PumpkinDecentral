@@ -8,14 +8,15 @@
 //! the tick thread and takes no locks.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use pumpkin_cluster::banks::{FuseEnds, WorkerEnds, bank_pipes};
-use pumpkin_cluster::codec::encode_batch;
-use pumpkin_cluster::identity::{GlobalPlayerId, PlayerSeq, PlayerSlot, ServerId};
-use pumpkin_cluster::protocol::{PosUpdate, TickBatch};
+use pumpkin_cluster::identity::{GlobalPlayerId, PlayerSeq, ServerId};
+use pumpkin_cluster::protocol::{ChunkAddr, PosUpdate, TickBatch};
 use pumpkin_cluster::time::TickStamp;
+use pumpkin_util::math::vector3::Vector3;
 
 use crate::entity::player::Player;
 
@@ -27,6 +28,75 @@ thread_local! {
     static FUSED: RefCell<Option<FuseEnds>> = const { RefCell::new(None) };
     static SEQS: RefCell<HashMap<GlobalPlayerId, PlayerSeq>> =
         RefCell::new(HashMap::new());
+}
+
+static REMOTE_POSITIONS: std::sync::LazyLock<ArcSwap<BTreeMap<GlobalPlayerId, PosUpdate>>> =
+    std::sync::LazyLock::new(|| ArcSwap::from_pointee(BTreeMap::new()));
+
+fn update_is_fresh(candidate: &PosUpdate, current: &PosUpdate) -> bool {
+    candidate.tick.is_newer_than(current.tick) && candidate.seq.is_newer_than(current.seq)
+}
+
+fn position_chunk(update: &PosUpdate) -> Option<ChunkAddr> {
+    let [x, _, z] = update.pos;
+    if !update.pos.iter().all(|component| component.is_finite())
+        || !update.vel.iter().all(|component| component.is_finite())
+        || !update.yaw.is_finite()
+        || !update.pitch.is_finite()
+        || x < f64::from(i32::MIN)
+        || x > f64::from(i32::MAX)
+        || z < f64::from(i32::MIN)
+        || z > f64::from(i32::MAX)
+    {
+        return None;
+    }
+    Some(ChunkAddr {
+        x: (x.floor() as i32).div_euclid(16),
+        z: (z.floor() as i32).div_euclid(16),
+    })
+}
+
+pub fn observe_remote_pos(server: &Server, sender: ServerId, update: &PosUpdate) -> bool {
+    let local = ServerId(server.advanced_config.cluster.server_id);
+    if sender == local || update.gid.server != sender {
+        return false;
+    }
+    if super::cluster_presence::remote_presence_entry(update.gid)
+        .is_none_or(|entry| entry.in_lobby)
+    {
+        return false;
+    }
+    let Some(chunk) = position_chunk(update) else {
+        return false;
+    };
+    if !super::cluster::chunk_holders(chunk).contains(&local.0) {
+        return false;
+    }
+    let Some(player) = server
+        .get_all_players()
+        .into_iter()
+        .find(|player| player.cluster_gid() == Some(update.gid))
+    else {
+        return false;
+    };
+    let current = REMOTE_POSITIONS.load();
+    if current
+        .get(&update.gid)
+        .is_some_and(|seen| !update_is_fresh(update, seen))
+    {
+        return false;
+    }
+    let mut next = (**current).clone();
+    next.insert(update.gid, *update);
+    REMOTE_POSITIONS.store(Arc::new(next));
+    let entity = &player.living_entity.entity;
+    entity.set_pos(Vector3::new(update.pos[0], update.pos[1], update.pos[2]));
+    entity
+        .velocity
+        .store(Vector3::new(update.vel[0], update.vel[1], update.vel[2]));
+    entity.yaw.store(update.yaw);
+    entity.pitch.store(update.pitch);
+    true
 }
 
 fn ensure_worker() {
@@ -91,10 +161,22 @@ pub fn sample_local(
     yaw: f32,
     pitch: f32,
 ) {
+    sample_local_with_seq(gid, next_seq(gid), tick, pos, vel, yaw, pitch);
+}
+
+fn sample_local_with_seq(
+    gid: GlobalPlayerId,
+    seq: PlayerSeq,
+    tick: TickStamp,
+    pos: [f64; 3],
+    vel: [f64; 3],
+    yaw: f32,
+    pitch: f32,
+) {
     ensure_worker();
     let update = PosUpdate {
         gid,
-        seq: next_seq(gid),
+        seq,
         tick,
         pos,
         vel,
@@ -113,23 +195,23 @@ pub fn sample_local(
 }
 
 /// Samples one player's position, velocity and facing into the write bank.
-pub fn sample_player(player: &Player, server_id: u16, tick: TickStamp) {
-    let gid = player.cluster_gid().unwrap_or_else(|| {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let slot = player.living_entity.entity.entity_id as u16;
-        GlobalPlayerId::new(ServerId(server_id), PlayerSlot(slot))
-    });
+pub fn sample_player(player: &Player, tick: TickStamp) -> bool {
+    let Some(gid) = player.cluster_gid() else {
+        return false;
+    };
     let entity = &player.living_entity.entity;
     let pos = entity.pos.load();
     let vel = entity.velocity.load();
-    sample_local(
+    sample_local_with_seq(
         gid,
+        player.next_cluster_world_seq(),
         tick,
         [pos.x, pos.y, pos.z],
         [vel.x, vel.y, vel.z],
         entity.yaw.load(),
         entity.pitch.load(),
     );
+    true
 }
 
 /// Hands the filled write bank to the fuse side as a boxed bank over mpsc.
@@ -217,10 +299,7 @@ pub fn pump_movement_fuse(tick: TickStamp) {
     if batch.is_empty() {
         return;
     }
-    match encode_batch(&batch) {
-        Ok(bytes) => super::cluster::forward_movement_batch(bytes),
-        Err(error) => tracing::warn!(%error, "cluster movement fuse encode failed"),
-    }
+    super::cluster_datagram::forward_pos_updates(&batch.pos);
 }
 
 /// Samples every local player and hands the bank off. Call once per tick.
@@ -236,12 +315,18 @@ pub fn sample_server_tick(server: &Arc<Server>) -> usize {
         return 0;
     }
     ensure_worker();
-    let tick = TickStamp::now();
-    let server_id = server.advanced_config.cluster.server_id;
+    let players = server.get_all_players();
+    for player in &players {
+        player.capture_cluster_last_tick_movement();
+    }
+    let Some(tick) = super::cluster::disciplined_tick_now() else {
+        return 0;
+    };
     let mut sampled = 0;
-    for player in server.get_all_players() {
-        sample_player(&player, server_id, tick);
-        sampled += 1;
+    for player in players {
+        if sample_player(&player, tick) {
+            sampled += 1;
+        }
     }
     end_tick();
     pump_movement_fuse(tick);
@@ -251,6 +336,7 @@ pub fn sample_server_tick(server: &Arc<Server>) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pumpkin_cluster::identity::{PlayerSlot, ServerId};
 
     #[test]
     fn samples_land_in_write_bank() {
@@ -258,7 +344,7 @@ mod tests {
         let gid = GlobalPlayerId::new(ServerId(9), PlayerSlot(1));
         sample_local(
             gid,
-            TickStamp(7),
+            TickStamp::new(7),
             [1.0, 2.0, 3.0],
             [0.0; 3],
             90.0,

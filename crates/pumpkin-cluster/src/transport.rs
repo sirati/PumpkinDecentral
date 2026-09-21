@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
@@ -39,6 +40,8 @@ const LOCAL_CERT_SAN: &str = "pumpkin-mesh";
 const CHUNK_STREAM_PRIORITY: i32 = -16;
 
 const ROUTER_BUFFER: usize = 4096;
+
+static CHUNK_PAYLOAD_WRITE_LAST_MILLIS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportError {
@@ -108,7 +111,7 @@ pub struct TransportChannels {
     pub outbound_rx: mpsc::Receiver<OutboundParcel>,
     pub datagram_in_tx: mpsc::Sender<(ServerId, Vec<u8>)>,
     pub datagram_out_rx: mpsc::Receiver<(ServerId, Vec<u8>)>,
-    pub restart_tx: mpsc::Sender<ServerId>,
+    pub peer_ready_tx: mpsc::Sender<ServerId>,
 }
 
 #[derive(Debug)]
@@ -117,7 +120,7 @@ pub struct MeshChannels {
     pub outbound_tx: mpsc::Sender<OutboundParcel>,
     pub datagram_in_rx: mpsc::Receiver<(ServerId, Vec<u8>)>,
     pub datagram_out_tx: mpsc::Sender<(ServerId, Vec<u8>)>,
-    pub restart_rx: mpsc::Receiver<ServerId>,
+    pub peer_ready_rx: mpsc::Receiver<ServerId>,
 }
 
 #[must_use]
@@ -126,21 +129,21 @@ pub fn channel_pair(buffer: usize) -> (TransportChannels, MeshChannels) {
     let (outbound_tx, outbound_rx) = mpsc::channel(buffer);
     let (datagram_in_tx, datagram_in_rx) = mpsc::channel(buffer);
     let (datagram_out_tx, datagram_out_rx) = mpsc::channel(buffer);
-    let (restart_tx, restart_rx) = mpsc::channel(buffer);
+    let (peer_ready_tx, peer_ready_rx) = mpsc::channel(buffer);
     (
         TransportChannels {
             inbound_tx,
             outbound_rx,
             datagram_in_tx,
             datagram_out_rx,
-            restart_tx,
+            peer_ready_tx,
         },
         MeshChannels {
             inbound_rx,
             outbound_tx,
             datagram_in_rx,
             datagram_out_tx,
-            restart_rx,
+            peer_ready_rx,
         },
     )
 }
@@ -207,30 +210,29 @@ impl Transport {
             outbound_rx,
             datagram_in_tx,
             mut datagram_out_rx,
-            restart_tx,
+            peer_ready_tx,
         } = channels;
         let forward_tx = router_tx.clone();
         tokio::spawn(async move {
             let mut outbound_rx = outbound_rx;
             while let Some(parcel) = outbound_rx.recv().await {
-                if forward_tx.send(RouterMsg::Parcel(parcel)).await.is_err() {
-                    return;
+                if forward_tx.try_send(RouterMsg::Parcel(parcel)).is_err() {
+                    tracing::warn!("dropping cluster parcel because the router is unavailable");
                 }
             }
-            let _ = forward_tx.send(RouterMsg::OutboundClosed).await;
+            let _ = forward_tx.try_send(RouterMsg::OutboundClosed);
         });
         let datagram_tx = router_tx.clone();
         tokio::spawn(async move {
             while let Some((peer, payload)) = datagram_out_rx.recv().await {
                 if datagram_tx
-                    .send(RouterMsg::Datagram(peer, payload))
-                    .await
+                    .try_send(RouterMsg::Datagram(peer, payload))
                     .is_err()
                 {
-                    return;
+                    tracing::warn!("dropping cluster datagram because the router is unavailable");
                 }
             }
-            let _ = datagram_tx.send(RouterMsg::DatagramsClosed).await;
+            let _ = datagram_tx.try_send(RouterMsg::DatagramsClosed);
         });
         let mut connections: HashMap<ServerId, quinn::Connection> = HashMap::new();
         let mut streams: HashMap<StreamKey, quinn::SendStream> = HashMap::new();
@@ -252,9 +254,8 @@ impl Transport {
                         &inbound_tx,
                         &datagram_in_tx,
                     ) {
-                        if restart_tx.try_send(peer).is_err() {
-                            tracing::warn!(server = peer.0, "dropping a peer restart signal");
-                            let _ = restart_tx.send(peer).await;
+                        if peer_ready_tx.try_send(peer).is_err() {
+                            tracing::warn!(server = peer.0, "dropping a peer-ready signal");
                         }
                     }
                 }
@@ -603,13 +604,15 @@ async fn dial_loop(
         match established {
             Some(conn) => {
                 backoff = BASE_DIAL_BACKOFF;
-                if router_tx.send(RouterMsg::Connection(conn.clone())).await.is_err() {
-                    return;
+                if router_tx.try_send(RouterMsg::Connection(conn.clone())).is_err() {
+                    tracing::warn!(server = peer.server.0, "closing a newly established cluster connection because the router is unavailable");
+                    conn.close(quinn::VarInt::from_u32(0), b"router unavailable");
                 }
                 conn.closed().await;
                 tokio::time::sleep(BASE_DIAL_BACKOFF).await;
             }
             None => {
+                tracing::warn!(server = peer.server.0, "cluster connection attempt failed");
                 tokio::time::sleep(backoff).await;
                 backoff = core::cmp::min(backoff.saturating_add(backoff), MAX_DIAL_BACKOFF);
             }
@@ -625,7 +628,9 @@ async fn accept_loop(endpoint: quinn::Endpoint, router_tx: mpsc::Sender<RouterMs
         let sender = router_tx.clone();
         tokio::spawn(async move {
             if let Ok(conn) = incoming.await {
-                let _ = sender.send(RouterMsg::Connection(conn)).await;
+                if sender.try_send(RouterMsg::Connection(conn)).is_err() {
+                    tracing::warn!("dropping an accepted cluster connection because the router is unavailable");
+                }
             }
         });
     }
@@ -705,8 +710,8 @@ async fn serve_stream(
         match read_frame(&mut recv).await {
             Ok(Some(bytes)) => {
                 let parcel = InboundParcel { peer, header, bytes };
-                if inbound_tx.send(parcel).await.is_err() {
-                    return;
+                if inbound_tx.try_send(parcel).is_err() {
+                    tracing::warn!(server = peer.0, "dropping cluster parcel because the inbound queue is unavailable");
                 }
             }
             Ok(None) | Err(_) => return,
@@ -722,8 +727,8 @@ async fn serve_datagrams(
     loop {
         match conn.read_datagram().await {
             Ok(data) => {
-                if datagram_in_tx.send((peer, data.to_vec())).await.is_err() {
-                    return;
+                if datagram_in_tx.try_send((peer, data.to_vec())).is_err() {
+                    tracing::warn!(server = peer.0, "dropping cluster datagram because the inbound queue is unavailable");
                 }
             }
             Err(_) => return,
@@ -769,6 +774,37 @@ fn log_unavailable_datagram(
             tracing::debug!(server = peer.0, bytes, "dropping a datagram while the peer remains unavailable");
         }
     }
+}
+
+fn log_chunk_payload_write(parcel: &OutboundParcel) {
+    if parcel.header.kind != StreamKind::ChunkData {
+        return;
+    }
+    let Ok(payload) = crate::xfer::decode_payload(&parcel.bytes) else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|age| age.as_millis() as u64)
+        .unwrap_or(0);
+    let last = CHUNK_PAYLOAD_WRITE_LAST_MILLIS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 1_000
+        || CHUNK_PAYLOAD_WRITE_LAST_MILLIS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        return;
+    }
+    tracing::info!(
+        target: "cluster_chunk",
+        stage = "transport_chunk_payload_written",
+        chunk_x = payload.chunk.x,
+        chunk_z = payload.chunk.z,
+        source = payload.holder,
+        destination = parcel.peer.0,
+        payload_bytes = parcel.bytes.len(),
+        "cluster chunk payload was written to the QUIC stream"
+    );
 }
 
 async fn route_parcel(
@@ -823,6 +859,8 @@ async fn route_parcel(
         if let Err(error) = write_frame(send, &parcel.bytes).await {
             tracing::warn!(server = peer.0, kind = ?parcel.header.kind, bytes = parcel.bytes.len(), error = %error, "dropping a parcel after failing to write it");
             broken = true;
+        } else {
+            log_chunk_payload_write(&parcel);
         }
     }
     if broken {
@@ -1222,7 +1260,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first.bytes, vec![1]);
-        let linked = tokio::time::timeout(Duration::from_secs(10), mesh_b.restart_rx.recv())
+        let linked = tokio::time::timeout(Duration::from_secs(10), mesh_b.peer_ready_rx.recv())
             .await
             .unwrap()
             .unwrap();
@@ -1240,7 +1278,7 @@ mod tests {
         let (transport_a2, mesh_a2) = channel_pair(32);
         let endpoint_a2 = Transport::bind(config_a2, transport_a2).unwrap();
         let run_a2 = tokio::spawn(endpoint_a2.run());
-        let peer = tokio::time::timeout(Duration::from_secs(10), mesh_b.restart_rx.recv())
+        let peer = tokio::time::timeout(Duration::from_secs(10), mesh_b.peer_ready_rx.recv())
             .await
             .unwrap()
             .unwrap();

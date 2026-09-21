@@ -20,9 +20,9 @@ use tokio::sync::mpsc;
 
 use crate::inventory::InventoryOp;
 use crate::protocol::{
-    ArmorUpdate, BreakAnimUpdate, BreakBlockUpdate, EatAbortUpdate, EatStartUpdate,
-    FireProjectileUpdate, HeldUpdate, HitEntityUpdate, HitPlayerUpdate, PlaceBlockUpdate,
-    PosUpdate, SkinLayersUpdate, SneakUpdate, SprintUpdate, SwingUpdate, BlockingUpdate,
+    ArmorUpdate, BlockingUpdate, BreakAnimUpdate, BreakBlockUpdate, EatAbortUpdate, EatStartUpdate,
+    CapturedAttack, EntityMutationUpdate, FireProjectileUpdate, HeldUpdate,
+    PlaceBlockUpdate, PosUpdate, SkinLayersUpdate, SneakUpdate, SprintUpdate, SwingUpdate,
     TickBatch,
 };
 use crate::time::TickStamp;
@@ -51,9 +51,9 @@ pub struct Bank {
     pub break_block: Vec<BreakBlockUpdate>,
     pub place_block: Vec<PlaceBlockUpdate>,
     pub inv_ops: Vec<InventoryOp>,
-    pub hit_player: Vec<HitPlayerUpdate>,
-    pub hit_entity: Vec<HitEntityUpdate>,
+    pub attacks: Vec<CapturedAttack>,
     pub fire: Vec<FireProjectileUpdate>,
+    pub entity_mutations: Vec<EntityMutationUpdate>,
 }
 
 impl Bank {
@@ -78,9 +78,9 @@ impl Bank {
         self.break_block.clear();
         self.place_block.clear();
         self.inv_ops.clear();
-        self.hit_player.clear();
-        self.hit_entity.clear();
+        self.attacks.clear();
         self.fire.clear();
+        self.entity_mutations.clear();
     }
 
     #[must_use]
@@ -99,9 +99,9 @@ impl Bank {
             && self.break_block.is_empty()
             && self.place_block.is_empty()
             && self.inv_ops.is_empty()
-            && self.hit_player.is_empty()
-            && self.hit_entity.is_empty()
+            && self.attacks.is_empty()
             && self.fire.is_empty()
+            && self.entity_mutations.is_empty()
     }
 }
 
@@ -163,15 +163,13 @@ impl WorkerEnds {
         let mut next = match self.empty_rx.try_recv() {
             Ok(bank) => bank,
             Err(_) => {
-                self.counters.empty_missed =
-                    self.counters.empty_missed.saturating_add(1);
+                self.counters.empty_missed = self.counters.empty_missed.saturating_add(1);
                 Box::new(Bank::new())
             }
         };
         core::mem::swap(&mut self.bank, &mut next);
         if let Err(error) = self.full_tx.try_send(next) {
-            self.counters.fuse_backpressure =
-                self.counters.fuse_backpressure.saturating_add(1);
+            self.counters.fuse_backpressure = self.counters.fuse_backpressure.saturating_add(1);
             self.bank = error.into_inner();
             self.warn_slow_fuse();
         }
@@ -198,6 +196,7 @@ impl WorkerEnds {
 #[derive(Debug)]
 pub struct Fuse {
     pub last_lag_warn: Option<tokio::time::Instant>,
+    pub last_outbox_warn: Option<tokio::time::Instant>,
     pub lag_warnings: u64,
 }
 
@@ -206,6 +205,7 @@ impl Fuse {
     pub fn new() -> Self {
         Self {
             last_lag_warn: None,
+            last_outbox_warn: None,
             lag_warnings: 0,
         }
     }
@@ -225,8 +225,8 @@ impl Fuse {
             let batch = Self::drain(ends, tick);
             match crate::codec::encode_batch(&batch) {
                 Ok(bytes) => {
-                    if out_tx.send(bytes).await.is_err() {
-                        break;
+                    if out_tx.try_send(bytes).is_err() {
+                        self.warn_outbox_unavailable();
                     }
                 }
                 Err(error) => {
@@ -265,10 +265,19 @@ impl Fuse {
         if due {
             self.last_lag_warn = Some(now);
             self.lag_warnings = self.lag_warnings.saturating_add(1);
-            tracing::warn!(
-                pending_ticks,
-                "cluster fuse behind tick; ticks queuing"
-            );
+            tracing::warn!(pending_ticks, "cluster fuse behind tick; ticks queuing");
+        }
+    }
+
+    fn warn_outbox_unavailable(&mut self) {
+        let now = tokio::time::Instant::now();
+        let due = match self.last_outbox_warn {
+            None => true,
+            Some(last) => now.duration_since(last) >= SLOW_WARN_COOLDOWN,
+        };
+        if due {
+            self.last_outbox_warn = Some(now);
+            tracing::warn!("cluster fuse outbox unavailable; dropping fused tick");
         }
     }
 }

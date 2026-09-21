@@ -151,6 +151,7 @@ mod tests {
         let gid = GlobalPlayerId::new(ServerId(1), PlayerSlot(2));
         plan.push_equipment_correction(gid, 4, 11);
         let ghost = EntityRef {
+            origin: ServerId(1),
             owner: ServerId(1),
             local_id: 8,
             chunk: ChunkAddr { x: 0, z: 0 },

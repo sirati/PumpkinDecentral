@@ -281,6 +281,7 @@ fn level_data_from_nbt(data: &NbtCompound, seed: i64) -> LevelData {
     }
     if let Some(day_time) = data.get_long("DayTime") {
         level_data.day_time = day_time;
+        level_data.time_model_loaded = false;
     }
     if let Some(clear_weather_time) = data.get_int("clearWeatherTime") {
         level_data.clear_weather_time = clear_weather_time;
@@ -396,7 +397,16 @@ impl WorldInfoReader for AnvilLevelInfo {
         {
             let clocks = read_world_clocks(level_folder);
             if let Some(overworld) = clocks.clocks.get("minecraft:overworld") {
-                level_data.day_time = overworld.total_ticks;
+                level_data.double_day_counter = overworld.double_day_counter;
+                level_data.sync_time_offset = overworld.sync_time_offset;
+                if let Some(legacy_total_ticks) = overworld.legacy_total_ticks {
+                    level_data.day_time = legacy_total_ticks;
+                    level_data.time_model_loaded = false;
+                } else {
+                    level_data.time_model_loaded = true;
+                    level_data.day_time = i64::from(overworld.double_day_counter) * 48_000
+                        + i64::from(overworld.sync_time_offset);
+                }
             }
         }
 
@@ -462,15 +472,20 @@ impl WorldInfoWriter for AnvilLevelInfo {
             error!("Failed to write world_gen_settings.dat: {e}");
         }
 
-        // world_clocks.dat – persist the overworld day_time; preserve other
         let mut clocks = read_world_clocks(level_folder);
         clocks.data_version = data_version;
         clocks
             .clocks
             .entry("minecraft:overworld".to_string())
-            .and_modify(|c| c.total_ticks = info.day_time)
+            .and_modify(|clock| {
+                clock.double_day_counter = info.double_day_counter;
+                clock.sync_time_offset = info.sync_time_offset;
+                clock.legacy_total_ticks = None;
+            })
             .or_insert(crate::world_info::data_files::DimensionClock {
-                total_ticks: info.day_time,
+                double_day_counter: info.double_day_counter,
+                sync_time_offset: info.sync_time_offset,
+                legacy_total_ticks: None,
             });
 
         if let Err(e) = write_world_clocks(level_folder, &clocks) {
@@ -779,6 +794,7 @@ mod test {
         original.border_size = 2048.0;
         original.border_center_x = 8.0;
         original.day_time = 12_345;
+        original.sync_time_offset = 12_345;
         original.map_id = 3;
 
         AnvilLevelInfo
@@ -858,6 +874,9 @@ mod test {
             },
             data_version: 4189,
             day_time: 1727,
+            double_day_counter: 0,
+            sync_time_offset: 0,
+            time_model_loaded: true,
             difficulty: Difficulty::Normal,
             difficulty_locked: false,
             game_rules: GameRuleRegistry {
@@ -1060,8 +1079,16 @@ mod test {
                 .clocks
                 .get("minecraft:overworld")
                 .unwrap()
-                .total_ticks,
-            24000
+                .double_day_counter,
+            0
+        );
+        assert_eq!(
+            loaded_clocks
+                .clocks
+                .get("minecraft:overworld")
+                .unwrap()
+                .sync_time_offset,
+            0
         );
 
         // Verify wandering_trader.dat read

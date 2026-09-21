@@ -110,41 +110,33 @@ impl JavaClient {
                         held.get_max_use_time(),
                     );
                     if blocking {
-                        pumpkin_cluster::visual::emit_blocking(
-                            player.cluster_gid(),
-                            pumpkin_cluster::visual::tick_from_counter(
-                                player.tick_counter.load(Ordering::Relaxed),
-                            ),
-                            true,
-                        );
+                        if let Some(tick) = crate::server::cluster::disciplined_tick_now() {
+                            pumpkin_cluster::visual::emit_blocking(player.cluster_gid(), tick, true);
+                        }
                     }
                     #[allow(clippy::cast_possible_truncation)]
                     let eat_slot = match hand {
                         Hand::Right => inventory.get_selected_slot(),
                         Hand::Left => PlayerInventory::OFF_HAND_SLOT as u8,
                     };
-                    pumpkin_cluster::transient::emit_eat_start(
-                        player.cluster_gid(),
-                        pumpkin_cluster::transient::tick_from_counter(
-                            player.tick_counter.load(Ordering::Relaxed),
-                        ),
-                        eat_slot,
-                        held.item.id,
-                        held.item_count,
-                    );
+                    if let Some(tick) = crate::server::cluster::disciplined_tick_now() {
+                        pumpkin_cluster::transient::emit_eat_start(
+                            player.cluster_gid(),
+                            tick,
+                            eat_slot,
+                            held.item.id,
+                            held.item_count,
+                        );
+                    }
                 }
             } else {
                 player
                     .living_entity
                     .set_active_hand(hand, held.clone(), held.get_max_use_time());
                 if blocking {
-                    pumpkin_cluster::visual::emit_blocking(
-                        player.cluster_gid(),
-                        pumpkin_cluster::visual::tick_from_counter(
-                            player.tick_counter.load(Ordering::Relaxed),
-                        ),
-                        true,
-                    );
+                    if let Some(tick) = crate::server::cluster::disciplined_tick_now() {
+                        pumpkin_cluster::visual::emit_blocking(player.cluster_gid(), tick, true);
+                    }
                 }
             }
         }

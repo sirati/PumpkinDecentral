@@ -48,6 +48,7 @@ fn place_update(
         seq: PlayerSeq(seq),
         tick,
         pos: cell(),
+        expected_old_state: 0,
         new_state: state,
         inv: pumpkin_cluster::inventory::INV_MAIN,
         slot: 0,

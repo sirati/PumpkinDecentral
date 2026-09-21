@@ -32,12 +32,13 @@ write_stub() {
 enabled = true
 role = "$role"
 server_id = $sid
+primary_server_id = 0
 bind_addr = "$qbind"
 cert_path = "$ndir/cluster-cert.der"
 key_path = "$ndir/cluster-key.der"
 peers = [{ server_id = 1, addr = "$S1_BIND", pubkey_sha256_hex = "<paste from collect-pins.sh>" }, { server_id = 2, addr = "$S2_BIND", pubkey_sha256_hex = "<paste from collect-pins.sh>" }]
 ntp_servers = ["$ntp"]
-max_offset_millis = $HALF_TICK_MILLIS
+max_precision_millis = $HALF_TICK_MILLIS
 [networking.java]
 enabled = false
 [networking.bedrock]
@@ -56,12 +57,13 @@ TOML
 enabled = true
 role = "$role"
 server_id = $sid
+primary_server_id = 0
 bind_addr = "$qbind"
 cert_path = "$ndir/cluster-cert.der"
 key_path = "$ndir/cluster-key.der"
 $peer_line
 ntp_servers = ["$ntp"]
-max_offset_millis = $HALF_TICK_MILLIS
+max_precision_millis = $HALF_TICK_MILLIS
 [networking.java]
 enabled = true
 address = "$jip:$JAVA_PORT"
@@ -164,11 +166,11 @@ expect_val "networking.bedrock" "$S2CFG" "true" "node-2"
 expect_val "networking.bedrock.nethernet" "$S2CFG" "true" "node-2"
 expect_addr "networking.bedrock.nethernet" "$S2CFG" "$S2_BED" "node-2"
 expect_cluster "ntp_servers" "$PCFG" "[\"$EU_NTP\"]" "primary"
-expect_cluster "max_offset_millis" "$PCFG" "$HALF_TICK_MILLIS" "primary"
+expect_cluster "max_precision_millis" "$PCFG" "$HALF_TICK_MILLIS" "primary"
 expect_cluster "ntp_servers" "$S1CFG" "[\"$EU_NTP\"]" "node-1"
-expect_cluster "max_offset_millis" "$S1CFG" "$HALF_TICK_MILLIS" "node-1"
+expect_cluster "max_precision_millis" "$S1CFG" "$HALF_TICK_MILLIS" "node-1"
 expect_cluster "ntp_servers" "$S2CFG" "[\"$LAPTOP_NTP\"]" "node-2"
-expect_cluster "max_offset_millis" "$S2CFG" "$HALF_TICK_MILLIS" "node-2"
+expect_cluster "max_precision_millis" "$S2CFG" "$HALF_TICK_MILLIS" "node-2"
 check_mesh() {
   for self in 0 1 2; do
     cfg="$DIR/$(node_of "$self")/pumpkin.toml"

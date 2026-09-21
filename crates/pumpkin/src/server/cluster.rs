@@ -1,12 +1,12 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use pumpkin_cluster::accept::{Acceptor, decode_accept};
+use arc_swap::ArcSwap;
 use pumpkin_cluster::admin_sync::{
-    AdminControlMessage, AdminMutation, InMemoryBanStore, InMemoryOpStore, OpGrant, OpStore,
-    apply_mutation_to_stores, decode_control_message, mutation_parcels_for_peers,
+    AdminControlMessage, AdminMutation, InMemoryBanStore, InMemoryOpStore,
+    apply_mutation_to_stores, decode_control_message,
     submit_admin_mutation,
 };
 use pumpkin_cluster::chunks::{
@@ -26,23 +26,24 @@ use pumpkin_cluster::streams::{
 };
 use pumpkin_cluster::transport::{Transport, channel_pair, load_or_generate_keypair};
 use pumpkin_cluster::xfer::{
-    ChunkPayload, decode_announce, decode_payload, decode_request, encode_announce,
+    ChunkPayload, PendingRef, decode_announce, decode_payload, decode_request, encode_announce,
     encode_payload, encode_request,
 };
 use pumpkin_config::{ClusterConfig, ClusterRole};
+use pumpkin_data::chunk::ChunkStatus;
 use pumpkin_util::math::vector2::Vector2;
 use pumpkin_world::level::{
-    ClusterFetchRequest, ClusterLogoutGrace, cluster_decode_snapshot, cluster_encode_snapshot,
-    set_cluster_fetch_sender, set_cluster_has_peers, set_cluster_logout_sender,
-    set_cluster_secondary, set_cluster_unwant_sender,
+    ClusterChunkAvailability, ClusterFetchRequest, ClusterLogoutGrace, cluster_decode_snapshot,
+    cluster_encode_snapshot, set_cluster_chunk_availability_sender, set_cluster_fetch_sender,
+    set_cluster_has_peers, set_cluster_logout_sender, set_cluster_secondary,
+    set_cluster_unwant_sender,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
 use super::Server;
 use super::cluster_regions;
-use super::cluster_combat_apply::spawn_combat_apply;
-use super::cluster_entity_apply::{spawn_entity_apply, spawn_entity_datagram_apply};
+use super::cluster_entity_apply::spawn_entity_apply;
 use super::cluster_world_apply::spawn_world_apply;
 use super::cluster_transient::spawn_transient_apply;
 use super::cluster_visual::spawn_visual_apply;
@@ -56,14 +57,66 @@ static SERVED_CHUNKS: AtomicU64 = AtomicU64::new(0);
 static NTP_UNDISCIPLINED_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 static NTP_DISCIPLINE_STARTED: AtomicBool = AtomicBool::new(false);
 static CLUSTER_ADMITTED: AtomicBool = AtomicBool::new(false);
+static WORLD_TIME_BOOTSTRAPPED: AtomicBool = AtomicBool::new(false);
 static CLUSTER_LIFECYCLE_STATE: AtomicU64 = AtomicU64::new(0);
+static CLUSTER_ENABLED: AtomicBool = AtomicBool::new(false);
 static CLUSTER_MESH_READY: AtomicBool = AtomicBool::new(false);
 static CLUSTER_IS_PRIMARY: AtomicBool = AtomicBool::new(false);
 static CLUSTER_PENDING_SYNC: AtomicU64 = AtomicU64::new(0);
 static CLUSTER_INFLIGHT_FETCH: AtomicU64 = AtomicU64::new(0);
 static CLUSTER_DROPPED_SYNC: AtomicU64 = AtomicU64::new(0);
 static CLUSTER_HANDOFF_SENT: AtomicU64 = AtomicU64::new(0);
+static CHUNK_DIAGNOSTIC_LAST_MILLIS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 static LIFECYCLE_IN: std::sync::OnceLock<mpsc::Sender<LifecycleInput>> = std::sync::OnceLock::new();
+static CHUNK_HOLDER_DIRECTORY: std::sync::LazyLock<ArcSwap<BTreeMap<ChunkAddr, Vec<u16>>>> =
+    std::sync::LazyLock::new(|| ArcSwap::from_pointee(BTreeMap::new()));
+static CLUSTER_MEMBERS: std::sync::LazyLock<ArcSwap<BTreeSet<u16>>> =
+    std::sync::LazyLock::new(|| ArcSwap::from_pointee(BTreeSet::new()));
+
+#[must_use]
+pub fn chunk_holders(chunk: ChunkAddr) -> Vec<u16> {
+    CHUNK_HOLDER_DIRECTORY
+        .load()
+        .get(&chunk)
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[must_use]
+pub fn cluster_peer_admitted(peer: u16) -> bool {
+    CLUSTER_MEMBERS.load().contains(&peer)
+}
+
+fn admit_cluster_peer(peer: u16) {
+    CLUSTER_MEMBERS.rcu(|members| {
+        let mut next = (**members).clone();
+        next.insert(peer);
+        Arc::new(next)
+    });
+}
+
+fn remove_cluster_peer(peer: u16) {
+    CLUSTER_MEMBERS.rcu(|members| {
+        let mut next = (**members).clone();
+        next.remove(&peer);
+        Arc::new(next)
+    });
+}
+
+fn publish_chunk_holders(directory: &Directory) {
+    let mut snapshot = BTreeMap::new();
+    for chunk in directory.holders.keys() {
+        let holders: Vec<u16> = directory
+            .sorted_holders(chunk)
+            .into_iter()
+            .filter(|peer| cluster_peer_admitted(*peer))
+            .collect();
+        if !holders.is_empty() {
+            snapshot.insert(*chunk, holders);
+        }
+    }
+    CHUNK_HOLDER_DIRECTORY.store(Arc::new(snapshot));
+}
 
 #[must_use]
 pub fn disciplined_offset_millis() -> i64 {
@@ -79,6 +132,16 @@ pub fn disciplined_offset_millis() -> i64 {
 #[must_use]
 pub fn disciplined_tick_stamp(millis: i64) -> TickStamp {
     TickStamp::from_disciplined_millis(millis, disciplined_offset_millis())
+}
+
+#[must_use]
+pub fn disciplined_tick_now() -> Option<TickStamp> {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|age| i64::try_from(age.as_millis()).ok())?;
+    let offset = pumpkin_cluster::ntp::shared_offset_millis()?;
+    Some(TickStamp::from_disciplined_millis(millis, offset))
 }
 
 #[must_use]
@@ -99,14 +162,14 @@ fn start_ntp_discipline(server: &Server, config: &ClusterConfig) {
     if servers.is_empty() {
         servers.push(DEFAULT_NTP_SERVER.to_owned());
     }
-    let max_offset_millis = config.max_offset_millis;
-    let (sync, _) = NtpSync::new(NtpConfig::new(servers.clone(), max_offset_millis));
+    let max_precision_millis = config.max_precision_millis;
+    let (sync, _) = NtpSync::new(NtpConfig::new(servers.clone(), max_precision_millis));
     server.spawn_task(async move {
         sync.run().await;
     });
     info!(
         servers = servers.len(),
-        max_offset_millis, "cluster ntp discipline started"
+        max_precision_millis, "cluster ntp discipline started"
     );
 }
 
@@ -131,14 +194,38 @@ pub fn served_chunks() -> u64 {
 }
 
 #[must_use]
-pub fn cluster_player_join_allowed() -> bool {
-    if !CLUSTER_MESH_READY.load(Ordering::Relaxed) {
+pub fn cluster_real_world_handoff_allowed() -> bool {
+    if !CLUSTER_ENABLED.load(Ordering::Relaxed) {
         return true;
+    }
+    if !CLUSTER_MESH_READY.load(Ordering::Relaxed) {
+        return false;
     }
     if CLUSTER_IS_PRIMARY.load(Ordering::Relaxed) {
         return false;
     }
-    true
+    CLUSTER_ADMITTED.load(Ordering::Acquire) && WORLD_TIME_BOOTSTRAPPED.load(Ordering::Acquire)
+}
+
+#[must_use]
+pub fn cluster_lobby_connection_status() -> Option<&'static str> {
+    if !CLUSTER_ENABLED.load(Ordering::Relaxed) {
+        return None;
+    }
+    if !CLUSTER_MESH_READY.load(Ordering::Relaxed) {
+        return Some("No connection to cluster peers");
+    }
+    if !CLUSTER_ADMITTED.load(Ordering::Acquire) {
+        return Some("No connection to all cluster peers");
+    }
+    if !WORLD_TIME_BOOTSTRAPPED.load(Ordering::Acquire) {
+        return Some("No connection to primary");
+    }
+    None
+}
+
+pub fn mark_world_time_bootstrapped() {
+    WORLD_TIME_BOOTSTRAPPED.store(true, Ordering::Release);
 }
 
 #[must_use]
@@ -168,10 +255,11 @@ pub fn cluster_dropped_sync() -> u64 {
 
 pub fn log_cluster_shutdown_progress(server: &Server, context: &str) {
     let players = server.get_player_count();
+    let owned_entities = super::cluster_entity_emit::locally_owned_entities(server).len();
     info!(
         context,
         players,
-        owned_entities = 0,
+        owned_entities,
         pending_sync_buckets = CLUSTER_PENDING_SYNC.load(Ordering::Relaxed),
         inflight_chunk_fetches = CLUSTER_INFLIGHT_FETCH.load(Ordering::Relaxed),
         dropped_sync_buckets = CLUSTER_DROPPED_SYNC.load(Ordering::Relaxed),
@@ -190,10 +278,16 @@ pub fn begin_cluster_leave_drain(server: &Server) {
         return;
     }
     let player_count = server.get_player_count();
+    let owned = super::cluster_entity_emit::locally_owned_entities(server);
+    let mut holders = Vec::with_capacity(owned.len());
+    for entity in &owned {
+        let chunk = entity.chunk();
+        holders.push((chunk, chunk_holders(chunk)));
+    }
     let request = LifecycleInput::RequestLeave {
         player_count,
-        owned: Vec::new(),
-        holders: Vec::new(),
+        owned,
+        holders,
     };
     if input.try_send(request).is_err() {
         warn!(player_count, "cluster leave request dropped: lifecycle inbox full");
@@ -231,15 +325,52 @@ fn send_handshake(outbound: &mpsc::Sender<OutboundParcel>, to: &[u16], message: 
     }
 }
 
-fn send_handoff(outbound: &mpsc::Sender<OutboundParcel>, to: &[u16], request: &EntityHandoffRequest, local: u16) {
+fn send_handoff(
+    outbound: &mpsc::Sender<OutboundParcel>,
+    members: &[u16],
+    request: &EntityHandoffRequest,
+    local: u16,
+) -> Option<Vec<pumpkin_cluster::entities::EntityHandoff>> {
+    if !request.is_consistent() {
+        warn!(server_id = local, leaver = request.leaver, "cluster handoff rejected: inconsistent payload");
+        return None;
+    }
+    if !request.handoffs.is_empty() {
+        let mut sent = Vec::new();
+        for successor in request.successors() {
+            if !cluster_peer_admitted(successor.0) {
+                warn!(server_id = local, successor = successor.0, "cluster handoff successor is not admitted");
+                continue;
+            }
+            let scoped = request.for_successor(successor);
+            let Ok(bytes) = postcard::to_allocvec(&scoped) else {
+                warn!(server_id = local, successor = successor.0, "cluster handoff encode failed");
+                continue;
+            };
+            if outbound
+                .try_send(OutboundParcel {
+                    peer: successor,
+                    header: StreamHeader::new(StreamKind::Control, None),
+                    bytes,
+                })
+                .is_err()
+            {
+                warn!(server_id = local, to = successor.0, "cluster handoff send dropped: mesh queue full");
+                continue;
+            }
+            sent.extend(scoped.handoffs);
+        }
+        CLUSTER_HANDOFF_SENT.fetch_add(sent.len() as u64, Ordering::Relaxed);
+        return Some(sent);
+    }
     let Ok(bytes) = postcard::to_allocvec(request) else {
         warn!(server_id = local, "cluster handoff encode failed");
-        return;
+        return None;
     };
-    if to.is_empty() {
-        warn!(server_id = local, leaver = request.leaver, entities = request.handoffs.len(), "cluster handoff has no targets, broadcasting to mesh");
-    }
-    for peer in to {
+    for peer in members {
+        if !cluster_peer_admitted(*peer) {
+            continue;
+        }
         let parcel = OutboundParcel {
             peer: ServerId(*peer),
             header: StreamHeader::new(StreamKind::Control, None),
@@ -247,9 +378,11 @@ fn send_handoff(outbound: &mpsc::Sender<OutboundParcel>, to: &[u16], request: &E
         };
         if outbound.try_send(parcel).is_err() {
             warn!(server_id = local, to = peer, "cluster handoff send dropped: mesh queue full");
+            return None;
         }
     }
     CLUSTER_HANDOFF_SENT.fetch_add(1, Ordering::Relaxed);
+    Some(Vec::new())
 }
 
 async fn lifecycle_effect_task(
@@ -257,9 +390,8 @@ async fn lifecycle_effect_task(
     local: ServerId,
     outbound: mpsc::Sender<OutboundParcel>,
     peers: Vec<ServerId>,
+    membership_notice: mpsc::Sender<bool>,
     mut effects: mpsc::Receiver<LifecycleEffect>,
-    peer_reset: mpsc::Sender<u16>,
-    peer_ready: mpsc::Sender<u16>,
 ) {
     let fallback: Vec<u16> = peers.iter().map(|peer| peer.0).collect();
     while let Some(effect) = effects.recv().await {
@@ -285,28 +417,61 @@ async fn lifecycle_effect_task(
                     handoffs = request.handoffs.len(),
                     "cluster leave handoff emitted"
                 );
-                let targets: Vec<u16> = if fallback.is_empty() { Vec::new() } else { fallback.clone() };
-                send_handoff(&outbound, &targets, &request, local.0);
+                let Some(sent) = send_handoff(&outbound, &fallback, &request, local.0) else {
+                    continue;
+                };
+                if !request.handoffs.is_empty() {
+                    let removed = super::cluster_entity_apply::remove_transferred_entities(
+                        &server,
+                        local,
+                        &sent,
+                    );
+                    if removed != sent.len() {
+                        warn!(server_id = local.0, removed, expected = sent.len(), "cluster handoff source removal incomplete");
+                        continue;
+                    }
+                    if sent.len() != request.handoffs.len() {
+                        warn!(server_id = local.0, delivered = sent.len(), expected = request.handoffs.len(), "cluster handoff remains locally owned");
+                        continue;
+                    }
+                    begin_cluster_leave_drain(server.as_ref());
+                } else if let Some(input) = LIFECYCLE_IN.get() {
+                    if input
+                        .try_send(LifecycleInput::LeaveNoticeEnqueued)
+                        .is_err()
+                    {
+                        warn!(server_id = local.0, "cluster leave state notice dropped: lifecycle inbox full");
+                    }
+                }
             }
             LifecycleEffect::Joined { candidate } => {
                 info!(server_id = local.0, candidate, "cluster peer joined");
-                if candidate == local.0 {
-                    CLUSTER_ADMITTED.store(true, Ordering::Relaxed);
-                    CLUSTER_LIFECYCLE_STATE.store(2, Ordering::Relaxed);
-                } else {
+                admit_cluster_peer(candidate);
+                if candidate != local.0 {
+                    if CLUSTER_ADMITTED.load(Ordering::Relaxed)
+                        && membership_notice.try_send(true).is_err()
+                    {
+                        warn!(server_id = local.0, "cluster membership peer notice dropped");
+                    }
                     super::cluster_admin_apply::publish_ops_to_peer(&server, candidate);
                     super::cluster_hide::publish_hidden_to_peer(&server, candidate);
                     super::cluster_presence::publish_roster_to_peer(&server, candidate);
-                    let _ = peer_ready.try_send(candidate);
+                    if local.0 == server.advanced_config.cluster.primary_server_id {
+                        super::cluster_world_time::send_bootstrap_to_peer(
+                            &server,
+                            &outbound,
+                            ServerId(candidate),
+                        );
+                    }
                 }
             }
             LifecycleEffect::Left { peer } => {
                 info!(server_id = local.0, peer, "cluster peer left");
+                remove_cluster_peer(peer);
                 if peer == local.0 {
                     CLUSTER_ADMITTED.store(false, Ordering::Relaxed);
                 } else {
                     super::cluster_presence::forget_remote_server(peer);
-                    let _ = peer_reset.try_send(peer);
                 }
             }
             LifecycleEffect::LeaveBlocked { player_count, owned_entities } => {
@@ -332,9 +497,19 @@ async fn lifecycle_effect_task(
             LifecycleEffect::StateChanged(state) => {
                 CLUSTER_LIFECYCLE_STATE.store(lifecycle_state_code(state), Ordering::Relaxed);
                 if state == LifecycleState::Member {
+                    admit_cluster_peer(local.0);
+                    for peer in &peers {
+                        admit_cluster_peer(peer.0);
+                    }
                     CLUSTER_ADMITTED.store(true, Ordering::Relaxed);
-                } else if state == LifecycleState::Solo || state == LifecycleState::Joining {
+                    if membership_notice.try_send(true).is_err() {
+                        warn!(server_id = local.0, "cluster membership admission notice dropped");
+                    }
+                } else {
                     CLUSTER_ADMITTED.store(false, Ordering::Relaxed);
+                    if membership_notice.try_send(false).is_err() {
+                        warn!(server_id = local.0, "cluster membership withdrawal notice dropped");
+                    }
                 }
                 info!(server_id = local.0, ?state, "cluster lifecycle state");
             }
@@ -348,10 +523,33 @@ pub fn note_cluster_handshake(parcel: &InboundParcel) {
     };
     let Ok(message) = decode_handshake(&parcel.bytes) else {
         if let Ok(request) = postcard::from_bytes::<EntityHandoffRequest>(&parcel.bytes) {
-            let _ = input.try_send(LifecycleInput::RemoteHandoff(request.clone()));
+            if request.handoffs.is_empty() {
+                if request.leaver != parcel.peer.0 {
+                    warn!(peer = parcel.peer.0, leaver = request.leaver, "cluster leave notice owner mismatch");
+                } else if input.try_send(LifecycleInput::RemoteHandoff(request)).is_err() {
+                    warn!(peer = parcel.peer.0, "cluster leave notice dropped: lifecycle inbox full");
+                }
+            } else {
+                if !super::cluster_entity_apply::forward_entity_handoffs(
+                    parcel.peer,
+                    request.handoffs,
+                ) {
+                    warn!(peer = parcel.peer.0, "cluster entity handoff dropped");
+                }
+            }
         }
         return;
     };
+    let authenticated = match &message {
+        JoinHandshake::Hello(hello) => hello.candidate == parcel.peer.0,
+        JoinHandshake::VoteRequest(request) => request.requested_by == parcel.peer.0,
+        JoinHandshake::Vote(vote) => vote.voter == parcel.peer.0,
+        JoinHandshake::Admit(admit) => admit.admitted_by == parcel.peer.0,
+    };
+    if !authenticated {
+        warn!(peer = parcel.peer.0, "cluster handshake identity mismatch");
+        return;
+    }
     let next = match message {
         JoinHandshake::Hello(hello) => LifecycleInput::RemoteHello { hello, pin_match: true },
         JoinHandshake::VoteRequest(request) => LifecycleInput::RemoteVoteRequest(request),
@@ -441,6 +639,7 @@ fn mesh_from_config(config: &ClusterConfig) -> Option<MeshConfig> {
 
 pub fn maybe_bootstrap(server: &Arc<Server>) {
     let config = server.advanced_config.cluster.clone();
+    CLUSTER_ENABLED.store(config.enabled, Ordering::Relaxed);
     if !config.enabled {
         return;
     }
@@ -480,6 +679,21 @@ pub fn maybe_bootstrap(server: &Arc<Server>) {
         Err(error) => warn!("cluster endpoint bound but local addr unknown: {error}"),
     }
     let fingerprint = transport.local_cert_fingerprint();
+    let (lifecycle_in_tx, mut lifecycle_in_rx) = mpsc::channel(4096);
+    let (lifecycle_out_tx, lifecycle_out_rx) = mpsc::channel::<LifecycleEffect>(4096);
+    let lifecycle = Lifecycle::new_solo(local.0);
+    let peer_list: Vec<u16> = peer_ids.iter().map(|peer| peer.0).collect();
+    let _ = LIFECYCLE_IN.set(lifecycle_in_tx.clone());
+    if lifecycle_in_tx
+        .try_send(LifecycleInput::BeginJoin {
+            cert_fingerprint: fingerprint,
+            peers: peer_list,
+        })
+        .is_err()
+    {
+        error!(server_id = local.0, "cluster lifecycle bootstrap input dropped");
+        return;
+    }
     server.spawn_task(async move {
         transport.run().await;
     });
@@ -490,12 +704,21 @@ pub fn maybe_bootstrap(server: &Arc<Server>) {
         let _ = control_tx.try_send(DemuxControl::OpenShared { peer: *peer });
     }
     let inbound_rx = mesh_channels.inbound_rx;
-    let restart_rx = mesh_channels.restart_rx;
+    let peer_ready_rx = mesh_channels.peer_ready_rx;
     let outbound_tx = mesh_channels.outbound_tx;
     let datagram_in_rx = mesh_channels.datagram_in_rx;
     cluster_datagram::install_datagram_outbox(peer_ids.clone(), mesh_channels.datagram_out_tx);
-    super::cluster_world_delta::install_world_delta_outbox(peer_ids.clone(), outbound_tx.clone());
-    spawn_entity_datagram_apply(&server, datagram_in_rx);
+    super::cluster_world_delta::install_world_delta_outbox(local, outbound_tx.clone());
+    super::cluster_world_apply::install_world_action_outbox(outbound_tx.clone());
+    super::cluster_primary_persist::install_primary_tick_stream(
+        &server,
+        local,
+        ServerId(config.primary_server_id),
+        outbound_tx.clone(),
+        demux_receivers.primary_tick,
+    );
+    super::cluster_playerdata::install_playerdata(&server, peer_ids.clone(), outbound_tx.clone());
+    super::cluster_playerdata::spawn_position_datagram_demux(&server, datagram_in_rx);
     server.spawn_task(run_demux(
         inbound_rx,
         control_rx,
@@ -507,26 +730,40 @@ pub fn maybe_bootstrap(server: &Arc<Server>) {
 
     spawn_visual_apply(&server, local, demux_receivers.visual);
 
-    spawn_world_apply(&server, demux_receivers.world);
+    spawn_world_apply(&server, demux_receivers.world, demux_receivers.combat);
 
+    let peer_ready_server = Arc::clone(server);
+    let peer_ready_outbound = outbound_tx.clone();
     server.spawn_task(async move {
-        let mut restart_rx = restart_rx;
-        while let Some(peer) = restart_rx.recv().await {
+        let mut peer_ready_rx = peer_ready_rx;
+        while let Some(peer) = peer_ready_rx.recv().await {
+            if is_primary {
+                super::cluster_world_time::send_bootstrap_to_peer(
+                    &peer_ready_server,
+                    &peer_ready_outbound,
+                    peer,
+                );
+            }
             if let Some(input) = LIFECYCLE_IN.get() {
-                let _ = input.try_send(LifecycleInput::NotePeerRestarted { peer: peer.0 });
-                let _ = input.try_send(LifecycleInput::NotePeerConnected { peer: peer.0 });
+                if input
+                    .try_send(LifecycleInput::PeerReady { peer: peer.0 })
+                    .is_err()
+                {
+                    warn!(peer = peer.0, "cluster peer-ready notice dropped: lifecycle inbox full");
+                }
             }
         }
     });
 
-    let (peer_reset_tx, peer_reset_rx) = mpsc::channel::<u16>(64);
-    let (peer_ready_tx, peer_ready_rx) = mpsc::channel::<u16>(64);
     let (fetch_tx, fetch_rx) = mpsc::channel::<ClusterFetchRequest>(4096);
     set_cluster_fetch_sender(fetch_tx);
     let (unwant_tx, unwant_rx) = mpsc::channel::<ClusterFetchRequest>(4096);
     set_cluster_unwant_sender(unwant_tx);
     let (logout_tx, logout_rx) = mpsc::channel::<ClusterLogoutGrace>(64);
     set_cluster_logout_sender(logout_tx);
+    let (availability_tx, availability_rx) = mpsc::channel::<ClusterChunkAvailability>(4096);
+    set_cluster_chunk_availability_sender(availability_tx);
+    let (chunk_membership_tx, chunk_membership_rx) = mpsc::channel::<bool>(4096);
     let chunk_server = server.clone();
     let chunk_outbound = outbound_tx.clone();
     server.spawn_task(chunk_task(
@@ -538,12 +775,16 @@ pub fn maybe_bootstrap(server: &Arc<Server>) {
         fetch_rx,
         unwant_rx,
         logout_rx,
-        peer_reset_rx,
-        peer_ready_rx,
+        availability_rx,
+        chunk_membership_rx,
     ));
 
-    spawn_combat_apply(&server, local, demux_receivers.combat);
     spawn_entity_apply(&server, local, demux_receivers.entity);
+    super::cluster_entity_boundary::install_boundary_outbox(
+        local,
+        ServerId(config.primary_server_id),
+        outbound_tx.clone(),
+    );
 
     server.spawn_task(accept_task(
         server.clone(),
@@ -553,17 +794,18 @@ pub fn maybe_bootstrap(server: &Arc<Server>) {
     super::cluster_entity_apply::install_entity_outbox(local, fallback.clone(), outbound_tx.clone());
     cluster_chat_out::install_chat_outbox(local, fallback.clone(), outbound_tx.clone());
     super::cluster_admin_apply::install_admin_outbox(fallback.clone(), outbound_tx.clone());
-    super::cluster_invsee::install_invsee_outbox(local, fallback.clone(), outbound_tx.clone());
-    super::cluster_moderation::install_moderation_outbox(local, outbound_tx.clone());
+    super::cluster_lobby_control::install_lobby_control_outbox(local, outbound_tx.clone());
 
     super::cluster_hide::install_hide_outbox(local, fallback.clone(), outbound_tx.clone());
     super::cluster_world_time::install_world_time_outbox(fallback.clone(), outbound_tx.clone());
     let (admin_tx, admin_rx) = mpsc::channel::<InboundParcel>(1024);
     let (chat_tx, chat_rx) = mpsc::channel::<InboundParcel>(1024);
     let (hide_tx, hide_rx) = mpsc::channel::<InboundParcel>(1024);
-    let (invsee_tx, invsee_rx) = mpsc::channel::<InboundParcel>(1024);
     let (presence_tx, presence_rx) = mpsc::channel::<InboundParcel>(1024);
     let (world_time_tx, world_time_rx) = mpsc::channel::<InboundParcel>(1024);
+    let (playerdata_tx, playerdata_rx) = mpsc::channel::<InboundParcel>(1024);
+    let (lobby_control_tx, lobby_control_rx) = mpsc::channel::<InboundParcel>(1024);
+    let (boundary_tx, boundary_rx) = mpsc::channel::<InboundParcel>(1024);
     super::cluster_presence::install_presence_outbox(local, fallback.clone(), outbound_tx.clone());
     super::cluster_tick_pump::install_tick_pump_outbox(peer_ids.clone(), outbound_tx.clone());
     cluster_chat_in::spawn_control_fanout(
@@ -571,25 +813,22 @@ pub fn maybe_bootstrap(server: &Arc<Server>) {
         demux_receivers.control,
         admin_tx,
         chat_tx,
-        invsee_tx,
         presence_tx,
         hide_tx,
         world_time_tx,
+        playerdata_tx,
+        lobby_control_tx,
+        boundary_tx,
     );
     super::cluster_hide::spawn_hide_apply(server, hide_rx);
     super::cluster_world_time::spawn_world_time_apply(server, world_time_rx);
     cluster_chat_in::spawn_chat_delivery(server, local, chat_rx);
-    super::cluster_invsee::spawn_invsee_apply(server, local, invsee_rx);
     super::cluster_presence::spawn_presence_apply(server, local, presence_rx);
+    super::cluster_playerdata::spawn_playerdata_control(server, playerdata_rx);
+    super::cluster_lobby_control::spawn_lobby_control_apply(server, local, lobby_control_rx);
+    super::cluster_entity_boundary::spawn_boundary_actor(server, boundary_rx);
 
-    let admin_peers = fallback.clone();
-    server.spawn_task(admin_task(
-        server.clone(),
-        local,
-        admin_peers,
-        outbound_tx.clone(),
-        admin_rx,
-    ));
+    server.spawn_task(admin_task(server.clone(), admin_rx));
 
     let (fused_tx, fused_rx) = mpsc::channel::<Vec<u8>>(8);
     let _ = FUSED_BRIDGE.set(fused_tx);
@@ -598,16 +837,8 @@ pub fn maybe_bootstrap(server: &Arc<Server>) {
     CLUSTER_IS_PRIMARY.store(is_primary, Ordering::Relaxed);
     CLUSTER_MESH_READY.store(true, Ordering::Relaxed);
     CLUSTER_LIFECYCLE_STATE.store(0, Ordering::Relaxed);
-    CLUSTER_ADMITTED.store(peer_ids.is_empty(), Ordering::Relaxed);
-    let (lifecycle_in_tx, mut lifecycle_in_rx) = mpsc::channel(32);
-    let (lifecycle_out_tx, lifecycle_out_rx) = mpsc::channel::<LifecycleEffect>(32);
-    let lifecycle = Lifecycle::new_solo(local.0);
-    let peer_list: Vec<u16> = peer_ids.iter().map(|peer| peer.0).collect();
-    let _ = lifecycle_in_tx.try_send(LifecycleInput::BeginJoin {
-        cert_fingerprint: fingerprint,
-        peers: peer_list,
-    });
-    let _ = LIFECYCLE_IN.set(lifecycle_in_tx);
+    CLUSTER_ADMITTED.store(false, Ordering::Relaxed);
+    WORLD_TIME_BOOTSTRAPPED.store(is_primary, Ordering::Release);
     server.spawn_task(async move {
         run_lifecycle(lifecycle, &mut lifecycle_in_rx, &lifecycle_out_tx).await;
     });
@@ -616,9 +847,8 @@ pub fn maybe_bootstrap(server: &Arc<Server>) {
         local,
         outbound_tx.clone(),
         peer_ids.clone(),
+        chunk_membership_tx,
         lifecycle_out_rx,
-        peer_reset_tx,
-        peer_ready_tx,
     ));
 
     for world in server.worlds.load().iter() {
@@ -657,6 +887,17 @@ fn chunk_warn_cooldown_elapsed() -> bool {
         .is_ok()
 }
 
+fn chunk_diagnostic_cooldown_elapsed(stage: usize) -> bool {
+    let now = chunk_now_millis();
+    let last = CHUNK_DIAGNOSTIC_LAST_MILLIS[stage].load(Ordering::Relaxed);
+    if now.saturating_sub(last) < 1_000 {
+        return false;
+    }
+    CHUNK_DIAGNOSTIC_LAST_MILLIS[stage]
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
 async fn chunk_task(
     server: Arc<Server>,
     local: ServerId,
@@ -666,9 +907,11 @@ async fn chunk_task(
     mut want_rx: mpsc::Receiver<ClusterFetchRequest>,
     mut unwant_rx: mpsc::Receiver<ClusterFetchRequest>,
     mut logout_rx: mpsc::Receiver<ClusterLogoutGrace>,
-    mut peer_reset_rx: mpsc::Receiver<u16>,
-    mut peer_ready_rx: mpsc::Receiver<u16>,
+    mut availability_rx: mpsc::Receiver<ClusterChunkAvailability>,
+    mut membership_rx: mpsc::Receiver<bool>,
 ) {
+    let primary = ServerId(server.advanced_config.cluster.primary_server_id);
+    let is_primary = matches!(server.advanced_config.cluster.role, ClusterRole::Primary);
     let mut directory = Directory::new();
     let mut wanted: HashSet<ChunkAddr> = HashSet::new();
     let mut pending: HashMap<ChunkAddr, (u16, u64)> = HashMap::new();
@@ -678,12 +921,82 @@ async fn chunk_task(
     let mut stuck_reported: HashSet<ChunkAddr> = HashSet::new();
     let mut unroutable_reported: HashSet<ChunkAddr> = HashSet::new();
     let mut grace: HashMap<ChunkAddr, u64> = HashMap::new();
+    let mut primary_waiters: HashMap<ChunkAddr, HashSet<ServerId>> = HashMap::new();
+    let mut early_parcels: VecDeque<InboundParcel> = VecDeque::new();
+    let mut admitted = false;
+    publish_chunk_holders(&directory);
     let mut sweep = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
+            membership = membership_rx.recv() => {
+                let Some(next) = membership else { break };
+                admitted = next;
+                if admitted {
+                    advertise_loaded_chunks(
+                        &server,
+                        local,
+                        &mut directory,
+                        &mut advertised,
+                        &fallback,
+                        &outbound,
+                    );
+                    for addr in &wanted {
+                        if request_chunk_once(
+                            &directory,
+                            &pings,
+                            primary,
+                            &fallback,
+                            &outbound,
+                            &mut pending,
+                            *addr,
+                        ) {
+                            unroutable_reported.remove(addr);
+                        }
+                    }
+                    while let Some(parcel) = early_parcels.pop_front() {
+                        if cluster_peer_admitted(parcel.peer.0) {
+                            handle_chunk_parcel(
+                                &server,
+                                local,
+                                primary,
+                                is_primary,
+                                &mut directory,
+                                &mut wanted,
+                                &mut pending,
+                                &mut pings,
+                                &mut claims,
+                                &mut primary_waiters,
+                                &mut stuck_reported,
+                                &mut unroutable_reported,
+                                &fallback,
+                                &outbound,
+                                parcel,
+                            );
+                        }
+                    }
+                } else {
+                    early_parcels.clear();
+                    for addr in advertised.drain() {
+                        directory.apply_drop(ChunkDrop { holder: local.0, chunk: addr });
+                        announce_holds(
+                            &outbound,
+                            &fallback,
+                            ChunkAnnounce::Release(ChunkDrop { holder: local.0, chunk: addr }),
+                        );
+                    }
+                }
+                publish_chunk_holders(&directory);
+            }
             incoming = chunk_rx.recv() => {
                 let Some(parcel) = incoming else { break };
-                handle_chunk_parcel(&server, local.0, &mut directory, &mut wanted, &mut pending, &mut pings, &mut advertised, &mut claims, &mut stuck_reported, &mut unroutable_reported, &fallback, &outbound, parcel).await;
+                if admitted && cluster_peer_admitted(parcel.peer.0) {
+                    handle_chunk_parcel(&server, local, primary, is_primary, &mut directory, &mut wanted, &mut pending, &mut pings, &mut claims, &mut primary_waiters, &mut stuck_reported, &mut unroutable_reported, &fallback, &outbound, parcel);
+                } else if early_parcels.len() < 4096 {
+                    early_parcels.push_back(parcel);
+                } else {
+                    error!("cluster chunk parcel arrived before membership and deferred inbox is full");
+                }
+                publish_chunk_holders(&directory);
                 CLUSTER_INFLIGHT_FETCH.store(pending.len() as u64, Ordering::Relaxed);
             }
             want = want_rx.recv() => {
@@ -694,14 +1007,14 @@ async fn chunk_task(
                 };
                 wanted.insert(addr);
                 grace.remove(&addr);
-                if request_chunk_once(
+                if admitted && request_chunk_once(
                     &directory,
                     &pings,
+                    primary,
                     &fallback,
                     &outbound,
                     &mut pending,
                     addr,
-                    None,
                 ) {
                     unroutable_reported.remove(&addr);
                 }
@@ -712,14 +1025,14 @@ async fn chunk_task(
                     };
                     wanted.insert(addr);
                     grace.remove(&addr);
-                    if request_chunk_once(
+                    if admitted && request_chunk_once(
                         &directory,
                         &pings,
+                        primary,
                         &fallback,
                         &outbound,
                         &mut pending,
                         addr,
-                        None,
                     ) {
                         unroutable_reported.remove(&addr);
                     }
@@ -768,62 +1081,32 @@ async fn chunk_task(
                     );
                 }
             }
-            reset = peer_reset_rx.recv() => {
-                let Some(peer) = reset else { break };
-                let mut retry: Vec<ChunkAddr> = Vec::new();
-                pending.retain(|addr, (from, _)| {
-                    if *from == peer {
-                        retry.push(*addr);
-                        false
-                    } else {
-                        true
-                    }
-                });
-                for addr in retry {
-                    stuck_reported.remove(&addr);
-                    if request_chunk_once(
-                        &directory,
-                        &pings,
-                        &fallback,
-                        &outbound,
-                        &mut pending,
-                        addr,
-                        Some(peer),
-                    ) {
-                        unroutable_reported.remove(&addr);
-                    }
+            availability = availability_rx.recv() => {
+                let Some(availability) = availability else { break };
+                if admitted {
+                    handle_chunk_availability(
+                    &server,
+                    local,
+                    is_primary,
+                    &mut directory,
+                    &mut advertised,
+                    &mut primary_waiters,
+                    &fallback,
+                    &outbound,
+                    availability,
+                    );
                 }
-                CLUSTER_INFLIGHT_FETCH.store(pending.len() as u64, Ordering::Relaxed);
-            }
-            ready = peer_ready_rx.recv() => {
-                let Some(_peer) = ready else { break };
-                let retry: Vec<ChunkAddr> = pending
-                    .keys()
-                    .copied()
-                    .filter(|addr| stuck_reported.contains(addr))
-                    .collect();
-                for addr in retry {
-                    pending.remove(&addr);
-                    stuck_reported.remove(&addr);
-                    if request_chunk_once(
-                        &directory,
-                        &pings,
-                        &fallback,
-                        &outbound,
-                        &mut pending,
-                        addr,
-                        None,
-                    ) {
-                        unroutable_reported.remove(&addr);
-                    }
-                }
-                CLUSTER_INFLIGHT_FETCH.store(pending.len() as u64, Ordering::Relaxed);
+                publish_chunk_holders(&directory);
             }
             _ = sweep.tick() => {
                 let now_millis = chunk_now_millis();
-                release_expired_claims(&server, &directory, &mut claims, now_millis);
-                report_stuck_fetches(&pending, &mut stuck_reported, now_millis);
-                report_unroutable_wants(&wanted, &pending, &mut unroutable_reported);
+                if is_primary {
+                    release_expired_claims(&server, &mut claims, now_millis);
+                }
+                if admitted {
+                    report_stuck_fetches(&pending, &mut stuck_reported, now_millis);
+                    report_unroutable_wants(&wanted, &pending, &mut unroutable_reported);
+                }
                 if !grace.is_empty() {
                     let expired: Vec<ChunkAddr> = grace
                         .iter()
@@ -877,22 +1160,49 @@ fn chunk_now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+fn advertise_loaded_chunks(
+    server: &Arc<Server>,
+    local: ServerId,
+    directory: &mut Directory,
+    advertised: &mut HashSet<ChunkAddr>,
+    fallback: &[u16],
+    outbound: &mpsc::Sender<OutboundParcel>,
+) {
+    for world in server.worlds.load().iter() {
+        for entry in world.level.loaded_chunks.iter() {
+            if entry.value().status != ChunkStatus::Full {
+                continue;
+            }
+            let addr = ChunkAddr {
+                x: entry.key().x,
+                z: entry.key().y,
+            };
+            directory.apply_advert(ChunkAdvert {
+                holder: local.0,
+                chunk: addr,
+            });
+            advertised.insert(addr);
+            announce_holds(
+                outbound,
+                fallback,
+                ChunkAnnounce::Acquire(ChunkAdvert {
+                    holder: local.0,
+                    chunk: addr,
+                }),
+            );
+        }
+    }
+}
+
 fn release_expired_claims(
     server: &Arc<Server>,
-    directory: &Directory,
     claims: &mut PrimaryClaims,
     now_millis: u64,
 ) {
     for addr in claims.take_expired(now_millis) {
-        if directory
-            .holders_of(&addr)
-            .is_some_and(|holders| !holders.is_empty())
-        {
-            claims.note_requested(addr, now_millis);
-            continue;
-        }
         let pos = Vector2::new(addr.x, addr.z);
         for world in server.worlds.load().iter() {
+            world.level.finish_cluster_full_chunk_request(pos);
             world.level.unpin_cluster_chunk(&pos);
         }
     }
@@ -919,31 +1229,16 @@ fn report_stuck_fetches(
 fn request_chunk_once(
     directory: &Directory,
     pings: &PingTracker,
+    primary: ServerId,
     fallback: &[u16],
     outbound: &mpsc::Sender<OutboundParcel>,
     pending: &mut HashMap<ChunkAddr, (u16, u64)>,
     addr: ChunkAddr,
-    exclude: Option<u16>,
 ) -> bool {
     if pending.contains_key(&addr) {
         return true;
     }
-    let holders: Vec<u16> = directory
-        .sorted_holders(&addr)
-        .into_iter()
-        .filter(|holder| Some(*holder) != exclude)
-        .collect();
-    let peers: Vec<u16> = fallback
-        .iter()
-        .copied()
-        .filter(|peer| Some(*peer) != exclude)
-        .collect();
-    let candidates: &[u16] = if holders.is_empty() {
-        &peers
-    } else {
-        &holders
-    };
-    let Some(from) = pings.best(candidates) else {
+    let Some(from) = chunk_source(directory, pings, primary, fallback, addr) else {
         return false;
     };
     let fetch = ChunkFetch { chunk: addr, from };
@@ -1005,6 +1300,9 @@ fn announce_holds(
         return;
     };
     for peer in fallback {
+        if !cluster_peer_admitted(*peer) {
+            continue;
+        }
         if outbound
             .try_send(OutboundParcel {
                 peer: ServerId(*peer),
@@ -1018,15 +1316,216 @@ fn announce_holds(
     }
 }
 
-async fn handle_chunk_parcel(
+fn chunk_source(
+    directory: &Directory,
+    pings: &PingTracker,
+    primary: ServerId,
+    fallback: &[u16],
+    chunk: ChunkAddr,
+) -> Option<u16> {
+    let holders: Vec<u16> = directory
+        .sorted_holders(&chunk)
+        .into_iter()
+        .filter(|peer| cluster_peer_admitted(*peer))
+        .collect();
+    pings.best(&holders).or_else(|| {
+        fallback
+            .contains(&primary.0)
+            .then_some(primary.0)
+    })
+}
+
+fn send_chunk_payload(
     server: &Arc<Server>,
-    local: u16,
+    local: ServerId,
+    directory: &Directory,
+    outbound: &mpsc::Sender<OutboundParcel>,
+    chunk: ChunkAddr,
+    peer: ServerId,
+) -> bool {
+    let Some(snapshot) = snapshot_chunk(server, chunk) else {
+        if chunk_diagnostic_cooldown_elapsed(0) {
+            warn!(
+                target: "cluster_chunk",
+                stage = "snapshot_absent",
+                chunk_x = chunk.x,
+                chunk_z = chunk.z,
+                source = local.0,
+                destination = peer.0,
+                "cluster chunk transfer stopped before payload encoding"
+            );
+        }
+        return false;
+    };
+    let mut holders = directory.sorted_holders(&chunk);
+    if !holders.contains(&local.0) {
+        holders.push(local.0);
+    }
+    let pendings = super::cluster_world_apply::pending_action_frames(chunk)
+        .into_iter()
+        .map(|bytes| PendingRef { bytes })
+        .collect();
+    let payload = ChunkPayload::new(chunk, local.0, snapshot, pendings, holders);
+    let Ok(bytes) = encode_payload(&payload) else {
+        error!(chunk_x = chunk.x, chunk_z = chunk.z, to = peer.0, "cluster chunk payload encode failed");
+        return false;
+    };
+    let payload_bytes = bytes.len();
+    if outbound
+        .try_send(OutboundParcel {
+            peer,
+            header: StreamHeader::new(StreamKind::ChunkData, None),
+            bytes,
+        })
+        .is_err()
+    {
+        error!(chunk_x = chunk.x, chunk_z = chunk.z, to = peer.0, "cluster chunk snapshot send failed");
+        false
+    } else {
+        SERVED_CHUNKS.fetch_add(1, Ordering::Relaxed);
+        if chunk_diagnostic_cooldown_elapsed(1) {
+            info!(
+                target: "cluster_chunk",
+                stage = "payload_encoded_enqueued",
+                chunk_x = chunk.x,
+                chunk_z = chunk.z,
+                source = local.0,
+                destination = peer.0,
+                payload_bytes,
+                "cluster chunk payload entered transport"
+            );
+        }
+        true
+    }
+}
+
+pub(super) fn request_primary_chunk_load(server: &Arc<Server>, addr: ChunkAddr) {
+    let Some(world) = server.worlds.load().first().cloned() else {
+        return;
+    };
+    let pos = Vector2::new(addr.x, addr.z);
+    world.level.pin_cluster_chunk(pos);
+    world.level.request_cluster_full_chunk(pos);
+}
+
+fn handle_chunk_availability(
+    server: &Arc<Server>,
+    local: ServerId,
+    is_primary: bool,
+    directory: &mut Directory,
+    advertised: &mut HashSet<ChunkAddr>,
+    primary_waiters: &mut HashMap<ChunkAddr, HashSet<ServerId>>,
+    fallback: &[u16],
+    outbound: &mpsc::Sender<OutboundParcel>,
+    availability: ClusterChunkAvailability,
+) {
+    let (addr, full) = match availability {
+        ClusterChunkAvailability::Full(pos) => (ChunkAddr { x: pos.x, z: pos.y }, true),
+        ClusterChunkAvailability::Drop(pos) => (ChunkAddr { x: pos.x, z: pos.y }, false),
+    };
+    if full {
+        let pos = Vector2::new(addr.x, addr.z);
+        let is_full = server
+            .worlds
+            .load()
+            .first()
+            .is_some_and(|world| world.level.is_cluster_full(&pos));
+        if !is_full {
+            if chunk_warn_cooldown_elapsed() {
+                error!(
+                    chunk_x = addr.x,
+                    chunk_z = addr.z,
+                    "cluster full chunk availability arrived without a full chunk"
+                );
+            }
+            return;
+        }
+        if is_primary {
+            if chunk_diagnostic_cooldown_elapsed(2) {
+                info!(
+                    target: "cluster_chunk",
+                    stage = "primary_full_available_save_requested",
+                    chunk_x = addr.x,
+                    chunk_z = addr.z,
+                    source = local.0,
+                    "cluster primary full chunk is retained and scheduled for save"
+                );
+            }
+            if let Some(world) = server.worlds.load().first() {
+                world.level.should_save.store(true, Ordering::Release);
+                world.level.level_channel.notify();
+            }
+        }
+        directory.apply_advert(ChunkAdvert { holder: local.0, chunk: addr });
+        if advertised.insert(addr) {
+            announce_holds(
+                outbound,
+                fallback,
+                ChunkAnnounce::Acquire(ChunkAdvert { holder: local.0, chunk: addr }),
+            );
+            if chunk_diagnostic_cooldown_elapsed(3) {
+                info!(
+                    target: "cluster_chunk",
+                    stage = "full_chunk_advertised",
+                    chunk_x = addr.x,
+                    chunk_z = addr.z,
+                    source = local.0,
+                    primary = is_primary,
+                    peers = fallback.len(),
+                    "cluster full chunk availability was advertised"
+                );
+            }
+        }
+        if is_primary {
+            super::cluster_entity_boundary::notify_primary_chunk_full(addr);
+            if let Some(waiters) = primary_waiters.remove(&addr) {
+                let mut undelivered = HashSet::new();
+                for peer in waiters {
+                    if !send_chunk_payload(server, local, directory, outbound, addr, peer) {
+                        undelivered.insert(peer);
+                    }
+                }
+                if !undelivered.is_empty() {
+                    error!(
+                        chunk_x = addr.x,
+                        chunk_z = addr.z,
+                        waiters = undelivered.len(),
+                        "cluster full chunk could not be delivered to waiting peer"
+                    );
+                    primary_waiters.insert(addr, undelivered);
+                } else {
+                    for world in server.worlds.load().iter() {
+                        world.level.finish_cluster_full_chunk_request(pos);
+                    }
+                }
+            }
+        }
+        return;
+    }
+    if advertised.remove(&addr) {
+        directory.apply_drop(ChunkDrop { holder: local.0, chunk: addr });
+        announce_holds(
+            outbound,
+            fallback,
+            ChunkAnnounce::Release(ChunkDrop { holder: local.0, chunk: addr }),
+        );
+    }
+    if is_primary {
+        primary_waiters.remove(&addr);
+    }
+}
+
+fn handle_chunk_parcel(
+    server: &Arc<Server>,
+    local: ServerId,
+    primary: ServerId,
+    is_primary: bool,
     directory: &mut Directory,
     wanted: &mut HashSet<ChunkAddr>,
     pending: &mut HashMap<ChunkAddr, (u16, u64)>,
     pings: &mut PingTracker,
-    advertised: &mut HashSet<ChunkAddr>,
     claims: &mut PrimaryClaims,
+    primary_waiters: &mut HashMap<ChunkAddr, HashSet<ServerId>>,
     stuck_reported: &mut HashSet<ChunkAddr>,
     unroutable_reported: &mut HashSet<ChunkAddr>,
     fallback: &[u16],
@@ -1046,45 +1545,56 @@ async fn handle_chunk_parcel(
         };
         match announce {
             ChunkAnnounce::Acquire(advert) => {
+                if advert.holder != parcel.peer.0 {
+                    warn!(peer = parcel.peer.0, holder = advert.holder, "cluster chunk acquire holder mismatch");
+                    return;
+                }
                 directory.apply_advert(advert);
                 if wanted.contains(&advert.chunk) {
                     if request_chunk_once(
                         directory,
                         pings,
+                        primary,
                         fallback,
                         outbound,
                         pending,
                         advert.chunk,
-                        None,
                     ) {
                         unroutable_reported.remove(&advert.chunk);
                     }
                 }
             }
             ChunkAnnounce::Release(drop) => {
+                if drop.holder != parcel.peer.0 {
+                    warn!(peer = parcel.peer.0, holder = drop.holder, "cluster chunk drop holder mismatch");
+                    return;
+                }
                 directory.apply_drop(drop);
                 if wanted.contains(&drop.chunk)
                     && pending.get(&drop.chunk).is_some_and(|(from, _)| *from == drop.holder)
                 {
                     pending.remove(&drop.chunk);
                     stuck_reported.remove(&drop.chunk);
-                    if request_chunk_once(
-                        directory,
-                        pings,
-                        fallback,
-                        outbound,
-                        pending,
-                        drop.chunk,
-                        Some(drop.holder),
-                    ) {
+                    if chunk_source(directory, pings, primary, fallback, drop.chunk)
+                        .is_some_and(|next| next != drop.holder)
+                        && request_chunk_once(
+                            directory,
+                            pings,
+                            primary,
+                            fallback,
+                            outbound,
+                            pending,
+                            drop.chunk,
+                        )
+                    {
                         unroutable_reported.remove(&drop.chunk);
-                        let worlds = server.worlds.load();
-                        if let Some(world) = worlds.first() {
-                            world.level.clear_cluster_fetch_wanted(&Vector2::new(
-                                drop.chunk.x,
-                                drop.chunk.z,
-                            ));
-                        }
+                    } else {
+                        error!(
+                            chunk_x = drop.chunk.x,
+                            chunk_z = drop.chunk.z,
+                            source = drop.holder,
+                            "cluster chunk source dropped without another eligible holder"
+                        );
                     }
                 }
             }
@@ -1101,6 +1611,10 @@ async fn handle_chunk_parcel(
             );
             return;
         };
+        if fetch.from != local.0 {
+            warn!(peer = parcel.peer.0, requested = fetch.from, local = local.0, "cluster chunk request sent to wrong holder");
+            return;
+        }
         info!(
             target: "cluster_chunk",
             chunk_x = fetch.chunk.x,
@@ -1108,74 +1622,33 @@ async fn handle_chunk_parcel(
             from = parcel.peer.0,
             "cluster chunk request received"
         );
-        claims.note_requested(fetch.chunk, chunk_now_millis());
-        if let Some(world) = server.worlds.load().first() {
-            world
-                .level
-                .pin_cluster_chunk(Vector2::new(fetch.chunk.x, fetch.chunk.z));
+        let now = chunk_now_millis();
+        let first_claim = is_primary && !claims.is_retained(&fetch.chunk, now);
+        if is_primary {
+            claims.note_requested(fetch.chunk, now);
+            if let Some(world) = server.worlds.load().first() {
+                world
+                    .level
+                    .pin_cluster_chunk(Vector2::new(fetch.chunk.x, fetch.chunk.z));
+            }
         }
-        let Some((snapshot, loaded)) = snapshot_chunk(server, fetch.chunk).await else {
-            info!(
-                target: "cluster_chunk",
-                chunk_x = fetch.chunk.x,
-                chunk_z = fetch.chunk.z,
-                from = parcel.peer.0,
-                "cluster chunk not held, drop announced"
-            );
+        if send_chunk_payload(server, local, directory, outbound, fetch.chunk, parcel.peer) {
+            return;
+        }
+        if !is_primary {
             announce_holds(
                 outbound,
                 fallback,
                 ChunkAnnounce::Release(ChunkDrop {
-                    holder: local,
+                    holder: local.0,
                     chunk: fetch.chunk,
                 }),
             );
             return;
-        };
-        info!(
-            target: "cluster_chunk",
-            chunk_x = fetch.chunk.x,
-            chunk_z = fetch.chunk.z,
-            to = parcel.peer.0,
-            loaded,
-            "cluster chunk snapshot ready"
-        );
-        let payload = ChunkPayload::new(fetch.chunk, local, snapshot, Vec::new(), vec![local]);
-        let Ok(bytes) = encode_payload(&payload) else {
-            info!(
-                target: "cluster_chunk",
-                chunk_x = fetch.chunk.x,
-                chunk_z = fetch.chunk.z,
-                to = parcel.peer.0,
-                "cluster chunk payload encode failed"
-            );
-            return;
-        };
-        SERVED_CHUNKS.fetch_add(1, Ordering::Relaxed);
-        if outbound
-            .try_send(OutboundParcel {
-                peer: parcel.peer,
-                header: StreamHeader::new(StreamKind::ChunkData, None),
-                bytes,
-            })
-            .is_err()
-        {
-            error!(
-                target: "cluster_chunk",
-                chunk_x = fetch.chunk.x,
-                chunk_z = fetch.chunk.z,
-                to = parcel.peer.0,
-                "cluster chunk snapshot send failed"
-            );
-        } else {
-            info!(
-                target: "cluster_chunk",
-                chunk_x = fetch.chunk.x,
-                chunk_z = fetch.chunk.z,
-                to = parcel.peer.0,
-                served = SERVED_CHUNKS.load(Ordering::Relaxed),
-                "cluster chunk snapshot served"
-            );
+        }
+        primary_waiters.entry(fetch.chunk).or_default().insert(parcel.peer);
+        if first_claim {
+            request_primary_chunk_load(server, fetch.chunk);
         }
         return;
     }
@@ -1192,16 +1665,26 @@ async fn handle_chunk_parcel(
         }
         return;
     };
-    if !wanted.contains(&payload.chunk) {
+    let Some((expected, started)) = pending.get(&payload.chunk).copied() else {
+        warn!(peer = parcel.peer.0, chunk_x = payload.chunk.x, chunk_z = payload.chunk.z, "cluster unsolicited chunk payload ignored");
+        return;
+    };
+    if expected != parcel.peer.0 || payload.holder != parcel.peer.0 {
+        warn!(peer = parcel.peer.0, expected, holder = payload.holder, chunk_x = payload.chunk.x, chunk_z = payload.chunk.z, "cluster payload source mismatch ignored");
         return;
     }
-    if let Some((_, at)) = pending.get(&payload.chunk) {
-        pings.record(parcel.peer.0, chunk_now_millis().saturating_sub(*at));
+    if chunk_diagnostic_cooldown_elapsed(4) {
+        info!(
+            target: "cluster_chunk",
+            stage = "payload_received",
+            chunk_x = payload.chunk.x,
+            chunk_z = payload.chunk.z,
+            source = parcel.peer.0,
+            destination = local.0,
+            payload_bytes = parcel.bytes.len(),
+            "cluster chunk payload reached secondary chunk actor"
+        );
     }
-    wanted.remove(&payload.chunk);
-    pending.remove(&payload.chunk);
-    stuck_reported.remove(&payload.chunk);
-    unroutable_reported.remove(&payload.chunk);
     let worlds = server.worlds.load();
     let Some(world) = worlds.first() else {
         return;
@@ -1211,8 +1694,20 @@ async fn handle_chunk_parcel(
         payload.chunk.z,
         &payload.snapshot,
     ) {
-        Some(chunk) => {
+        Some(chunk) if chunk.status == ChunkStatus::Full => {
+            for holder in payload.holders.iter().copied().chain(std::iter::once(payload.holder)) {
+                directory.apply_advert(ChunkAdvert { holder, chunk: payload.chunk });
+            }
+            super::cluster_world_apply::ingest_chunk_snapshot_pendings(
+                payload.chunk,
+                payload.pendings.into_iter().map(|pending| pending.bytes).collect(),
+            );
             FETCHED_CHUNKS.fetch_add(1, Ordering::Relaxed);
+            pings.record(parcel.peer.0, chunk_now_millis().saturating_sub(started));
+            wanted.remove(&payload.chunk);
+            pending.remove(&payload.chunk);
+            stuck_reported.remove(&payload.chunk);
+            unroutable_reported.remove(&payload.chunk);
             trace!(
                 chunk_x = payload.chunk.x,
                 chunk_z = payload.chunk.z,
@@ -1224,22 +1719,28 @@ async fn handle_chunk_parcel(
                 Vector2::new(payload.chunk.x, payload.chunk.z),
                 &chunk,
             );
-            if advertised.insert(payload.chunk) {
-                announce_holds(
-                    outbound,
-                    fallback,
-                    ChunkAnnounce::Acquire(ChunkAdvert {
-                        holder: local,
-                        chunk: payload.chunk,
-                    }),
+            if chunk_diagnostic_cooldown_elapsed(5) {
+                info!(
+                    target: "cluster_chunk",
+                    stage = "payload_decoded_snapshot_stored",
+                    chunk_x = payload.chunk.x,
+                    chunk_z = payload.chunk.z,
+                    source = parcel.peer.0,
+                    destination = local.0,
+                    "cluster full chunk snapshot is ready for secondary installation"
+                );
+            }
+        }
+        Some(_) => {
+            if chunk_warn_cooldown_elapsed() {
+                warn!(
+                    chunk_x = payload.chunk.x,
+                    chunk_z = payload.chunk.z,
+                    "cluster chunk snapshot was not full"
                 );
             }
         }
         None => {
-            world.level.clear_cluster_fetch_wanted(&Vector2::new(
-                payload.chunk.x,
-                payload.chunk.z,
-            ));
             if chunk_warn_cooldown_elapsed() {
                 warn!(
                     chunk_x = payload.chunk.x,
@@ -1251,42 +1752,16 @@ async fn handle_chunk_parcel(
     }
 }
 
-async fn snapshot_chunk(server: &Arc<Server>, addr: ChunkAddr) -> Option<(Vec<u8>, bool)> {
+fn snapshot_chunk(server: &Arc<Server>, addr: ChunkAddr) -> Option<Vec<u8>> {
     let worlds = server.worlds.load();
     let world = worlds.first()?;
     let pos = Vector2::new(addr.x, addr.z);
     if let Some(entry) = world.level.loaded_chunks.get(&pos) {
-        return Some((cluster_encode_snapshot(entry.value()), true));
+        if entry.value().status == ChunkStatus::Full {
+            return Some(cluster_encode_snapshot(entry.value()));
+        }
     }
-    world.level.get_or_fetch_chunk(pos, |_| ()).await;
-    world
-        .level
-        .loaded_chunks
-        .get(&pos)
-        .map(|entry| (cluster_encode_snapshot(entry.value()), false))
-}
-
-fn seed_grants(server: &Arc<Server>) -> Vec<OpGrant> {
-    if !matches!(server.advanced_config.cluster.role, ClusterRole::Primary) {
-        return Vec::new();
-    }
-    let guard = server
-        .data
-        .operator_config
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    guard
-        .ops
-        .iter()
-        .map(|op| {
-            OpGrant::new(
-                *op.uuid.as_bytes(),
-                op.name.clone(),
-                op.level as u8,
-                op.bypasses_player_limit,
-            )
-        })
-        .collect()
+    None
 }
 
 fn persist_admin(server: &Arc<Server>, mutation: &AdminMutation) {
@@ -1305,60 +1780,10 @@ fn persist_admin(server: &Arc<Server>, mutation: &AdminMutation) {
 
 async fn admin_task(
     server: Arc<Server>,
-    local: ServerId,
-    peers: Vec<u16>,
-    outbound: mpsc::Sender<OutboundParcel>,
     mut control_rx: mpsc::Receiver<InboundParcel>,
 ) {
     let mut ops = InMemoryOpStore::new();
     let mut bans = InMemoryBanStore::new();
-    for grant in seed_grants(&server) {
-        let grant_uuid = uuid::Uuid::from_bytes(grant.uuid);
-        if ops.grant(&grant) {
-            info!(
-                server_id = local.0,
-                uuid = %grant_uuid,
-                level = grant.level,
-                "cluster admin seed grant applied locally"
-            );
-        }
-        let mutation = AdminMutation::GrantOp(grant);
-        match mutation_parcels_for_peers(&mutation, &peers) {
-            Ok(parcels) => {
-                let mut sent = 0_usize;
-                for parcel in parcels {
-                    let outbound_parcel = OutboundParcel {
-                        peer: ServerId(parcel.peer),
-                        header: StreamHeader::new(parcel.kind, None),
-                        bytes: parcel.bytes,
-                    };
-                    if outbound.try_send(outbound_parcel).is_ok() {
-                        sent = sent.saturating_add(1);
-                    }
-                }
-                if sent == peers.len() {
-                    info!(
-                        uuid = %grant_uuid,
-                        peers = peers.len(),
-                        "cluster admin seed grant broadcast"
-                    );
-                } else {
-                    warn!(
-                        uuid = %grant_uuid,
-                        sent = sent,
-                        peers = peers.len(),
-                        "cluster admin seed grant partially broadcast"
-                    );
-                }
-            }
-            Err(_) => {
-                warn!(
-                    uuid = %grant_uuid,
-                    "cluster admin seed grant encode failed"
-                );
-            }
-        }
-    }
     while let Some(parcel) = control_rx.recv().await {
         if parcel.header.kind != StreamKind::Control {
             continue;
@@ -1369,7 +1794,6 @@ async fn admin_task(
             continue;
         };
         super::cluster_admin_apply::handle_admin_message_for_server(&server, &message);
-        super::cluster_moderation::handle_moderation_parcel(&server, &parcel);
         let mutation = match &message {
             AdminControlMessage::Mutation(mutation) => mutation,
             AdminControlMessage::MutationWithAudit(audit) => &audit.mutation,
@@ -1390,52 +1814,13 @@ async fn admin_task(
 }
 
 async fn accept_task(server: Arc<Server>, mut accept_rx: mpsc::Receiver<InboundParcel>) {
-    const MAX_SYNC_TICKS: usize = 256;
-    const SYNC_EXPIRY_SECS: u64 = 30;
-    let mut acceptor = Acceptor::new();
-    let mut expiry = tokio::time::interval(Duration::from_secs(SYNC_EXPIRY_SECS));
-    expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            incoming = accept_rx.recv() => {
-                let Some(parcel) = incoming else { break };
-                if parcel.header.kind != StreamKind::Accept {
-                    continue;
-                }
-                match decode_accept(&parcel.bytes) {
-                    Ok(batch) => {
-                        if batch.is_empty() {
-                            debug!(tick = batch.tick.0, "cluster accept batch applied");
-                        } else {
-                            info!(
-                                tick = batch.tick.0,
-                                decisions = batch.len(),
-                                "cluster accept batch applied"
-                            );
-                        }
-                        if let Some(handle) = server.primary_save.as_ref() {
-                            let _ = handle.try_submit(batch.tick, parcel.bytes.clone());
-                        }
-                        acceptor.apply_accept(batch);
-                        CLUSTER_PENDING_SYNC.store(acceptor.pending_ticks() as u64, Ordering::Relaxed);
-                    }
-                    Err(_) => {
-                        warn!("cluster accept batch decode failed");
-                    }
-                }
-            }
-            _ = expiry.tick() => {
-                let dropped = acceptor.expire_stale(MAX_SYNC_TICKS);
-                if dropped > 0 {
-                    CLUSTER_DROPPED_SYNC.fetch_add(dropped as u64, Ordering::Relaxed);
-                    warn!(
-                        dropped,
-                        pending = acceptor.pending_ticks(),
-                        "cluster sync buckets expired stale entries without waiting"
-                    );
-                }
-                CLUSTER_PENDING_SYNC.store(acceptor.pending_ticks() as u64, Ordering::Relaxed);
-            }
+    while let Some(parcel) = accept_rx.recv().await {
+        if parcel.header.kind != StreamKind::Accept {
+            continue;
+        }
+        super::cluster_world_apply::submit_accept_batch(parcel.peer, parcel.bytes);
+        if server.primary_save.is_some() {
+            debug!(from = parcel.peer.0, "primary received holder acceptance");
         }
     }
 }
@@ -1473,6 +1858,22 @@ async fn fuse_task(
 mod discipline_tests {
     use super::*;
     use pumpkin_cluster::ntp::{publish_shared_offset, withdraw_shared_offset};
+
+    #[test]
+    fn primary_fallback_is_routable_before_holder_advertisement() {
+        let directory = Directory::new();
+        let pings = PingTracker::new();
+        assert_eq!(
+            chunk_source(
+                &directory,
+                &pings,
+                ServerId(0),
+                &[0, 2],
+                ChunkAddr { x: 12, z: -7 },
+            ),
+            Some(0)
+        );
+    }
 
     #[test]
     fn undisciplined_stamp_falls_back_and_healthy_sample_applies() {

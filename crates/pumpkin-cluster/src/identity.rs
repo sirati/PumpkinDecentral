@@ -47,6 +47,20 @@ pub struct GlobalPlayerId {
     pub player: PlayerSlot,
 }
 
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
+pub enum ActionActor {
+    Player(GlobalPlayerId),
+    Server(ServerId),
+}
+
+impl From<GlobalPlayerId> for ActionActor {
+    fn from(value: GlobalPlayerId) -> Self {
+        Self::Player(value)
+    }
+}
+
 /// The whole id fits in 32 bits: two `u16` halves, no padding.
 /// Fails to compile if either half stops being a `u16`.
 const _: [u8; 4] = [0; core::mem::size_of::<GlobalPlayerId>()];
@@ -105,6 +119,17 @@ impl PlayerSeq {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ActionSeq(pub u16);
+
+impl ActionSeq {
+    #[must_use]
+    pub const fn is_newer_than(self, other: Self) -> bool {
+        let distance = self.0.wrapping_sub(other.0);
+        distance != 0 && distance < 32_768
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +165,7 @@ mod tests {
     fn player_identity_stays_distinct_from_entity_identity() {
         let player = GlobalPlayerId::new(ServerId(1), PlayerSlot(7));
         let entity = EntityRef {
+            origin: ServerId(1),
             owner: ServerId(1),
             local_id: 7,
             chunk: crate::protocol::ChunkAddr { x: 0, z: 0 },

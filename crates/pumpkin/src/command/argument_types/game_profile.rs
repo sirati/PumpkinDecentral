@@ -136,6 +136,23 @@ impl GameProfileResult {
     }
 
     fn resolve_known_profile_by_name(server: &Server, name: &str) -> Option<GameProfile> {
+        if let Some(waiter) = server
+            .lobby_waiters
+            .load()
+            .iter()
+            .find(|waiter| waiter.profile.name.eq_ignore_ascii_case(name))
+        {
+            return Some(waiter.profile.clone());
+        }
+        if let Some((_, entry)) = crate::server::cluster_presence::remote_presence_entries()
+            .into_iter()
+            .find(|(_, entry)| entry.name.eq_ignore_ascii_case(name))
+        {
+            return Some(Self::profile_from_uuid_name(
+                Uuid::from_bytes(entry.uuid),
+                entry.name,
+            ));
+        }
         let ops = server
             .data
             .operator_config
@@ -175,6 +192,20 @@ impl GameProfileResult {
     }
 
     fn resolve_known_profile_by_uuid(server: &Server, uuid: Uuid) -> Option<GameProfile> {
+        if let Some(waiter) = server
+            .lobby_waiters
+            .load()
+            .iter()
+            .find(|waiter| waiter.profile.id == uuid)
+        {
+            return Some(waiter.profile.clone());
+        }
+        if let Some((_, entry)) = crate::server::cluster_presence::remote_presence_entries()
+            .into_iter()
+            .find(|(_, entry)| entry.uuid == *uuid.as_bytes())
+        {
+            return Some(Self::profile_from_uuid_name(uuid, entry.name));
+        }
         let ops = server
             .data
             .operator_config

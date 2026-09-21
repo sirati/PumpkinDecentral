@@ -1,4 +1,6 @@
-use pumpkin_cluster::ntp::shared_offset_millis;
+use pumpkin_cluster::ntp::{
+    shared_offset_millis, shared_precision_millis, shared_precision_target_millis,
+};
 use pumpkin_cluster::time::TickStamp;
 use pumpkin_util::PermissionLvl;
 use pumpkin_util::math::position::BlockPos;
@@ -182,11 +184,21 @@ fn send_ntp_time(context: &CommandContext) {
         Some(offset) => format!("{offset}ms"),
         None => "none".to_owned(),
     };
+    let precision_text = match shared_precision_millis() {
+        Some(precision) => format!("{precision}ms"),
+        None => "none".to_owned(),
+    };
+    let precision_target_text = match shared_precision_target_millis() {
+        Some(target) => format!("{target}ms"),
+        None => "none".to_owned(),
+    };
     context.source.send_feedback(
         TextComponent::text(format!(
-            "NTP time: disciplined wall {}ms (offset {}, disciplined: {}, fallbacks: {})",
+            "NTP time: disciplined wall {}ms (offset {}, sample precision {} / target {}, disciplined: {}, fallbacks: {})",
             wall,
             offset_text,
+            precision_text,
+            precision_target_text,
             crate::server::cluster::ntp_disciplined(),
             crate::server::cluster::ntp_undisciplined_fallbacks()
         )),

@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::hash::Hasher;
 
-use crate::identity::GlobalPlayerId;
+use crate::identity::{ActionActor, GlobalPlayerId};
 use crate::time::TickStamp;
 
 #[must_use]
@@ -27,6 +27,40 @@ pub fn order_players(
     } else {
         by_hash
     }
+}
+
+#[must_use]
+pub fn order_action_actors(
+    cluster_seed: u64,
+    tick: TickStamp,
+    left: ActionActor,
+    right: ActionActor,
+) -> Ordering {
+    match (left, right) {
+        (ActionActor::Player(left), ActionActor::Player(right)) => {
+            order_players(cluster_seed, tick, left, right)
+        }
+        _ => action_actor_rank(cluster_seed, tick, left)
+            .cmp(&action_actor_rank(cluster_seed, tick, right))
+            .then_with(|| left.cmp(&right)),
+    }
+}
+
+fn action_actor_rank(cluster_seed: u64, tick: TickStamp, actor: ActionActor) -> u64 {
+    let mut hasher = xxhash_rust::xxh64::Xxh64::new(cluster_seed);
+    hasher.write_u16(tick.0);
+    match actor {
+        ActionActor::Player(player) => {
+            hasher.write_u8(0);
+            hasher.write_u16(player.server.0);
+            hasher.write_u16(player.player.0);
+        }
+        ActionActor::Server(server) => {
+            hasher.write_u8(1);
+            hasher.write_u16(server.0);
+        }
+    }
+    hasher.finish()
 }
 
 #[cfg(test)]

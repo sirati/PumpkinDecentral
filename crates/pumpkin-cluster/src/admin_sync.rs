@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 use crate::identity::{GlobalPlayerId, ServerId};
 use crate::primary::{AcceptedTick, PrimarySaveHandle};
@@ -152,42 +152,6 @@ impl KickRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SpectateRequest {
-    pub viewer: GlobalPlayerId,
-    pub target: GlobalPlayerId,
-    pub target_name: String,
-}
-
-impl SpectateRequest {
-    #[must_use]
-    pub fn new(viewer: GlobalPlayerId, target: GlobalPlayerId, target_name: String) -> Self {
-        Self {
-            viewer,
-            target,
-            target_name,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SpectateLocation {
-    pub target: GlobalPlayerId,
-    pub target_name: String,
-    pub host: ServerId,
-}
-
-impl SpectateLocation {
-    #[must_use]
-    pub fn new(target: GlobalPlayerId, target_name: String, host: ServerId) -> Self {
-        Self {
-            target,
-            target_name,
-            host,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdminControlMessage {
     Mutation(AdminMutation),
     /// A state mutation together with the one operator-visible notification
@@ -195,7 +159,6 @@ pub enum AdminControlMessage {
     /// a peer cannot display a success before it has applied the change.
     MutationWithAudit(AdminAudit),
     Kick(KickRequest),
-    Spectate(SpectateRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,31 +242,6 @@ pub fn kick_parcel_for_host(request: &KickRequest) -> Result<AdminParcel, AdminS
         admin_control_kind(),
         bytes,
     ))
-}
-
-pub fn spectate_parcel_for_host(request: &SpectateRequest) -> Result<AdminParcel, AdminSyncError> {
-    let bytes = encode_control_message(&AdminControlMessage::Spectate(request.clone()))?;
-    Ok(AdminParcel::new(
-        request.target.server.0,
-        admin_control_kind(),
-        bytes,
-    ))
-}
-
-pub async fn broadcast_control_message(
-    tx: &mpsc::Sender<AdminParcel>,
-    message: &AdminControlMessage,
-    peers: &[u16],
-) -> Result<usize, AdminSyncError> {
-    let bytes = encode_control_message(message)?;
-    let mut sent = 0_usize;
-    for peer in peers {
-        let parcel = AdminParcel::new(*peer, admin_control_kind(), bytes.clone());
-        if tx.send(parcel).await.is_ok() {
-            sent = sent.saturating_add(1);
-        }
-    }
-    Ok(sent)
 }
 
 pub fn try_broadcast_control_message(
@@ -573,14 +511,6 @@ pub struct KickDelivery {
     pub request: KickRequest,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SpectateResolution {
-    pub viewer: GlobalPlayerId,
-    pub target: GlobalPlayerId,
-    pub remote: bool,
-    pub location: SpectateLocation,
-}
-
 #[must_use]
 pub fn resolve_kick_by_name(
     directory: &PlayerDirectorySnapshot,
@@ -622,52 +552,7 @@ pub fn resolve_kick_by_id(
 }
 
 #[must_use]
-pub fn resolve_spectate_by_name(
-    directory: &PlayerDirectorySnapshot,
-    viewer: GlobalPlayerId,
-    target_name: &str,
-) -> Option<SpectateResolution> {
-    let target = directory.locate_by_name(target_name)?;
-    if target == viewer {
-        return None;
-    }
-    let canonical = directory
-        .player_name(&target)
-        .cloned()
-        .unwrap_or_else(|| target_name.to_string());
-    Some(SpectateResolution {
-        viewer,
-        target,
-        remote: !directory.is_local(&target),
-        location: SpectateLocation::new(target, canonical, directory.host_of(&target)),
-    })
-}
-
-#[must_use]
-pub fn resolve_spectate_by_id(
-    directory: &PlayerDirectorySnapshot,
-    viewer: GlobalPlayerId,
-    target: GlobalPlayerId,
-) -> Option<SpectateResolution> {
-    if target == viewer {
-        return None;
-    }
-    let canonical = directory.player_name(&target)?.clone();
-    Some(SpectateResolution {
-        viewer,
-        target,
-        remote: !directory.is_local(&target),
-        location: SpectateLocation::new(target, canonical, directory.host_of(&target)),
-    })
-}
-
-#[must_use]
 pub fn should_deliver_kick_locally(request: &KickRequest, local: ServerId) -> bool {
-    request.target.server == local
-}
-
-#[must_use]
-pub fn should_deliver_spectate_locally(request: &SpectateRequest, local: ServerId) -> bool {
     request.target.server == local
 }
 
@@ -678,7 +563,6 @@ pub enum AdminInboundEffect {
         changed: bool,
     },
     KickDelivery(KickRequest),
-    SpectateDelivery(SpectateRequest),
     Ignored,
 }
 
@@ -710,62 +594,7 @@ where
                 AdminInboundEffect::Ignored
             }
         }
-        AdminControlMessage::Spectate(request) => {
-            if should_deliver_spectate_locally(&request, local) {
-                AdminInboundEffect::SpectateDelivery(request)
-            } else {
-                AdminInboundEffect::Ignored
-            }
-        }
     })
-}
-
-#[derive(Debug)]
-pub struct SpectateQuery {
-    pub viewer: GlobalPlayerId,
-    pub target_name: String,
-    pub reply: oneshot::Sender<Option<SpectateLocation>>,
-}
-
-impl SpectateQuery {
-    #[must_use]
-    pub fn new(
-        viewer: GlobalPlayerId,
-        target_name: String,
-        reply: oneshot::Sender<Option<SpectateLocation>>,
-    ) -> Self {
-        Self {
-            viewer,
-            target_name,
-            reply,
-        }
-    }
-}
-
-pub fn answer_spectate_query(directory: &PlayerDirectorySnapshot, query: SpectateQuery) {
-    let SpectateQuery {
-        viewer,
-        target_name,
-        reply,
-    } = query;
-    let location = resolve_spectate_by_name(directory, viewer, &target_name).map(|found| found.location);
-    let _ = reply.send(location);
-}
-
-pub async fn query_spectate_location(
-    tx: &mpsc::Sender<SpectateQuery>,
-    viewer: GlobalPlayerId,
-    target_name: String,
-) -> Option<SpectateLocation> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    let query = SpectateQuery::new(viewer, target_name, reply_tx);
-    if tx.send(query).await.is_err() {
-        return None;
-    }
-    match reply_rx.await {
-        Ok(location) => location,
-        Err(_) => None,
-    }
 }
 
 #[cfg(test)]
@@ -942,23 +771,6 @@ mod tests {
     }
 
     #[test]
-    fn spectate_resolves_live_location() {
-        let snapshot = directory();
-        let viewer = gid(1, 1);
-        let remote = resolve_spectate_by_name(&snapshot, viewer, "bob").unwrap();
-        assert!(remote.remote);
-        assert_eq!(remote.location.host, ServerId(2));
-        assert_eq!(remote.location.target, gid(2, 7));
-        assert!(resolve_spectate_by_name(&snapshot, viewer, "alice").is_none());
-        let by_id = resolve_spectate_by_id(&snapshot, viewer, gid(2, 7)).unwrap();
-        assert_eq!(by_id.location.target_name, String::from("Bob"));
-        assert!(resolve_spectate_by_id(&snapshot, viewer, gid(9, 9)).is_none());
-        let request = SpectateRequest::new(viewer, gid(2, 7), String::from("Bob"));
-        assert!(should_deliver_spectate_locally(&request, ServerId(2)));
-        assert!(!should_deliver_spectate_locally(&request, ServerId(1)));
-    }
-
-    #[test]
     fn inbound_dispatch_applies_or_delivers() {
         let mut ops = InMemoryOpStore::new();
         let mut bans = InMemoryBanStore::new();
@@ -976,41 +788,6 @@ mod tests {
         let bytes = encode_control_message(&AdminControlMessage::Kick(remote_kick)).unwrap();
         let effect = handle_control_bytes(&mut ops, &mut bans, ServerId(1), &bytes).unwrap();
         assert_eq!(effect, AdminInboundEffect::Ignored);
-    }
-
-    #[tokio::test]
-    async fn broadcast_sends_to_all_peers() {
-        let (tx, mut rx) = mpsc::channel(8);
-        let count = broadcast_control_message(&tx, &AdminControlMessage::Mutation(grant()), &[2, 3])
-            .await
-            .unwrap();
-        assert_eq!(count, 2);
-        assert!(rx.recv().await.is_some());
-        assert!(rx.recv().await.is_some());
-    }
-
-    #[tokio::test]
-    async fn spectate_query_roundtrips_without_locks() {
-        let snapshot = directory();
-        let (tx, mut rx) = mpsc::channel(4);
-        let viewer = gid(1, 1);
-        let task = tokio::spawn(async move {
-            let Some(query) = rx.recv().await else {
-                return;
-            };
-            answer_spectate_query(&snapshot, query);
-        });
-        let found = query_spectate_location(&tx, viewer, String::from("Bob")).await.unwrap();
-        assert_eq!(found.host, ServerId(2));
-        task.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn spectate_query_missing_sender_returns_none() {
-        let (tx, rx) = mpsc::channel::<SpectateQuery>(1);
-        drop(rx);
-        let found = query_spectate_location(&tx, gid(1, 1), String::from("Bob")).await;
-        assert!(found.is_none());
     }
 
     #[test]

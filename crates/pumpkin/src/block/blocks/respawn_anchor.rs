@@ -1,9 +1,12 @@
 use pumpkin_data::block_properties::RespawnAnchorLikeProperties;
 use pumpkin_data::item::Item;
+use pumpkin_data::data_component_impl::EquipmentSlot;
 use pumpkin_data::sound::{Sound, SoundCategory};
 use pumpkin_data::{BlockState, translation};
 use pumpkin_macros::pumpkin_block;
 use pumpkin_world::world::BlockFlags;
+use pumpkin_inventory::player::player_inventory::PlayerInventory;
+use pumpkin_util::GameMode;
 
 use crate::block::registry::BlockActionResult;
 use crate::block::{
@@ -30,11 +33,25 @@ impl BlockBehaviour for RespawnAnchorBlock {
             return BlockActionResult::Pass;
         }
 
+        let slot = match args.equipment_slot {
+            EquipmentSlot::MainHand(_) => args.player.inventory().get_selected_slot() as usize,
+            EquipmentSlot::OffHand(_) => PlayerInventory::OFF_HAND_SLOT,
+            _ => return BlockActionResult::Pass,
+        };
+        let before = args.item_stack.clone();
         props.charges += 1;
-        args.world.set_block_state(
+        let new_state = props.to_state_id(args.block);
+        args.world
+            .set_block_state(args.position, new_state, BlockFlags::NOTIFY_ALL);
+
+        crate::server::cluster_world_delta::emit_anchor_charge_action(
+            args.player,
             args.position,
-            props.to_state_id(args.block),
-            BlockFlags::NOTIFY_ALL,
+            state_id.as_u16(),
+            new_state.as_u16(),
+            slot,
+            &before,
+            args.player.gamemode.load() != GameMode::Creative,
         );
 
         args.item_stack

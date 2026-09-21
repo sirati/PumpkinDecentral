@@ -49,6 +49,12 @@ impl BedrockClient {
                         BlockFlags::NOTIFY_ALL | BlockFlags::SKIP_DROPS,
                     );
                     if new_state.is_some() {
+                        crate::net::java::play::player_action::record_cluster_break_snapshot(
+                            player,
+                            server,
+                            location,
+                            state.id.as_u16(),
+                        );
                         server
                             .block_registry
                             .broken(&world, block, player, &location, server, state);
@@ -66,6 +72,12 @@ impl BedrockClient {
                         };
                         let new_state = world.break_block(&location, Some(player), flags);
                         if new_state.is_some() {
+                            crate::net::java::play::player_action::record_cluster_break_snapshot(
+                                player,
+                                server,
+                                location,
+                                broken_state.id.as_u16(),
+                            );
                             server.block_registry.broken(
                                 &world,
                                 block,
@@ -184,6 +196,12 @@ impl BedrockClient {
                             BlockFlags::SKIP_DROPS | BlockFlags::NOTIFY_ALL
                         };
                         if world.break_block(&location, Some(player), flags).is_some() {
+                            crate::net::java::play::player_action::record_cluster_break_snapshot(
+                                player,
+                                server,
+                                location,
+                                state.id.as_u16(),
+                            );
                             server
                                 .block_registry
                                 .broken(&world, block, player, &location, server, state);

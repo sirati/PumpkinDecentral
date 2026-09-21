@@ -32,12 +32,7 @@ impl HoglinEntity {
 
     pub fn new(entity: Entity) -> Arc<Self> {
         let mob_entity = MobEntity::new(entity);
-        {
-            let mut attributes = mob_entity
-                .living_entity
-                .attributes
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        mob_entity.living_entity.update_attributes(|attributes| {
             if let Some(health) = attributes.get_mut(&Attributes::MAX_HEALTH.id) {
                 health.base_value = 40.0;
                 health.dirty.store(true, Ordering::Relaxed);
@@ -58,7 +53,7 @@ impl HoglinEntity {
                 damage.base_value = 6.0;
                 damage.dirty.store(true, Ordering::Relaxed);
             }
-        }
+        });
         mob_entity.living_entity.health.store(40.0);
 
         let hoglin = Self {

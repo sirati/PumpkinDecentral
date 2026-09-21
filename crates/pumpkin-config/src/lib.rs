@@ -405,7 +405,12 @@ pub trait LoadConfiguration {
     #[must_use]
     fn merge_toml_values(base: toml::Value, overlay: toml::Value) -> (toml::Value, bool) {
         match (base, overlay) {
-            (toml::Value::Table(mut base_table), toml::Value::Table(overlay_table)) => {
+            (toml::Value::Table(mut base_table), toml::Value::Table(mut overlay_table)) => {
+                if let Some(legacy_precision) = overlay_table.remove("max_offset_millis") {
+                    overlay_table
+                        .entry("max_precision_millis".to_owned())
+                        .or_insert(legacy_precision);
+                }
                 let mut changed = false;
 
                 for key in base_table.keys() {
@@ -444,7 +449,7 @@ pub trait LoadConfiguration {
 mod tests {
     use toml::from_str;
 
-    use super::BasicConfiguration;
+    use super::{BasicConfiguration, LoadConfiguration, PumpkinConfig};
 
     #[test]
     fn accepts_transfers_defaults_to_true() {
@@ -459,5 +464,13 @@ mod tests {
 
         let config: BasicConfiguration = from_str("accepts_transfers = false").unwrap();
         assert!(!config.accepts_transfers);
+    }
+
+    #[test]
+    fn merged_legacy_cluster_precision_uses_the_new_field() {
+        let overlay = from_str("[cluster]\nmax_offset_millis = 19").unwrap();
+        let (config, changed) = PumpkinConfig::merge_with_default_toml(overlay);
+        assert!(changed);
+        assert_eq!(config.advanced.cluster.max_precision_millis, 19);
     }
 }

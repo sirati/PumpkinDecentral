@@ -30,10 +30,13 @@ fn toggle_trapdoor(player: &Player, world: &Arc<World>, block_pos: &BlockPos) {
         *block_pos,
     );
 
-    world.set_block_state(
+    let new_state = trapdoor_props.to_state_id(block);
+    world.set_block_state(block_pos, new_state, BlockFlags::NOTIFY_LISTENERS);
+    crate::server::cluster_world_delta::emit_linked_trapdoor_toggle(
+        player,
         block_pos,
-        trapdoor_props.to_state_id(block),
-        BlockFlags::NOTIFY_LISTENERS,
+        block_state.as_u16(),
+        new_state.as_u16(),
     );
 }
 

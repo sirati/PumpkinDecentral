@@ -89,12 +89,12 @@ impl JavaClient {
                 server.plugin_manager.fire_blocking(server, &mut event);
             }
 
-            if skin_changed {
+            if skin_changed
+                && let Some(tick) = crate::server::cluster::disciplined_tick_now()
+            {
                 pumpkin_cluster::visual::emit_skin(
                     player.cluster_gid(),
-                    pumpkin_cluster::visual::tick_from_counter(
-                        player.tick_counter.load(std::sync::atomic::Ordering::Relaxed),
-                    ),
+                    tick,
                     client_information.skin_parts,
                 );
             }

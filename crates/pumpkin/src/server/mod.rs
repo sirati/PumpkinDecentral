@@ -62,17 +62,20 @@ pub mod cluster_chat_pm;
 pub mod cluster_combat_apply;
 pub mod cluster_datagram;
 pub mod cluster_entity_apply;
+pub mod cluster_entity_boundary;
 pub mod cluster_entity_emit;
-/// Cluster-wide invsee snapshot and edit routing.
 pub mod cluster_invsee;
 pub mod cluster_lobby;
+pub mod cluster_lobby_control;
+pub mod cluster_loaded_player_boundary;
 pub mod cluster_world_apply;
 pub mod cluster_world_delta;
 pub mod cluster_world_time;
 pub mod cluster_transient;
 pub mod cluster_visual;
-pub mod cluster_moderation;
 pub mod cluster_movement_sample;
+pub mod cluster_playerdata;
+pub mod cluster_primary_persist;
 pub mod cluster_hide;
 pub mod cluster_presence;
 pub mod cluster_regions;
@@ -128,6 +131,7 @@ pub struct Server {
     pub worlds: ArcSwap<Vec<Arc<World>>>,
     /// All the dimensions that exist on the server.
     pub dimensions: Vec<Dimension>,
+    pub lobby_waiters: ArcSwap<Vec<Arc<cluster_lobby::LobbyWaiter>>>,
     /// Assigns unique IDs to containers.
     container_id: AtomicU32,
     pub recipe_manager: Arc<recipe::RecipeManager>,
@@ -214,7 +218,10 @@ impl Server {
 
         let block_registry = super::block::registry::default_registry();
 
-        let level_info = match AnvilLevelInfo.read_world_info(&world_path) {
+        let level_info = if cluster_secondary_early {
+            LevelData::default(basic_config.seed)
+        } else {
+            match AnvilLevelInfo.read_world_info(&world_path) {
             Ok(level_info) => {
                 let dat_path = world_path.join(LEVEL_DAT_FILE_NAME);
                 if dat_path.exists() {
@@ -226,20 +233,6 @@ impl Server {
                 level_info
             }
             Err(WorldInfoError::InfoNotFound) => {
-                if cluster_secondary_early {
-                    error!(
-                        "Cluster secondary found no {LEVEL_DAT_FILE_NAME} in {}; refusing to invent a seed",
-                        world_path.display()
-                    );
-                    error!(
-                        "Copy the primary's {LEVEL_DAT_FILE_NAME} into {} so every node generates the same terrain",
-                        world_path.display()
-                    );
-                    error!(
-                        "Run tools/cluster/collect-pins.sh to sync the primary seed before starting this secondary"
-                    );
-                    std::process::exit(1);
-                }
                 warn!(
                     "No {LEVEL_DAT_FILE_NAME} in {}, creating a new world with seed {}",
                     world_path.display(),
@@ -251,11 +244,7 @@ impl Server {
                 );
                 let default_data =
                     LevelData::from_world_generator(basic_config.seed, &overworld_gen);
-                if cluster_secondary_early {
-                    info!("Cluster secondary: keeping fresh level info in memory only");
-                } else if let Err(err) =
-                    AnvilLevelInfo.write_world_info(&default_data, &world_path)
-                {
+                if let Err(err) = AnvilLevelInfo.write_world_info(&default_data, &world_path) {
                     error!("Failed to save level.dat: {err}");
                 }
                 default_data
@@ -277,6 +266,7 @@ impl Server {
                 );
                 error!("Failed to load the world data! See the logs for more info.");
                 std::process::exit(1);
+            }
             }
         };
 
@@ -355,6 +345,7 @@ impl Server {
             map_id: level_info.load().map_id.into(),
             worlds: ArcSwap::from_pointee(vec![]),
             dimensions,
+            lobby_waiters: ArcSwap::from_pointee(Vec::new()),
             command_dispatcher,
             block_registry: block_registry.clone(),
             item_registry: super::item::items::default_registry(),
@@ -401,21 +392,29 @@ impl Server {
                 .clone();
             cluster_status::install_favicon(favicon);
         }
-        cluster_status::spawn_cluster_status_poller(&server);
+        cluster_status::refresh_cluster_status(&server);
 
         if cluster_primary {
             info!("Cluster primary: persisting accepted ticks; player logins are refused");
             if let Some(inbox) = primary_inbox {
                 let saver = server.clone();
+                let apply_server = Arc::clone(&saver);
+                let mut ledger = pumpkin_cluster::inventory::InvLedger::new();
                 server.spawn_task(async move {
                     inbox
                         .run(
-                            |accepted| {
-                                debug!(
-                                    tick = accepted.tick.0,
-                                    bytes = accepted.payload.len(),
-                                    "Primary saver applying accepted tick"
-                                );
+                            move |accepted| {
+                                if cluster_primary_persist::apply_primary_accepted_tick(
+                                    &apply_server,
+                                    &mut ledger,
+                                    accepted,
+                                ) {
+                                    debug!(
+                                        tick = accepted.tick.0,
+                                        bytes = accepted.payload.len(),
+                                        "primary accepted game tick applied"
+                                    );
+                                }
                             },
                             || {
                                 let saver = saver.clone();
@@ -549,8 +548,7 @@ impl Server {
         server
     }
 
-    /// Spawns a task associated with this server. All tasks spawned with this method are awaited
-    /// when the server stops. This means tasks should complete in a reasonable (no looping) amount of time.
+    /// Spawns a task associated with this server. Task intake closes when the server stops.
     pub fn spawn_task<F>(&self, task: F) -> JoinHandle<F::Output>
     where
         F: Future + Send + 'static,
@@ -674,7 +672,7 @@ impl Server {
 
         let dynamic_recipes = self.recipe_manager.get_dynamic_recipes_internal();
         for player in self.get_all_players() {
-            if let crate::net::ClientPlatform::Java(java_client) = player.client.as_ref() {
+            if let Some(crate::net::ClientPlatform::Java(java_client)) = player.client.as_deref() {
                 let add_packet = pumpkin_protocol::java::client::play::CRecipeBookAdd::new(
                     true,
                     &dynamic_recipes,
@@ -776,6 +774,13 @@ impl Server {
             );
             return None;
         }
+        if !cluster::cluster_real_world_handoff_allowed() {
+            client.try_kick(
+                DisconnectReason::Kicked,
+                &TextComponent::text("This cluster peer cannot hand off a player into the game world"),
+            );
+            return None;
+        }
 
         let gamemode = self
             .defaultgamemode
@@ -786,7 +791,10 @@ impl Server {
         let first_world = self.worlds.load().first().cloned()?;
 
         let (world, nbt) = if pumpkin_world::level::is_cluster_secondary() {
-            (first_world, None)
+            let world = cluster_playerdata::cached_handoff_location(profile.id)
+                .map(|location| self.get_world_from_dimension(&location.dimension))
+                .unwrap_or(first_world);
+            (world, None)
         } else if let Ok(Some(data)) = self.player_data_storage.load_data(&profile.id) {
             if let Some(dimension_key) = data.get_string("Dimension") {
                 if let Some(dimension) = Dimension::from_name(dimension_key) {
@@ -805,12 +813,14 @@ impl Server {
             (first_world, None)
         };
 
+        let lobby_waiter = self.take_lobby_waiter(profile.id);
         let mut player = Player::new(
             client,
             profile,
             config.clone().unwrap_or_default(),
             &world,
             gamemode,
+            lobby_waiter.as_ref().map(|waiter| waiter.entity_id),
         );
 
         if let Some(mut nbt_data) = nbt {
@@ -822,6 +832,9 @@ impl Server {
 
         // Wrap in Arc after data is loaded
         let player = Arc::new(player);
+        if let Some(waiter) = lobby_waiter.as_ref() {
+            player.set_cluster_gid(Some(waiter.gid));
+        }
         let _ = cluster_presence::assign_login_gid(self, &player);
         {
             let mut advancements = player
@@ -871,6 +884,10 @@ impl Server {
         }};
         if let Some((joined_player, _)) = joined.as_ref() {
             cluster_presence::publish_login(self, joined_player);
+            crate::server::cluster_entity_emit::stage_spawn_arc_if_cluster(
+                self,
+                joined_player.clone() as Arc<dyn crate::entity::EntityBase>,
+            );
         }
         joined
     }
@@ -896,10 +913,7 @@ impl Server {
             primary.shutdown();
         }
         self.tasks.close();
-        debug!("Awaiting tasks for server");
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), self.tasks.wait()).await;
-        debug!("Done awaiting tasks for server");
-        crate::server::cluster::log_cluster_shutdown_progress(self, "server tasks drained");
+        crate::server::cluster::log_cluster_shutdown_progress(self, "server task intake closed");
 
         info!("Starting worlds");
         for world in self.worlds.load().iter() {
@@ -1077,9 +1091,7 @@ impl Server {
     /// so name selectors never resolve them.
     pub fn get_player_by_name(&self, name: &str) -> Option<Arc<Player>> {
         for world in self.worlds.load().iter() {
-            if let Some(player) = world.get_player_by_name(name)
-                && !player.is_in_cluster_lobby()
-            {
+            if let Some(player) = world.get_player_by_name(name) {
                 return Some(player);
             }
         }
@@ -1088,11 +1100,44 @@ impl Server {
 
     #[must_use]
     pub fn player_in_cluster_lobby(&self, name: &str) -> bool {
-        self.worlds.load().iter().any(|world| {
-            world.players.load().iter().any(|player| {
-                player.is_in_cluster_lobby() && player.gameprofile.name.eq_ignore_ascii_case(name)
-            })
-        }) || cluster_presence::remote_player_in_lobby(name)
+        self.lobby_waiters
+            .load()
+            .iter()
+            .any(|waiter| waiter.profile.name.eq_ignore_ascii_case(name))
+            || cluster_presence::remote_player_in_lobby(name)
+    }
+
+    pub fn insert_lobby_waiter(&self, waiter: Arc<cluster_lobby::LobbyWaiter>) {
+        self.lobby_waiters.rcu(|current| {
+            let mut next = (**current).clone();
+            next.push(waiter.clone());
+            next
+        });
+        cluster_status::refresh_cluster_status(self);
+    }
+
+    pub fn remove_lobby_waiter(&self, gid: pumpkin_cluster::identity::GlobalPlayerId) {
+        self.lobby_waiters.rcu(|current| {
+            current
+                .iter()
+                .filter(|waiter| waiter.gid != gid)
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+        cluster_status::refresh_cluster_status(self);
+    }
+
+    fn take_lobby_waiter(&self, uuid: uuid::Uuid) -> Option<Arc<cluster_lobby::LobbyWaiter>> {
+        let waiter = self
+            .lobby_waiters
+            .load()
+            .iter()
+            .find(|waiter| waiter.profile.id == uuid)
+            .cloned();
+        if let Some(waiter) = waiter.as_ref() {
+            self.remove_lobby_waiter(waiter.gid);
+        }
+        waiter
     }
 
     pub fn get_players_by_ip(&self, ip: IpAddr) -> Vec<Arc<Player>> {
@@ -1100,7 +1145,11 @@ impl Server {
 
         for world in self.worlds.load().iter() {
             for player in world.players.load().iter() {
-                if player.client.address().ip() == ip {
+                if player
+                    .client
+                    .as_deref()
+                    .is_some_and(|client| client.address().ip() == ip)
+                {
                     players.push(player.clone());
                 }
             }
@@ -1173,6 +1222,7 @@ impl Server {
         for world in self.worlds.load().iter() {
             count += world.players.load().len();
         }
+        count += self.lobby_waiters.load().len();
         count
     }
 
@@ -1185,7 +1235,7 @@ impl Server {
                 return true;
             }
         }
-        false
+        count.saturating_add(self.lobby_waiters.load().len()) >= n
     }
 
     /// Returns the maximum number of players allowed on the server.
@@ -1271,12 +1321,20 @@ impl Server {
     /// Main server tick method. This now handles both player/network ticking (which always runs)
     /// and world/game logic ticking (which is affected by freeze state).
     pub fn tick(self: &Arc<Self>) {
+        cluster_lobby::tick_virtual_lobbies(self);
         if pumpkin_world::level::is_cluster_secondary()
             && self
                 .worlds
                 .load()
                 .iter()
-                .all(|world| world.players.load().is_empty())
+                .all(|world| {
+                    world.players.load().iter().all(|player| {
+                        !crate::world::entity_runs_local_simulation(
+                            player.as_ref(),
+                            self.advanced_config.cluster.server_id,
+                        )
+                    })
+                })
         {
             return;
         }
@@ -1299,7 +1357,14 @@ impl Server {
         let handle = self.runtime.clone();
 
         for world in worlds.iter() {
-            if pumpkin_world::level::is_cluster_secondary() && world.players.load().is_empty() {
+            if pumpkin_world::level::is_cluster_secondary()
+                && world.players.load().iter().all(|player| {
+                    !crate::world::entity_runs_local_simulation(
+                        player.as_ref(),
+                        self.advanced_config.cluster.server_id,
+                    )
+                })
+            {
                 continue;
             }
             world.flush_block_updates();
@@ -1307,10 +1372,14 @@ impl Server {
 
             let players = world.players.load();
             let player_handle = handle.clone();
-            players.par_iter().for_each(|player| {
-                let _guard = player_handle.enter();
-                player.tick(self);
-            });
+            let local = self.advanced_config.cluster.server_id;
+            players
+                .par_iter()
+                .filter(|player| crate::world::entity_runs_local_simulation(player.as_ref(), local))
+                .for_each(|player| {
+                    let _guard = player_handle.enter();
+                    player.tick(self);
+                });
         }
     }
 
@@ -1390,7 +1459,7 @@ impl Server {
                     player.subscribed_debug_sample.load(Ordering::Relaxed)
                         && player.permission_lvl.load() >= pumpkin_util::PermissionLvl::Two
                 })
-                .filter_map(|player| player.client.java());
+                .filter_map(|player| player.client.as_deref().and_then(crate::net::ClientPlatform::java));
             World::broadcast_java_clients(&packet, recipients);
         }
     }

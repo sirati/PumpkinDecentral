@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use pumpkin_cluster::codec::{decode_batch, encode_pos};
 use pumpkin_cluster::identity::ServerId;
-use pumpkin_cluster::protocol::TickBatch;
+use pumpkin_cluster::protocol::{PosUpdate, TickBatch};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -52,10 +52,7 @@ pub fn install_datagram_outbox(
     peers: Vec<ServerId>,
     datagram_out: mpsc::Sender<(ServerId, Vec<u8>)>,
 ) {
-    let _ = DATAGRAM_OUTBOX.set(DatagramOutbox {
-        peers,
-        datagram_out,
-    });
+    let _ = DATAGRAM_OUTBOX.set(DatagramOutbox { peers, datagram_out });
 }
 
 fn note_dropped(reason: &str) {
@@ -98,12 +95,6 @@ pub fn pos_payloads(batch: &TickBatch) -> Vec<Vec<u8>> {
 /// nothing when no outbox is installed, when there are no peers, or when the
 /// batch carries no position updates.
 pub fn forward_fused_batch(batch_bytes: &[u8]) {
-    let Some(outbox) = DATAGRAM_OUTBOX.get() else {
-        return;
-    };
-    if outbox.peers.is_empty() {
-        return;
-    }
     let batch = match decode_batch(batch_bytes) {
         Ok(batch) => batch,
         Err(error) => {
@@ -112,43 +103,33 @@ pub fn forward_fused_batch(batch_bytes: &[u8]) {
             return;
         }
     };
-    if batch.pos.is_empty() {
-        return;
-    }
-    let mut sent = 0_u64;
-    for payload in pos_payloads(&batch) {
-        for peer in &outbox.peers {
-            if outbox.datagram_out.try_send((*peer, payload.clone())).is_ok() {
-                sent = sent.saturating_add(1);
-            } else {
-                note_dropped("backpressure");
-            }
-        }
-    }
-    if sent > 0 {
-        DATAGRAMS_SENT.fetch_add(sent, Ordering::Relaxed);
-        debug!(
-            datagrams = sent,
-            peers = outbox.peers.len(),
-            bytes = batch_bytes.len(),
-            "cluster movement datagrams forwarded"
-        );
-    }
+    forward_pos_updates(&batch.pos);
 }
 
-pub fn forward_entity_datagrams(payloads: &[Vec<u8>]) {
+pub fn forward_pos_updates(updates: &[PosUpdate]) {
     let Some(outbox) = DATAGRAM_OUTBOX.get() else {
         return;
     };
     if outbox.peers.is_empty() {
         return;
     }
+    if updates.is_empty() {
+        return;
+    }
     let mut sent = 0_u64;
-    for payload in payloads {
-        if payload.len() > MAX_DATAGRAM_BYTES {
-            note_dropped("oversize");
-            continue;
-        }
+    for chunk in updates.chunks(MAX_POS_PER_DATAGRAM) {
+        let payload = match pumpkin_cluster::codec::encode_pos(chunk) {
+            Ok(payload) if payload.len() <= MAX_DATAGRAM_BYTES => payload,
+            Ok(_) => {
+                note_dropped("oversize");
+                continue;
+            }
+            Err(error) => {
+                warn!(%error, "cluster movement datagram encode failed");
+                note_dropped("encode");
+                continue;
+            }
+        };
         for peer in &outbox.peers {
             if outbox.datagram_out.try_send((*peer, payload.clone())).is_ok() {
                 sent = sent.saturating_add(1);
@@ -162,6 +143,32 @@ pub fn forward_entity_datagrams(payloads: &[Vec<u8>]) {
         debug!(
             datagrams = sent,
             peers = outbox.peers.len(),
+            updates = updates.len(),
+            "cluster movement datagrams forwarded"
+        );
+    }
+}
+
+pub fn forward_entity_datagrams(payloads: &[(ServerId, Vec<u8>)]) {
+    let Some(outbox) = DATAGRAM_OUTBOX.get() else {
+        return;
+    };
+    let mut sent = 0_u64;
+    for (peer, payload) in payloads {
+        if payload.len() > MAX_DATAGRAM_BYTES {
+            note_dropped("oversize");
+            continue;
+        }
+        if outbox.datagram_out.try_send((*peer, payload.clone())).is_ok() {
+            sent = sent.saturating_add(1);
+        } else {
+            note_dropped("backpressure");
+        }
+    }
+    if sent > 0 {
+        DATAGRAMS_SENT.fetch_add(sent, Ordering::Relaxed);
+        debug!(
+            datagrams = sent,
             "cluster entity datagrams forwarded"
         );
     }

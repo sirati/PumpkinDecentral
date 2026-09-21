@@ -5,9 +5,11 @@ use core::cmp::Ordering;
 use serde::{Deserialize, Serialize};
 
 use crate::buckets::BucketTable;
-use crate::identity::{GlobalPlayerId, PlayerSlot, ServerId};
-use crate::order::order_players;
-use crate::protocol::{BlockPos, BlockUndo, ChunkAddr, StreamKind};
+use crate::identity::{ActionActor, ActionSeq, ServerId};
+use crate::interact::InteractGroup;
+use crate::inventory::InventoryStack;
+use crate::order::order_action_actors;
+use crate::protocol::{BlockPos, BlockUndo, ChunkAddr, EntityRef, StreamKind};
 use crate::reconcile::ReconcilePlan;
 use crate::time::TickStamp;
 
@@ -16,6 +18,8 @@ pub const WORLD_DELTA_MAGIC: [u8; 4] = [0x57, 0x44, 0x4C, 0x54];
 pub const WORLD_DELTA_TAG_RANDOM_TICK: u8 = 1;
 pub const WORLD_DELTA_TAG_REDSTONE: u8 = 2;
 pub const WORLD_DELTA_TAG_EXPLOSION: u8 = 3;
+pub const WORLD_DELTA_TAG_CAUSAL_REDSTONE: u8 = 4;
+pub const WORLD_DELTA_TAG_TRANSACTIONAL_EXPLOSION: u8 = 5;
 pub const WORLD_DELTA_MAX_EDITS: usize = 256;
 pub const WORLD_DELTA_NO_INVENTORY: u8 = u8::MAX;
 
@@ -26,8 +30,277 @@ pub struct BlockDelta {
     pub new_state: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorldActionRef {
+    pub owner: ServerId,
+    pub tick: TickStamp,
+    pub ordinal: u16,
+    pub anchor: BlockPos,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorldCause {
+    Entity { owner: ServerId, entity: EntityRef },
+    Interact(InteractGroup),
+    Cascade(WorldActionRef),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorldActionGroup {
+    pub reference: WorldActionRef,
+    pub cause: WorldCause,
+}
+
+impl WorldActionGroup {
+    #[must_use]
+    pub const fn entity(
+        owner: ServerId,
+        tick: TickStamp,
+        ordinal: u16,
+        anchor: BlockPos,
+        entity: EntityRef,
+    ) -> Self {
+        Self {
+            reference: WorldActionRef {
+                owner,
+                tick,
+                ordinal,
+                anchor,
+            },
+            cause: WorldCause::Entity { owner, entity },
+        }
+    }
+
+    #[must_use]
+    pub const fn interact(
+        owner: ServerId,
+        ordinal: u16,
+        group: InteractGroup,
+    ) -> Self {
+        Self {
+            reference: WorldActionRef {
+                owner,
+                tick: group.tick,
+                ordinal,
+                anchor: group.anchor,
+            },
+            cause: WorldCause::Interact(group),
+        }
+    }
+
+    #[must_use]
+    pub const fn cascade(
+        owner: ServerId,
+        tick: TickStamp,
+        ordinal: u16,
+        anchor: BlockPos,
+        cause: WorldActionRef,
+    ) -> Self {
+        Self {
+            reference: WorldActionRef {
+                owner,
+                tick,
+                ordinal,
+                anchor,
+            },
+            cause: WorldCause::Cascade(cause),
+        }
+    }
+
+    #[must_use]
+    pub fn is_valid(self) -> bool {
+        match self.cause {
+            WorldCause::Entity { owner, entity } => owner == self.reference.owner && entity.owner == owner,
+            WorldCause::Interact(group) => group.tick == self.reference.tick,
+            WorldCause::Cascade(_) => true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorldDependentKind {
+    Comparator,
+    Observer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorldDependency {
+    pub cause: WorldActionRef,
+    pub kind: WorldDependentKind,
+    pub target: BlockPos,
+    pub delay_ticks: u8,
+    pub fire_tick: TickStamp,
+    pub expected_old_state: u16,
+    pub new_state: u16,
+}
+
+impl WorldDependency {
+    #[must_use]
+    pub const fn new(
+        cause: WorldActionRef,
+        kind: WorldDependentKind,
+        target: BlockPos,
+        delay_ticks: u8,
+        expected_old_state: u16,
+        new_state: u16,
+    ) -> Self {
+        Self {
+            cause,
+            kind,
+            target,
+            delay_ticks,
+            fire_tick: TickStamp(cause.tick.0.wrapping_add(delay_ticks as u16)),
+            expected_old_state,
+            new_state,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        self.expected_old_state != self.new_state
+            && self.fire_tick.0 == self.cause.tick.0.wrapping_add(self.delay_ticks as u16)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CausalRedstoneUpdate {
+    pub group: WorldActionGroup,
+    pub chunk: ChunkAddr,
+    pub edits: Vec<BlockDelta>,
+    pub dependencies: Vec<WorldDependency>,
+}
+
+impl CausalRedstoneUpdate {
+    #[must_use]
+    pub const fn stream_kind() -> StreamKind {
+        StreamKind::PlayerWorld
+    }
+
+    #[must_use]
+    pub const fn tick(&self) -> TickStamp {
+        self.group.reference.tick
+    }
+
+    #[must_use]
+    pub const fn owner(&self) -> ServerId {
+        self.group.reference.owner
+    }
+
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.group.is_valid()
+            && !self.edits.is_empty()
+            && self.edits.iter().all(|edit| {
+                edit.old_state != edit.new_state
+                    && chunk_of_block(edit.pos.x, edit.pos.z) == self.chunk
+            })
+            && self.dependencies.iter().all(|dependency| {
+                dependency.cause == self.group.reference && dependency.is_valid()
+            })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplosionDropRef {
+    pub entity: EntityRef,
+    pub source: BlockPos,
+    pub stack: InventoryStack,
+}
+
+impl ExplosionDropRef {
+    #[must_use]
+    pub fn is_valid_for(&self, owner: ServerId, chunk: ChunkAddr) -> bool {
+        self.entity.owner == owner
+            && !self.stack.is_empty()
+            && chunk_of_block(self.source.x, self.source.z) == chunk
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExplosionEntityDamageRef {
+    pub target: EntityRef,
+    pub expected_health_milli: u32,
+    pub new_health_milli: u32,
+}
+
+impl ExplosionEntityDamageRef {
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        self.new_health_milli <= self.expected_health_milli
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransactionalExplosionUpdate {
+    pub group: WorldActionGroup,
+    pub chunk: ChunkAddr,
+    pub center: BlockPos,
+    pub edits: Vec<BlockDelta>,
+    pub drops: Vec<ExplosionDropRef>,
+    pub damages: Vec<ExplosionEntityDamageRef>,
+}
+
+impl TransactionalExplosionUpdate {
+    #[must_use]
+    pub const fn stream_kind() -> StreamKind {
+        StreamKind::PlayerWorld
+    }
+
+    #[must_use]
+    pub const fn tick(&self) -> TickStamp {
+        self.group.reference.tick
+    }
+
+    #[must_use]
+    pub const fn owner(&self) -> ServerId {
+        self.group.reference.owner
+    }
+
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.group.is_valid()
+            && (!self.edits.is_empty() || !self.drops.is_empty() || !self.damages.is_empty())
+            && self.edits.iter().all(|edit| {
+                edit.old_state != edit.new_state
+                    && chunk_of_block(edit.pos.x, edit.pos.z) == self.chunk
+            })
+            && self
+                .drops
+                .iter()
+                .all(|drop| drop.is_valid_for(self.owner(), self.chunk))
+            && self.damages.iter().all(|damage| damage.is_valid())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactionalExplosionUndo {
+    pub blocks: Vec<(BlockPos, BlockUndo)>,
+    pub spawned_drops: Vec<EntityRef>,
+    pub damages: Vec<(EntityRef, u32)>,
+}
+
+#[must_use]
+pub fn transactional_explosion_undo(
+    update: &TransactionalExplosionUpdate,
+) -> TransactionalExplosionUndo {
+    TransactionalExplosionUndo {
+        blocks: update
+            .edits
+            .iter()
+            .map(|edit| (edit.pos, make_delta_undo(edit.old_state)))
+            .collect(),
+        spawned_drops: update.drops.iter().map(|drop| drop.entity).collect(),
+        damages: update
+            .damages
+            .iter()
+            .map(|damage| (damage.target, damage.expected_health_milli))
+            .collect(),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RandomTickDelta {
+    pub holder: ServerId,
     pub chunk: ChunkAddr,
     pub tick: TickStamp,
     pub edits: Vec<BlockDelta>,
@@ -149,6 +422,8 @@ pub enum WorldDelta {
     RandomTick(RandomTickDelta),
     Redstone(RedstoneFallibleUpdate),
     Explosion(ExplosionFallibleUpdate),
+    CausalRedstone(CausalRedstoneUpdate),
+    TransactionalExplosion(TransactionalExplosionUpdate),
 }
 
 impl WorldDelta {
@@ -163,6 +438,8 @@ impl WorldDelta {
             Self::RandomTick(_) => WORLD_DELTA_TAG_RANDOM_TICK,
             Self::Redstone(_) => WORLD_DELTA_TAG_REDSTONE,
             Self::Explosion(_) => WORLD_DELTA_TAG_EXPLOSION,
+            Self::CausalRedstone(_) => WORLD_DELTA_TAG_CAUSAL_REDSTONE,
+            Self::TransactionalExplosion(_) => WORLD_DELTA_TAG_TRANSACTIONAL_EXPLOSION,
         }
     }
 
@@ -172,6 +449,8 @@ impl WorldDelta {
             Self::RandomTick(update) => update.chunk,
             Self::Redstone(update) => update.chunk,
             Self::Explosion(update) => update.chunk,
+            Self::CausalRedstone(update) => update.chunk,
+            Self::TransactionalExplosion(update) => update.chunk,
         }
     }
 
@@ -181,6 +460,8 @@ impl WorldDelta {
             Self::RandomTick(update) => update.tick,
             Self::Redstone(update) => update.tick,
             Self::Explosion(update) => update.tick,
+            Self::CausalRedstone(update) => update.tick(),
+            Self::TransactionalExplosion(update) => update.tick(),
         }
     }
 }
@@ -221,7 +502,13 @@ pub fn chunk_of_block(x: i32, z: i32) -> ChunkAddr {
 pub fn normalize_edits(edits: &mut Vec<BlockDelta>) {
     edits.retain(|edit| edit.old_state != edit.new_state);
     edits.sort_by(|left, right| {
-        (left.pos.x, left.pos.y, left.pos.z).cmp(&(right.pos.x, right.pos.y, right.pos.z))
+        (left.pos.x, left.pos.y, left.pos.z, left.old_state, left.new_state).cmp(&(
+            right.pos.x,
+            right.pos.y,
+            right.pos.z,
+            right.old_state,
+            right.new_state,
+        ))
     });
     edits.dedup_by_key(|edit| edit.pos);
     edits.truncate(WORLD_DELTA_MAX_EDITS);
@@ -229,6 +516,7 @@ pub fn normalize_edits(edits: &mut Vec<BlockDelta>) {
 
 #[must_use]
 pub fn capture_random_tick_delta(
+    holder: ServerId,
     chunk: ChunkAddr,
     tick: TickStamp,
     mut edits: Vec<BlockDelta>,
@@ -237,7 +525,12 @@ pub fn capture_random_tick_delta(
     if edits.is_empty() {
         None
     } else {
-        Some(RandomTickDelta { chunk, tick, edits })
+        Some(RandomTickDelta {
+            holder,
+            chunk,
+            tick,
+            edits,
+        })
     }
 }
 
@@ -283,6 +576,66 @@ pub fn capture_explosion_update(
             edits,
         })
     }
+}
+
+#[must_use]
+pub fn capture_causal_redstone_update(
+    group: WorldActionGroup,
+    chunk: ChunkAddr,
+    mut edits: Vec<BlockDelta>,
+    mut dependencies: Vec<WorldDependency>,
+) -> Option<CausalRedstoneUpdate> {
+    normalize_edits(&mut edits);
+    dependencies.retain(|dependency| dependency.is_valid());
+    dependencies.sort_by(|left, right| {
+        (
+            left.fire_tick.0,
+            left.target.x,
+            left.target.y,
+            left.target.z,
+            left.kind as u8,
+        )
+            .cmp(&(
+                right.fire_tick.0,
+                right.target.x,
+                right.target.y,
+                right.target.z,
+                right.kind as u8,
+            ))
+    });
+    dependencies.dedup_by_key(|dependency| (dependency.kind as u8, dependency.target, dependency.fire_tick));
+    let update = CausalRedstoneUpdate {
+        group,
+        chunk,
+        edits,
+        dependencies,
+    };
+    update.is_valid().then_some(update)
+}
+
+#[must_use]
+pub fn capture_transactional_explosion_update(
+    group: WorldActionGroup,
+    chunk: ChunkAddr,
+    center: BlockPos,
+    mut edits: Vec<BlockDelta>,
+    mut drops: Vec<ExplosionDropRef>,
+    mut damages: Vec<ExplosionEntityDamageRef>,
+) -> Option<TransactionalExplosionUpdate> {
+    normalize_edits(&mut edits);
+    drops.sort_by_key(|drop| (drop.entity.owner, drop.entity.local_id));
+    drops.dedup_by_key(|drop| drop.entity);
+    damages.sort_by_key(|damage| (damage.target.owner, damage.target.local_id));
+    damages.dedup_by_key(|damage| damage.target);
+    let update = TransactionalExplosionUpdate {
+        group,
+        chunk,
+        center,
+        edits,
+        drops,
+        damages,
+    };
+    update.is_valid().then_some(update)
 }
 
 pub fn encode_random_tick(update: &RandomTickDelta) -> Result<Vec<u8>, WorldDeltaCodecError> {
@@ -386,6 +739,89 @@ pub fn encoded_explosion_len(
         .map_err(|error| codec_error("size explosion", error))
 }
 
+pub fn encode_causal_redstone(
+    update: &CausalRedstoneUpdate,
+) -> Result<Vec<u8>, WorldDeltaCodecError> {
+    postcard::to_allocvec(update).map_err(|error| codec_error("encode causal redstone", error))
+}
+
+pub fn decode_causal_redstone(
+    bytes: &[u8],
+) -> Result<CausalRedstoneUpdate, WorldDeltaCodecError> {
+    postcard::from_bytes(bytes).map_err(|error| codec_error("decode causal redstone", error))
+}
+
+pub fn decode_causal_redstone_prefix(
+    bytes: &[u8],
+) -> Result<(CausalRedstoneUpdate, &[u8]), WorldDeltaCodecError> {
+    postcard::take_from_bytes(bytes).map_err(|error| codec_error("decode causal redstone", error))
+}
+
+pub fn encode_causal_redstone_into(
+    update: &CausalRedstoneUpdate,
+    out: Vec<u8>,
+) -> Result<Vec<u8>, WorldDeltaCodecError> {
+    postcard::to_extend(update, out).map_err(|error| codec_error("encode causal redstone", error))
+}
+
+pub fn encode_causal_redstone_to_slice<'out>(
+    update: &CausalRedstoneUpdate,
+    out: &'out mut [u8],
+) -> Result<&'out mut [u8], WorldDeltaCodecError> {
+    postcard::to_slice(update, out).map_err(|error| codec_error("encode causal redstone", error))
+}
+
+pub fn encoded_causal_redstone_len(
+    update: &CausalRedstoneUpdate,
+) -> Result<usize, WorldDeltaCodecError> {
+    postcard::experimental::serialized_size(update)
+        .map_err(|error| codec_error("size causal redstone", error))
+}
+
+pub fn encode_transactional_explosion(
+    update: &TransactionalExplosionUpdate,
+) -> Result<Vec<u8>, WorldDeltaCodecError> {
+    postcard::to_allocvec(update)
+        .map_err(|error| codec_error("encode transactional explosion", error))
+}
+
+pub fn decode_transactional_explosion(
+    bytes: &[u8],
+) -> Result<TransactionalExplosionUpdate, WorldDeltaCodecError> {
+    postcard::from_bytes(bytes)
+        .map_err(|error| codec_error("decode transactional explosion", error))
+}
+
+pub fn decode_transactional_explosion_prefix(
+    bytes: &[u8],
+) -> Result<(TransactionalExplosionUpdate, &[u8]), WorldDeltaCodecError> {
+    postcard::take_from_bytes(bytes)
+        .map_err(|error| codec_error("decode transactional explosion", error))
+}
+
+pub fn encode_transactional_explosion_into(
+    update: &TransactionalExplosionUpdate,
+    out: Vec<u8>,
+) -> Result<Vec<u8>, WorldDeltaCodecError> {
+    postcard::to_extend(update, out)
+        .map_err(|error| codec_error("encode transactional explosion", error))
+}
+
+pub fn encode_transactional_explosion_to_slice<'out>(
+    update: &TransactionalExplosionUpdate,
+    out: &'out mut [u8],
+) -> Result<&'out mut [u8], WorldDeltaCodecError> {
+    postcard::to_slice(update, out)
+        .map_err(|error| codec_error("encode transactional explosion", error))
+}
+
+pub fn encoded_transactional_explosion_len(
+    update: &TransactionalExplosionUpdate,
+) -> Result<usize, WorldDeltaCodecError> {
+    postcard::experimental::serialized_size(update)
+        .map_err(|error| codec_error("size transactional explosion", error))
+}
+
 #[must_use]
 pub fn is_world_delta_frame(bytes: &[u8]) -> bool {
     bytes.len() > WORLD_DELTA_FRAME_PREFIX && bytes.starts_with(&WORLD_DELTA_MAGIC[..])
@@ -413,6 +849,14 @@ pub fn encode_frame(update: &WorldDelta) -> Result<Vec<u8>, WorldDeltaCodecError
             WORLD_DELTA_TAG_EXPLOSION,
             postcard::to_allocvec(inner).map_err(|error| codec_error("encode frame", error))?,
         ),
+        WorldDelta::CausalRedstone(inner) => (
+            WORLD_DELTA_TAG_CAUSAL_REDSTONE,
+            postcard::to_allocvec(inner).map_err(|error| codec_error("encode frame", error))?,
+        ),
+        WorldDelta::TransactionalExplosion(inner) => (
+            WORLD_DELTA_TAG_TRANSACTIONAL_EXPLOSION,
+            postcard::to_allocvec(inner).map_err(|error| codec_error("encode frame", error))?,
+        ),
     };
     Ok(push_frame_tag(body, tag))
 }
@@ -432,6 +876,8 @@ pub fn encoded_frame_len(update: &WorldDelta) -> Result<usize, WorldDeltaCodecEr
         WorldDelta::RandomTick(inner) => encoded_random_tick_len(inner)?,
         WorldDelta::Redstone(inner) => encoded_redstone_len(inner)?,
         WorldDelta::Explosion(inner) => encoded_explosion_len(inner)?,
+        WorldDelta::CausalRedstone(inner) => encoded_causal_redstone_len(inner)?,
+        WorldDelta::TransactionalExplosion(inner) => encoded_transactional_explosion_len(inner)?,
     };
     Ok(WORLD_DELTA_FRAME_PREFIX.saturating_add(body))
 }
@@ -446,6 +892,10 @@ pub fn decode_frame(bytes: &[u8]) -> Result<WorldDelta, WorldDeltaCodecError> {
         WORLD_DELTA_TAG_RANDOM_TICK => decode_random_tick(body).map(WorldDelta::RandomTick),
         WORLD_DELTA_TAG_REDSTONE => decode_redstone(body).map(WorldDelta::Redstone),
         WORLD_DELTA_TAG_EXPLOSION => decode_explosion(body).map(WorldDelta::Explosion),
+        WORLD_DELTA_TAG_CAUSAL_REDSTONE => decode_causal_redstone(body).map(WorldDelta::CausalRedstone),
+        WORLD_DELTA_TAG_TRANSACTIONAL_EXPLOSION => {
+            decode_transactional_explosion(body).map(WorldDelta::TransactionalExplosion)
+        }
         _ => Err(frame_error("decode frame: unknown world delta tag")),
     }
 }
@@ -463,6 +913,10 @@ pub fn decode_frame_prefix(bytes: &[u8]) -> Result<(WorldDelta, &[u8]), WorldDel
             .map(|(update, rest)| (WorldDelta::Redstone(update), rest)),
         WORLD_DELTA_TAG_EXPLOSION => decode_explosion_prefix(body)
             .map(|(update, rest)| (WorldDelta::Explosion(update), rest)),
+        WORLD_DELTA_TAG_CAUSAL_REDSTONE => decode_causal_redstone_prefix(body)
+            .map(|(update, rest)| (WorldDelta::CausalRedstone(update), rest)),
+        WORLD_DELTA_TAG_TRANSACTIONAL_EXPLOSION => decode_transactional_explosion_prefix(body)
+            .map(|(update, rest)| (WorldDelta::TransactionalExplosion(update), rest)),
         _ => Err(frame_error("decode frame: unknown world delta tag")),
     }
 }
@@ -559,7 +1013,8 @@ pub fn revert_undos_to_map(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FallibleClaim {
-    pub holder: ServerId,
+    pub actor: ActionActor,
+    pub seq: ActionSeq,
     pub tick: TickStamp,
     pub trigger: BlockPos,
     pub pos: BlockPos,
@@ -568,25 +1023,24 @@ pub struct FallibleClaim {
 }
 
 #[must_use]
-pub const fn holder_gid(holder: ServerId) -> GlobalPlayerId {
-    GlobalPlayerId::new(holder, PlayerSlot(0))
-}
-
-#[must_use]
 pub fn elect_fallible_claim(
     cluster_seed: u64,
     left: &FallibleClaim,
     right: &FallibleClaim,
 ) -> FallibleClaim {
-    match order_players(
+    match order_action_actors(
         cluster_seed,
         left.tick,
-        holder_gid(left.holder),
-        holder_gid(right.holder),
+        left.actor,
+        right.actor,
     ) {
         Ordering::Less => *left,
         Ordering::Greater => *right,
         Ordering::Equal => {
+            let by_seq = left.seq.cmp(&right.seq);
+            if by_seq != Ordering::Equal {
+                return if by_seq == Ordering::Less { *left } else { *right };
+            }
             let left_key = (
                 (left.trigger.x, left.trigger.y, left.trigger.z),
                 left.new_state,
@@ -679,6 +1133,7 @@ mod tests {
 
     fn sample_random_tick() -> RandomTickDelta {
         RandomTickDelta {
+            holder: holder(2),
             chunk: ChunkAddr { x: 0, z: 0 },
             tick: TickStamp(41),
             edits: vec![edit(1, 64, 1, 7, 8), edit(2, 64, 3, 9, 10)],
@@ -703,6 +1158,68 @@ mod tests {
             center: pos(20, 65, 20),
             edits: vec![edit(20, 65, 21, 12, 0), edit(21, 65, 20, 13, 0)],
         }
+    }
+
+    fn entity(origin: u16, owner: u16, local_id: i32, chunk: ChunkAddr) -> EntityRef {
+        EntityRef {
+            origin: holder(origin),
+            owner: holder(owner),
+            local_id,
+            chunk,
+        }
+    }
+
+    fn causal_group() -> WorldActionGroup {
+        WorldActionGroup::entity(
+            holder(3),
+            TickStamp(50),
+            2,
+            pos(4, 64, -20),
+            entity(2, 3, 9, ChunkAddr { x: 0, z: -2 }),
+        )
+    }
+
+    fn sample_causal_redstone() -> CausalRedstoneUpdate {
+        let group = causal_group();
+        capture_causal_redstone_update(
+            group,
+            ChunkAddr { x: 0, z: -2 },
+            vec![edit(4, 64, -21, 100, 115)],
+            vec![WorldDependency::new(
+                group.reference,
+                WorldDependentKind::Comparator,
+                pos(5, 64, -21),
+                2,
+                120,
+                121,
+            )],
+        )
+        .unwrap()
+    }
+
+    fn sample_transactional_explosion() -> TransactionalExplosionUpdate {
+        let group = causal_group();
+        capture_transactional_explosion_update(
+            group,
+            ChunkAddr { x: 0, z: -2 },
+            pos(4, 64, -20),
+            vec![edit(4, 64, -21, 100, 0)],
+            vec![ExplosionDropRef {
+                entity: entity(3, 3, 10, ChunkAddr { x: 0, z: -2 }),
+                source: pos(4, 64, -21),
+                stack: InventoryStack {
+                    item: 5,
+                    count: 2,
+                    nbt: vec![1],
+                },
+            }],
+            vec![ExplosionEntityDamageRef {
+                target: entity(8, 8, 12, ChunkAddr { x: 0, z: -2 }),
+                expected_health_milli: 10_000,
+                new_health_milli: 7_500,
+            }],
+        )
+        .unwrap()
     }
 
     #[test]
@@ -754,11 +1271,77 @@ mod tests {
     }
 
     #[test]
+    fn causal_redstone_roundtrips_and_keeps_dependency() {
+        let update = sample_causal_redstone();
+        let bytes = encode_causal_redstone(&update).unwrap();
+        assert_eq!(decode_causal_redstone(&bytes).unwrap(), update);
+        assert_eq!(encode_causal_redstone_into(&update, Vec::new()).unwrap(), bytes);
+        assert_eq!(encoded_causal_redstone_len(&update).unwrap(), bytes.len());
+        let mut slice = vec![0_u8; bytes.len()];
+        let used = encode_causal_redstone_to_slice(&update, &mut slice).unwrap().len();
+        assert_eq!(&slice[..used], bytes);
+        let (back, rest) = decode_causal_redstone_prefix(&bytes).unwrap();
+        assert_eq!(back, update);
+        assert!(rest.is_empty());
+        assert_eq!(update.dependencies[0].fire_tick, TickStamp(52));
+    }
+
+    #[test]
+    fn transactional_explosion_roundtrips_and_has_complete_undo() {
+        let update = sample_transactional_explosion();
+        let bytes = encode_transactional_explosion(&update).unwrap();
+        assert_eq!(decode_transactional_explosion(&bytes).unwrap(), update);
+        assert_eq!(encode_transactional_explosion_into(&update, Vec::new()).unwrap(), bytes);
+        assert_eq!(encoded_transactional_explosion_len(&update).unwrap(), bytes.len());
+        let mut slice = vec![0_u8; bytes.len()];
+        let used = encode_transactional_explosion_to_slice(&update, &mut slice)
+            .unwrap()
+            .len();
+        assert_eq!(&slice[..used], bytes);
+        let (back, rest) = decode_transactional_explosion_prefix(&bytes).unwrap();
+        assert_eq!(back, update);
+        assert!(rest.is_empty());
+        let undo = transactional_explosion_undo(&update);
+        assert_eq!(undo.blocks, vec![(pos(4, 64, -21), make_delta_undo(100))]);
+        assert_eq!(undo.spawned_drops, vec![entity(3, 3, 10, ChunkAddr { x: 0, z: -2 })]);
+        assert_eq!(undo.damages, vec![(entity(8, 8, 12, ChunkAddr { x: 0, z: -2 }), 10_000)]);
+    }
+
+    #[test]
+    fn causal_owner_and_chunk_preconditions_reject_invalid_groups() {
+        let group = WorldActionGroup::entity(
+            holder(3),
+            TickStamp(50),
+            2,
+            pos(4, 64, -20),
+            entity(2, 4, 9, ChunkAddr { x: 0, z: -2 }),
+        );
+        assert!(capture_causal_redstone_update(
+            group,
+            ChunkAddr { x: 0, z: -2 },
+            vec![edit(4, 64, -21, 100, 115)],
+            Vec::new(),
+        )
+        .is_none());
+        assert!(capture_transactional_explosion_update(
+            causal_group(),
+            ChunkAddr { x: 0, z: -2 },
+            pos(4, 64, -20),
+            vec![edit(20, 64, 20, 1, 0)],
+            Vec::new(),
+            Vec::new(),
+        )
+        .is_none());
+    }
+
+    #[test]
     fn frame_carries_every_kind() {
         for update in [
             WorldDelta::RandomTick(sample_random_tick()),
             WorldDelta::Redstone(sample_redstone()),
             WorldDelta::Explosion(sample_explosion()),
+            WorldDelta::CausalRedstone(sample_causal_redstone()),
+            WorldDelta::TransactionalExplosion(sample_transactional_explosion()),
         ] {
             let bytes = encode_frame(&update).unwrap();
             assert!(is_world_delta_frame(&bytes));
@@ -796,11 +1379,12 @@ mod tests {
     #[test]
     fn capture_drops_noops_and_empty() {
         let chunk = ChunkAddr { x: 0, z: 0 };
-        assert!(capture_random_tick_delta(chunk, TickStamp(1), Vec::new()).is_none());
+        assert!(capture_random_tick_delta(holder(1), chunk, TickStamp(1), Vec::new()).is_none());
         assert!(
-            capture_random_tick_delta(chunk, TickStamp(1), vec![edit(0, 0, 0, 5, 5)]).is_none()
+            capture_random_tick_delta(holder(1), chunk, TickStamp(1), vec![edit(0, 0, 0, 5, 5)]).is_none()
         );
         let kept = capture_random_tick_delta(
+            holder(1),
             chunk,
             TickStamp(1),
             vec![edit(0, 0, 0, 5, 5), edit(1, 1, 1, 5, 6)],
@@ -833,7 +1417,7 @@ mod tests {
             ));
         }
         let kept =
-            capture_random_tick_delta(chunk, TickStamp(7), edits).expect("edits survive capture");
+            capture_random_tick_delta(holder(1), chunk, TickStamp(7), edits).expect("edits survive capture");
         assert_eq!(kept.len(), WORLD_DELTA_MAX_EDITS);
         let mut sorted = kept.edits.clone();
         sorted.sort_by(|left, right| {
@@ -928,7 +1512,8 @@ mod tests {
     #[test]
     fn election_is_deterministic_across_orders() {
         let first = FallibleClaim {
-            holder: holder(2),
+            actor: ActionActor::Server(holder(2)),
+            seq: ActionSeq(3),
             tick: TickStamp(9),
             trigger: pos(0, 64, 0),
             pos: pos(1, 64, 0),
@@ -936,7 +1521,8 @@ mod tests {
             new_state: 8,
         };
         let second = FallibleClaim {
-            holder: holder(1),
+            actor: ActionActor::Server(holder(1)),
+            seq: ActionSeq(4),
             tick: TickStamp(9),
             trigger: pos(5, 64, 5),
             pos: pos(1, 64, 0),
@@ -944,11 +1530,11 @@ mod tests {
             new_state: 9,
         };
         let seed = 0x9E37_79B9_7F4A_7C15;
-        let expected = match order_players(
+        let expected = match order_action_actors(
             seed,
             TickStamp(9),
-            holder_gid(first.holder),
-            holder_gid(second.holder),
+            first.actor,
+            second.actor,
         ) {
             Ordering::Less => first,
             Ordering::Greater => second,
@@ -964,7 +1550,6 @@ mod tests {
         };
         assert_eq!(elect_fallible_claim(seed, &first, &second), expected);
         assert_eq!(elect_fallible_claim(seed, &second, &first), expected);
-        assert_eq!(holder_gid(holder(2)), GlobalPlayerId::new(holder(2), PlayerSlot(0)));
     }
 
     #[test]

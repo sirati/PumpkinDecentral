@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::protocol::ChunkAddr;
 
@@ -126,8 +126,8 @@ impl<C> Clone for DualChunk<C> {
 /// Dual-copy registry tracking optimistic edits per chunk.
 #[derive(Debug)]
 pub struct DualStore<C> {
-    chunks: Mutex<HashMap<ChunkAddr, DualChunk<C>>>,
-    pending: Mutex<HashMap<ChunkAddr, Vec<BlockEdit>>>,
+    chunks: HashMap<ChunkAddr, DualChunk<C>>,
+    pending: HashMap<ChunkAddr, Vec<BlockEdit>>,
 }
 
 impl<C> Default for DualStore<C> {
@@ -140,68 +140,44 @@ impl<C> DualStore<C> {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            chunks: Mutex::new(HashMap::new()),
-            pending: Mutex::new(HashMap::new()),
+            chunks: HashMap::new(),
+            pending: HashMap::new(),
         }
     }
 }
 
 impl<C: DualChunkData> DualStore<C> {
-    pub fn ingest(&self, chunk: ChunkAddr, pair: DualChunk<C>, pending: Vec<BlockEdit>) {
-        if let Ok(mut chunks) = self.chunks.lock() {
-            chunks.insert(chunk, pair);
-        }
-        if let Ok(mut pendings) = self.pending.lock() {
-            pendings.insert(chunk, pending);
-        }
+    pub fn ingest(&mut self, chunk: ChunkAddr, pair: DualChunk<C>, pending: Vec<BlockEdit>) {
+        self.chunks.insert(chunk, pair);
+        self.pending.insert(chunk, pending);
     }
 
     #[must_use]
-    pub fn remove(&self, chunk: ChunkAddr) -> bool {
-        let had_pair = if let Ok(mut chunks) = self.chunks.lock() {
-            chunks.remove(&chunk).is_some()
-        } else {
-            false
-        };
-        let had_pending = if let Ok(mut pendings) = self.pending.lock() {
-            pendings.remove(&chunk).is_some()
-        } else {
-            false
-        };
+    pub fn remove(&mut self, chunk: ChunkAddr) -> bool {
+        let had_pair = self.chunks.remove(&chunk).is_some();
+        let had_pending = self.pending.remove(&chunk).is_some();
         had_pair || had_pending
     }
 
     #[must_use]
     pub fn contains(&self, chunk: ChunkAddr) -> bool {
-        if let Ok(chunks) = self.chunks.lock() {
-            chunks.contains_key(&chunk)
-        } else {
-            false
-        }
+        self.chunks.contains_key(&chunk)
     }
 
     #[must_use]
     pub fn pair(&self, chunk: ChunkAddr) -> Option<DualChunk<C>> {
-        if let Ok(chunks) = self.chunks.lock() {
-            chunks.get(&chunk).cloned()
-        } else {
-            None
-        }
+        self.chunks.get(&chunk).cloned()
     }
 
     #[must_use]
     pub fn pending_for(&self, chunk: ChunkAddr) -> Vec<BlockEdit> {
-        if let Ok(pendings) = self.pending.lock() {
-            pendings.get(&chunk).cloned().unwrap_or_default()
-        } else {
-            Vec::new()
-        }
+        self.pending.get(&chunk).cloned().unwrap_or_default()
     }
 
     /// Applies optimistic edits to local-truth immediately and tracks them as pending.
     ///
     /// Ground-truth stays untouched until promotion agrees on the tick.
-    pub fn apply_local(&self, chunk: ChunkAddr, edits: &[BlockEdit]) -> bool {
+    pub fn apply_local(&mut self, chunk: ChunkAddr, edits: &[BlockEdit]) -> bool {
         let Some(pair) = self.pair(chunk) else {
             return false;
         };
@@ -219,15 +195,11 @@ impl<C: DualChunkData> DualStore<C> {
         if changed {
             pair.local.set_dirty(true);
         }
-        if let Ok(mut pendings) = self.pending.lock() {
-            pendings
-                .entry(chunk)
-                .or_default()
-                .extend(edits.iter().copied().filter(BlockEdit::is_in_bounds));
-            true
-        } else {
-            false
-        }
+        self.pending
+            .entry(chunk)
+            .or_default()
+            .extend(edits.iter().copied().filter(BlockEdit::is_in_bounds));
+        true
     }
 
     /// Promotes agreed ticks to ground-truth, then undoes superseded optimism and reapplies survivors.
@@ -238,7 +210,7 @@ impl<C: DualChunkData> DualStore<C> {
     /// copying ground back to local. Survivor edits are reapplied on top. Local
     /// is never rebuilt by full copy or replay regeneration here.
     pub fn promote_tick(
-        &self,
+        &mut self,
         chunk: ChunkAddr,
         accepted: &[BlockEdit],
         still_pending: &[BlockEdit],
@@ -289,16 +261,7 @@ impl<C: DualChunkData> DualStore<C> {
                 local_changed = true;
             }
         }
-        if self
-            .pending
-            .lock()
-            .map(|mut pendings| {
-                pendings.insert(chunk, survivors.clone());
-            })
-            .is_err()
-        {
-            return false;
-        }
+        self.pending.insert(chunk, survivors.clone());
         for edit in &survivors {
             if let Some(old) = pair.local.write_block(edit.x, edit.y, edit.z, edit.state)
                 && old != edit.state
@@ -314,11 +277,7 @@ impl<C: DualChunkData> DualStore<C> {
 
     #[must_use]
     pub fn len(&self) -> usize {
-        if let Ok(chunks) = self.chunks.lock() {
-            chunks.len()
-        } else {
-            0
-        }
+        self.chunks.len()
     }
 
     #[must_use]
@@ -330,26 +289,25 @@ impl<C: DualChunkData> DualStore<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::cell::{Cell, RefCell};
 
     struct MockChunk {
-        blocks: StdMutex<HashMap<(usize, i32, usize), u16>>,
-        dirty: AtomicBool,
+        blocks: RefCell<HashMap<(usize, i32, usize), u16>>,
+        dirty: Cell<bool>,
     }
 
     impl MockChunk {
         fn new() -> Arc<Self> {
             Arc::new(Self {
-                blocks: StdMutex::new(HashMap::new()),
-                dirty: AtomicBool::new(false),
+                blocks: RefCell::new(HashMap::new()),
+                dirty: Cell::new(false),
             })
         }
 
         fn tracked(entries: &[((usize, i32, usize), u16)]) -> Arc<Self> {
             let chunk = Self::new();
             {
-                let mut blocks = chunk.blocks.lock().unwrap();
+                let mut blocks = chunk.blocks.borrow_mut();
                 for (pos, state) in entries {
                     blocks.insert(*pos, *state);
                 }
@@ -360,11 +318,11 @@ mod tests {
 
     impl DualChunkData for MockChunk {
         fn read_block(&self, x: usize, y: i32, z: usize) -> Option<u16> {
-            self.blocks.lock().ok()?.get(&(x, y, z)).copied()
+            self.blocks.borrow().get(&(x, y, z)).copied()
         }
 
         fn write_block(&self, x: usize, y: i32, z: usize, state: u16) -> Option<u16> {
-            let mut blocks = self.blocks.lock().ok()?;
+            let mut blocks = self.blocks.borrow_mut();
             if y < -64 || x >= DUAL_CHUNK_WIDTH || z >= DUAL_CHUNK_WIDTH {
                 return None;
             }
@@ -372,11 +330,11 @@ mod tests {
         }
 
         fn set_dirty(&self, flag: bool) {
-            self.dirty.store(flag, Ordering::Relaxed);
+            self.dirty.set(flag);
         }
 
         fn is_dirty(&self) -> bool {
-            self.dirty.load(Ordering::Relaxed)
+            self.dirty.get()
         }
 
         fn min_y(&self) -> i32 {
@@ -393,7 +351,7 @@ mod tests {
     }
 
     fn store_with_pair() -> (DualStore<MockChunk>, ChunkAddr, Arc<MockChunk>, Arc<MockChunk>) {
-        let store = DualStore::new();
+        let mut store = DualStore::new();
         let chunk = addr();
         let ground = MockChunk::tracked(&[((1, 0, 1), 7)]);
         let local = MockChunk::tracked(&[((1, 0, 1), 7)]);
@@ -403,7 +361,7 @@ mod tests {
 
     #[test]
     fn apply_local_touches_local_only() {
-        let (store, chunk, ground, local) = store_with_pair();
+        let (mut store, chunk, ground, local) = store_with_pair();
         assert!(store.apply_local(chunk, &[BlockEdit::new(1, 0, 1, 9)]));
         assert_eq!(ground.read_block(1, 0, 1), Some(7));
         assert_eq!(local.read_block(1, 0, 1), Some(9));
@@ -414,7 +372,7 @@ mod tests {
 
     #[test]
     fn promote_tick_moves_accepted_to_ground_and_rebases() {
-        let (store, chunk, ground, local) = store_with_pair();
+        let (mut store, chunk, ground, local) = store_with_pair();
         assert!(store.apply_local(chunk, &[BlockEdit::new(2, 0, 2, 5)]));
         assert!(store.apply_local(chunk, &[BlockEdit::new(1, 0, 1, 9)]));
         let accepted = [BlockEdit::new(1, 0, 1, 9)];
@@ -429,7 +387,7 @@ mod tests {
 
     #[test]
     fn rebase_drops_superseded_local_edits() {
-        let (store, chunk, _ground, local) = store_with_pair();
+        let (mut store, chunk, _ground, local) = store_with_pair();
         assert!(store.apply_local(chunk, &[BlockEdit::new(1, 0, 1, 9)]));
         assert!(store.promote_tick(chunk, &[BlockEdit::new(1, 0, 1, 4)], &[]));
         assert_eq!(local.read_block(1, 0, 1), Some(4));
@@ -438,7 +396,7 @@ mod tests {
 
     #[test]
     fn ingest_replaces_both_copies() {
-        let (store, chunk, _ground, _local) = store_with_pair();
+        let (mut store, chunk, _ground, _local) = store_with_pair();
         let fresh_ground = MockChunk::tracked(&[((4, 0, 4), 11)]);
         let fresh_local = MockChunk::tracked(&[((4, 0, 4), 11)]);
         store.ingest(
@@ -454,7 +412,7 @@ mod tests {
 
     #[test]
     fn missing_chunk_operations_report_false() {
-        let store: DualStore<MockChunk> = DualStore::new();
+        let mut store: DualStore<MockChunk> = DualStore::new();
         assert!(!store.apply_local(addr(), &[BlockEdit::new(0, 0, 0, 1)]));
         assert!(!store.promote_tick(addr(), &[], &[]));
         assert!(!store.remove(addr()));
@@ -463,7 +421,7 @@ mod tests {
 
     #[test]
     fn out_of_bounds_edits_are_ignored() {
-        let (store, chunk, ground, local) = store_with_pair();
+        let (mut store, chunk, ground, local) = store_with_pair();
         assert!(store.apply_local(chunk, &[BlockEdit::new(16, 0, 0, 1)]));
         assert!(!local.is_dirty());
         assert!(store.pending_for(chunk).is_empty());

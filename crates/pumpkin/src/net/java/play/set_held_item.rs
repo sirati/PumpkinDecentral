@@ -23,14 +23,16 @@ impl JavaClient {
 
         let inv = player.inventory();
         inv.set_selected_slot(slot);
-        pumpkin_cluster::visual::emit_held(
-            player.cluster_gid(),
-            pumpkin_cluster::visual::tick_from_counter(
-                player.tick_counter.load(std::sync::atomic::Ordering::Relaxed),
-            ),
-            slot,
-        );
+        if let Some(tick) = crate::server::cluster::disciplined_tick_now() {
+            pumpkin_cluster::visual::emit_held(player.cluster_gid(), tick, slot);
+        }
         let stack = inv.held_item();
+        if server.advanced_config.cluster.enabled {
+            let _ = player.cluster_seed_attack_held_slot(
+                slot,
+                Player::cluster_attack_stack_snapshot(&stack),
+            );
+        }
         let equipment = &[(EquipmentSlot::MAIN_HAND, stack)];
         player.living_entity.send_equipment_changes(equipment);
     }

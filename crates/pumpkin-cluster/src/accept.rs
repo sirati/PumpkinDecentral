@@ -27,7 +27,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::buckets::BucketTable;
-use crate::identity::GlobalPlayerId;
+use crate::identity::{ActionActor, GlobalPlayerId};
+use crate::identity::ServerId;
 use crate::protocol::{BlockPos, ChunkAddr, EntityRef};
 use crate::time::TickStamp;
 
@@ -35,9 +36,7 @@ use crate::time::TickStamp;
 ///
 /// Tags keep block, entity, and player conflicts in disjoint key spaces so a
 /// single winner map can resolve every conflict deterministically.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ConflictKey {
     pub tag: u8,
     pub payload: [u8; 12],
@@ -47,6 +46,8 @@ impl ConflictKey {
     pub const BLOCK_TAG: u8 = 0;
     pub const ENTITY_TAG: u8 = 1;
     pub const PLAYER_TAG: u8 = 2;
+    pub const ENTITY_EFFECT_TAG: u8 = 3;
+    pub const PLAYER_EFFECT_TAG: u8 = 4;
 
     /// Encodes a block position into the block key space.
     #[must_use]
@@ -57,8 +58,7 @@ impl ConflictKey {
         Self {
             tag: Self::BLOCK_TAG,
             payload: [
-                x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3], z[0], z[1],
-                z[2], z[3],
+                x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3], z[0], z[1], z[2], z[3],
             ],
         }
     }
@@ -66,13 +66,17 @@ impl ConflictKey {
     /// Encodes an entity reference into the entity key space.
     #[must_use]
     pub const fn for_entity(target: EntityRef) -> Self {
-        let owner = target.owner.0.to_le_bytes();
-        let id = target.local_id.to_le_bytes();
+        Self::for_entity_origin(target.origin, target.local_id)
+    }
+
+    #[must_use]
+    pub const fn for_entity_origin(origin: ServerId, local_id: i32) -> Self {
+        let origin = origin.0.to_le_bytes();
+        let id = local_id.to_le_bytes();
         Self {
             tag: Self::ENTITY_TAG,
             payload: [
-                owner[0], owner[1], id[0], id[1], id[2], id[3], 0, 0, 0, 0, 0,
-                0,
+                origin[0], origin[1], id[0], id[1], id[2], id[3], 0, 0, 0, 0, 0, 0,
             ],
         }
     }
@@ -85,8 +89,44 @@ impl ConflictKey {
         Self {
             tag: Self::PLAYER_TAG,
             payload: [
-                server[0], server[1], player[0], player[1], 0, 0, 0, 0, 0, 0,
-                0, 0,
+                server[0], server[1], player[0], player[1], 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+        }
+    }
+
+    #[must_use]
+    pub const fn for_entity_effect(origin: u16, local_id: i32, effect: u16) -> Self {
+        let origin = origin.to_le_bytes();
+        let local_id = local_id.to_le_bytes();
+        let effect = effect.to_le_bytes();
+        Self {
+            tag: Self::ENTITY_EFFECT_TAG,
+            payload: [
+                origin[0],
+                origin[1],
+                local_id[0],
+                local_id[1],
+                local_id[2],
+                local_id[3],
+                effect[0],
+                effect[1],
+                0,
+                0,
+                0,
+                0,
+            ],
+        }
+    }
+
+    #[must_use]
+    pub const fn for_player_effect(target: GlobalPlayerId, effect: u16) -> Self {
+        let server = target.server.0.to_le_bytes();
+        let player = target.player.0.to_le_bytes();
+        let effect = effect.to_le_bytes();
+        Self {
+            tag: Self::PLAYER_EFFECT_TAG,
+            payload: [
+                server[0], server[1], player[0], player[1], effect[0], effect[1], 0, 0, 0, 0, 0, 0,
             ],
         }
     }
@@ -100,16 +140,16 @@ impl ConflictKey {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkDecision {
     pub chunk: ChunkAddr,
-    pub accepted_gids: Vec<GlobalPlayerId>,
-    pub winners: Vec<(ConflictKey, GlobalPlayerId)>,
+    pub accepted_actors: Vec<ActionActor>,
+    pub winners: Vec<(ConflictKey, ActionActor)>,
     pub new_holders: Vec<u16>,
 }
 
 impl ChunkDecision {
     /// Sorts and dedupes every payload so equal votes compare and encode equal.
     pub fn normalize(&mut self) {
-        self.accepted_gids.sort();
-        self.accepted_gids.dedup();
+        self.accepted_actors.sort();
+        self.accepted_actors.dedup();
         self.winners.sort();
         self.winners.dedup();
         self.new_holders.sort_unstable();
@@ -153,7 +193,8 @@ impl AcceptBatch {
         for decision in &mut self.decisions {
             decision.normalize();
         }
-        self.decisions.sort_by(|left, right| left.chunk.cmp(&right.chunk));
+        self.decisions
+            .sort_by(|left, right| left.chunk.cmp(&right.chunk));
     }
 }
 
@@ -164,8 +205,8 @@ impl AcceptBatch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalChunkOutcome {
     pub chunk: ChunkAddr,
-    pub accepted_gids: Vec<GlobalPlayerId>,
-    pub winners: Vec<(ConflictKey, GlobalPlayerId)>,
+    pub accepted_actors: Vec<ActionActor>,
+    pub winners: Vec<(ConflictKey, ActionActor)>,
     pub new_holders: Vec<u16>,
 }
 
@@ -182,7 +223,7 @@ pub fn build_accept(tick: TickStamp, local_outcomes: Vec<LocalChunkOutcome>) -> 
             .into_iter()
             .map(|outcome| ChunkDecision {
                 chunk: outcome.chunk,
-                accepted_gids: outcome.accepted_gids,
+                accepted_actors: outcome.accepted_actors,
                 winners: outcome.winners,
                 new_holders: outcome.new_holders,
             })
@@ -264,18 +305,35 @@ impl Acceptor {
         }
         for decision in &batch.decisions {
             let mut fresh: Vec<u16> = Vec::new();
-            for gid in &decision.accepted_gids {
-                let peer = gid.server.0;
-                if self.seen.insert((batch.tick, decision.chunk, peer))
-                    && !fresh.contains(&peer)
-                {
+            for actor in &decision.accepted_actors {
+                let peer = match actor {
+                    ActionActor::Player(gid) => gid.server.0,
+                    ActionActor::Server(server) => server.0,
+                };
+                if self.seen.insert((batch.tick, decision.chunk, peer)) && !fresh.contains(&peer) {
                     fresh.push(peer);
                 }
             }
             if !fresh.is_empty() {
                 fresh.sort_unstable();
+                self.table.accept_peers(batch.tick, decision.chunk, &fresh);
+            }
+        }
+        let slot = self.buffered.entry(batch.tick).or_default();
+        if !slot.contains(&batch) {
+            slot.push(batch);
+        }
+    }
+
+    pub fn apply_accept_from(&mut self, holder: u16, batch: AcceptBatch) {
+        for decision in &batch.decisions {
+            self.table
+                .merge_holders(batch.tick, decision.chunk, &decision.new_holders);
+        }
+        for decision in &batch.decisions {
+            if self.seen.insert((batch.tick, decision.chunk, holder)) {
                 self.table
-                    .accept_peers(batch.tick, decision.chunk, &fresh);
+                    .accept_peers(batch.tick, decision.chunk, &[holder]);
             }
         }
         let slot = self.buffered.entry(batch.tick).or_default();
@@ -349,7 +407,10 @@ impl Acceptor {
         for batches in self.buffered.values_mut() {
             batches.retain(|batch| {
                 !batch.decisions.iter().all(|decision| {
-                    decision.accepted_gids.iter().all(|gid| gid.server.0 == peer)
+                    decision.accepted_actors.iter().all(|actor| match actor {
+                        ActionActor::Player(gid) => gid.server.0 == peer,
+                        ActionActor::Server(server) => server.0 == peer,
+                    })
                 })
             });
         }
@@ -433,14 +494,10 @@ mod tests {
         ChunkAddr { x, z }
     }
 
-    fn outcome(
-        addr: ChunkAddr,
-        gids: &[GlobalPlayerId],
-        new_holders: &[u16],
-    ) -> LocalChunkOutcome {
+    fn outcome(addr: ChunkAddr, gids: &[GlobalPlayerId], new_holders: &[u16]) -> LocalChunkOutcome {
         LocalChunkOutcome {
             chunk: addr,
-            accepted_gids: gids.to_vec(),
+            accepted_actors: gids.iter().copied().map(ActionActor::Player).collect(),
             winners: Vec::new(),
             new_holders: new_holders.to_vec(),
         }
@@ -468,10 +525,7 @@ mod tests {
         let tick = TickStamp(3);
         let addr = chunk(1, 2);
         acceptor.require(tick, addr, &[1, 2]);
-        let batch = build_accept(
-            tick,
-            vec![outcome(addr, &[gid(1, 0), gid(2, 5)], &[])],
-        );
+        let batch = build_accept(tick, vec![outcome(addr, &[gid(1, 0), gid(2, 5)], &[])]);
         acceptor.apply_accept(batch.clone());
         assert!(acceptor.is_globally_accepted(tick));
         assert_eq!(acceptor.buffered_batches(tick), 1);
@@ -508,18 +562,25 @@ mod tests {
             tick,
             decisions: vec![ChunkDecision {
                 chunk: addr,
-                accepted_gids: vec![gid(1, 2)],
+                accepted_actors: vec![ActionActor::Player(gid(1, 2))],
                 winners: vec![
-                    (ConflictKey::for_block(block), gid(1, 2)),
+                    (
+                        ConflictKey::for_block(block),
+                        ActionActor::Player(gid(1, 2)),
+                    ),
                     (
                         ConflictKey::for_entity(EntityRef {
+                            origin: ServerId(1),
                             owner: ServerId(1),
                             local_id: 77,
                             chunk: addr,
                         }),
-                        gid(2, 0),
+                        ActionActor::Player(gid(2, 0)),
                     ),
-                    (ConflictKey::for_player(gid(4, 4)), gid(4, 4)),
+                    (
+                        ConflictKey::for_player(gid(4, 4)),
+                        ActionActor::Player(gid(4, 4)),
+                    ),
                 ],
                 new_holders: vec![3],
             }],
@@ -534,7 +595,10 @@ mod tests {
         let tick = TickStamp(5);
         let batch = build_accept(
             tick,
-            vec![outcome(chunk(9, 0), &[], &[]), outcome(chunk(1, 0), &[], &[])],
+            vec![
+                outcome(chunk(9, 0), &[], &[]),
+                outcome(chunk(1, 0), &[], &[]),
+            ],
         );
         assert_eq!(batch.decisions[0].chunk, chunk(1, 0));
         assert_eq!(batch.decisions[1].chunk, chunk(9, 0));
@@ -549,23 +613,42 @@ mod tests {
             tick,
             vec![LocalChunkOutcome {
                 chunk: addr,
-                accepted_gids: vec![gid(2, 0), gid(1, 0), gid(2, 0)],
+                accepted_actors: vec![
+                    ActionActor::Player(gid(2, 0)),
+                    ActionActor::Player(gid(1, 0)),
+                    ActionActor::Player(gid(2, 0)),
+                ],
                 winners: vec![
-                    (ConflictKey::for_block(block), gid(2, 0)),
-                    (ConflictKey::for_block(block), gid(1, 0)),
+                    (
+                        ConflictKey::for_block(block),
+                        ActionActor::Player(gid(2, 0)),
+                    ),
+                    (
+                        ConflictKey::for_block(block),
+                        ActionActor::Player(gid(1, 0)),
+                    ),
                 ],
                 new_holders: vec![3, 1, 3],
             }],
         );
         assert_eq!(
-            batch.decisions[0].accepted_gids,
-            vec![gid(1, 0), gid(2, 0)]
+            batch.decisions[0].accepted_actors,
+            vec![
+                ActionActor::Player(gid(1, 0)),
+                ActionActor::Player(gid(2, 0))
+            ]
         );
         assert_eq!(
             batch.decisions[0].winners,
             vec![
-                (ConflictKey::for_block(block), gid(1, 0)),
-                (ConflictKey::for_block(block), gid(2, 0)),
+                (
+                    ConflictKey::for_block(block),
+                    ActionActor::Player(gid(1, 0))
+                ),
+                (
+                    ConflictKey::for_block(block),
+                    ActionActor::Player(gid(2, 0))
+                ),
             ]
         );
         assert_eq!(batch.decisions[0].new_holders, vec![1, 3]);
@@ -579,13 +662,11 @@ mod tests {
         acceptor.require(tick, addr, &[1]);
         let items = vec![10_u32, 20_u32];
         let mut applied: Vec<u32> = Vec::new();
-        let ran =
-            apply_if_globally_accepted(&acceptor, tick, &items, |item| applied.push(*item));
+        let ran = apply_if_globally_accepted(&acceptor, tick, &items, |item| applied.push(*item));
         assert_eq!(ran, 0);
         assert!(applied.is_empty());
         acceptor.apply_accept(build_accept(tick, vec![outcome(addr, &[gid(1, 0)], &[])]));
-        let ran =
-            apply_if_globally_accepted(&acceptor, tick, &items, |item| applied.push(*item));
+        let ran = apply_if_globally_accepted(&acceptor, tick, &items, |item| applied.push(*item));
         assert_eq!(ran, 2);
         assert_eq!(applied, items);
     }

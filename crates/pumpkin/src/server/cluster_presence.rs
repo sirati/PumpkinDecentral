@@ -1,17 +1,18 @@
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering};
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use arc_swap::ArcSwap;
 use pumpkin_cluster::admin_sync::PlayerDirectorySnapshot;
 use pumpkin_cluster::identity::{GlobalPlayerId, PlayerSlot, ServerId};
 use pumpkin_cluster::presence::{
-    PRESENCE_MAX_ENTRIES, PRESENCE_MAX_NAME_LEN, PresenceControl, PresenceLogin, PresenceLogout,
-    PresenceProperty, RemotePlayerEntry, decode_control, encode_control, is_valid_presence_name,
+    PRESENCE_MAX_ENTRIES, PresenceControl, PresenceLogin, PresenceLogout, PresenceProperty,
+    RemotePlayerEntry, RemotePlayerProfile, decode_control, encode_control,
+    is_valid_presence_name,
 };
-use pumpkin_cluster::protocol::StreamKind;
+use pumpkin_cluster::protocol::{PlayerGameMode, StreamKind};
 use pumpkin_cluster::streams::{InboundParcel, OutboundParcel, StreamHeader};
 use pumpkin_config::ClusterRole;
 use pumpkin_util::text::TextComponent;
@@ -21,6 +22,8 @@ use tracing::{debug, info, warn};
 
 use super::Server;
 use crate::entity::player::Player;
+use crate::net::GameProfile;
+use pumpkin_util::GameMode;
 
 struct PresenceOutbox {
     local: ServerId,
@@ -31,153 +34,19 @@ struct PresenceOutbox {
 static PRESENCE_OUTBOX: OnceLock<PresenceOutbox> = OnceLock::new();
 static NEXT_SLOT: AtomicU16 = AtomicU16::new(1);
 static PRESENCE_ANNOUNCED: AtomicU64 = AtomicU64::new(0);
-static PRESENCE_VICTIM: AtomicU64 = AtomicU64::new(0);
-static REMOTE_SLOTS: LazyLock<[PresenceSlot; PRESENCE_MAX_ENTRIES]> =
-    LazyLock::new(|| core::array::from_fn(|_| PresenceSlot::new()));
+static REMOTE_PRESENCE: LazyLock<ArcSwap<Vec<RemotePlayerEntry>>> =
+    LazyLock::new(|| ArcSwap::from_pointee(Vec::new()));
 
-const PRESENCE_READ_RETRIES: u8 = 4;
 const LOGOUT_GRACE_MILLIS: u64 = 30_000;
 
-struct PresenceSlot {
-    claimed: AtomicBool,
-    live: AtomicBool,
-    seq: AtomicU64,
-    server: AtomicU16,
-    player: AtomicU16,
-    uuid_hi: AtomicU64,
-    uuid_lo: AtomicU64,
-    name_len: AtomicU8,
-    name_first: AtomicU64,
-    name_rest: AtomicU64,
-    joined: AtomicU64,
-    in_lobby: AtomicBool,
-}
-
 #[must_use]
-fn pack_name(name: &str) -> (u64, u64, u8) {
-    let bytes = name.as_bytes();
-    let mut padded = [0_u8; PRESENCE_MAX_NAME_LEN];
-    let end = bytes.len().min(PRESENCE_MAX_NAME_LEN);
-    padded[..end].copy_from_slice(&bytes[..end]);
-    let (first, rest) = padded.split_at(8);
-    let len = u8::try_from(bytes.len().min(PRESENCE_MAX_NAME_LEN)).unwrap_or(u8::MAX);
-    (
-        u64::from_le_bytes(first.try_into().unwrap_or([0_u8; 8])),
-        u64::from_le_bytes(rest.try_into().unwrap_or([0_u8; 8])),
-        len,
-    )
-}
-
-#[must_use]
-fn unpack_name(first: u64, rest: u64, len: u8) -> String {
-    let mut bytes = [0_u8; PRESENCE_MAX_NAME_LEN];
-    bytes[..8].copy_from_slice(&first.to_le_bytes());
-    bytes[8..].copy_from_slice(&rest.to_le_bytes());
-    let end = usize::from(len).min(PRESENCE_MAX_NAME_LEN);
-    String::from_utf8(bytes[..end].to_vec()).unwrap_or_default()
-}
-
-impl PresenceSlot {
-    fn new() -> Self {
-        Self {
-            claimed: AtomicBool::new(false),
-            live: AtomicBool::new(false),
-            seq: AtomicU64::new(0),
-            server: AtomicU16::new(0),
-            player: AtomicU16::new(0),
-            uuid_hi: AtomicU64::new(0),
-            uuid_lo: AtomicU64::new(0),
-            name_len: AtomicU8::new(0),
-            name_first: AtomicU64::new(0),
-            name_rest: AtomicU64::new(0),
-            joined: AtomicU64::new(0),
-            in_lobby: AtomicBool::new(false),
-        }
+fn presence_gamemode(gamemode: GameMode) -> PlayerGameMode {
+    match gamemode {
+        GameMode::Survival => PlayerGameMode::Survival,
+        GameMode::Creative => PlayerGameMode::Creative,
+        GameMode::Adventure => PlayerGameMode::Adventure,
+        GameMode::Spectator => PlayerGameMode::Spectator,
     }
-
-    fn matches(&self, gid: GlobalPlayerId) -> bool {
-        self.claimed.load(Ordering::Acquire)
-            && self.server.load(Ordering::Acquire) == gid.server.0
-            && self.player.load(Ordering::Acquire) == gid.player.0
-    }
-
-    fn write(&self, login: &PresenceLogin, stamp: u64) {
-        let (first, rest, len) = pack_name(login.name.as_str());
-        self.seq.fetch_add(1, Ordering::AcqRel);
-        self.server.store(login.gid.server.0, Ordering::Relaxed);
-        self.player.store(login.gid.player.0, Ordering::Relaxed);
-        self.uuid_hi.store(
-            u64::from_le_bytes(login.uuid[..8].try_into().unwrap_or([0_u8; 8])),
-            Ordering::Relaxed,
-        );
-        self.uuid_lo.store(
-            u64::from_le_bytes(login.uuid[8..].try_into().unwrap_or([0_u8; 8])),
-            Ordering::Relaxed,
-        );
-        self.name_first.store(first, Ordering::Relaxed);
-        self.name_rest.store(rest, Ordering::Relaxed);
-        self.name_len.store(len, Ordering::Relaxed);
-        self.joined.store(stamp, Ordering::Relaxed);
-        self.in_lobby.store(login.in_lobby, Ordering::Relaxed);
-        self.live.store(true, Ordering::Release);
-        self.seq.fetch_add(1, Ordering::AcqRel);
-    }
-
-    fn clear(&self) {
-        self.seq.fetch_add(1, Ordering::AcqRel);
-        self.live.store(false, Ordering::Release);
-        self.claimed.store(false, Ordering::Release);
-        self.seq.fetch_add(1, Ordering::AcqRel);
-    }
-
-    fn read(&self) -> Option<(GlobalPlayerId, RemotePlayerEntry)> {
-        if !self.live.load(Ordering::Acquire) {
-            return None;
-        }
-        let before = self.seq.load(Ordering::Acquire);
-        if before & 1 == 1 {
-            return None;
-        }
-        let gid = GlobalPlayerId::new(
-            ServerId(self.server.load(Ordering::Acquire)),
-            PlayerSlot(self.player.load(Ordering::Acquire)),
-        );
-        let mut uuid = [0_u8; 16];
-        uuid[..8].copy_from_slice(&self.uuid_hi.load(Ordering::Acquire).to_le_bytes());
-        uuid[8..].copy_from_slice(&self.uuid_lo.load(Ordering::Acquire).to_le_bytes());
-        let name = unpack_name(
-            self.name_first.load(Ordering::Acquire),
-            self.name_rest.load(Ordering::Acquire),
-            self.name_len.load(Ordering::Acquire),
-        );
-        let joined = self.joined.load(Ordering::Acquire);
-        let in_lobby = self.in_lobby.load(Ordering::Acquire);
-        if before != self.seq.load(Ordering::Acquire) || !self.live.load(Ordering::Acquire) {
-            return None;
-        }
-        Some((
-            gid,
-            RemotePlayerEntry::new(gid, uuid, name, Vec::new(), joined, in_lobby),
-        ))
-    }
-}
-
-fn find_slot(gid: GlobalPlayerId) -> Option<usize> {
-    REMOTE_SLOTS.iter().position(|slot| slot.matches(gid))
-}
-
-fn claim_slot() -> usize {
-    for (index, slot) in REMOTE_SLOTS.iter().enumerate() {
-        if slot
-            .claimed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-        {
-            return index;
-        }
-    }
-    let victim = usize::try_from(PRESENCE_VICTIM.fetch_add(1, Ordering::Relaxed)).unwrap_or(0);
-    victim % PRESENCE_MAX_ENTRIES
 }
 
 #[must_use]
@@ -229,7 +98,24 @@ pub fn publish_roster_to_peer(server: &Server, peer: u16) {
             player.gameprofile.id.into_bytes(),
             name,
             presence_properties_for(&player),
-            player.is_in_cluster_lobby(),
+            presence_gamemode(player.gamemode.load()),
+            false,
+        );
+        if let Some(parcel) = login_parcel_for_peer(&login, target) {
+            let _ = outbox.outbound.try_send(parcel);
+        }
+    }
+    for waiter in server.lobby_waiters.load().iter() {
+        if waiter.gid.server != outbox.local || !is_valid_presence_name(&waiter.profile.name) {
+            continue;
+        }
+        let login = PresenceLogin::new(
+            waiter.gid,
+            waiter.profile.id.into_bytes(),
+            waiter.profile.name.clone(),
+            profile_properties(&waiter.profile),
+            PlayerGameMode::Spectator,
+            true,
         );
         if let Some(parcel) = login_parcel_for_peer(&login, target) {
             let _ = outbox.outbound.try_send(parcel);
@@ -244,10 +130,7 @@ pub fn presence_announced() -> u64 {
 
 #[must_use]
 pub fn remote_presence_count() -> usize {
-    REMOTE_SLOTS
-        .iter()
-        .filter(|slot| slot.live.load(Ordering::Acquire))
-        .count()
+    REMOTE_PRESENCE.load().len()
 }
 
 pub fn install_presence_outbox(
@@ -302,11 +185,38 @@ pub fn assign_login_gid(server: &Server, player: &Player) -> GlobalPlayerId {
     gid
 }
 
-pub fn publish_login(server: &Server, player: &Player) {
-    if !cluster_enabled(server) {
-        return;
+#[must_use]
+pub fn assign_lobby_gid(server: &Server) -> GlobalPlayerId {
+    let local = local_server_id(server);
+    let mut slot = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
+    if slot == u16::MAX {
+        slot = NEXT_SLOT.fetch_add(1, Ordering::Relaxed);
     }
-    if player.cluster_login_announced.load(Ordering::Acquire) {
+    GlobalPlayerId::new(local, PlayerSlot(slot))
+}
+
+#[must_use]
+fn profile_properties(profile: &GameProfile) -> Vec<PresenceProperty> {
+    profile
+        .properties
+        .load()
+        .iter()
+        .map(|property| {
+            PresenceProperty::new(
+                property.name.to_string(),
+                property.value.to_string(),
+                property
+                    .signature
+                    .as_ref()
+                    .map(|signature| signature.to_string()),
+            )
+        })
+        .collect()
+}
+
+pub fn publish_login(server: &Server, player: &Player) {
+    super::cluster_status::refresh_cluster_status(server);
+    if !cluster_enabled(server) {
         return;
     }
     let gid = assign_login_gid(server, player);
@@ -320,7 +230,8 @@ pub fn publish_login(server: &Server, player: &Player) {
         player.gameprofile.id.into_bytes(),
         name,
         presence_properties_for(player),
-        player.is_in_cluster_lobby(),
+        presence_gamemode(player.gamemode.load()),
+        false,
     );
     let Ok(bytes) = encode_control(&PresenceControl::Login(login)) else {
         warn!("cluster presence login encode failed");
@@ -344,44 +255,44 @@ pub fn publish_login(server: &Server, player: &Player) {
         }
     }
     if sent > 0 {
-        PRESENCE_ANNOUNCED.fetch_add(1, Ordering::Relaxed);
-        player.cluster_login_announced.store(true, Ordering::Release);
+        if !player.cluster_login_announced.swap(true, Ordering::AcqRel) {
+            PRESENCE_ANNOUNCED.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
-pub fn publish_lobby_state(server: &Server, player: &Player) {
-    if !cluster_enabled(server) {
+pub fn publish_lobby_login(server: &Server, gid: GlobalPlayerId, profile: &GameProfile) {
+    if !cluster_enabled(server) || !is_valid_presence_name(&profile.name) {
         return;
     }
-    let gid = assign_login_gid(server, player);
-    let name = player.gameprofile.name.clone();
-    if !is_valid_presence_name(&name) {
-        return;
-    }
-    let login = PresenceLogin::new(
-        gid,
-        player.gameprofile.id.into_bytes(),
-        name,
-        presence_properties_for(player),
-        player.is_in_cluster_lobby(),
-    );
-    let Ok(bytes) = encode_control(&PresenceControl::Login(login)) else {
-        return;
-    };
     let Some(outbox) = PRESENCE_OUTBOX.get() else {
         return;
     };
     if gid.server != outbox.local {
         return;
     }
+    let Ok(bytes) = encode_control(&PresenceControl::Login(PresenceLogin::new(
+        gid,
+        profile.id.into_bytes(),
+        profile.name.clone(),
+        profile_properties(profile),
+        PlayerGameMode::Spectator,
+        true,
+    ))) else {
+        warn!(uuid = %profile.id, "cluster lobby presence encode failed");
+        return;
+    };
     let mut sent = 0_u64;
     for peer in &outbox.peers {
-        let parcel = OutboundParcel {
-            peer: ServerId(*peer),
-            header: StreamHeader::new(StreamKind::Control, None),
-            bytes: bytes.clone(),
-        };
-        if outbox.outbound.try_send(parcel).is_ok() {
+        if outbox
+            .outbound
+            .try_send(OutboundParcel {
+                peer: ServerId(*peer),
+                header: StreamHeader::new(StreamKind::Control, None),
+                bytes: bytes.clone(),
+            })
+            .is_ok()
+        {
             sent = sent.saturating_add(1);
         }
     }
@@ -390,7 +301,30 @@ pub fn publish_lobby_state(server: &Server, player: &Player) {
     }
 }
 
+pub fn publish_lobby_logout(server: &Server, gid: GlobalPlayerId) {
+    if !cluster_enabled(server) {
+        return;
+    }
+    let Some(outbox) = PRESENCE_OUTBOX.get() else {
+        return;
+    };
+    if gid.server != outbox.local {
+        return;
+    }
+    let Ok(bytes) = encode_control(&PresenceControl::Logout(PresenceLogout::new(gid))) else {
+        return;
+    };
+    for peer in &outbox.peers {
+        let _ = outbox.outbound.try_send(OutboundParcel {
+            peer: ServerId(*peer),
+            header: StreamHeader::new(StreamKind::Control, None),
+            bytes: bytes.clone(),
+        });
+    }
+}
+
 pub fn publish_logout(server: &Server, player: &Player) {
+    super::cluster_status::refresh_cluster_status(server);
     if !cluster_enabled(server) {
         return;
     }
@@ -434,53 +368,71 @@ pub fn publish_logout(server: &Server, player: &Player) {
 }
 
 pub fn note_remote_login(login: &PresenceLogin, stamp: u64) -> bool {
-    if !is_valid_presence_name(login.name.as_str()) {
+    if !is_valid_presence_name(login.name.as_str())
+        || !login
+            .properties
+            .iter()
+            .all(pumpkin_cluster::presence::is_valid_presence_property)
+    {
         return false;
     }
-    let index = find_slot(login.gid).unwrap_or_else(claim_slot);
-    REMOTE_SLOTS[index].write(login, stamp);
-    super::cluster_chat_pm::note_remote_roster(login.gid, &login.name, &login.properties);
+    let current = REMOTE_PRESENCE.load();
+    let mut next = (**current).clone();
+    let entry = RemotePlayerEntry::new(
+        login.gid,
+        login.uuid,
+        login.name.clone(),
+        login.properties.clone(),
+        login.gamemode,
+        stamp,
+        login.in_lobby,
+    );
+    if let Some(index) = next.iter().position(|known| known.gid == login.gid) {
+        next[index] = entry;
+    } else {
+        if next.len() == PRESENCE_MAX_ENTRIES {
+            next.remove(0);
+        }
+        next.push(entry);
+    }
+    REMOTE_PRESENCE.store(Arc::new(next));
     true
 }
 
 pub fn forget_remote_server(server: u16) -> usize {
-    let mut cleared = 0;
-    for slot in REMOTE_SLOTS.iter() {
-        if slot.claimed.load(Ordering::Acquire) && slot.server.load(Ordering::Acquire) == server
-        {
-            if let Some((gid, _)) = slot.read() {
-                slot.clear();
-                let _ = super::cluster_chat_pm::forget_remote_player(&gid);
-                cleared += 1;
-            }
-        }
+    let current = REMOTE_PRESENCE.load();
+    let mut next = (**current).clone();
+    let before = next.len();
+    next.retain(|entry| entry.gid.server.0 != server);
+    let cleared = before.saturating_sub(next.len());
+    if cleared != 0 {
+        REMOTE_PRESENCE.store(Arc::new(next));
     }
     cleared
 }
 
 pub fn forget_remote_presence(gid: &GlobalPlayerId) -> Option<RemotePlayerEntry> {
-    for _ in 0..PRESENCE_READ_RETRIES {
-        let Some(index) = find_slot(*gid) else {
-            return None;
-        };
-        if let Some((_, entry)) = REMOTE_SLOTS[index].read() {
-            REMOTE_SLOTS[index].clear();
-            let _ = super::cluster_chat_pm::forget_remote_player(gid);
-            return Some(entry);
-        }
-    }
-    None
+    let current = REMOTE_PRESENCE.load();
+    let mut next = (**current).clone();
+    let index = next.iter().position(|entry| entry.gid == *gid)?;
+    let removed = next.remove(index);
+    REMOTE_PRESENCE.store(Arc::new(next));
+    Some(removed)
 }
 
 #[must_use]
 pub fn remote_presence_entries() -> Vec<(GlobalPlayerId, RemotePlayerEntry)> {
-    let mut merged: HashMap<GlobalPlayerId, RemotePlayerEntry> = HashMap::new();
-    for slot in REMOTE_SLOTS.iter() {
-        if let Some((gid, entry)) = slot.read() {
-            merged.insert(gid, entry);
-        }
-    }
-    merged.into_iter().collect()
+    REMOTE_PRESENCE
+        .load()
+        .iter()
+        .cloned()
+        .map(|entry| (entry.gid, entry))
+        .collect()
+}
+
+#[must_use]
+pub fn remote_presence_snapshot() -> Arc<Vec<RemotePlayerEntry>> {
+    REMOTE_PRESENCE.load_full()
 }
 
 #[must_use]
@@ -492,20 +444,39 @@ pub fn remote_player_in_lobby(name: &str) -> bool {
 
 #[must_use]
 pub fn remote_presence_entry(gid: GlobalPlayerId) -> Option<RemotePlayerEntry> {
-    find_slot(gid).and_then(|index| REMOTE_SLOTS[index].read().map(|(_, entry)| entry))
+    REMOTE_PRESENCE
+        .load()
+        .iter()
+        .find(|entry| entry.gid == gid)
+        .cloned()
 }
 
-pub fn apply_presence_bytes(server: &Arc<Server>, local: ServerId, bytes: &[u8]) -> bool {
+#[must_use]
+pub fn remote_replica_profile(gid: GlobalPlayerId) -> Option<RemotePlayerProfile> {
+    REMOTE_PRESENCE
+        .load()
+        .iter()
+        .find(|entry| entry.gid == gid)
+        .and_then(RemotePlayerEntry::replica_profile)
+}
+
+pub fn apply_presence_bytes(
+    server: &Arc<Server>,
+    local: ServerId,
+    source: ServerId,
+    bytes: &[u8],
+) -> bool {
     let control = match decode_control(bytes) {
         Ok(control) => control,
         Err(_) => return false,
     };
     match control {
         PresenceControl::Login(login) => {
-            if login.gid.server == local {
+            if source == local || login.gid.server != source {
                 return false;
             }
-            let was_known = find_slot(login.gid).is_some();
+            super::cluster_playerdata::note_presence(login.clone());
+            let was_known = remote_presence_entry(login.gid).is_some();
             if !note_remote_login(&login, now_millis()) {
                 debug!(
                     server = login.gid.server.0,
@@ -514,6 +485,7 @@ pub fn apply_presence_bytes(server: &Arc<Server>, local: ServerId, bytes: &[u8])
                 return false;
             }
             if was_known {
+                super::cluster_status::refresh_cluster_status(server);
                 return true;
             }
             super::cluster_hide::push_remote_login_to_viewers(
@@ -550,12 +522,14 @@ pub fn apply_presence_bytes(server: &Arc<Server>, local: ServerId, bytes: &[u8])
                     "cluster presence login applied"
                 );
             }
+            super::cluster_status::refresh_cluster_status(server);
             true
         }
         PresenceControl::Logout(logout) => {
-            if logout.gid.server == local {
+            if source == local || logout.gid.server != source {
                 return false;
             }
+            super::cluster_playerdata::note_presence_logout(logout.gid);
             let hidden = super::cluster_hide::is_hidden_gid(&logout.gid);
             let removed = forget_remote_presence(&logout.gid);
             let hidden = hidden
@@ -608,6 +582,7 @@ pub fn apply_presence_bytes(server: &Arc<Server>, local: ServerId, bytes: &[u8])
                     );
                 }
             }
+            super::cluster_status::refresh_cluster_status(server);
             true
         }
     }
@@ -627,7 +602,7 @@ pub async fn presence_task(
             first = false;
             debug!(from = parcel.peer.0, "cluster presence stream started");
         }
-        apply_presence_bytes(&server, local, &parcel.bytes);
+        apply_presence_bytes(&server, local, parcel.peer, &parcel.bytes);
     }
     debug!("cluster presence stream closed");
 }
@@ -646,10 +621,9 @@ pub fn admin_directory_snapshot(server: &Server) -> PlayerDirectorySnapshot {
     let local = local_server_id(server);
     let mut snapshot = PlayerDirectorySnapshot::new(local);
     for player in server.get_all_players() {
-        let gid = player
-            .cluster_gid()
-            .unwrap_or(GlobalPlayerId::new(local, PlayerSlot(u16::MAX)));
-        snapshot.apply_presence_login(gid, player.gameprofile.name.clone());
+        if let Some(gid) = player.cluster_gid() {
+            snapshot.apply_presence_login(gid, player.gameprofile.name.clone());
+        }
     }
     for (gid, entry) in remote_presence_entries() {
         if snapshot.player_name(&gid).is_none()
@@ -671,6 +645,7 @@ mod tests {
             [0xAB; 16],
             name.to_string(),
             Vec::new(),
+            PlayerGameMode::Survival,
             false,
         )
     }
@@ -715,6 +690,7 @@ mod tests {
             [0xCD; 16],
             String::from("PresenceCarol"),
             Vec::new(),
+            PlayerGameMode::Creative,
             false,
         );
         assert!(note_remote_login(&second, 20));
@@ -724,6 +700,38 @@ mod tests {
             .unwrap();
         assert_eq!(found.1.uuid, [0xCD; 16]);
         assert!(forget_remote_presence(&first.gid).is_some());
+    }
+
+    #[test]
+    fn replica_profile_keeps_authenticated_login_fields() {
+        let announced = PresenceLogin::new(
+            GlobalPlayerId::new(ServerId(916), PlayerSlot(1)),
+            [0xCE; 16],
+            String::from("PresenceDana"),
+            vec![PresenceProperty::new(
+                String::from("textures"),
+                String::from("signed-texture"),
+                Some(String::from("signature")),
+            )],
+            PlayerGameMode::Adventure,
+            false,
+        );
+        assert!(note_remote_login(&announced, 30));
+        let profile = remote_replica_profile(announced.gid).unwrap();
+        assert_eq!(profile.uuid, announced.uuid);
+        assert_eq!(profile.name, announced.name);
+        assert_eq!(profile.properties, announced.properties);
+        assert_eq!(profile.gamemode, PlayerGameMode::Adventure);
+        assert!(forget_remote_presence(&announced.gid).is_some());
+    }
+
+    #[test]
+    fn lobby_presence_has_no_replica_profile() {
+        let mut announced = login(917, 1, "PresenceEli");
+        announced.in_lobby = true;
+        assert!(note_remote_login(&announced, 40));
+        assert!(remote_replica_profile(announced.gid).is_none());
+        assert!(forget_remote_presence(&announced.gid).is_some());
     }
 
     #[test]

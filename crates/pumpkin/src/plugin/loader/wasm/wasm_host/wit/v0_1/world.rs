@@ -1913,7 +1913,7 @@ impl pumpkin::plugin::world::HostWorldBorder for PluginHostState {
             .worldborder
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .set_damage_buffer(buffer as f32);
+            .set_damage_buffer(&border_res.provider, buffer as f32);
         Ok(())
     }
 
@@ -1943,7 +1943,7 @@ impl pumpkin::plugin::world::HostWorldBorder for PluginHostState {
             .worldborder
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .set_damage_per_block(damage as f32);
+            .set_damage_per_block(&border_res.provider, damage as f32);
         Ok(())
     }
 

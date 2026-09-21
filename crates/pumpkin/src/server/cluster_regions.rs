@@ -8,7 +8,6 @@ use pumpkin_util::math::vector2::Vector2;
 use pumpkin_world::level::is_cluster_secondary;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
 use tracing::{info, trace, warn};
 
 use super::Server;
@@ -70,12 +69,11 @@ async fn run_region_keeper(
 ) {
     let mut registry = RegionRegistry::new();
     let mut spawned: Vec<SyncedRegion> = Vec::new();
-    let region_loads = TaskTracker::new();
     let region_stop = stop.child_token();
     let mut sweep = tokio::time::interval(Duration::from_secs(REGION_SWEEP_SECS));
     ensure_spawn_regions(&server, &mut registry, &mut spawned);
     REGION_COUNT.store(registry.len(), Ordering::Relaxed);
-    sync_regions(&server, &registry, &region_stop, &region_loads);
+    sync_regions(&server, &registry, &region_stop);
     sweep.reset();
     loop {
         tokio::select! {
@@ -93,20 +91,18 @@ async fn run_region_keeper(
                 );
                 registry.register(region);
                 REGION_COUNT.store(registry.len(), Ordering::Relaxed);
-                sync_regions(&server, &registry, &region_stop, &region_loads);
+                sync_regions(&server, &registry, &region_stop);
             }
             _ = sweep.tick() => {
                 ensure_spawn_regions(&server, &mut registry, &mut spawned);
                 REGION_COUNT.store(registry.len(), Ordering::Relaxed);
                 if !registry.is_empty() {
-                    sync_regions(&server, &registry, &region_stop, &region_loads);
+                    sync_regions(&server, &registry, &region_stop);
                 }
             }
         }
     }
     region_stop.cancel();
-    region_loads.close();
-    region_loads.wait().await;
 }
 
 fn ensure_spawn_regions(
@@ -183,7 +179,6 @@ fn sync_regions(
     server: &Arc<Server>,
     registry: &RegionRegistry,
     stop: &CancellationToken,
-    region_loads: &TaskTracker,
 ) {
     if stop.is_cancelled() {
         return;
@@ -217,7 +212,7 @@ fn sync_regions(
         let ensured = u64::try_from(missing.len()).unwrap_or(u64::MAX);
         if !missing.is_empty() {
             let stop = stop.clone();
-            region_loads.spawn(async move {
+            tokio::spawn(async move {
                 for pos in missing {
                     if stop.is_cancelled() {
                         break;

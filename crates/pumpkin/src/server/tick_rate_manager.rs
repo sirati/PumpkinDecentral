@@ -209,7 +209,11 @@ impl ServerTickRateManager {
         ));
     }
     pub async fn update_joining_player(&self, player: &Player) {
-        if player.client.java_version() >= pumpkin_util::version::JavaMinecraftVersion::V_1_20_3 {
+        if player
+            .client
+            .as_deref()
+            .is_some_and(|client| client.java_version() >= pumpkin_util::version::JavaMinecraftVersion::V_1_20_3)
+        {
             player
                 .send_client_packet(&CTickingState::new(self.tickrate(), self.is_frozen()))
                 .await;

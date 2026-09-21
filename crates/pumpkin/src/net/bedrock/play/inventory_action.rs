@@ -260,6 +260,7 @@ impl BedrockClient {
                             data.click_position,
                             block,
                             &server,
+                            player.inventory().get_selected_slot() as usize,
                         );
 
                         if should_try_block_placement(&item_result) {
@@ -374,13 +375,13 @@ impl BedrockClient {
                                         .get_data_component::<BlocksAttacksImpl>()
                                         .is_some()
                                     {
-                                        pumpkin_cluster::visual::emit_blocking(
-                                            player.cluster_gid(),
-                                            pumpkin_cluster::visual::tick_from_counter(
-                                                player.tick_counter.load(Ordering::Relaxed),
-                                            ),
-                                            true,
-                                        );
+                                        if let Some(tick) = crate::server::cluster::disciplined_tick_now() {
+                                            pumpkin_cluster::visual::emit_blocking(
+                                                player.cluster_gid(),
+                                                tick,
+                                                true,
+                                            );
+                                        }
                                     }
                                 } else {
                                     // Correct predicted eating when the server's food
@@ -532,13 +533,9 @@ impl BedrockClient {
                         return;
                     };
                     if stack.get_data_component::<BlocksAttacksImpl>().is_some() {
-                        pumpkin_cluster::visual::emit_blocking(
-                            player.cluster_gid(),
-                            pumpkin_cluster::visual::tick_from_counter(
-                                player.tick_counter.load(Ordering::Relaxed),
-                            ),
-                            false,
-                        );
+                        if let Some(tick) = crate::server::cluster::disciplined_tick_now() {
+                            pumpkin_cluster::visual::emit_blocking(player.cluster_gid(), tick, false);
+                        }
                     }
                     server.item_registry.on_stopped_using(&stack, player);
                 }

@@ -26,13 +26,13 @@ impl JavaClient {
                         'after: {
                             player.set_sprinting(event.is_sprinting);
                             player.update_player_pose();
-                            pumpkin_cluster::visual::emit_sprint(
-                                player.cluster_gid(),
-                                pumpkin_cluster::visual::tick_from_counter(
-                                    player.tick_counter.load(Ordering::Relaxed),
-                                ),
-                                event.is_sprinting,
-                            );
+                            if let Some(tick) = crate::server::cluster::disciplined_tick_now() {
+                                pumpkin_cluster::visual::emit_sprint(
+                                    player.cluster_gid(),
+                                    tick,
+                                    event.is_sprinting,
+                                );
+                            }
                         }
                     }}
                 }
@@ -45,13 +45,13 @@ impl JavaClient {
                         'after: {
                             player.set_sprinting(event.is_sprinting);
                             player.update_player_pose();
-                            pumpkin_cluster::visual::emit_sprint(
-                                player.cluster_gid(),
-                                pumpkin_cluster::visual::tick_from_counter(
-                                    player.tick_counter.load(Ordering::Relaxed),
-                                ),
-                                event.is_sprinting,
-                            );
+                            if let Some(tick) = crate::server::cluster::disciplined_tick_now() {
+                                pumpkin_cluster::visual::emit_sprint(
+                                    player.cluster_gid(),
+                                    tick,
+                                    event.is_sprinting,
+                                );
+                            }
                         }
                     }}
                 }
@@ -87,13 +87,9 @@ impl JavaClient {
                 );
                 let now_sneaking = player.get_entity().is_sneaking();
                 if was_sneaking != want_sneaking && now_sneaking == want_sneaking {
-                    pumpkin_cluster::visual::emit_sneak(
-                        player.cluster_gid(),
-                        pumpkin_cluster::visual::tick_from_counter(
-                            player.tick_counter.load(Ordering::Relaxed),
-                        ),
-                        want_sneaking,
-                    );
+                    if let Some(tick) = crate::server::cluster::disciplined_tick_now() {
+                        pumpkin_cluster::visual::emit_sneak(player.cluster_gid(), tick, want_sneaking);
+                    }
                 }
             }
         }

@@ -1306,7 +1306,11 @@ impl pumpkin::plugin::server::HostBanManagerWithStore<PluginHostState>
 
                 if kick_matching_players {
                     for player in server.get_all_players() {
-                        if player.client.address().ip() == ip_addr {
+                        if player
+                            .client
+                            .as_deref()
+                            .is_some_and(|client| client.address().ip() == ip_addr)
+                        {
                             player.kick(
                                 crate::net::DisconnectReason::Kicked,
                                 &pumpkin_util::text::TextComponent::text(reason_text.clone()),

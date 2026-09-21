@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use crate::entity::EntityBase;
+use pumpkin_cluster::combat::{CombatTrackerEntryState, CombatTrackerState};
 use pumpkin_data::tag::Taggable;
 use pumpkin_data::{
     attributes::Attributes,
@@ -28,12 +29,20 @@ pub enum AttackType {
 
 impl AttackType {
     pub fn new(player: &Player, attack_cooldown_progress: f32) -> Self {
+        let held_item = player.inventory().held_item();
+        Self::from_snapshot(player, attack_cooldown_progress, &held_item)
+    }
+
+    pub fn from_snapshot(
+        player: &Player,
+        attack_cooldown_progress: f32,
+        held_item: &pumpkin_data::item_stack::ItemStack,
+    ) -> Self {
         let entity = &player.get_entity();
 
         let sprinting = entity.is_sprinting();
         let on_ground = entity.on_ground.load(Ordering::Relaxed);
         let fall_distance = player.living_entity.fall_distance.load();
-        let held_item = player.inventory().held_item();
         let is_mace = held_item.item.id == pumpkin_data::item::Item::MACE.id;
 
         if is_mace && !on_ground && fall_distance > 1.5 {
@@ -41,7 +50,7 @@ impl AttackType {
         }
 
         let sword = held_item.is_sword();
-        let is_bedrock = matches!(player.client.as_ref(), ClientPlatform::Bedrock(_));
+        let is_bedrock = matches!(player.client.as_deref(), Some(ClientPlatform::Bedrock(_)));
 
         let is_strong = attack_cooldown_progress > 0.9;
         if sprinting && is_strong {
@@ -249,7 +258,7 @@ pub struct CombatEntry {
     pub attacker_is_player: bool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct CombatTracker {
     entries: Vec<CombatEntry>,
     last_damage_time: i64,
@@ -263,6 +272,101 @@ impl CombatTracker {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn cluster_state(&self) -> CombatTrackerState {
+        CombatTrackerState {
+            entries: self
+                .entries
+                .iter()
+                .map(|entry| CombatTrackerEntryState {
+                    damage_type: u16::from(entry.damage_type.id),
+                    damage_milli: (entry.damage * 1000.0).round() as i32,
+                    fall_location: entry.fall_location.map(|location| match location {
+                        FallLocation::Generic => 0,
+                        FallLocation::Ladder => 1,
+                        FallLocation::Vines => 2,
+                        FallLocation::WeepingVines => 3,
+                        FallLocation::TwistingVines => 4,
+                        FallLocation::Scaffolding => 5,
+                        FallLocation::OtherClimbable => 6,
+                        FallLocation::Water => 7,
+                    }),
+                    fall_distance_milli: (entry.fall_distance * 1000.0).round() as i32,
+                    tick: entry.timestamp,
+                    source_id: entry.source_id,
+                    attacker_id: entry.attacker_id,
+                    attacker_name: entry
+                        .attacker_name
+                        .as_ref()
+                        .map(|name| serde_json::to_vec(name).expect("text serializes")),
+                    attacker_item_name: entry
+                        .attacker_item_name
+                        .as_ref()
+                        .map(|name| serde_json::to_vec(name).expect("text serializes")),
+                    attacker_is_living: entry.attacker_is_living,
+                    attacker_is_player: entry.attacker_is_player,
+                })
+                .collect(),
+            last_damage_tick: self.last_damage_time,
+            combat_start_tick: self.combat_start_time,
+            combat_end_tick: self.combat_end_time,
+            in_combat: self.in_combat,
+            taking_damage: self.taking_damage,
+        }
+    }
+
+    pub fn from_cluster_state(state: &CombatTrackerState) -> Option<Self> {
+        let entries = state
+            .entries
+            .iter()
+            .map(|entry| {
+                Some(CombatEntry {
+                    damage_type: pumpkin_data::damage::DamageType::from_id(
+                        u8::try_from(entry.damage_type).ok()?,
+                    )?,
+                    damage: entry.damage_milli as f32 / 1000.0,
+                    fall_location: match entry.fall_location {
+                        None => None,
+                        Some(0) => Some(FallLocation::Generic),
+                        Some(1) => Some(FallLocation::Ladder),
+                        Some(2) => Some(FallLocation::Vines),
+                        Some(3) => Some(FallLocation::WeepingVines),
+                        Some(4) => Some(FallLocation::TwistingVines),
+                        Some(5) => Some(FallLocation::Scaffolding),
+                        Some(6) => Some(FallLocation::OtherClimbable),
+                        Some(7) => Some(FallLocation::Water),
+                        Some(_) => return None,
+                    },
+                    fall_distance: entry.fall_distance_milli as f32 / 1000.0,
+                    timestamp: entry.tick,
+                    source_id: entry.source_id,
+                    attacker_id: entry.attacker_id,
+                    attacker_name: entry
+                        .attacker_name
+                        .as_deref()
+                        .map(serde_json::from_slice)
+                        .transpose()
+                        .ok()?,
+                    attacker_item_name: entry
+                        .attacker_item_name
+                        .as_deref()
+                        .map(serde_json::from_slice)
+                        .transpose()
+                        .ok()?,
+                    attacker_is_living: entry.attacker_is_living,
+                    attacker_is_player: entry.attacker_is_player,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            entries,
+            last_damage_time: state.last_damage_tick,
+            combat_start_time: state.combat_start_tick,
+            combat_end_time: state.combat_end_tick,
+            in_combat: state.in_combat,
+            taking_damage: state.taking_damage,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -340,6 +444,39 @@ impl CombatTracker {
             self.in_combat = true;
             self.combat_start_time = current_tick;
             self.combat_end_time = self.combat_start_time;
+        }
+    }
+
+    pub fn record_cluster_attack(
+        &mut self,
+        current_tick: i64,
+        is_alive: bool,
+        fall_distance: f32,
+        damage_type: pumpkin_data::damage::DamageType,
+        damage: f32,
+        attacker_id: i32,
+        attacker_is_player: bool,
+    ) {
+        self.recheck_status(current_tick, is_alive);
+        self.entries.push(CombatEntry {
+            damage_type,
+            damage,
+            fall_location: None,
+            fall_distance,
+            timestamp: current_tick,
+            source_id: Some(attacker_id),
+            attacker_id: Some(attacker_id),
+            attacker_name: None,
+            attacker_item_name: None,
+            attacker_is_living: true,
+            attacker_is_player,
+        });
+        self.last_damage_time = current_tick;
+        self.taking_damage = true;
+        if !self.in_combat && is_alive {
+            self.in_combat = true;
+            self.combat_start_time = current_tick;
+            self.combat_end_time = current_tick;
         }
     }
 
@@ -650,5 +787,32 @@ mod tests {
         // Stacked armour modifiers can push resistance above 1.0; the result is
         // negative and callers guard on `strength > 0.0`.
         assert!(knockback_after_resistance(0.4, 1.2) < 0.0);
+    }
+
+    #[test]
+    fn cluster_tracker_state_roundtrips_all_entry_fields() {
+        let tracker = CombatTracker {
+            entries: vec![CombatEntry {
+                damage_type: pumpkin_data::damage::DamageType::PLAYER_ATTACK,
+                damage: 1.25,
+                fall_location: Some(FallLocation::Water),
+                fall_distance: 2.5,
+                timestamp: 42,
+                source_id: Some(7),
+                attacker_id: Some(8),
+                attacker_name: Some(pumpkin_util::text::TextComponent::text("attacker")),
+                attacker_item_name: Some(pumpkin_util::text::TextComponent::text("item")),
+                attacker_is_living: true,
+                attacker_is_player: true,
+            }],
+            last_damage_time: 42,
+            combat_start_time: 40,
+            combat_end_time: 41,
+            in_combat: true,
+            taking_damage: true,
+        };
+        let state = tracker.cluster_state();
+        let restored = CombatTracker::from_cluster_state(&state).expect("valid state restores");
+        assert_eq!(restored.cluster_state(), state);
     }
 }

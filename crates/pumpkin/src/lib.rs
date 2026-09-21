@@ -549,7 +549,6 @@ impl PumpkinServer {
         info!("Ending player tasks");
 
         tasks.close();
-        tasks.wait().await;
 
         self.unload_plugins().await;
 
@@ -611,26 +610,116 @@ impl PumpkinServer {
                                      pending.close();
                                 },
                                 PacketHandlerResult::ReadyToPlay(profile, config) => {
-                                     let mut java_client = JavaClient::from_pending(pending, profile.clone(), config.clone());
-                                     java_client.start_outgoing_packet_task();
+                                     let (mut java_client, mut network_reader, network_writer) =
+                                         JavaClient::from_pending(pending, profile.clone(), config.clone());
+                                     java_client.start_outgoing_packet_task(network_writer);
+                                     let client = Arc::new(ClientPlatform::Java(java_client));
+                                     let Some(java_client) = client.java() else {
+                                         return;
+                                     };
 
-                                     if let Some((player, world)) = server_clone
-                                         .add_player(Arc::new(ClientPlatform::Java(java_client)), profile, Some(config))
+                                     if crate::server::cluster_lobby::lobby_enabled(&server_clone) {
+                                         let mut waiter = crate::server::cluster_lobby::enter_java_lobby(
+                                             &server_clone,
+                                             Arc::clone(&client),
+                                             profile,
+                                             config,
+                                         );
+                                         loop {
+                                             if !java_client
+                                                 .progress_lobby_packets(
+                                                     &mut network_reader,
+                                                     &server_clone,
+                                                     waiter.clone(),
+                                                 )
+                                                 .await
+                                             {
+                                                 server_clone.remove_lobby_waiter(waiter.gid);
+                                                 crate::server::cluster_presence::publish_lobby_logout(&server_clone, waiter.gid);
+                                                 java_client.close();
+                                                 java_client.close_tasks();
+                                                 return;
+                                             }
+                                             crate::server::cluster_lobby::finish_java_lobby(&server_clone, &waiter, java_client);
+                                             let Some((player, world)) = server_clone.add_player(
+                                                 Arc::clone(&waiter.client),
+                                                 waiter.profile.clone(),
+                                                 Some(waiter.config.clone()),
+                                             ) else {
+                                                 crate::server::cluster_presence::publish_lobby_logout(&server_clone, waiter.gid);
+                                                 java_client.close();
+                                                 java_client.close_tasks();
+                                                 return;
+                                             };
+                                             java_client.set_player(player.clone());
+                                             let _ = crate::server::cluster_playerdata::apply_replicated_playerdata(&player);
+                                             if crate::server::cluster_playerdata::cached_handoff_location(player.gameprofile.id).is_some() {
+                                                 player.has_played_before.store(true, std::sync::atomic::Ordering::Relaxed);
+                                             }
+                                             let _ = crate::server::cluster_playerdata::seed_replicated_inventory_from_player(&player);
+                                             player.living_entity.entity.no_physics.store(true, std::sync::atomic::Ordering::Release);
+                                             world.spawn_java_player(&server_clone.basic_config, &player, &server_clone).await;
+                                             if let Some(tick) = crate::server::cluster::disciplined_tick_now() {
+                                                 let _ = crate::server::cluster_playerdata::stage_accepted_playerdata_for_player(&player, tick);
+                                             }
+                                             let moved_to_lobby = java_client
+                                                 .progress_player_packets(
+                                                     &mut network_reader,
+                                                     &player,
+                                                     &server_clone,
+                                                 )
+                                                 .await;
+                                             let profile = player.gameprofile.clone();
+                                             let config = player.config.load_full().as_ref().clone();
+                                             let gid = player.cluster_gid();
+                                             player.remove().await;
+                                             server_clone.remove_player(&player);
+                                             if moved_to_lobby {
+                                                 let Some(gid) = gid else {
+                                                     java_client.close();
+                                                     java_client.close_tasks();
+                                                     return;
+                                                 };
+                                                 let _ = java_client.take_virtual_lobby_request();
+                                                 java_client.clear_player();
+                                                 waiter = crate::server::cluster_lobby::enter_manual_java_lobby(
+                                                     &server_clone,
+                                                     Arc::clone(&client),
+                                                     profile,
+                                                     config,
+                                                     gid,
+                                                 );
+                                                 continue;
+                                             }
+                                             java_client.close();
+                                             java_client.close_tasks();
+                                             return;
+                                         }
+                                     }
+
+                                         if let Some((player, world)) = server_clone
+                                         .add_player(client, profile, Some(config))
                                  {
 
-                                     if let ClientPlatform::Java(client) = player.client.as_ref() {
+                                     if let Some(ClientPlatform::Java(client)) = player.client.as_deref() {
                                          client.set_player(player.clone());
                                      }
                                      world
                                          .spawn_java_player(&server_clone.basic_config, &player, &server_clone)
                                          .await;
 
-                                     if let ClientPlatform::Java(client) = player.client.as_ref() {
-                                         client.progress_player_packets(&player, &server_clone).await;
+                                     if let Some(ClientPlatform::Java(client)) = player.client.as_deref() {
+                                         client
+                                             .progress_player_packets(
+                                                 &mut network_reader,
+                                                 &player,
+                                                 &server_clone,
+                                             )
+                                             .await;
 
                                          // Close when done
                                          client.close();
-                                         client.await_tasks().await;
+                                         client.close_tasks();
                                      }
                                      player.remove().await;
                                      server_clone.remove_player(&player);
@@ -729,18 +818,69 @@ impl PumpkinServer {
             match login_result {
                 PacketHandlerResult::Stop => {
                     client.close().await;
-                    client.await_tasks().await;
+                    client.close_tasks();
                 }
                 PacketHandlerResult::ReadyToPlay(profile, config) => {
+                    let platform = Arc::new(ClientPlatform::Bedrock(client.clone()));
+                    if crate::server::cluster_lobby::lobby_enabled(&server) {
+                        let waiter = crate::server::cluster_lobby::enter_bedrock_lobby(
+                            &server,
+                            platform,
+                            profile,
+                            config,
+                        );
+                        if !client
+                            .progress_virtual_lobby_packets(&server, waiter.clone())
+                            .await
+                        {
+                            server.remove_lobby_waiter(waiter.gid);
+                            crate::server::cluster_presence::publish_lobby_logout(
+                                &server,
+                                waiter.gid,
+                            );
+                            client.close().await;
+                            client.close_tasks();
+                            return;
+                        }
+                        let Some((player, world)) = server.add_player(
+                            Arc::clone(&waiter.client),
+                            waiter.profile.clone(),
+                            Some(waiter.config.clone()),
+                        ) else {
+                            crate::server::cluster_presence::publish_lobby_logout(
+                                &server,
+                                waiter.gid,
+                            );
+                            client.close().await;
+                            client.close_tasks();
+                            return;
+                        };
+                        client.set_player(player.clone());
+                        let _ = crate::server::cluster_playerdata::apply_replicated_playerdata(&player);
+                        if crate::server::cluster_playerdata::cached_handoff_location(player.gameprofile.id).is_some() {
+                            player.has_played_before.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        let _ = crate::server::cluster_playerdata::seed_replicated_inventory_from_player(&player);
+                        player.living_entity.entity.no_physics.store(true, std::sync::atomic::Ordering::Release);
+                        world
+                            .spawn_bedrock_player(&server.basic_config, player.clone(), &server)
+                            .await;
+                        client.progress_player_packets(&player).await;
+                        client.close().await;
+                        client.close_tasks();
+                        player.remove().await;
+                        server.remove_player(&player);
+                        return;
+                    }
                     if let Some((player, _world)) = server.add_player(
-                        Arc::new(ClientPlatform::Bedrock(client.clone())),
+                        platform,
                         profile,
                         Some(config),
                     ) {
                         client.set_player(player.clone());
                         client.progress_player_packets(&player).await;
                         client.close().await;
-                        client.await_tasks().await;
+                        client.close_tasks();
                         player.remove().await;
                         server.remove_player(&player);
                         if !server.persistence_delegated_to_primary() {

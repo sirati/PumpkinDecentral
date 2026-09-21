@@ -1,11 +1,15 @@
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU8;
 
-use pumpkin_cluster::identity::{GlobalPlayerId, PlayerSlot, ServerId};
-use pumpkin_cluster::invsee::{InventorySnapshot, InvseeSlot, InvseeWrite};
+use pumpkin_cluster::identity::GlobalPlayerId;
+use pumpkin_cluster::inventory::{
+    InvLoc, InvOpKind, InventoryOp, InventoryStack, capture_semantic_inv_op, next_inv_seq,
+};
+use pumpkin_cluster::invsee::{InventorySnapshot, InvseeSlot};
 use pumpkin_data::data_component_impl::EquipmentSlot;
 use pumpkin_data::item::Item;
 use pumpkin_data::item_stack::ItemStack;
@@ -18,7 +22,7 @@ use pumpkin_inventory::screen_handler::{
     SharedScreenHandler,
 };
 use pumpkin_inventory::slot::{ArmorSlot, NormalSlot, Slot};
-use pumpkin_nbt::Nbt;
+use pumpkin_protocol::java::server::play::SlotActionType;
 use pumpkin_util::PermissionLvl;
 use pumpkin_util::permission::{Permission, PermissionDefault, PermissionRegistry};
 use pumpkin_util::text::TextComponent;
@@ -60,7 +64,6 @@ const STORAGE_END: usize = 36;
 const HOTBAR_START: usize = 36;
 const HOTBAR_END: usize = 45;
 const HOTBAR_COUNT: usize = 9;
-const PLAYER_SLOTS: usize = 41;
 
 fn container_to_player(container: usize) -> Option<usize> {
     if container < ARMOR_COUNT {
@@ -94,63 +97,33 @@ fn player_to_container(player_index: usize) -> Option<usize> {
 }
 
 fn filler_stack() -> ItemStack {
-    let mut stack = ItemStack::new(1, &Item::LIGHT_GRAY_STAINED_GLASS_PANE);
+    let mut stack = ItemStack::new(1, &Item::GRAY_STAINED_GLASS_PANE);
     stack.set_custom_name(String::new());
     stack
 }
 
-fn encode_stack(index: u16, stack: &ItemStack) -> Option<InvseeSlot> {
+fn encode_stack(index: u16, stack: &ItemStack) -> InvseeSlot {
     if stack.is_empty() {
-        return None;
+        return InvseeSlot::new(index, 0, 0, Vec::new());
     }
     let mut compound = pumpkin_nbt::compound::NbtCompound::new();
     stack.write_item_stack(&mut compound);
-    let bytes = Nbt::new(String::new(), compound).write_unnamed().to_vec();
-    Some(InvseeSlot::new(index, stack.item.id, stack.item_count, bytes))
+    let bytes = pumpkin_nbt::Nbt::new(String::new(), compound)
+        .write_unnamed()
+        .to_vec();
+    InvseeSlot::new(index, stack.item.id, stack.item_count, bytes)
 }
 
 fn decode_stack(slot: &InvseeSlot) -> ItemStack {
-    if slot.nbt.is_empty() {
+    if slot.is_empty_slot() || slot.nbt.is_empty() {
         return ItemStack::EMPTY.clone();
     }
     let mut cursor = Cursor::new(slot.nbt.as_slice());
     let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new(&mut cursor);
-    Nbt::read_unnamed(&mut reader)
+    pumpkin_nbt::Nbt::read_unnamed(&mut reader)
         .ok()
         .and_then(|nbt| ItemStack::read_item_stack(&nbt.root_tag))
         .unwrap_or_else(|| ItemStack::EMPTY.clone())
-}
-
-#[must_use]
-pub fn snapshot_player(player: &Player, target: GlobalPlayerId) -> InventorySnapshot {
-    let mut slots = Vec::new();
-    for index in 0..PLAYER_SLOTS {
-        let stack = player.inventory.get_stack(index);
-        if let Some(slot) = encode_stack(index as u16, &stack) {
-            slots.push(slot);
-        }
-    }
-    InventorySnapshot::new(
-        target,
-        player.gameprofile.name.clone(),
-        player.inventory.get_selected_slot(),
-        slots,
-    )
-}
-
-pub fn apply_write_to_player(player: &Player, write: &InvseeWrite) {
-    for slot in &write.slots {
-        if usize::from(slot.index) < PLAYER_SLOTS {
-            player
-                .inventory
-                .set_stack(usize::from(slot.index), decode_stack(slot));
-        }
-    }
-}
-
-pub struct RemoteEditSink {
-    pub viewer: GlobalPlayerId,
-    pub target: GlobalPlayerId,
 }
 
 struct LockedSlot {
@@ -194,27 +167,183 @@ impl Slot for LockedSlot {
     fn mark_dirty(&self) {}
 }
 
-enum CloseAction {
-    Detached,
-    LocalEdit {
-        target: Arc<Player>,
-        viewer: GlobalPlayerId,
-        target_gid: GlobalPlayerId,
-    },
-    RemoteEdit { sink: RemoteEditSink },
+fn snapshot_values(snapshot: &InventorySnapshot) -> BTreeMap<u16, InvseeSlot> {
+    let mut values = BTreeMap::new();
+    for index in 0..=PLAYER_OFFHAND {
+        values.insert(index as u16, InvseeSlot::new(index as u16, 0, 0, Vec::new()));
+    }
+    for slot in &snapshot.slots {
+        if usize::from(slot.index) <= PLAYER_OFFHAND {
+            values.insert(slot.index, slot.clone());
+        }
+    }
+    values
+}
+
+fn stack_from_slot(slot: &InvseeSlot) -> InventoryStack {
+    InventoryStack {
+        item: slot.item_id,
+        count: slot.count,
+        nbt: slot.nbt.clone(),
+    }
+}
+
+fn make_move(
+    gid: GlobalPlayerId,
+    tick: pumpkin_cluster::time::TickStamp,
+    source: &InvseeSlot,
+    destination: &InvseeSlot,
+    count: u8,
+) -> Option<InventoryOp> {
+    capture_semantic_inv_op(
+        gid,
+        next_inv_seq(gid),
+        tick,
+        InvOpKind::Move,
+        InvLoc::new(pumpkin_cluster::inventory::INV_MAIN, source.index),
+        InvLoc::new(pumpkin_cluster::inventory::INV_MAIN, destination.index),
+        stack_from_slot(source),
+        stack_from_slot(destination),
+        count,
+    )
+}
+
+fn make_swap(
+    gid: GlobalPlayerId,
+    tick: pumpkin_cluster::time::TickStamp,
+    source: &InvseeSlot,
+    destination: &InvseeSlot,
+) -> Option<InventoryOp> {
+    capture_semantic_inv_op(
+        gid,
+        next_inv_seq(gid),
+        tick,
+        InvOpKind::Swap,
+        InvLoc::new(pumpkin_cluster::inventory::INV_MAIN, source.index),
+        InvLoc::new(pumpkin_cluster::inventory::INV_MAIN, destination.index),
+        stack_from_slot(source),
+        stack_from_slot(destination),
+        source.count,
+    )
+}
+
+fn semantic_changes(
+    target: GlobalPlayerId,
+    original: &InventorySnapshot,
+    current: &[InvseeSlot],
+) -> Option<Vec<InventoryOp>> {
+    let tick = crate::server::cluster::disciplined_tick_now()?;
+    let before = snapshot_values(original);
+    let after = current
+        .iter()
+        .cloned()
+        .map(|slot| (slot.index, slot))
+        .collect::<BTreeMap<_, _>>();
+    let mut working = before.clone();
+    let changed = before
+        .iter()
+        .filter_map(|(index, old)| {
+            let new = after.get(index)?;
+            (old != new).then_some((old.clone(), new.clone()))
+        })
+        .collect::<Vec<_>>();
+    if changed.is_empty() {
+        return Some(Vec::new());
+    }
+    if changed.len() == 2
+        && changed[0].0.item_id == changed[1].1.item_id
+        && changed[0].0.count == changed[1].1.count
+        && changed[0].0.nbt == changed[1].1.nbt
+        && changed[1].0.item_id == changed[0].1.item_id
+        && changed[1].0.count == changed[0].1.count
+        && changed[1].0.nbt == changed[0].1.nbt
+        && !changed[0].0.is_empty_slot()
+        && !changed[1].0.is_empty_slot()
+    {
+        return make_swap(target, tick, &changed[0].0, &changed[1].0)
+            .map(|operation| vec![operation]);
+    }
+    let mut deficits = Vec::<(InvseeSlot, u8)>::new();
+    let mut surpluses = Vec::<(InvseeSlot, u8)>::new();
+    for (old, new) in changed {
+        if old.is_empty_slot() {
+            if new.is_empty_slot() {
+                continue;
+            }
+            surpluses.push((new.clone(), new.count));
+            continue;
+        }
+        if new.is_empty_slot() {
+            deficits.push((old.clone(), old.count));
+            continue;
+        }
+        if old.item_id != new.item_id || old.nbt != new.nbt {
+            return None;
+        }
+        if old.count > new.count {
+            deficits.push((old.clone(), old.count.saturating_sub(new.count)));
+        } else if new.count > old.count {
+            surpluses.push((new.clone(), new.count.saturating_sub(old.count)));
+        }
+    }
+    let mut operations = Vec::new();
+    for (source, remaining) in &mut deficits {
+        while *remaining > 0 {
+            let destination_index = surpluses.iter().position(|(destination, amount)| {
+                *amount > 0
+                    && destination.item_id == source.item_id
+                    && destination.nbt == source.nbt
+            })?;
+            let (destination, amount) = &mut surpluses[destination_index];
+            let count = (*remaining).min(*amount);
+            let current_source = working.get(&source.index)?.clone();
+            let current_destination = working.get(&destination.index)?.clone();
+            operations.push(make_move(
+                target,
+                tick,
+                &current_source,
+                &current_destination,
+                count,
+            )?);
+            let mut source_after = current_source.clone();
+            source_after.count = source_after.count.saturating_sub(count);
+            if source_after.count == 0 {
+                source_after.item_id = 0;
+                source_after.nbt.clear();
+            }
+            let mut destination_after = current_destination.clone();
+            if destination_after.is_empty_slot() {
+                destination_after.item_id = current_source.item_id;
+                destination_after.nbt = current_source.nbt.clone();
+            }
+            destination_after.count = destination_after.count.saturating_add(count);
+            working.insert(source_after.index, source_after);
+            working.insert(destination_after.index, destination_after);
+            *remaining = remaining.saturating_sub(count);
+            *amount = amount.saturating_sub(count);
+        }
+    }
+    if surpluses.iter().any(|(_, amount)| *amount > 0) {
+        return None;
+    }
+    if working != after {
+        return None;
+    }
+    Some(operations)
 }
 
 pub struct InvseeScreenHandler {
     behaviour: ScreenHandlerBehaviour,
     container: Arc<dyn Inventory>,
     editable: bool,
-    close_action: CloseAction,
+    target: GlobalPlayerId,
+    original: InventorySnapshot,
 }
 
 impl InvseeScreenHandler {
-    fn push_container_slots(&mut self, editable: bool) {
+    fn push_container_slots(&mut self) {
         for container in 0..ARMOR_COUNT {
-            if editable {
+            if self.editable {
                 self.add_slot(Arc::new(ArmorSlot::new(
                     self.container.clone(),
                     container,
@@ -227,7 +356,7 @@ impl InvseeScreenHandler {
         for container in FILLER_SLOTS {
             self.add_slot(Arc::new(LockedSlot::new(self.container.clone(), container)));
         }
-        if editable {
+        if self.editable {
             self.add_slot(Arc::new(NormalSlot::new(
                 self.container.clone(),
                 OFFHAND_CONTAINER,
@@ -239,7 +368,7 @@ impl InvseeScreenHandler {
             )));
         }
         for container in STORAGE_START..CONTAINER_SIZE {
-            if editable {
+            if self.editable {
                 self.add_slot(Arc::new(NormalSlot::new(self.container.clone(), container)));
             } else {
                 self.add_slot(Arc::new(LockedSlot::new(self.container.clone(), container)));
@@ -247,17 +376,27 @@ impl InvseeScreenHandler {
         }
     }
 
-    fn collect_slots(&self) -> Vec<InvseeSlot> {
-        let mut slots = Vec::new();
+    fn current_values(&self) -> Vec<InvseeSlot> {
+        let mut values = Vec::new();
         for container in 0..CONTAINER_SIZE {
             if let Some(player_index) = container_to_player(container) {
-                let stack = self.container.get_stack(container);
-                if let Some(slot) = encode_stack(player_index as u16, &stack) {
-                    slots.push(slot);
-                }
+                values.push(encode_stack(
+                    player_index as u16,
+                    &self.container.get_stack(container),
+                ));
             }
         }
-        slots
+        values
+    }
+
+    fn push_viewer_slots(&mut self, player_inventory: &Arc<PlayerInventory>) {
+        let inventory: Arc<dyn Inventory> = player_inventory.clone();
+        for index in 9..36 {
+            self.add_slot(Arc::new(LockedSlot::new(inventory.clone(), index)));
+        }
+        for index in 0..9 {
+            self.add_slot(Arc::new(LockedSlot::new(inventory.clone(), index)));
+        }
     }
 }
 
@@ -278,56 +417,35 @@ impl ScreenHandler for InvseeScreenHandler {
         &mut self.behaviour
     }
 
-    fn on_closed(&mut self, player: &dyn InventoryPlayer) {
-        self.default_on_closed(player);
-        match &self.close_action {
-            CloseAction::Detached => {}
-            CloseAction::LocalEdit {
-                target,
-                viewer,
-                target_gid,
-            } => {
-                let write = InvseeWrite::new(*viewer, *target_gid, self.collect_slots());
-                apply_write_to_player(target, &write);
-            }
-            CloseAction::RemoteEdit { sink } => {
-                let write = InvseeWrite::new(sink.viewer, sink.target, self.collect_slots());
-                cluster_invsee::submit_remote_write(&write);
-            }
+    fn on_slot_click(
+        &mut self,
+        slot_index: i32,
+        button: i32,
+        action_type: SlotActionType,
+        player: &dyn InventoryPlayer,
+    ) {
+        if !self.editable
+            || !matches!(&action_type, SlotActionType::Pickup | SlotActionType::QuickCraft)
+        {
+            self.cancel();
+            return;
         }
+        self.internal_on_slot_click(slot_index, button, action_type, player);
     }
 
-    fn quick_move(&mut self, _player: &dyn InventoryPlayer, slot_index: i32) -> ItemStack {
+    fn on_closed(&mut self, _player: &dyn InventoryPlayer) {
         if !self.editable {
-            return ItemStack::EMPTY.clone();
+            return;
         }
-        if slot_index < 0 || slot_index as usize >= self.get_behaviour().slots.len() {
-            return ItemStack::EMPTY.clone();
-        }
-        let slot = self.get_behaviour().slots[slot_index as usize].clone();
-        if !slot.has_stack() {
-            return ItemStack::EMPTY.clone();
-        }
-        let mut slot_stack = slot.get_stack();
-        let moved = slot_stack.clone();
-        if slot_index < CONTAINER_SIZE as i32 {
-            if !self.insert_item(
-                &mut slot_stack,
-                CONTAINER_SIZE as i32,
-                self.get_behaviour().slots.len() as i32,
-                true,
-            ) {
-                return ItemStack::EMPTY.clone();
-            }
-        } else if !self.insert_item(&mut slot_stack, 0, CONTAINER_SIZE as i32, false) {
-            return ItemStack::EMPTY.clone();
-        }
-        if slot_stack.is_empty() {
-            slot.set_stack(ItemStack::EMPTY.clone());
-        } else {
-            slot.set_stack(slot_stack);
-        }
-        moved
+        let Some(operations) = semantic_changes(self.target, &self.original, &self.current_values())
+        else {
+            return;
+        };
+        let _ = cluster_invsee::submit_inventory_ops(operations);
+    }
+
+    fn quick_move(&mut self, _player: &dyn InventoryPlayer, _slot_index: i32) -> ItemStack {
+        ItemStack::EMPTY.clone()
     }
 }
 
@@ -335,6 +453,8 @@ struct InvseeScreenFactory {
     title: TextComponent,
     container: Arc<dyn Inventory>,
     editable: bool,
+    target: GlobalPlayerId,
+    original: InventorySnapshot,
 }
 
 impl ScreenHandlerFactory for InvseeScreenFactory {
@@ -348,11 +468,11 @@ impl ScreenHandlerFactory for InvseeScreenFactory {
             behaviour: ScreenHandlerBehaviour::new(sync_id, Some(WindowType::Generic9x5)),
             container: self.container.clone(),
             editable: self.editable,
-            close_action: CloseAction::Detached,
+            target: self.target,
+            original: self.original.clone(),
         };
-        handler.push_container_slots(self.editable);
-        let viewer_inventory: Arc<dyn Inventory> = player_inventory.clone();
-        handler.add_player_slots(&viewer_inventory);
+        handler.push_container_slots();
+        handler.push_viewer_slots(player_inventory);
         Some(Arc::new(Mutex::new(handler)) as SharedScreenHandler)
     }
 
@@ -374,62 +494,28 @@ fn fill_from_snapshot(container: &SimpleInventory, snapshot: &InventorySnapshot)
     }
 }
 
-fn set_close_action(viewer: &Player, action: CloseAction) {
-    let current = viewer
-        .current_screen_handler
-        .try_lock()
-        .ok()
-        .map(|guard| guard.clone());
-    if let Some(current) = current {
-        if let Ok(mut concrete) = current.try_lock() {
-            if let Some(invsee) = concrete.as_any_mut().downcast_mut::<InvseeScreenHandler>() {
-                invsee.close_action = action;
-            }
-        }
-    }
-}
-
-fn local_gid(player: &Player, server_id: u16) -> GlobalPlayerId {
-    player
-        .cluster_gid()
-        .unwrap_or(GlobalPlayerId::new(ServerId(server_id), PlayerSlot(0)))
-}
-
-fn open_local_view(server_id: u16, viewer: &Arc<Player>, target: &Arc<Player>, editable: bool) {
-    let target_gid = local_gid(target, server_id);
-    let snapshot = snapshot_player(target, target_gid);
-    open_remote_view(viewer, &snapshot, editable, None);
-    if editable {
-        set_close_action(
-            viewer,
-            CloseAction::LocalEdit {
-                target: target.clone(),
-                viewer: local_gid(viewer, server_id),
-                target_gid,
-            },
-        );
-    }
-}
-
-pub fn open_remote_view(
-    viewer: &Arc<Player>,
-    snapshot: &InventorySnapshot,
-    editable: bool,
-    sink: Option<RemoteEditSink>,
-) {
+fn open_replicated_view(viewer: &Arc<Player>, snapshot: InventorySnapshot, editable: bool) {
     let container = Arc::new(SimpleInventory::new(CONTAINER_SIZE));
-    fill_from_snapshot(&container, snapshot);
+    fill_from_snapshot(&container, &snapshot);
     let factory = InvseeScreenFactory {
         title: TextComponent::text(snapshot.owner_name.clone()),
-        container: container.clone(),
+        container,
         editable,
+        target: snapshot.target,
+        original: snapshot,
     };
-    if viewer.open_handled_screen(&factory, None).is_some() {
-        match sink {
-            Some(sink) => set_close_action(viewer, CloseAction::RemoteEdit { sink }),
-            None => set_close_action(viewer, CloseAction::Detached),
-        }
-    }
+    let _ = viewer.open_handled_screen(&factory, None);
+}
+
+fn local_gid(player: &Player) -> Option<GlobalPlayerId> {
+    player.cluster_gid()
+}
+
+fn named_remote_target(name: &str) -> Option<(GlobalPlayerId, String)> {
+    crate::server::cluster_presence::remote_presence_entries()
+        .into_iter()
+        .find(|(_, entry)| entry.name.eq_ignore_ascii_case(name))
+        .map(|(gid, entry)| (gid, entry.name))
 }
 
 fn execute_invsee(context: &CommandContext, editable: bool) -> CommandExecutorResult {
@@ -439,81 +525,42 @@ fn execute_invsee(context: &CommandContext, editable: bool) -> CommandExecutorRe
         .as_player()
         .ok_or_else(|| ERROR_NOT_PLAYER.create_without_context())?;
     let selector = context.get_argument::<EntitySelector>("target")?;
-    match selector.find_single_player(&context.source) {
-        Ok(target) => {
-            let server_id = context.server().advanced_config.cluster.server_id;
-            open_local_view(server_id, &viewer, &target, editable);
-            context.source.send_feedback(
-                TextComponent::text(target.gameprofile.name.clone()),
-                false,
-            );
-            return Ok(1);
+    let server = context.server();
+    let name = selector.player_name.clone().unwrap_or_default();
+    let target = selector
+        .find_single_player(&context.source)
+        .ok()
+        .and_then(|player| {
+            local_gid(&player).map(|gid| (gid, player.gameprofile.name.clone()))
+        })
+        .or_else(|| named_remote_target(&name));
+    let Some((target, owner_name)) = target else {
+        if server.player_in_cluster_lobby(&name) {
+            context.source.send_error(TextComponent::text(format!(
+                "{name} is currently in the lobby, and not in the game world"
+            )));
+        } else {
+            context.source.send_error(TextComponent::text(format!(
+                "Player '{name}' is not online on this server or any linked peer"
+            )));
         }
-        Err(local_error) => {
-            let target_name = selector.player_name.clone().unwrap_or_default();
-            if target_name.trim().is_empty() {
-                return Err(local_error);
-            }
-            let server = context.server().clone();
-            let source = context.source.clone();
-            let server_id = server.advanced_config.cluster.server_id;
-            let viewer_gid = local_gid(&viewer, server_id);
-            let editable_flag = editable;
-            tokio::spawn(async move {
-                match cluster_invsee::request_remote_snapshot(
-                    &server,
-                    viewer_gid,
-                    &target_name,
-                    editable_flag,
-                )
-                .await
-                {
-                    Some(snapshot) => {
-                        let target_gid = snapshot.target;
-                        let owner = snapshot.owner_name.clone();
-                        if editable_flag {
-                            open_remote_view(
-                                &viewer,
-                                &snapshot,
-                                true,
-                                Some(RemoteEditSink {
-                                    viewer: viewer_gid,
-                                    target: target_gid,
-                                }),
-                            );
-                        } else {
-                            open_remote_view(&viewer, &snapshot, false, None);
-                        }
-                        source.send_feedback(TextComponent::text(owner), false);
-                    }
-                    None => {
-                        if server.player_in_cluster_lobby(&target_name) {
-                            source.send_error(TextComponent::text(format!(
-                                "{target_name} is currently in the lobby, and not in the game world"
-                            )));
-                        } else if crate::server::cluster_presence::remote_presence_entries()
-                            .into_iter()
-                            .any(|(_, entry)| entry.name.eq_ignore_ascii_case(&target_name))
-                        {
-                            source.send_error(TextComponent::text("No entity was found"));
-                        } else {
-                            source.send_error(TextComponent::text(format!(
-                                "Player '{target_name}' is not online on this server or any linked peer"
-                            )));
-                        }
-                    }
-                }
-            });
-            return Ok(1);
-        }
-    }
+        return Ok(0);
+    };
+    let Some(snapshot) = cluster_invsee::replicated_snapshot(target, &owner_name) else {
+        context.source.send_error(TextComponent::text("No entity was found"));
+        return Ok(0);
+    };
+    let owner = snapshot.owner_name.clone();
+    open_replicated_view(&viewer, snapshot, editable);
+    context.source.send_feedback(TextComponent::text(owner), false);
+    Ok(1)
 }
 
 struct ViewExecutor;
 
 impl CommandExecutor for ViewExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
-        execute_invsee(context, false)
+        execute_invsee(context, context.source.has_permission(EDIT_PERMISSION))
     }
 }
 
@@ -536,14 +583,10 @@ pub fn register(dispatcher: &mut CommandDispatcher, registry: &PermissionRegistr
         EDIT_DESCRIPTION,
         PermissionDefault::Op(PermissionLvl::Two),
     ));
-
     dispatcher.register(
         command("invsee", DESCRIPTION)
             .requires(PERMISSION)
-            .then(
-                argument("target", EntityArgumentType::Player)
-                    .executes(ViewExecutor),
-            )
+            .then(argument("target", EntityArgumentType::Player).executes(ViewExecutor))
             .then(
                 literal("edit").then(
                     argument("target", EntityArgumentType::Player)

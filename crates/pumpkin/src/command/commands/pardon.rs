@@ -29,7 +29,9 @@ impl CommandExecutor for PardonExecutor {
         let targets = GameProfileArgumentType::get(context, "targets")?;
         let server = context.source.server();
         let issuer = context.source.name.clone();
-        let mut lock = server.data.banned_player_list.write().unwrap();
+        let Ok(mut lock) = server.data.banned_player_list.try_write() else {
+            return Err(ERROR_PARDON_FAILED.create_without_context(TextComponent::empty()));
+        };
         let mut successes = 0;
         let mut pardoned: Vec<(uuid::Uuid, String)> = Vec::new();
 
@@ -55,7 +57,9 @@ impl CommandExecutor for PardonExecutor {
         }
 
         if successes > 0 {
-            lock.save();
+            if crate::server::cluster_admin_apply::persists_admin_state(server) {
+                lock.save();
+            }
             drop(lock);
             for (id, name) in &pardoned {
                 crate::server::cluster_admin_apply::publish_ban_remove(server, *id, name, &issuer);
@@ -96,12 +100,9 @@ impl SuggestionProvider for PardonSuggestionProvider {
         // empty result merely because a concurrent ban update holds the write lock
         // makes the command look unreliable to the client, so take the normal read
         // lock and return the current replicated list.
-        let banned_players = context
-            .server()
-            .data
-            .banned_player_list
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Ok(banned_players) = context.server().data.banned_player_list.try_read() else {
+            return builder.build();
+        };
         suggest_banned_player_names(&banned_players, builder)
     }
 }

@@ -32,8 +32,8 @@ impl ToFromWasmEvent for PacketReceivedEvent {
             .add_player(self.player.clone())
             .expect("failed to add player resource");
 
-        let packet = match self.player.client.as_ref() {
-            ClientPlatform::Java(client) => {
+        let packet = match self.player.client.as_deref() {
+            Some(ClientPlatform::Java(client)) => {
                 let version = client.version.load();
                 generated_packets::deserialize_java_serverbound_packet(
                     self.packet_id,
@@ -42,13 +42,14 @@ impl ToFromWasmEvent for PacketReceivedEvent {
                 )
                 .map_or(ServerboundPacket::Unknown, ServerboundPacket::Java)
             }
-            ClientPlatform::Bedrock(_) => {
+            Some(ClientPlatform::Bedrock(_)) => {
                 generated_packets::deserialize_bedrock_serverbound_packet(
                     self.packet_id,
                     &self.payload,
                 )
                 .map_or(ServerboundPacket::Unknown, ServerboundPacket::Bedrock)
             }
+            None => ServerboundPacket::Unknown,
         };
 
         Event::PacketReceivedEvent(PacketReceivedEventData {
@@ -88,15 +89,16 @@ impl ToFromWasmEvent for PacketSentEvent {
             .add_player(self.player.clone())
             .expect("failed to add player resource");
 
-        let packet = match self.player.client.as_ref() {
-            ClientPlatform::Java(_) => {
+        let packet = match self.player.client.as_deref() {
+            Some(ClientPlatform::Java(_)) => {
                 generated_packets::clientbound_java_any_to_wit(self.packet.as_ref())
                     .map_or(ClientboundPacket::Unknown, ClientboundPacket::Java)
             }
-            ClientPlatform::Bedrock(_) => {
+            Some(ClientPlatform::Bedrock(_)) => {
                 generated_packets::clientbound_bedrock_any_to_wit(self.packet.as_ref())
                     .map_or(ClientboundPacket::Unknown, ClientboundPacket::Bedrock)
             }
+            None => ClientboundPacket::Unknown,
         };
 
         Event::PacketSentEvent(PacketSentEventData {

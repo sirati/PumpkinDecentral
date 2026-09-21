@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -7,6 +7,8 @@ use crate::membership::{
     AdmitBroadcast, JoinHandshake, JoinHello, JoinVote, JoinVoteRequest, JoinVotes, Membership,
     can_leave_network, handshake_channel,
 };
+use crate::entities::{EntityHandoff, EntityOrigin, EntitySpawn};
+use crate::identity::ServerId;
 use crate::protocol::ChunkAddr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,62 +19,112 @@ pub enum LifecycleState {
     Leaving,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OwnedEntity {
-    pub local_id: i32,
-    pub chunk: ChunkAddr,
+    pub spawn: EntitySpawn,
+    pub velocity: [f64; 3],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Handoff {
-    pub chunk: ChunkAddr,
-    pub entity_local_ids: Vec<i32>,
-    pub targets: Vec<u16>,
+impl OwnedEntity {
+    #[must_use]
+    pub fn origin(&self) -> EntityOrigin {
+        EntityOrigin {
+            server: self.spawn.entity.origin,
+            local_id: self.spawn.entity.local_id,
+        }
+    }
+
+    #[must_use]
+    pub const fn chunk(&self) -> ChunkAddr {
+        self.spawn.entity.chunk
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EntityHandoffRequest {
     pub leaver: u16,
-    pub handoffs: Vec<Handoff>,
+    pub handoffs: Vec<EntityHandoff>,
+}
+
+impl EntityHandoffRequest {
+    #[must_use]
+    pub fn is_consistent(&self) -> bool {
+        self.handoffs.iter().all(|handoff| {
+            handoff.previous_owner.0 == self.leaver && handoff.is_consistent()
+        })
+    }
+
+    #[must_use]
+    pub fn for_successor(&self, successor: ServerId) -> Self {
+        Self {
+            leaver: self.leaver,
+            handoffs: self
+                .handoffs
+                .iter()
+                .filter(|handoff| handoff.applies_to(successor))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    #[must_use]
+    pub fn successors(&self) -> Vec<ServerId> {
+        let mut successors: Vec<ServerId> = self
+            .handoffs
+            .iter()
+            .map(|handoff| handoff.successor)
+            .collect();
+        successors.sort_unstable();
+        successors.dedup();
+        successors
+    }
 }
 
 #[must_use]
 pub fn plan_handoff(
     owned: &[OwnedEntity],
     holders: &dyn Fn(ChunkAddr) -> Vec<u16>,
-) -> Vec<Handoff> {
-    let mut grouped: BTreeMap<ChunkAddr, Vec<i32>> = BTreeMap::new();
+) -> Option<Vec<EntityHandoff>> {
+    let mut handoffs = Vec::with_capacity(owned.len());
     for entity in owned {
-        grouped.entry(entity.chunk).or_default().push(entity.local_id);
+        let mut targets = holders(entity.chunk());
+        targets.sort_unstable();
+        targets.dedup();
+        let successor = targets
+            .into_iter()
+            .find(|target| *target != entity.spawn.entity.owner.0)
+            .map(ServerId)?;
+        let handoff = EntityHandoff {
+            origin: entity.origin(),
+            previous_owner: entity.spawn.entity.owner,
+            successor,
+            spawn: entity.spawn.clone(),
+            velocity: entity.velocity,
+        };
+        if !handoff.is_consistent() {
+            return None;
+        }
+        handoffs.push(handoff);
     }
-    grouped
-        .into_iter()
-        .map(|(chunk, entity_local_ids)| {
-            let targets = holders(chunk);
-            Handoff {
-                chunk,
-                entity_local_ids,
-                targets,
-            }
-        })
-        .collect()
+    handoffs.sort_by(|left, right| {
+        (left.origin.server, left.origin.local_id)
+            .cmp(&(right.origin.server, right.origin.local_id))
+    });
+    Some(handoffs)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum LifecycleInput {
     BeginJoin {
         cert_fingerprint: [u8; 32],
         peers: Vec<u16>,
     },
+    PeerReady {
+        peer: u16,
+    },
     RemoteHello {
         hello: JoinHello,
         pin_match: bool,
-    },
-    NotePeerRestarted {
-        peer: u16,
-    },
-    NotePeerConnected {
-        peer: u16,
     },
     RemoteVoteRequest(JoinVoteRequest),
     RemoteVote(JoinVote),
@@ -83,6 +135,7 @@ pub enum LifecycleInput {
         owned: Vec<OwnedEntity>,
         holders: Vec<(ChunkAddr, Vec<u16>)>,
     },
+    LeaveNoticeEnqueued,
     NoteUncleanDrop {
         peer: u16,
     },
@@ -92,7 +145,7 @@ pub enum LifecycleInput {
     CompleteLeave,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum LifecycleEffect {
     SendHello {
         to: Vec<u16>,
@@ -171,8 +224,11 @@ pub struct Lifecycle {
     state: LifecycleState,
     membership: Membership,
     votes: JoinVotes,
+    configured_voters: HashSet<u16>,
     suspects: HashSet<u16>,
     hellos: HashMap<u16, JoinHello>,
+    ready_peers: HashSet<u16>,
+    hello_sent_to: HashSet<u16>,
     local_fingerprint: [u8; 32],
 }
 
@@ -184,8 +240,11 @@ impl Lifecycle {
             state: LifecycleState::Solo,
             membership: Membership::new(&[local_id]),
             votes: JoinVotes::new(),
+            configured_voters: HashSet::new(),
             suspects: HashSet::new(),
             hellos: HashMap::new(),
+            ready_peers: HashSet::new(),
+            hello_sent_to: HashSet::new(),
             local_fingerprint: [0_u8; 32],
         }
     }
@@ -206,8 +265,11 @@ impl Lifecycle {
             state,
             membership: Membership::new(&seeded),
             votes: JoinVotes::new(),
+            configured_voters: HashSet::new(),
             suspects: HashSet::new(),
             hellos: HashMap::new(),
+            ready_peers: HashSet::new(),
+            hello_sent_to: HashSet::new(),
             local_fingerprint: [0_u8; 32],
         }
     }
@@ -233,11 +295,8 @@ impl Lifecycle {
     }
 
     #[must_use]
-    pub const fn player_join_allowed(&self) -> bool {
-        matches!(
-            self.state,
-            LifecycleState::Member | LifecycleState::Joining
-        )
+    pub fn player_join_allowed(&self) -> bool {
+        self.state == LifecycleState::Member
     }
 
     pub fn apply(&mut self, input: LifecycleInput) -> Vec<LifecycleEffect> {
@@ -246,11 +305,10 @@ impl Lifecycle {
                 cert_fingerprint,
                 peers,
             } => self.begin_join(cert_fingerprint, peers),
+            LifecycleInput::PeerReady { peer } => self.peer_ready(peer),
             LifecycleInput::RemoteHello { hello, pin_match } => {
                 self.remote_hello(hello, pin_match)
             }
-            LifecycleInput::NotePeerRestarted { peer } => self.note_peer_restarted(peer),
-            LifecycleInput::NotePeerConnected { peer } => self.note_peer_connected(peer),
             LifecycleInput::RemoteVoteRequest(request) => self.remote_vote_request(request),
             LifecycleInput::RemoteVote(vote) => self.remote_vote(vote),
             LifecycleInput::RemoteAdmit(admit) => self.remote_admit(admit),
@@ -260,6 +318,7 @@ impl Lifecycle {
                 owned,
                 holders,
             } => self.request_leave(player_count, &owned, &holders),
+            LifecycleInput::LeaveNoticeEnqueued => self.leave_notice_enqueued(),
             LifecycleInput::NoteUncleanDrop { peer } => self.note_unclean_drop(peer),
             LifecycleInput::OperatorClearSuspect { peer } => self.operator_clear_suspect(peer),
             LifecycleInput::CompleteLeave => self.complete_leave(),
@@ -272,6 +331,10 @@ impl Lifecycle {
         } else {
             self.membership.contains(candidate)
         }
+    }
+
+    fn knows_candidate(&self, candidate: u16) -> bool {
+        candidate == self.local_id || self.hellos.contains_key(&candidate)
     }
 
     fn sorted_others(&self, exclude: u16) -> Vec<u16> {
@@ -287,12 +350,27 @@ impl Lifecycle {
     }
 
     fn vote_recipients(&self, candidate: u16) -> Vec<u16> {
-        let mut to = self.sorted_others(self.local_id);
+        let mut to = self.voters_for(candidate);
+        to.retain(|peer| *peer != self.local_id);
         if !to.contains(&candidate) {
             to.push(candidate);
         }
         to.sort_unstable();
         to
+    }
+
+    fn voters_for(&self, candidate: u16) -> Vec<u16> {
+        let mut voters: Vec<u16> = if self.configured_voters.contains(&candidate) {
+            self.configured_voters.iter().copied().collect()
+        } else {
+            self.membership.members.iter().copied().collect()
+        };
+        voters.sort_unstable();
+        voters
+    }
+
+    fn voter_is_expected(&self, candidate: u16, voter: u16) -> bool {
+        self.voters_for(candidate).contains(&voter)
     }
 
     fn set_state(&mut self, state: LifecycleState, effects: &mut Vec<LifecycleEffect>) {
@@ -328,13 +406,11 @@ impl Lifecycle {
         if self.suspects.contains(&candidate) {
             return;
         }
-        let approved = self.votes.votes.get(&candidate).is_some_and(|voters| {
-            self.membership
-                .members
-                .iter()
-                .filter(|member| !self.suspects.contains(member))
-                .all(|member| voters.contains(member))
-        });
+        let approved = self
+            .votes
+            .votes
+            .get(&candidate)
+            .is_some_and(|voters| self.voters_for(candidate).iter().all(|voter| voters.contains(voter)));
         if !approved {
             return;
         }
@@ -358,52 +434,45 @@ impl Lifecycle {
         to.sort_unstable();
         to.dedup();
         to.retain(|peer| *peer != self.local_id);
+        self.configured_voters.clear();
+        self.configured_voters.insert(self.local_id);
+        self.configured_voters.extend(to.iter().copied());
+        self.hello_sent_to.clear();
         self.set_state(LifecycleState::Joining, &mut effects);
-        let hello = JoinHello {
-            candidate: self.local_id,
-            cert_fingerprint,
-        };
-        effects.push(LifecycleEffect::SendHello { to, hello });
+        let ready: Vec<u16> = self.ready_peers.iter().copied().collect();
+        for peer in ready {
+            self.send_hello_to_ready_peer(peer, &mut effects);
+        }
         self.votes
             .record(&self.membership, self.local_id, self.local_id);
         self.check_unanimity(self.local_id, &mut effects);
         effects
     }
 
-    fn note_peer_restarted(&mut self, peer: u16) -> Vec<LifecycleEffect> {
-        if peer == self.local_id || !self.membership.contains(peer) {
-            return Vec::new();
-        }
-        self.membership.remove(peer);
-        self.votes.discard_candidate(peer);
-        self.votes.discard_voter(peer);
-        self.suspects.remove(&peer);
-        let mut effects = vec![LifecycleEffect::Left { peer }];
-        if let Some(hello) = self.hellos.get(&peer).copied() {
-            effects.extend(self.remote_hello(hello, true));
-        }
-        let pending: Vec<u16> = self.votes.votes.keys().copied().collect();
-        for candidate in pending {
-            self.check_unanimity(candidate, &mut effects);
-        }
+    fn peer_ready(&mut self, peer: u16) -> Vec<LifecycleEffect> {
+        self.ready_peers.insert(peer);
+        self.hello_sent_to.remove(&peer);
+        let mut effects = Vec::new();
+        self.send_hello_to_ready_peer(peer, &mut effects);
         effects
     }
 
-    fn note_peer_connected(&mut self, peer: u16) -> Vec<LifecycleEffect> {
-        if peer == self.local_id
-            || (self.state != LifecycleState::Joining && self.state != LifecycleState::Member)
-            || self.membership.contains(peer)
-            || self.suspects.contains(&peer)
+    fn send_hello_to_ready_peer(&mut self, peer: u16, effects: &mut Vec<LifecycleEffect>) {
+        if self.state != LifecycleState::Joining
+            || peer == self.local_id
+            || !self.configured_voters.contains(&peer)
+            || !self.ready_peers.contains(&peer)
+            || !self.hello_sent_to.insert(peer)
         {
-            return Vec::new();
+            return;
         }
-        vec![LifecycleEffect::SendHello {
+        effects.push(LifecycleEffect::SendHello {
             to: vec![peer],
             hello: JoinHello {
                 candidate: self.local_id,
                 cert_fingerprint: self.local_fingerprint,
             },
-        }]
+        });
     }
 
     fn remote_hello(&mut self, hello: JoinHello, pin_match: bool) -> Vec<LifecycleEffect> {
@@ -461,7 +530,10 @@ impl Lifecycle {
     fn remote_vote_request(&mut self, request: JoinVoteRequest) -> Vec<LifecycleEffect> {
         let mut effects = Vec::new();
         let candidate = request.candidate;
-        if candidate == self.local_id || self.membership.contains(candidate) {
+        if candidate == self.local_id
+            || self.membership.contains(candidate)
+            || !self.knows_candidate(candidate)
+        {
             return effects;
         }
         if self.suspects.contains(&candidate) {
@@ -485,11 +557,14 @@ impl Lifecycle {
     fn remote_vote(&mut self, vote: JoinVote) -> Vec<LifecycleEffect> {
         let mut effects = Vec::new();
         let candidate = vote.candidate;
-        if self.is_admitted(candidate) {
+        if self.is_admitted(candidate) || !self.knows_candidate(candidate) {
             return effects;
         }
         if self.suspects.contains(&candidate) {
             effects.push(LifecycleEffect::VoteBlocked { candidate });
+            return effects;
+        }
+        if !self.voter_is_expected(candidate, vote.voter) {
             return effects;
         }
         if !vote.approve {
@@ -513,6 +588,9 @@ impl Lifecycle {
     fn remote_admit(&mut self, admit: AdmitBroadcast) -> Vec<LifecycleEffect> {
         let mut effects = Vec::new();
         let candidate = admit.candidate;
+        if !self.knows_candidate(candidate) {
+            return effects;
+        }
         if self.suspects.contains(&candidate) {
             effects.push(LifecycleEffect::VoteBlocked { candidate });
             return effects;
@@ -534,7 +612,11 @@ impl Lifecycle {
     /// path instead and need an operator to clear.
     fn remote_handoff(&mut self, request: EntityHandoffRequest) -> Vec<LifecycleEffect> {
         let leaver = request.leaver;
-        if leaver == self.local_id || !self.membership.contains(leaver) {
+        if leaver == self.local_id
+            || !self.membership.contains(leaver)
+            || !request.handoffs.is_empty()
+            || !request.is_consistent()
+        {
             return Vec::new();
         }
         self.membership.remove(leaver);
@@ -568,7 +650,6 @@ impl Lifecycle {
                 leaver: self.local_id,
                 handoffs: Vec::new(),
             }));
-            self.set_state(LifecycleState::Leaving, &mut effects);
             return effects;
         }
         if player_count == 0 {
@@ -578,11 +659,12 @@ impl Lifecycle {
                     .find(|entry| entry.0 == chunk)
                     .map_or_else(Vec::new, |entry| entry.1.clone())
             };
-            let handoffs = plan_handoff(owned, &lookup);
-            effects.push(LifecycleEffect::EmitHandoff(EntityHandoffRequest {
-                leaver: self.local_id,
-                handoffs,
-            }));
+            if let Some(handoffs) = plan_handoff(owned, &lookup) {
+                effects.push(LifecycleEffect::EmitHandoff(EntityHandoffRequest {
+                    leaver: self.local_id,
+                    handoffs,
+                }));
+            }
         }
         effects.push(LifecycleEffect::LeaveBlocked {
             player_count,
@@ -595,15 +677,8 @@ impl Lifecycle {
         if peer == self.local_id || !self.membership.contains(peer) {
             return Vec::new();
         }
-        self.membership.remove(peer);
-        self.votes.votes.remove(&peer);
         self.suspects.insert(peer);
-        let mut effects = vec![LifecycleEffect::SuspectMarked { peer }];
-        let pending: Vec<u16> = self.votes.votes.keys().copied().collect();
-        for candidate in pending {
-            self.check_unanimity(candidate, &mut effects);
-        }
-        effects
+        vec![LifecycleEffect::SuspectMarked { peer }]
     }
 
     fn operator_clear_suspect(&mut self, peer: u16) -> Vec<LifecycleEffect> {
@@ -612,6 +687,14 @@ impl Lifecycle {
         } else {
             Vec::new()
         }
+    }
+
+    fn leave_notice_enqueued(&mut self) -> Vec<LifecycleEffect> {
+        let mut effects = Vec::new();
+        if self.state == LifecycleState::Member {
+            self.set_state(LifecycleState::Leaving, &mut effects);
+        }
+        effects
     }
 
     /// Finishes a leave that [`Self::request_leave`] already announced.
@@ -633,11 +716,6 @@ impl Lifecycle {
     }
 }
 
-#[must_use]
-pub const fn can_accept_player() -> bool {
-    true
-}
-
 pub async fn run_lifecycle(
     mut lifecycle: Lifecycle,
     inputs: &mut mpsc::Receiver<LifecycleInput>,
@@ -646,8 +724,8 @@ pub async fn run_lifecycle(
     while let Some(input) = inputs.recv().await {
         let out = lifecycle.apply(input);
         for effect in out {
-            if effects.send(effect).await.is_err() {
-                return;
+            if effects.try_send(effect).is_err() {
+                tracing::warn!("cluster lifecycle effect dropped: output queue unavailable");
             }
         }
     }
@@ -661,6 +739,28 @@ mod tests {
 
     fn member_node(local: u16) -> Lifecycle {
         Lifecycle::new_with_members(local, &[1, 2, 3])
+    }
+
+    fn owned(local_id: i32, chunk: ChunkAddr) -> OwnedEntity {
+        OwnedEntity {
+            spawn: EntitySpawn {
+                entity: crate::protocol::EntityRef {
+                    origin: ServerId(1),
+                    owner: ServerId(1),
+                    local_id,
+                    chunk,
+                },
+                tick: crate::time::TickStamp(9),
+                kind: 1,
+                pos: [0.0, 64.0, 0.0],
+                yaw: 0.0,
+                pitch: 0.0,
+                state: crate::entities::EntitySpawnState::Entity {
+                    nbt: vec![10, 0, 0],
+                },
+            },
+            velocity: [0.0, 0.0, 0.0],
+        }
     }
 
     fn hello(candidate: u16) -> LifecycleInput {
@@ -735,90 +835,6 @@ mod tests {
     }
 
     #[test]
-    fn link_up_rehello_reaches_unadmitted_peer() {
-        let mut node = Lifecycle::new_solo(1);
-        assert!(
-            node.apply(LifecycleInput::NotePeerConnected { peer: 0 })
-                .is_empty()
-        );
-        node.apply(LifecycleInput::BeginJoin {
-            cert_fingerprint: FINGERPRINT,
-            peers: vec![0],
-        });
-        let effects = node.apply(LifecycleInput::NotePeerConnected { peer: 0 });
-        assert_eq!(effects.len(), 1);
-        match &effects[0] {
-            LifecycleEffect::SendHello { to, hello } => {
-                assert_eq!(*to, vec![0]);
-                assert_eq!(hello.candidate, 1);
-                assert_eq!(hello.cert_fingerprint, FINGERPRINT);
-            }
-            _ => panic!("expected a hello to the linked peer"),
-        }
-        assert!(
-            node.apply(LifecycleInput::NotePeerConnected { peer: 1 })
-                .is_empty()
-        );
-        let mut member = member_node(1);
-        assert!(member.apply(hello(2)).is_empty());
-        assert!(
-            member
-                .apply(LifecycleInput::NotePeerConnected { peer: 2 })
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn restarted_member_rejoins_through_fresh_admission() {
-        let mut node = member_node(1);
-        assert!(node.apply(hello(2)).is_empty());
-        assert!(node.membership().contains(2));
-        let effects = node.apply(LifecycleInput::NotePeerRestarted { peer: 2 });
-        assert!(
-            effects
-                .iter()
-                .any(|effect| matches!(effect, LifecycleEffect::Left { peer: 2 }))
-        );
-        assert!(!node.membership().contains(2));
-        assert!(!joined(&effects, 2));
-        let effects = node.apply(vote(2, 3));
-        assert!(joined(&effects, 2));
-        assert!(node.membership().contains(2));
-        assert!(node.apply(hello(2)).is_empty());
-    }
-
-    #[test]
-    fn rejoined_candidate_needs_fresh_votes() {
-        let mut node = member_node(1);
-        node.apply(hello(4));
-        node.apply(vote(4, 2));
-        node.apply(vote(4, 3));
-        assert!(node.membership().contains(4));
-        let effects = node.apply(LifecycleInput::NotePeerRestarted { peer: 4 });
-        assert!(
-            effects
-                .iter()
-                .any(|effect| matches!(effect, LifecycleEffect::Left { peer: 4 }))
-        );
-        assert!(!node.membership().contains(4));
-        let effects = node.apply(vote(4, 2));
-        assert!(!joined(&effects, 4));
-        let effects = node.apply(vote(4, 3));
-        assert!(joined(&effects, 4));
-        assert!(node.membership().contains(4));
-    }
-
-    #[test]
-    fn restart_of_unknown_peer_is_ignored() {
-        let mut node = member_node(1);
-        assert!(
-            node.apply(LifecycleInput::NotePeerRestarted { peer: 9 })
-                .is_empty()
-        );
-        assert!(!node.membership().contains(9));
-    }
-
-    #[test]
     fn explicit_refusal_surfaces_without_admit() {
         let mut node = member_node(1);
         node.apply(hello(4));
@@ -856,11 +872,7 @@ mod tests {
         let mut node = member_node(1);
         let chunk_a = ChunkAddr { x: 0, z: 0 };
         let chunk_b = ChunkAddr { x: 1, z: 0 };
-        let owned = vec![
-            OwnedEntity { local_id: 11, chunk: chunk_a },
-            OwnedEntity { local_id: 12, chunk: chunk_a },
-            OwnedEntity { local_id: 13, chunk: chunk_b },
-        ];
+        let owned = vec![owned(11, chunk_a), owned(12, chunk_a), owned(13, chunk_b)];
         let effects = node.apply(LifecycleInput::RequestLeave {
             player_count: 0,
             owned,
@@ -873,12 +885,68 @@ mod tests {
         assert!(request.is_some());
         let request = request.expect("leave with entities emits a handoff");
         assert_eq!(request.leaver, 1);
-        assert_eq!(request.handoffs.len(), 2);
+        assert_eq!(request.handoffs.len(), 3);
+        assert_eq!(request.handoffs[0].successor, ServerId(2));
+        assert_eq!(request.handoffs[1].successor, ServerId(2));
+        assert_eq!(request.handoffs[2].successor, ServerId(3));
+        assert!(request.is_consistent());
         assert!(
             effects
                 .iter()
                 .any(|effect| matches!(effect, LifecycleEffect::LeaveBlocked { owned_entities: 3, .. }))
         );
+        assert_eq!(node.state(), LifecycleState::Member);
+    }
+
+    #[test]
+    fn leave_handoff_is_scoped_to_its_successor() {
+        let mut node = member_node(1);
+        let chunk = ChunkAddr { x: 0, z: 0 };
+        let effects = node.apply(LifecycleInput::RequestLeave {
+            player_count: 0,
+            owned: vec![owned(11, chunk), owned(12, chunk)],
+            holders: vec![(chunk, vec![1, 2, 3])],
+        });
+        let request = effects
+            .iter()
+            .find_map(|effect| match effect {
+                LifecycleEffect::EmitHandoff(request) => Some(request),
+                _ => None,
+            })
+            .expect("leave emits transfer");
+        assert_eq!(request.successors(), vec![ServerId(2)]);
+        let scoped = request.for_successor(ServerId(2));
+        assert_eq!(scoped.handoffs.len(), 2);
+        assert!(scoped.handoffs.iter().all(|handoff| {
+            handoff.applies_to(ServerId(2))
+                && handoff.destination_ref().owner == ServerId(2)
+                && handoff.destination_ref().origin == ServerId(1)
+        }));
+        assert!(request.for_successor(ServerId(3)).handoffs.is_empty());
+    }
+
+    #[test]
+    fn leave_does_not_emit_a_partial_handoff() {
+        let mut node = member_node(1);
+        let available = ChunkAddr { x: 0, z: 0 };
+        let unavailable = ChunkAddr { x: 1, z: 0 };
+        let effects = node.apply(LifecycleInput::RequestLeave {
+            player_count: 0,
+            owned: vec![owned(11, available), owned(12, unavailable)],
+            holders: vec![(available, vec![1, 2]), (unavailable, vec![1])],
+        });
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, LifecycleEffect::EmitHandoff(_))));
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                LifecycleEffect::LeaveBlocked {
+                    player_count: 0,
+                    owned_entities: 2
+                }
+            )
+        }));
         assert_eq!(node.state(), LifecycleState::Member);
     }
 
@@ -890,6 +958,11 @@ mod tests {
             owned: Vec::new(),
             holders: Vec::new(),
         });
+        assert_eq!(node.state(), LifecycleState::Member);
+        assert!(effects
+            .iter()
+            .any(|effect| matches!(effect, LifecycleEffect::EmitHandoff(request) if request.handoffs.is_empty())));
+        let effects = node.apply(LifecycleInput::LeaveNoticeEnqueued);
         assert_eq!(node.state(), LifecycleState::Leaving);
         assert!(
             effects
@@ -908,7 +981,7 @@ mod tests {
     }
 
     #[test]
-    fn suspect_requires_operator_readmit() {
+    fn suspect_marks_without_removing_member() {
         let mut node = member_node(1);
         let effects = node.apply(LifecycleInput::NoteUncleanDrop { peer: 2 });
         assert!(
@@ -916,28 +989,8 @@ mod tests {
                 .iter()
                 .any(|effect| matches!(effect, LifecycleEffect::SuspectMarked { peer: 2 }))
         );
-        assert!(!node.membership().contains(2));
+        assert!(node.membership().contains(2));
         assert!(node.is_suspect(2));
-
-        let effects = node.apply(hello(2));
-        assert!(
-            effects
-                .iter()
-                .any(|effect| matches!(effect, LifecycleEffect::VoteBlocked { candidate: 2 }))
-        );
-        let effects = node.apply(vote(2, 3));
-        assert!(!joined(&effects, 2));
-        assert!(
-            effects
-                .iter()
-                .any(|effect| matches!(effect, LifecycleEffect::VoteBlocked { candidate: 2 }))
-        );
-        let effects = node.apply(LifecycleInput::RemoteAdmit(AdmitBroadcast {
-            candidate: 2,
-            admitted_by: 3,
-        }));
-        assert!(!joined(&effects, 2));
-        assert!(!node.membership().contains(2));
 
         let effects = node.apply(LifecycleInput::OperatorClearSuspect { peer: 2 });
         assert!(
@@ -946,28 +999,69 @@ mod tests {
                 .any(|effect| matches!(effect, LifecycleEffect::SuspectCleared { peer: 2 }))
         );
         assert!(!node.is_suspect(2));
-        assert!(!node.membership().contains(2));
-
-        node.apply(hello(2));
-        let effects = node.apply(vote(2, 3));
-        assert!(joined(&effects, 2));
         assert!(node.membership().contains(2));
     }
 
     #[test]
-    fn candidate_self_join_reaches_member() {
+    fn candidate_waits_for_configured_peer_vote() {
         let mut node = Lifecycle::new_solo(5);
         let effects = node.apply(LifecycleInput::BeginJoin {
             cert_fingerprint: FINGERPRINT,
             peers: vec![6],
         });
-        assert_eq!(node.state(), LifecycleState::Member);
-        assert!(joined(&effects, 5));
+        assert_eq!(node.state(), LifecycleState::Joining);
+        assert!(!joined(&effects, 5));
+        assert!(!effects
+            .iter()
+            .any(|effect| matches!(effect, LifecycleEffect::SendHello { .. })));
+        let effects = node.apply(LifecycleInput::PeerReady { peer: 6 });
         assert!(
             effects.iter().any(
                 |effect| matches!(effect, LifecycleEffect::SendHello { to, .. } if to == &vec![6_u16])
             )
         );
+        let effects = node.apply(vote(5, 6));
+        assert_eq!(node.state(), LifecycleState::Member);
+        assert!(joined(&effects, 5));
+    }
+
+    #[test]
+    fn ready_peer_before_begin_join_gets_hello() {
+        let mut node = Lifecycle::new_solo(5);
+        assert!(node
+            .apply(LifecycleInput::PeerReady { peer: 6 })
+            .is_empty());
+        let effects = node.apply(LifecycleInput::BeginJoin {
+            cert_fingerprint: FINGERPRINT,
+            peers: vec![6],
+        });
+        assert!(effects.iter().any(
+            |effect| matches!(effect, LifecycleEffect::SendHello { to, .. } if to == &vec![6_u16])
+        ));
+    }
+
+    #[test]
+    fn bootstrap_voters_admit_every_configured_peer() {
+        let mut node = Lifecycle::new_solo(1);
+        node.apply(LifecycleInput::BeginJoin {
+            cert_fingerprint: FINGERPRINT,
+            peers: vec![2, 3],
+        });
+        let votes = node.apply(hello(2));
+        assert!(votes.iter().any(|effect| {
+            matches!(effect, LifecycleEffect::SendVote { to, vote } if vote.candidate == 2 && to == &vec![2, 3])
+        }));
+        node.apply(hello(3));
+        node.apply(vote(1, 2));
+        node.apply(vote(1, 3));
+        node.apply(vote(2, 2));
+        node.apply(vote(2, 3));
+        node.apply(vote(3, 2));
+        node.apply(vote(3, 3));
+        assert_eq!(node.state(), LifecycleState::Member);
+        assert!(node.membership().contains(1));
+        assert!(node.membership().contains(2));
+        assert!(node.membership().contains(3));
     }
 
     #[test]
@@ -982,8 +1076,7 @@ mod tests {
     }
 
     #[test]
-    fn player_joins_allowed_while_joining() {
-        assert!(can_accept_player());
+    fn player_joins_allowed_only_after_admit() {
         assert!(!Lifecycle::new_solo(1).player_join_allowed());
         assert!(Lifecycle::new_with_members(1, &[1, 2]).player_join_allowed());
         let mut joining = Lifecycle::new_solo(9);
@@ -991,36 +1084,37 @@ mod tests {
             cert_fingerprint: FINGERPRINT,
             peers: vec![1, 2],
         });
-        assert!(joining.player_join_allowed());
+        assert!(!joining.player_join_allowed());
         let mut leaving = member_node(1);
         leaving.apply(LifecycleInput::RequestLeave {
             player_count: 0,
             owned: Vec::new(),
             holders: Vec::new(),
         });
+        leaving.apply(LifecycleInput::LeaveNoticeEnqueued);
         assert!(!leaving.player_join_allowed());
     }
 
     #[test]
-    fn suspect_mark_unblocks_pending_join() {
+    fn suspect_mark_keeps_membership_and_blocks_pending_join() {
         let mut node = member_node(1);
         node.apply(hello(9));
         let effects = node.apply(vote(9, 2));
         assert!(!joined(&effects, 9));
         let effects = node.apply(LifecycleInput::NoteUncleanDrop { peer: 3 });
+        assert!(!joined(&effects, 9));
+        assert!(node.membership().contains(3));
+        assert!(!node.membership().contains(9));
+        node.apply(LifecycleInput::OperatorClearSuspect { peer: 3 });
+        let effects = node.apply(vote(9, 3));
         assert!(joined(&effects, 9));
-        assert!(node.membership().contains(9));
     }
 
     #[test]
     fn plan_handoff_groups_per_chunk() {
         let chunk_a = ChunkAddr { x: 0, z: 0 };
         let chunk_b = ChunkAddr { x: 0, z: 1 };
-        let owned = vec![
-            OwnedEntity { local_id: 1, chunk: chunk_b },
-            OwnedEntity { local_id: 2, chunk: chunk_a },
-            OwnedEntity { local_id: 3, chunk: chunk_a },
-        ];
+        let owned = vec![owned(1, chunk_b), owned(2, chunk_a), owned(3, chunk_a)];
         let handoffs = plan_handoff(&owned, &|chunk| {
             if chunk == chunk_a {
                 vec![2_u16, 3_u16]
@@ -1028,12 +1122,7 @@ mod tests {
                 Vec::new()
             }
         });
-        assert_eq!(handoffs.len(), 2);
-        assert_eq!(handoffs[0].chunk, chunk_a);
-        assert_eq!(handoffs[0].entity_local_ids, vec![2, 3]);
-        assert_eq!(handoffs[0].targets, vec![2, 3]);
-        assert_eq!(handoffs[1].chunk, chunk_b);
-        assert!(handoffs[1].targets.is_empty());
+        assert!(handoffs.is_none());
     }
 
     #[test]

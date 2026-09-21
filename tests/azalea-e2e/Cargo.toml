@@ -1,0 +1,18 @@
+[workspace]
+
+[package]
+name = "pumpkin-azalea-e2e"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1.0.100"
+azalea = { git = "https://github.com/azalea-rs/azalea", rev = "b65fa8cf1bb957976cefa926b9b500d44767d806", default-features = false, features = ["packet-event"] }
+hex = "0.4.3"
+rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "ring"] }
+serde_json = "1.0.150"
+sha2 = "0.11.0"
+tempfile = "3.27.0"
+tokio = { version = "1.53.0", features = ["io-util", "macros", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
+uuid = "1.23.4"

@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use crate::entity::player::Player;
 use crate::entity::{Entity, EntityBase, living::LivingEntity};
 use crossbeam::atomic::AtomicCell;
@@ -23,7 +24,7 @@ use pumpkin_util::version::JavaMinecraftVersion;
 /// across save cycles.
 pub struct ItemFrameEntity {
     entity: Entity,
-    item_stack: Mutex<ItemStack>,
+    item_stack: ArcSwap<ItemStack>,
     /// Rotation of the displayed item, always in `0..8`.
     rotation: AtomicU8,
     /// The direction the frame faces, i.e. the axis pointing away from the
@@ -46,7 +47,7 @@ impl ItemFrameEntity {
         entity.data.store(i32::from(facing), Ordering::Relaxed);
         Self {
             entity,
-            item_stack: Mutex::new(ItemStack::EMPTY.clone()),
+            item_stack: ArcSwap::from_pointee(ItemStack::EMPTY.clone()),
             rotation: AtomicU8::new(0),
             facing: AtomicU8::new(facing),
             item_drop_chance: AtomicCell::new(1.0),
@@ -111,10 +112,7 @@ impl ItemFrameEntity {
     }
 
     pub fn get_item(&self) -> ItemStack {
-        self.item_stack
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        (*self.item_stack.load_full()).clone()
     }
 
     pub fn set_item(&self, mut item_stack: ItemStack, update_neighbours: bool) {
@@ -124,10 +122,7 @@ impl ItemFrameEntity {
 
         let play_sound = !item_stack.is_empty();
         let item_serializer = ItemStackSerializer::from(item_stack.clone());
-        *self
-            .item_stack
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = item_stack;
+        self.item_stack.store(Arc::new(item_stack));
 
         self.entity.set_synced_data(
             pumpkin_data::tracked_data::item_frame::ITEM,
@@ -216,12 +211,7 @@ impl ItemFrameEntity {
     ///
     /// Vanilla: `getItem().isEmpty() ? 0 : getRotation() % 8 + 1`.
     pub fn get_analog_output(&self) -> u8 {
-        if self
-            .item_stack
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty()
-        {
+        if self.item_stack.load().is_empty() {
             0
         } else {
             self.rotation.load(Ordering::Relaxed) % 8 + 1
@@ -234,10 +224,7 @@ impl ItemFrameEntity {
         }
 
         let item_stack = self.get_item();
-        *self
-            .item_stack
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = ItemStack::EMPTY.clone();
+        self.item_stack.store(Arc::new(ItemStack::EMPTY.clone()));
         let item_serializer = ItemStackSerializer::from(ItemStack::EMPTY.clone());
         self.entity.set_synced_data(
             pumpkin_data::tracked_data::item_frame::ITEM,
@@ -272,10 +259,7 @@ impl ItemFrameEntity {
 
 impl EntityBase for ItemFrameEntity {
     fn write_custom_nbt(&self, nbt: &mut NbtCompound) {
-        let item = self
-            .item_stack
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let item = self.item_stack.load();
         if !item.is_empty() {
             let mut item_compound = NbtCompound::new();
             item.write_item_stack(&mut item_compound);
@@ -292,10 +276,7 @@ impl EntityBase for ItemFrameEntity {
         if let Some(item_compound) = nbt.get_compound("Item")
             && let Some(stack) = ItemStack::read_item_stack(item_compound)
         {
-            *self
-                .item_stack
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = stack;
+            self.item_stack.store(Arc::new(stack));
         }
         self.rotation.store(
             (nbt.get_byte("ItemRotation").unwrap_or(0) as u8) % 8,
@@ -324,12 +305,7 @@ impl EntityBase for ItemFrameEntity {
     }
 
     fn init_data_tracker(&self) {
-        let item_serializer = ItemStackSerializer::from(
-            self.item_stack
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone(),
-        );
+        let item_serializer = ItemStackSerializer::from((*self.item_stack.load_full()).clone());
         let rotation = self.get_rotation() as i32;
 
         self.entity.set_synced_data(
@@ -348,12 +324,7 @@ impl EntityBase for ItemFrameEntity {
 
         let ver = client.version.load();
         if ver >= JavaMinecraftVersion::V_1_21 {
-            let item_serializer = ItemStackSerializer::from(
-                self.item_stack
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone(),
-            );
+            let item_serializer = ItemStackSerializer::from((*self.item_stack.load_full()).clone());
             let rotation = self.get_rotation() as i32;
 
             let mut data = Vec::new();

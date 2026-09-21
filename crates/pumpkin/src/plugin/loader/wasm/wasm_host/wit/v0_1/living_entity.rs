@@ -331,13 +331,8 @@ impl HostLivingEntity for PluginHostState {
         let entity = living_entity_from_resource(self, &this)?;
         let attribute = from_wit_attribute(attr);
         if let Some(living) = entity.get_living_entity() {
-            let map = living
-                .attributes
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(inst) = map.get(&attribute.id) {
-                return Ok(inst
-                    .modifiers
+            if let Some(modifiers) = living.attribute_modifiers(attribute) {
+                return Ok(modifiers
                     .iter()
                     .map(|m| WitAttributeModifier {
                         id: m.id.clone(),
@@ -358,13 +353,7 @@ impl HostLivingEntity for PluginHostState {
         let entity = living_entity_from_resource(self, &this)?;
         let attribute = from_wit_attribute(attr);
         if let Some(living) = entity.get_living_entity() {
-            {
-                let mut map = living
-                    .attributes
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                map.remove(&attribute.id);
-            };
+            living.remove_attribute(attribute);
             crate::entity::attributes::send_attribute_updates_for_living(
                 living,
                 vec![attribute.clone()],

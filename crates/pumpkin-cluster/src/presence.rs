@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::identity::{GlobalPlayerId, ServerId};
-use crate::protocol::StreamKind;
+use crate::protocol::{PlayerGameMode, StreamKind};
 
 pub const PRESENCE_MAX_NAME_LEN: usize = 16;
 
@@ -53,6 +53,7 @@ pub struct PresenceLogin {
     pub uuid: [u8; 16],
     pub name: String,
     pub properties: Vec<PresenceProperty>,
+    pub gamemode: PlayerGameMode,
     pub in_lobby: bool,
 }
 
@@ -63,6 +64,7 @@ impl PresenceLogin {
         uuid: [u8; 16],
         name: String,
         properties: Vec<PresenceProperty>,
+        gamemode: PlayerGameMode,
         in_lobby: bool,
     ) -> Self {
         Self {
@@ -70,6 +72,7 @@ impl PresenceLogin {
             uuid,
             name,
             properties: sanitize_presence_properties(properties),
+            gamemode,
             in_lobby,
         }
     }
@@ -227,6 +230,7 @@ pub struct RemotePlayerEntry {
     pub uuid: [u8; 16],
     pub name: String,
     pub properties: Vec<PresenceProperty>,
+    pub gamemode: PlayerGameMode,
     pub joined_at_millis: u64,
     pub in_lobby: bool,
 }
@@ -238,6 +242,7 @@ impl RemotePlayerEntry {
         uuid: [u8; 16],
         name: String,
         properties: Vec<PresenceProperty>,
+        gamemode: PlayerGameMode,
         joined_at_millis: u64,
         in_lobby: bool,
     ) -> Self {
@@ -246,6 +251,7 @@ impl RemotePlayerEntry {
             uuid,
             name,
             properties: sanitize_presence_properties(properties),
+            gamemode,
             joined_at_millis,
             in_lobby,
         }
@@ -254,6 +260,28 @@ impl RemotePlayerEntry {
     #[must_use]
     pub const fn host(&self) -> ServerId {
         self.gid.server
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemotePlayerProfile {
+    pub gid: GlobalPlayerId,
+    pub uuid: [u8; 16],
+    pub name: String,
+    pub properties: Vec<PresenceProperty>,
+    pub gamemode: PlayerGameMode,
+}
+
+impl RemotePlayerEntry {
+    #[must_use]
+    pub fn replica_profile(&self) -> Option<RemotePlayerProfile> {
+        (!self.in_lobby).then(|| RemotePlayerProfile {
+            gid: self.gid,
+            uuid: self.uuid,
+            name: self.name.clone(),
+            properties: self.properties.clone(),
+            gamemode: self.gamemode,
+        })
     }
 }
 
@@ -274,11 +302,15 @@ impl PresenceTable {
         if !is_valid_presence_name(&login.name) {
             return false;
         }
+        if !login.properties.iter().all(is_valid_presence_property) {
+            return false;
+        }
         let properties = sanitize_presence_properties(login.properties.clone());
         if let Some(entry) = self.entries.get_mut(&login.gid) {
             entry.uuid = login.uuid;
             entry.name = login.name.clone();
             entry.properties = properties;
+            entry.gamemode = login.gamemode;
             entry.in_lobby = login.in_lobby;
             return true;
         }
@@ -294,6 +326,7 @@ impl PresenceTable {
                 login.uuid,
                 login.name.clone(),
                 properties,
+                login.gamemode,
                 now_millis,
                 login.in_lobby,
             ),
@@ -380,6 +413,7 @@ mod tests {
             [player as u8; 16],
             name.to_string(),
             Vec::new(),
+            PlayerGameMode::Survival,
             false,
         )
     }

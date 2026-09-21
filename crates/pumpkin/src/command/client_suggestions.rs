@@ -231,7 +231,7 @@ pub fn send_bedrock_commands_packet(
         constraints: Vec::new(),
     };
 
-    if let crate::net::ClientPlatform::Bedrock(bedrock_client) = player.client.as_ref()
+    if let Some(crate::net::ClientPlatform::Bedrock(bedrock_client)) = player.client.as_deref()
         && let Ok(data) = bedrock_client.serialize_packet(&packet)
     {
         bedrock_client.try_enqueue_packet(data);

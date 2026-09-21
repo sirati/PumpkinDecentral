@@ -72,11 +72,7 @@ impl CommandExecutor for GetExecutor {
             1.0
         };
 
-        let has_attr = living
-            .attributes
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(&attribute.id);
+        let has_attr = living.has_attribute(&attribute);
         if !has_attr {
             return Err(NO_ATTRIBUTE_ERROR.create_without_context(
                 target.get_name(),
@@ -136,11 +132,7 @@ impl CommandExecutor for BaseSetExecutor {
         let attribute = AttributeArgumentType::get(context, ARG_ATTRIBUTE)?;
         let value = DoubleArgumentType::get(context, ARG_VALUE)?;
 
-        let has_attr = living
-            .attributes
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(&attribute.id);
+        let has_attr = living.has_attribute(&attribute);
         if !has_attr {
             return Err(NO_ATTRIBUTE_ERROR.create_without_context(
                 target.get_name(),
@@ -182,11 +174,7 @@ impl CommandExecutor for BaseResetExecutor {
 
         let attribute = AttributeArgumentType::get(context, ARG_ATTRIBUTE)?;
 
-        let has_attr = living
-            .attributes
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(&attribute.id);
+        let has_attr = living.has_attribute(&attribute);
         if !has_attr {
             return Err(NO_ATTRIBUTE_ERROR.create_without_context(
                 target.get_name(),
@@ -236,35 +224,26 @@ impl CommandExecutor for ModifierAddExecutor {
 
         let modifier_id = uuid.to_string();
 
-        let res = {
-            let mut map = living
-                .attributes
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let inst = map.get_mut(&attribute.id).ok_or_else(|| {
-                NO_ATTRIBUTE_ERROR.create_without_context(
-                    target.get_name(),
-                    TextComponent::translate(attribute_translation_key(&attribute), []),
-                )
-            })?;
-
-            if inst.modifiers.iter().any(|m| m.id == modifier_id) {
-                Err(MODIFIER_ALREADY_PRESENT_ERROR.create_without_context(
-                    TextComponent::text(modifier_id.clone()),
-                    TextComponent::translate(attribute_translation_key(&attribute), []),
-                    target.get_name(),
-                ))
-            } else {
-                inst.modifiers.push(crate::entity::attributes::Modifier {
-                    id: modifier_id.clone(),
-                    amount: value,
-                    operation: self.operation,
-                });
-                inst.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-                Ok(())
-            }
-        };
-        res?;
+        let modifiers = living.attribute_modifiers(&attribute).ok_or_else(|| {
+            NO_ATTRIBUTE_ERROR.create_without_context(
+                target.get_name(),
+                TextComponent::translate(attribute_translation_key(&attribute), []),
+            )
+        })?;
+        if modifiers.iter().any(|modifier| modifier.id == modifier_id) {
+            return Err(MODIFIER_ALREADY_PRESENT_ERROR.create_without_context(
+                TextComponent::text(modifier_id.clone()),
+                TextComponent::translate(attribute_translation_key(&attribute), []),
+                target.get_name(),
+            ));
+        }
+        living.update_attribute(&attribute, |inst| {
+            inst.modifiers.push(crate::entity::attributes::Modifier {
+                id: modifier_id.clone(),
+                amount: value,
+                operation: self.operation,
+            });
+        });
 
         crate::entity::attributes::send_attribute_updates_for_living(
             living,
@@ -302,35 +281,22 @@ impl CommandExecutor for ModifierRemoveExecutor {
 
         let modifier_id = uuid.to_string();
 
-        let res = {
-            let mut map = living
-                .attributes
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let inst = map.get_mut(&attribute.id).ok_or_else(|| {
-                NO_ATTRIBUTE_ERROR.create_without_context(
-                    target.get_name(),
-                    TextComponent::translate(attribute_translation_key(&attribute), []),
-                )
-            })?;
-
-            let index = inst
-                .modifiers
-                .iter()
-                .position(|m| m.id == modifier_id)
-                .ok_or_else(|| {
-                    NO_MODIFIER_ERROR.create_without_context(
-                        TextComponent::translate(attribute_translation_key(&attribute), []),
-                        target.get_name(),
-                        TextComponent::text(modifier_id.clone()),
-                    )
-                })?;
-
-            inst.modifiers.remove(index);
-            inst.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-            Ok(())
-        };
-        res?;
+        let modifiers = living.attribute_modifiers(&attribute).ok_or_else(|| {
+            NO_ATTRIBUTE_ERROR.create_without_context(
+                target.get_name(),
+                TextComponent::translate(attribute_translation_key(&attribute), []),
+            )
+        })?;
+        if !modifiers.iter().any(|modifier| modifier.id == modifier_id) {
+            return Err(NO_MODIFIER_ERROR.create_without_context(
+                TextComponent::translate(attribute_translation_key(&attribute), []),
+                target.get_name(),
+                TextComponent::text(modifier_id.clone()),
+            ));
+        }
+        living.update_attribute(&attribute, |inst| {
+            inst.modifiers.retain(|modifier| modifier.id != modifier_id);
+        });
 
         crate::entity::attributes::send_attribute_updates_for_living(
             living,
@@ -368,32 +334,23 @@ impl CommandExecutor for ModifierGetExecutor {
 
         let modifier_id = uuid.to_string();
 
-        let val = {
-            let map = living
-                .attributes
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let inst = map.get(&attribute.id).ok_or_else(|| {
-                NO_ATTRIBUTE_ERROR.create_without_context(
-                    target.get_name(),
+        let modifiers = living.attribute_modifiers(&attribute).ok_or_else(|| {
+            NO_ATTRIBUTE_ERROR.create_without_context(
+                target.get_name(),
+                TextComponent::translate(attribute_translation_key(&attribute), []),
+            )
+        })?;
+        let val = modifiers
+            .iter()
+            .find(|modifier| modifier.id == modifier_id)
+            .ok_or_else(|| {
+                NO_MODIFIER_ERROR.create_without_context(
                     TextComponent::translate(attribute_translation_key(&attribute), []),
+                    target.get_name(),
+                    TextComponent::text(modifier_id.clone()),
                 )
-            })?;
-
-            let modifier = inst
-                .modifiers
-                .iter()
-                .find(|m| m.id == modifier_id)
-                .ok_or_else(|| {
-                    NO_MODIFIER_ERROR.create_without_context(
-                        TextComponent::translate(attribute_translation_key(&attribute), []),
-                        target.get_name(),
-                        TextComponent::text(modifier_id.clone()),
-                    )
-                })?;
-
-            modifier.amount
-        };
+            })?
+            .amount;
 
         context.source.send_feedback(
             TextComponent::translate_cross(

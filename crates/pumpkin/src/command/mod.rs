@@ -122,6 +122,7 @@ pub enum CommandSender {
     /// Contains a reference to the [Player] struct to access their
     /// location, permissions, and session.
     Player(Arc<Player>),
+    Lobby(Arc<crate::server::cluster_lobby::LobbyWaiter>),
     /// A Command Block or Command Block Minecart.
     ///
     /// Contains the block entity responsible for the command and the
@@ -141,6 +142,7 @@ impl fmt::Display for CommandSender {
                 Self::Console => "Server",
                 Self::Rcon(_) => "Rcon",
                 Self::Player(p) => &p.gameprofile.name,
+                Self::Lobby(waiter) => &waiter.profile.name,
                 Self::CommandBlock(..) => "@",
                 Self::Dummy => "",
             }
@@ -154,6 +156,7 @@ impl CommandSender {
             #[allow(clippy::print_stdout)]
             Self::Console => println!("{}", text.to_pretty_console()),
             Self::Player(c) => c.send_system_message(&text),
+            Self::Lobby(waiter) => waiter.send_system_message(&text),
             Self::Rcon(s) => s
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -185,7 +188,7 @@ impl CommandSender {
 
     #[must_use]
     pub const fn is_player(&self) -> bool {
-        matches!(self, Self::Player(_))
+        matches!(self, Self::Player(_) | Self::Lobby(_))
     }
 
     #[must_use]
@@ -206,6 +209,7 @@ impl CommandSender {
         match self {
             Self::Console | Self::Rcon(_) => PermissionLvl::Four,
             Self::Player(p) => p.permission_lvl.load(),
+            Self::Lobby(_) => PermissionLvl::Zero,
             Self::CommandBlock(..) | Self::Dummy => PermissionLvl::Two,
         }
     }
@@ -215,6 +219,7 @@ impl CommandSender {
         match self {
             Self::Console | Self::Rcon(_) => true,
             Self::Player(p) => p.permission_lvl.load().ge(&lvl),
+            Self::Lobby(_) => PermissionLvl::Zero.ge(&lvl),
             Self::CommandBlock(..) | Self::Dummy => PermissionLvl::Two >= lvl,
         }
     }
@@ -224,6 +229,12 @@ impl CommandSender {
         match self {
             Self::Console | Self::Rcon(_) => true, // Console and RCON always have all permissions
             Self::Player(p) => p.has_permission(server, node),
+            Self::Lobby(_) => {
+                let Some(p) = server.permission_manager.get_permission(node) else {
+                    return false;
+                };
+                matches!(p.default, PermissionDefault::Allow)
+            }
             Self::CommandBlock(..) | Self::Dummy => {
                 let Some(p) = server.permission_manager.get_permission(node) else {
                     return false;
@@ -240,7 +251,7 @@ impl CommandSender {
     #[must_use]
     pub fn position(&self) -> Option<Vector3<f64>> {
         match self {
-            Self::Console | Self::Rcon(..) | Self::Dummy => None,
+            Self::Console | Self::Rcon(..) | Self::Dummy | Self::Lobby(_) => None,
             Self::Player(p) => Some(p.living_entity.entity.pos.load()),
             Self::CommandBlock(c, _) => Some(c.get_position().to_centered_f64()),
         }
@@ -249,7 +260,7 @@ impl CommandSender {
     #[must_use]
     pub fn rotation(&self) -> Option<(f32, f32)> {
         match self {
-            Self::Console | Self::Rcon(..) | Self::Dummy => None,
+            Self::Console | Self::Rcon(..) | Self::Dummy | Self::Lobby(_) => None,
             Self::Player(player) => Some(player.rotation()),
             Self::CommandBlock(command_block, world) => {
                 let pos = command_block.get_position();
@@ -277,7 +288,7 @@ impl CommandSender {
         match self {
             // These senders are not bound to a world. Use `world_or_first` to
             // fall back to the first world instead.
-            Self::Console | Self::Rcon(..) | Self::Dummy => None,
+            Self::Console | Self::Rcon(..) | Self::Dummy | Self::Lobby(_) => None,
             Self::Player(p) => Some(p.living_entity.entity.world.load_full()),
             Self::CommandBlock(_, w) => Some(w.clone()),
         }
@@ -299,6 +310,7 @@ impl CommandSender {
     pub fn get_locale(&self) -> Locale {
         match self {
             Self::CommandBlock(..) | Self::Console | Self::Rcon(..) | Self::Dummy => Locale::EnUs, // Default locale for console and RCON
+            Self::Lobby(waiter) => Locale::from_str(&waiter.config.locale).unwrap_or(Locale::EnUs),
             Self::Player(player) => {
                 Locale::from_str(&player.config.load().locale).unwrap_or(Locale::EnUs)
             }
@@ -319,6 +331,7 @@ impl CommandSender {
                     .game_rules
                     .send_command_feedback
             }
+            Self::Lobby(_) => true,
             Self::Console | Self::Rcon(_) => true,
             Self::Dummy => false,
         }
@@ -329,6 +342,7 @@ impl CommandSender {
         match self {
             Self::CommandBlock(_, world) => world.level_info.load().game_rules.command_block_output,
             Self::Player(..) => true,
+            Self::Lobby(..) => true,
             Self::Console | Self::Rcon(_) => {
                 BROADCAST_CONSOLE_TO_OPS.load(std::sync::atomic::Ordering::Relaxed)
             }
@@ -340,7 +354,7 @@ impl CommandSender {
     pub const fn should_track_output(&self) -> bool {
         match self {
             Self::Dummy => false,
-            Self::Player(..) | Self::Console | Self::Rcon(_) | Self::CommandBlock(..) => true,
+            Self::Player(..) | Self::Lobby(..) | Self::Console | Self::Rcon(_) | Self::CommandBlock(..) => true,
         }
     }
 
@@ -383,6 +397,19 @@ impl CommandSender {
                 player.get_display_name(),
                 server.clone(),
             ),
+            Self::Lobby(waiter) => {
+                let (world, spawn_point) = Self::get_world_and_spawn_point(server);
+                CommandSource::new(
+                    Self::Lobby(waiter.clone()),
+                    world,
+                    None,
+                    spawn_point,
+                    Vector2::new(0.0, 0.0),
+                    waiter.profile.name.clone(),
+                    TextComponent::text(waiter.profile.name.clone()),
+                    server.clone(),
+                )
+            }
             Self::CommandBlock(command_entity, world) => {
                 let pos = command_entity.position;
 

@@ -21,12 +21,14 @@ pub struct ClusterConfig {
     pub enabled: bool,
     pub role: ClusterRole,
     pub server_id: u16,
+    pub primary_server_id: u16,
     pub bind_addr: String,
     pub cert_path: String,
     pub key_path: String,
     pub peers: Vec<PinnedPeerConfig>,
     pub ntp_servers: Vec<String>,
-    pub max_offset_millis: i64,
+    #[serde(alias = "max_offset_millis")]
+    pub max_precision_millis: i64,
 }
 
 impl Default for ClusterConfig {
@@ -35,12 +37,13 @@ impl Default for ClusterConfig {
             enabled: false,
             role: ClusterRole::Secondary,
             server_id: 0,
+            primary_server_id: 0,
             bind_addr: String::from("0.0.0.0:24577"),
             cert_path: String::from("cluster-cert.der"),
             key_path: String::from("cluster-key.der"),
             peers: Vec::new(),
             ntp_servers: Vec::new(),
-            max_offset_millis: 25,
+            max_precision_millis: 25,
         }
     }
 }
@@ -68,6 +71,12 @@ impl ClusterConfig {
             );
         }
         let mut errors = Vec::new();
+        if self.role == ClusterRole::Primary && self.server_id != self.primary_server_id {
+            errors.push(format!(
+                "primary server id {} differs from primary_server_id {}",
+                self.server_id, self.primary_server_id
+            ));
+        }
         let primary_first_boot = self.role == ClusterRole::Primary && self.peers.is_empty();
         if self.peers.is_empty() && !primary_first_boot {
             errors.push(String::from(
@@ -93,6 +102,33 @@ impl ClusterConfig {
                 ));
             }
         }
+        if self.role == ClusterRole::Secondary
+            && !self.peers.iter().any(|peer| peer.server_id == self.primary_server_id)
+        {
+            errors.push(format!(
+                "secondary is missing configured primary peer {}",
+                self.primary_server_id
+            ));
+        }
         errors
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClusterConfig;
+
+    #[test]
+    fn legacy_offset_key_deserializes_as_precision() {
+        let config: ClusterConfig = toml::from_str("max_offset_millis = 19").unwrap();
+        assert_eq!(config.max_precision_millis, 19);
+    }
+
+    #[test]
+    fn precision_key_serializes_with_its_real_meaning() {
+        let config = ClusterConfig::default();
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(serialized.contains("max_precision_millis = 25"));
+        assert!(!serialized.contains("max_offset_millis"));
     }
 }

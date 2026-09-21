@@ -128,7 +128,7 @@ impl Player {
         );
 
         self.try_enqueue_packet_editioned(&je_packet, &be_packet);
-        if let ClientPlatform::Bedrock(bedrock) = self.client.as_ref() {
+        if let Some(ClientPlatform::Bedrock(bedrock)) = self.client.as_deref() {
             let register_packet = BBossEvent::register_player(boss_id, player_id);
             if let Ok(data) = bedrock.serialize_packet(&register_packet) {
                 bedrock.try_enqueue_packet(data);
@@ -145,7 +145,7 @@ impl Player {
         let be_packet = BBossEvent::hide(boss_id);
 
         self.try_enqueue_packet_editioned(&je_packet, &be_packet);
-        if let ClientPlatform::Bedrock(bedrock) = self.client.as_ref()
+        if let Some(ClientPlatform::Bedrock(bedrock)) = self.client.as_deref()
             && let Ok(data) = bedrock.serialize_packet(&unregister_packet)
         {
             bedrock.try_enqueue_packet(data);

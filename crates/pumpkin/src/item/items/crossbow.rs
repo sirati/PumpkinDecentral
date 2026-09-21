@@ -132,10 +132,15 @@ impl CrossbowItem {
             -pitch_rad.sin(),
             yaw_rad.cos() * pitch_rad.cos(),
         ];
+        let Some(tick) = crate::net::java::play::attack::combat_tick() else {
+            return;
+        };
+        let pos = player.position();
         let update = pumpkin_cluster::combat::capture_fire(
             gid,
             pumpkin_cluster::combat::next_combat_seq(gid),
-            crate::net::java::play::attack::combat_tick(),
+            tick,
+            pumpkin_cluster::combat::chunk_of_pos(pos.x, pos.z),
             kind,
             1000,
             dir,

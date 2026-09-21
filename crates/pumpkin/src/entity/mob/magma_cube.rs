@@ -17,13 +17,10 @@ impl MagmaCubeEntity {
     pub fn new(entity: Entity) -> Arc<Self> {
         let slime = SlimeEntity::new(entity);
         let size = slime.get_size();
-        {
-            let mut attributes = slime
-                .get_mob_entity()
-                .living_entity
-                .attributes
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slime
+            .get_mob_entity()
+            .living_entity
+            .update_attributes(|attributes| {
             if let Some(speed) = attributes.get_mut(&Attributes::MOVEMENT_SPEED.id) {
                 speed.base_value = 0.2;
                 speed.dirty.store(true, Ordering::Relaxed);
@@ -36,7 +33,7 @@ impl MagmaCubeEntity {
                 armor.base_value = (size * 3) as f64;
                 armor.dirty.store(true, Ordering::Relaxed);
             }
-        }
+            });
         Arc::new(Self { slime })
     }
 }

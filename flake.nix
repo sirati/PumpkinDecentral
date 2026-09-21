@@ -9,6 +9,11 @@
       flake = false;
     };
 
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
     self.submodules = true;
   };
 
@@ -58,6 +63,12 @@
             if name == "pumpkin-codegen" then "tools/pumpkin-codegen"
             else if name == "pumpkin-fuzzer" then "tools/pumpkin-fuzzer"
             else "crates/${name}";
+
+          azaleaRust =
+            (import nixpkgs {
+              system = pkgs.stdenv.hostPlatform.system;
+              overlays = [ inputs.rust-overlay.overlays.default ];
+            }).rust-bin.nightly."2026-09-15".default;
 
           binOnly = [
             "pumpkin-codegen"
@@ -239,6 +250,13 @@
               rustc
               rustfmt
               pkg-config
+            ];
+          };
+
+          devShells.azalea-e2e = pkgs.mkShell {
+            packages = [
+              azaleaRust
+              pkgs.pkg-config
             ];
           };
 

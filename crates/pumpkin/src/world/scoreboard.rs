@@ -27,6 +27,7 @@ pub trait ScoreboardTarget: Send + Sync {
         be_packet: &B,
     );
     fn send_je<J: ClientPacket + Sync>(&self, je_packet: &J);
+    fn replace_scoreboard_snapshot(&self, _scoreboard: &Scoreboard) {}
 }
 
 impl ScoreboardTarget for World {
@@ -40,6 +41,10 @@ impl ScoreboardTarget for World {
 
     fn send_je<J: ClientPacket + Sync>(&self, je_packet: &J) {
         self.broadcast_packet_all(je_packet);
+    }
+
+    fn replace_scoreboard_snapshot(&self, scoreboard: &Scoreboard) {
+        self.replace_scoreboard_snapshot(scoreboard);
     }
 }
 
@@ -55,6 +60,10 @@ impl<T: ScoreboardTarget + ?Sized> ScoreboardTarget for &T {
     fn send_je<J: ClientPacket + Sync>(&self, je_packet: &J) {
         (*self).send_je(je_packet);
     }
+
+    fn replace_scoreboard_snapshot(&self, scoreboard: &Scoreboard) {
+        (*self).replace_scoreboard_snapshot(scoreboard);
+    }
 }
 
 impl ScoreboardTarget for std::sync::Arc<World> {
@@ -68,6 +77,10 @@ impl ScoreboardTarget for std::sync::Arc<World> {
 
     fn send_je<J: ClientPacket + Sync>(&self, je_packet: &J) {
         self.broadcast_packet_all(je_packet);
+    }
+
+    fn replace_scoreboard_snapshot(&self, scoreboard: &Scoreboard) {
+        self.as_ref().replace_scoreboard_snapshot(scoreboard);
     }
 }
 
@@ -136,10 +149,6 @@ impl Scoreboard {
         self.objectives.get(name)
     }
 
-    pub fn get_objective_mut(&mut self, name: &str) -> Option<&mut ScoreboardObjective> {
-        self.objectives.get_mut(name)
-    }
-
     #[must_use]
     pub const fn get_display_slots(&self) -> &FxHashMap<ScoreboardDisplaySlot, String> {
         &self.display_slots
@@ -195,10 +204,6 @@ impl Scoreboard {
         self.teams.get(name)
     }
 
-    pub fn get_team_mut(&mut self, name: &str) -> Option<&mut Team> {
-        self.teams.get_mut(name)
-    }
-
     #[must_use]
     pub fn get_entity_team(&self, entity_name: &str) -> Option<&Team> {
         self.teams
@@ -235,9 +240,9 @@ impl Scoreboard {
             sort_order: VarInt(0),
         };
 
-        target.send_editioned(&je_update, &be_update);
-
         self.objectives.insert(objective.name.clone(), objective);
+        target.replace_scoreboard_snapshot(self);
+        target.send_editioned(&je_update, &be_update);
     }
 
     pub fn update_objective(
@@ -269,9 +274,9 @@ impl Scoreboard {
             sort_order: VarInt(0),
         };
 
-        target.send_editioned(&je_update, &be_update);
-
         self.objectives.insert(objective.name.clone(), objective);
+        target.replace_scoreboard_snapshot(self);
+        target.send_editioned(&je_update, &be_update);
     }
 
     pub fn set_display_objective(
@@ -304,13 +309,13 @@ impl Scoreboard {
             sort_order: VarInt(0),
         };
 
-        target.send_editioned(&je_display, &be_display);
-
         if let Some(name) = objective_name {
             self.display_slots.insert(slot, name.to_string());
         } else {
             self.display_slots.remove(&slot);
         }
+        target.replace_scoreboard_snapshot(self);
+        target.send_editioned(&je_display, &be_display);
     }
 
     pub fn clear_display_objective(
@@ -342,11 +347,11 @@ impl Scoreboard {
             objective_name: name.to_string(),
         };
 
-        target.send_editioned(&je_packet, &be_packet);
-
         self.objectives.remove(name);
         self.scores.remove(name);
         self.display_slots.retain(|_, obj| obj != name);
+        target.replace_scoreboard_snapshot(self);
+        target.send_editioned(&je_packet, &be_packet);
     }
 
     pub fn update_score(&mut self, target: &impl ScoreboardTarget, score: ScoreboardScore) {
@@ -378,12 +383,12 @@ impl Scoreboard {
             }],
         };
 
-        target.send_editioned(&je_packet, &be_packet);
-
         self.scores
             .entry(score.objective_name.clone())
             .or_default()
             .insert(score.entity_name.clone(), score);
+        target.replace_scoreboard_snapshot(self);
+        target.send_editioned(&je_packet, &be_packet);
     }
 
     pub fn set_score_value(
@@ -442,11 +447,11 @@ impl Scoreboard {
             }],
         };
 
-        target.send_editioned(&je_packet, &be_packet);
-
         if let Some(objective_scores) = self.scores.get_mut(objective_name) {
             objective_scores.remove(entity_name);
         }
+        target.replace_scoreboard_snapshot(self);
+        target.send_editioned(&je_packet, &be_packet);
     }
 
     pub fn reset_scores_for_entity(&mut self, target: &impl ScoreboardTarget, entity_name: &str) {
@@ -471,11 +476,11 @@ impl Scoreboard {
             entries: be_entries,
         };
 
-        target.send_editioned(&je_packet, &be_packet);
-
         for obj_scores in self.scores.values_mut() {
             obj_scores.remove(entity_name);
         }
+        target.replace_scoreboard_snapshot(self);
+        target.send_editioned(&je_packet, &be_packet);
     }
 
     pub fn add_team(&mut self, target: &impl ScoreboardTarget, team: Team) {
@@ -484,6 +489,10 @@ impl Scoreboard {
             return;
         }
 
+        let team_name = team.name.clone();
+        self.teams.insert(team_name.clone(), team);
+        target.replace_scoreboard_snapshot(self);
+        let team = self.teams.get(&team_name).unwrap();
         let parameters = TeamParameters {
             display_name: &team.display_name,
             options: team.options,
@@ -493,15 +502,12 @@ impl Scoreboard {
             player_prefix: &team.player_prefix,
             player_suffix: &team.player_suffix,
         };
-
         target.send_je(&CSetPlayerTeam {
-            team_name: team.name.clone(),
+            team_name,
             method: TeamMethod::Create,
             parameters: Some(parameters),
             players: team.players.clone().into(),
         });
-
-        self.teams.insert(team.name.clone(), team);
     }
 
     pub fn create_team(&mut self, target: &impl ScoreboardTarget, team: Team) {
@@ -514,6 +520,10 @@ impl Scoreboard {
             return;
         }
 
+        let team_name = team.name.clone();
+        self.teams.insert(team_name.clone(), team);
+        target.replace_scoreboard_snapshot(self);
+        let team = self.teams.get(&team_name).unwrap();
         let parameters = TeamParameters {
             display_name: &team.display_name,
             options: team.options,
@@ -523,15 +533,12 @@ impl Scoreboard {
             player_prefix: &team.player_prefix,
             player_suffix: &team.player_suffix,
         };
-
         target.send_je(&CSetPlayerTeam {
-            team_name: team.name.clone(),
+            team_name,
             method: TeamMethod::Update,
             parameters: Some(parameters),
             players: Box::new([]),
         });
-
-        self.teams.insert(team.name.clone(), team);
     }
 
     pub fn remove_team(&mut self, target: &impl ScoreboardTarget, name: &str) {
@@ -540,14 +547,14 @@ impl Scoreboard {
             return;
         }
 
+        self.teams.remove(name);
+        target.replace_scoreboard_snapshot(self);
         target.send_je(&CSetPlayerTeam {
             team_name: name.to_string(),
             method: TeamMethod::Remove,
             parameters: None,
             players: Box::new([]),
         });
-
-        self.teams.remove(name);
     }
 
     pub fn add_player_to_team(
@@ -556,7 +563,7 @@ impl Scoreboard {
         team_name: &str,
         player: String,
     ) {
-        let Some(team) = self.teams.get_mut(team_name) else {
+        let Some(team) = self.teams.get(team_name) else {
             warn!(
                 "Tried to add player to Team which does not exist, {}",
                 team_name
@@ -568,14 +575,18 @@ impl Scoreboard {
             return;
         }
 
+        self.teams
+            .get_mut(team_name)
+            .unwrap()
+            .players
+            .push(player.clone());
+        target.replace_scoreboard_snapshot(self);
         target.send_je(&CSetPlayerTeam {
             team_name: team_name.to_string(),
             method: TeamMethod::AddPlayers,
             parameters: None,
             players: vec![player.clone()].into(),
         });
-
-        team.players.push(player);
     }
 
     pub fn remove_player_from_team(
@@ -584,7 +595,7 @@ impl Scoreboard {
         team_name: &str,
         player: &str,
     ) {
-        let Some(team) = self.teams.get_mut(team_name) else {
+        let Some(team) = self.teams.get(team_name) else {
             warn!(
                 "Tried to remove player from Team which does not exist, {}",
                 team_name
@@ -596,18 +607,22 @@ impl Scoreboard {
             return;
         }
 
+        self.teams
+            .get_mut(team_name)
+            .unwrap()
+            .players
+            .retain(|current| current != player);
+        target.replace_scoreboard_snapshot(self);
         target.send_je(&CSetPlayerTeam {
             team_name: team_name.to_string(),
             method: TeamMethod::RemovePlayers,
             parameters: None,
             players: vec![player.to_string()].into(),
         });
-
-        team.players.retain(|p| p != player);
     }
 
     pub fn clear_team_players(&mut self, target: &impl ScoreboardTarget, team_name: &str) {
-        let Some(team) = self.teams.get_mut(team_name) else {
+        let Some(team) = self.teams.get(team_name) else {
             warn!(
                 "Tried to clear players from Team which does not exist, {}",
                 team_name
@@ -620,14 +635,14 @@ impl Scoreboard {
         }
 
         let players_to_remove = team.players.clone();
+        self.teams.get_mut(team_name).unwrap().players.clear();
+        target.replace_scoreboard_snapshot(self);
         target.send_je(&CSetPlayerTeam {
             team_name: team_name.to_string(),
             method: TeamMethod::RemovePlayers,
             parameters: None,
             players: players_to_remove.into(),
         });
-
-        team.players.clear();
     }
 
     pub fn send_to_player(&self, player: &Player) {
@@ -1206,6 +1221,147 @@ impl ScoreboardBuilder {
     #[must_use]
     pub fn build(self) -> Scoreboard {
         self.scoreboard
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use arc_swap::ArcSwap;
+
+    use super::*;
+
+    struct SnapshotTarget {
+        scoreboard: ArcSwap<Scoreboard>,
+        publications: AtomicUsize,
+    }
+
+    impl SnapshotTarget {
+        fn new() -> Self {
+            Self {
+                scoreboard: ArcSwap::from_pointee(Scoreboard::default()),
+                publications: AtomicUsize::new(0),
+            }
+        }
+
+        fn snapshot(&self) -> Arc<Scoreboard> {
+            self.scoreboard.load_full()
+        }
+    }
+
+    impl ScoreboardTarget for SnapshotTarget {
+        fn send_editioned<J: ClientPacket + Sync, B: BClientPacket + Sync>(
+            &self,
+            _je_packet: &J,
+            _be_packet: &B,
+        ) {
+        }
+
+        fn send_je<J: ClientPacket + Sync>(&self, _je_packet: &J) {}
+
+        fn replace_scoreboard_snapshot(&self, scoreboard: &Scoreboard) {
+            self.scoreboard.store(Arc::new(scoreboard.clone()));
+            self.publications.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn objective(display_name: &str) -> ScoreboardObjective {
+        ScoreboardObjective::new(
+            "objective",
+            TextComponent::text(display_name.to_string()),
+            RenderType::Integer,
+            None,
+            "dummy",
+        )
+    }
+
+    fn team(display_name: &str) -> Team {
+        Team {
+            name: "team".to_string(),
+            display_name: TextComponent::text(display_name.to_string()),
+            options: 0,
+            nametag_visibility: NameTagVisibility::Always,
+            collision_rule: CollisionRule::Always,
+            color: NamedColor::White,
+            player_prefix: TextComponent::empty(),
+            player_suffix: TextComponent::empty(),
+            players: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn every_world_scoreboard_mutation_publishes_a_complete_snapshot() {
+        let target = SnapshotTarget::new();
+        let mut scoreboard = Scoreboard::default();
+
+        scoreboard.add_objective(&target, objective("first"));
+        assert_eq!(
+            target
+                .snapshot()
+                .get_objective("objective")
+                .unwrap()
+                .display_name
+                .clone()
+                .get_text(),
+            "first"
+        );
+
+        scoreboard.update_objective(&target, objective("second"));
+        scoreboard.set_display_objective(
+            &target,
+            ScoreboardDisplaySlot::Sidebar,
+            Some("objective"),
+        );
+        assert_eq!(
+            target
+                .snapshot()
+                .get_display_objective(ScoreboardDisplaySlot::Sidebar),
+            Some("objective")
+        );
+        scoreboard.clear_display_objective(&target, ScoreboardDisplaySlot::Sidebar);
+        assert!(
+            target
+                .snapshot()
+                .get_display_objective(ScoreboardDisplaySlot::Sidebar)
+                .is_none()
+        );
+
+        scoreboard.update_score(
+            &target,
+            ScoreboardScore::new("player", "objective", VarInt(1), None, None),
+        );
+        scoreboard.set_score_value(&target, "player", "objective", 2);
+        scoreboard.add_score(&target, "player", "objective", 3);
+        assert_eq!(
+            target.snapshot().get_score_value("player", "objective"),
+            Some(5)
+        );
+        scoreboard.remove_score(&target, "player", "objective");
+        scoreboard.set_score_value(&target, "player", "objective", 2);
+        scoreboard.reset_scores_for_entity(&target, "player");
+        assert!(target.snapshot().get_score("player", "objective").is_none());
+
+        scoreboard.add_team(&target, team("first"));
+        scoreboard.update_team(&target, team("second"));
+        scoreboard.add_player_to_team(&target, "team", "player".to_string());
+        assert_eq!(
+            target.snapshot().get_team("team").unwrap().players,
+            vec!["player".to_string()]
+        );
+        scoreboard.remove_player_from_team(&target, "team", "player");
+        scoreboard.add_player_to_team(&target, "team", "player".to_string());
+        scoreboard.clear_team_players(&target, "team");
+        scoreboard.remove_team(&target, "team");
+        scoreboard.remove_objective(&target, "objective");
+
+        let snapshot = target.snapshot();
+        assert!(snapshot.get_objectives().is_empty());
+        assert!(snapshot.get_display_slots().is_empty());
+        assert!(snapshot.get_scores().is_empty());
+        assert!(snapshot.get_teams().is_empty());
+        assert_eq!(target.publications.load(Ordering::Relaxed), 18);
     }
 }
 
