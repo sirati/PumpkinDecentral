@@ -54,6 +54,17 @@ impl JavaClient {
             event;
             'after: {
                 player.swing_hand(hand, false);
+                let visual_hand = match hand {
+                    Hand::Right => 0,
+                    Hand::Left => 1,
+                };
+                pumpkin_cluster::visual::emit_swing(
+                    player.cluster_gid(),
+                    pumpkin_cluster::visual::tick_from_counter(
+                        player.tick_counter.load(Ordering::Relaxed),
+                    ),
+                    visual_hand,
+                );
             }
         }}
     }

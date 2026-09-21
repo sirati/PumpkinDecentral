@@ -19,7 +19,7 @@ impl JavaClient {
                 return;
             }
 
-            let (update_settings, update_watched, main_hand_changed, locale_changed) = {
+            let (update_settings, update_watched, main_hand_changed, locale_changed, skin_changed) = {
                 // 1. Load current snapshot
                 let current_config = player.config.load();
 
@@ -67,6 +67,7 @@ impl JavaClient {
                     update_watched,
                     main_hand_changed,
                     locale_changed,
+                    current_config.skin_parts != client_information.skin_parts,
                 )
             };
 
@@ -86,6 +87,16 @@ impl JavaClient {
                     cancelled: false,
                 };
                 server.plugin_manager.fire_blocking(server, &mut event);
+            }
+
+            if skin_changed {
+                pumpkin_cluster::visual::emit_skin(
+                    player.cluster_gid(),
+                    pumpkin_cluster::visual::tick_from_counter(
+                        player.tick_counter.load(std::sync::atomic::Ordering::Relaxed),
+                    ),
+                    client_information.skin_parts,
+                );
             }
 
             if update_settings {

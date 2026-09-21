@@ -63,6 +63,25 @@ impl EntityEquipment {
             .unwrap_or_else(|| ItemStack::EMPTY.clone())
     }
 
+    #[must_use]
+    pub const fn visual_slot_index(slot: &EquipmentSlot) -> u8 {
+        match slot {
+            EquipmentSlot::MainHand(_) => 0,
+            EquipmentSlot::OffHand(_) => 1,
+            EquipmentSlot::Feet(_) => 2,
+            EquipmentSlot::Legs(_) => 3,
+            EquipmentSlot::Chest(_) => 4,
+            EquipmentSlot::Head(_) => 5,
+            EquipmentSlot::Body(_) => 6,
+            EquipmentSlot::Saddle(_) => 7,
+        }
+    }
+
+    #[must_use]
+    pub const fn visual_item_id(stack: &ItemStack) -> u16 {
+        stack.item.id
+    }
+
     /// Checks if all equipment slots are empty.
     pub fn is_empty(&self) -> bool {
         self.equipment.values().all(ItemStack::is_empty)

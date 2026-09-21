@@ -28,8 +28,11 @@ pub mod recipe;
 
 /// Resource pack configuration options.
 pub mod resource_pack;
+#[allow(missing_docs)]
+pub mod cluster;
 
 pub use chat::{AntiSpamConfig, ChatConfig};
+pub use cluster::{ClusterConfig, ClusterRole, PinnedPeerConfig};
 pub use commands::{CommandOverride, CommandsConfig};
 pub use networking::auth::AuthenticationConfig;
 pub use networking::bedrock::BedrockConfig;
@@ -164,6 +167,8 @@ pub struct AdvancedConfiguration {
     pub chat: ChatConfig,
     /// Player-vs-player rules and mechanics.
     pub pvp: PVPConfig,
+    #[allow(missing_docs)]
+    pub cluster: ClusterConfig,
     /// Server links configuration exposed to clients.
     pub server_links: ServerLinksConfig,
     /// Persistent player data handling and storage behaviour.

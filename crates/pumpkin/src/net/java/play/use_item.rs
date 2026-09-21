@@ -97,9 +97,10 @@ impl JavaClient {
             }
         }
 
-        if held.get_data_component::<ConsumableImpl>().is_some()
-            || held.get_data_component::<BlocksAttacksImpl>().is_some()
-        {
+        let blocking = held
+            .get_data_component::<BlocksAttacksImpl>()
+            .is_some();
+        if held.get_data_component::<ConsumableImpl>().is_some() || blocking {
             // If its food we want to make sure we can actually consume it
             if let Some(food) = held.get_data_component::<FoodImpl>() {
                 if player.can_eat(food.can_always_eat) {
@@ -108,11 +109,43 @@ impl JavaClient {
                         held.clone(),
                         held.get_max_use_time(),
                     );
+                    if blocking {
+                        pumpkin_cluster::visual::emit_blocking(
+                            player.cluster_gid(),
+                            pumpkin_cluster::visual::tick_from_counter(
+                                player.tick_counter.load(Ordering::Relaxed),
+                            ),
+                            true,
+                        );
+                    }
+                    #[allow(clippy::cast_possible_truncation)]
+                    let eat_slot = match hand {
+                        Hand::Right => inventory.get_selected_slot(),
+                        Hand::Left => PlayerInventory::OFF_HAND_SLOT as u8,
+                    };
+                    pumpkin_cluster::transient::emit_eat_start(
+                        player.cluster_gid(),
+                        pumpkin_cluster::transient::tick_from_counter(
+                            player.tick_counter.load(Ordering::Relaxed),
+                        ),
+                        eat_slot,
+                        held.item.id,
+                        held.item_count,
+                    );
                 }
             } else {
                 player
                     .living_entity
                     .set_active_hand(hand, held.clone(), held.get_max_use_time());
+                if blocking {
+                    pumpkin_cluster::visual::emit_blocking(
+                        player.cluster_gid(),
+                        pumpkin_cluster::visual::tick_from_counter(
+                            player.tick_counter.load(Ordering::Relaxed),
+                        ),
+                        true,
+                    );
+                }
             }
         }
         let equipment_slot = held

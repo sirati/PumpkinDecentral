@@ -6,6 +6,7 @@ use pumpkin_util::text::TextComponent;
 use crate::command::argument_builder::{ArgumentBuilder, argument, command};
 use crate::command::argument_types::core::string::StringArgumentType;
 use crate::command::argument_types::entity::EntityArgumentType;
+use crate::command::argument_types::entity_selector::EntitySelector;
 use crate::command::context::command_context::CommandContext;
 use crate::command::node::dispatcher::CommandDispatcher;
 use crate::command::node::{CommandExecutor, CommandExecutorResult};
@@ -19,7 +20,46 @@ struct MsgExecutor;
 
 impl CommandExecutor for MsgExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
-        let targets = EntityArgumentType::get_players(context, "targets")?;
+        let targets = match EntityArgumentType::get_players(context, "targets") {
+            Ok(targets) => targets,
+            Err(error) => {
+                // No local player matched: retry as a cluster-wide private message to a
+                // player online on another host before reporting the selector error.
+                let selector = context.get_argument::<EntitySelector>("targets")?;
+                if selector.uses_selector_variable || selector.entity_uuid.is_some() {
+                    return Err(error);
+                }
+                let Some(target_name) = selector.player_name.clone() else {
+                    return Err(error);
+                };
+                let message = StringArgumentType::get(context, "message")?.to_string();
+                if crate::server::cluster_chat_pm::send_private_from_command(
+                    context,
+                    &target_name,
+                    &message,
+                )
+                .is_none()
+                {
+                    return Err(error);
+                }
+                return Ok(1);
+            }
+        };
+        let see_hidden =
+            context
+                .source
+                .has_permission(crate::server::cluster_hide::HIDE_PERMISSION);
+        let visible: Vec<_> = targets
+            .into_iter()
+            .filter(|target| see_hidden || !crate::server::cluster_hide::is_hidden_player(target))
+            .collect();
+        if visible.is_empty() {
+            return Err(
+                crate::command::argument_types::entity::NO_PLAYERS_ERROR_TYPE
+                    .create_without_context(),
+            );
+        }
+        let targets = visible;
         let msg = StringArgumentType::get(context, "message")?;
 
         let sender_name = &context.source.display_name;

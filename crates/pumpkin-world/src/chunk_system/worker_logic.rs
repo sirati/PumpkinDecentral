@@ -4,8 +4,8 @@ use super::{ChunkPos, IOLock};
 use crate::ProtoChunk;
 use crate::chunk::format::LightContainer;
 use crate::chunk::io::LoadedData::Loaded;
-use crate::chunk::io::{FileIO, LoadedData, run_blocking};
-use crate::level::Level;
+use crate::chunk::io::{Dirtiable, FileIO, LoadedData, run_blocking};
+use crate::level::{Level, SyncChunk};
 use pumpkin_config::lighting::LightingEngineConfig;
 use pumpkin_data::chunk::ChunkStatus;
 use std::collections::hash_map::Entry;
@@ -15,6 +15,7 @@ use tracing::{debug, error, warn};
 
 pub enum RecvChunk {
     IO(Chunk),
+    Cluster((ChunkPos, SyncChunk)),
     Generation(Cache),
     GenerationFailure {
         pos: ChunkPos,
@@ -209,14 +210,25 @@ pub async fn io_write_work(
         .await;
         let upgrade_failed = match upgrade_result {
             Ok(vec) => {
-                if let Err(e) = level
+                if crate::level::is_cluster_secondary() {
+                    for (_, chunk) in &vec {
+                        chunk.mark_dirty(false);
+                    }
+                    debug!(
+                        chunks = vec.len(),
+                        "refusing region write on cluster secondary (diskless); discarding"
+                    );
+                    false
+                } else if let Err(e) = level
                     .chunk_saver
                     .save_chunks(&level.level_folder, vec)
                     .await
                 {
                     error!("Failed to save chunks: {:?}", e);
+                    false
+                } else {
+                    false
                 }
-                false
             }
             Err(_) => true,
         };
@@ -260,6 +272,14 @@ pub fn run_generation(
     stage: StagedChunkEnum,
     level: &Level,
 ) -> RecvChunk {
+    if crate::level::is_cluster_secondary() {
+        error!("Cluster secondary refused local chunk generation at {pos:?} ({stage:?}): secondaries never generate, chunks must arrive from the holding peer");
+        return RecvChunk::GenerationFailure {
+            pos,
+            stage,
+            error: "chunk generation is disabled on cluster secondaries".to_string(),
+        };
+    }
     let portal = level.world_portal.load_full();
     let Some(portal_ref) = portal.as_deref() else {
         error!("Chunk generation FAILED at {pos:?} ({stage:?}): World portal is not initialized");

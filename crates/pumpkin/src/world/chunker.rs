@@ -162,6 +162,11 @@ pub fn update_position(player: &Arc<Player>) {
                     .await;
 
                 if !chunks_to_clean.is_empty() {
+                    if pumpkin_world::level::is_cluster_secondary() {
+                        for pos in &chunks_to_clean {
+                            world_clone.level.unwant_cluster_chunk(*pos);
+                        }
+                    }
                     world_clone
                         .remove_entities_in_chunks(&chunks_to_clean)
                         .await;

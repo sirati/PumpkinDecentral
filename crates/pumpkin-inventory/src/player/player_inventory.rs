@@ -143,6 +143,21 @@ impl PlayerInventory {
         }
     }
 
+    pub fn try_get_stack_in_hand(&self, hand: Hand) -> Option<ItemStack> {
+        match hand {
+            Hand::Right => {
+                let selected = self.get_selected_slot() as usize;
+                let stacks = self.main_inventory.try_read().ok()?;
+                stacks.get(selected).cloned()
+            }
+            Hand::Left => {
+                let slot = self.equipment_slots.get(&Self::OFF_HAND_SLOT)?;
+                let equipment = self.entity_equipment.try_lock().ok()?;
+                Some(equipment.get(slot))
+            }
+        }
+    }
+
     /// Gets the item in the off-hand.
     ///
     /// Mojang name: `getOffHandStack`
@@ -617,5 +632,60 @@ impl PlayerInventory {
     /// Gets the currently selected hotbar slot index.
     pub fn get_selected_slot(&self) -> u8 {
         self.selected_slot.load(Ordering::Relaxed)
+    }
+}
+
+impl PlayerInventory {
+    pub fn consume_for_place(
+        &self,
+        hand: Hand,
+        consume: bool,
+        emit: impl FnOnce(u8, u8),
+    ) -> bool {
+        match hand {
+            Hand::Right => {
+                let selected = self.get_selected_slot();
+                let Ok(mut stacks) = self.main_inventory.try_write() else {
+                    return false;
+                };
+                let Some(stack) = stacks.get_mut(selected as usize) else {
+                    return false;
+                };
+                if stack.is_empty() {
+                    return false;
+                }
+                let count_after = if consume {
+                    stack.item_count.saturating_sub(1)
+                } else {
+                    stack.item_count
+                };
+                stack.set_count(count_after);
+                drop(stacks);
+                emit(selected, count_after);
+                true
+            }
+            Hand::Left => {
+                let Some(slot) = self.equipment_slots.get(&Self::OFF_HAND_SLOT) else {
+                    return false;
+                };
+                let Ok(mut equipment) = self.entity_equipment.try_lock() else {
+                    return false;
+                };
+                let mut stack = equipment.get(slot);
+                if stack.is_empty() {
+                    return false;
+                }
+                let count_after = if consume {
+                    stack.item_count.saturating_sub(1)
+                } else {
+                    stack.item_count
+                };
+                stack.set_count(count_after);
+                equipment.put(slot, stack);
+                drop(equipment);
+                emit(Self::OFF_HAND_SLOT as u8, count_after);
+                true
+            }
+        }
     }
 }

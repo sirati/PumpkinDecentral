@@ -313,6 +313,13 @@ impl PartialEq for World {
 
 impl Eq for World {}
 
+static CLUSTER_BREAK_METRICS: pumpkin_cluster::break_emit::BreakMetrics =
+    pumpkin_cluster::break_emit::BreakMetrics::new();
+
+const fn secondary_tick_is_idle(cluster_secondary: bool, local_player_count: usize) -> bool {
+    cluster_secondary && local_player_count == 0
+}
+
 impl World {
     pub async fn get_block_state_id_async(&self, position: &BlockPos) -> BlockStateId {
         if !self.is_in_build_limit(*position) {
@@ -571,6 +578,10 @@ impl World {
     }
 
     pub async fn shutdown(&self) {
+        if pumpkin_world::level::is_cluster_secondary() {
+            self.level.shutdown().await;
+            return;
+        }
         for entity in self.entities.load().iter() {
             self.save_entity(entity).await;
         }
@@ -656,7 +667,8 @@ impl World {
         java_status: EntityStatus,
         bedrock_status: Option<ActorEventID>,
     ) {
-        let je_packet = CEntityStatus::new(entity.entity_id, java_status as i8);
+        let status_code = java_status as i8;
+        let je_packet = CEntityStatus::new(entity.entity_id, status_code);
         if let Some(be_event) = bedrock_status {
             let be_packet = SActorEvent {
                 target_runtime_id: VarULong(entity.entity_id as u64),
@@ -667,6 +679,13 @@ impl World {
             self.send_to_tracking_players_and_self_editioned(entity, &je_packet, &be_packet);
         } else {
             self.send_to_tracking_players_and_self(entity, &je_packet);
+        }
+        if let Some(server) = self.server.upgrade() {
+            crate::server::cluster_entity_emit::stage_transient_if_cluster(
+                &server,
+                entity,
+                u8::try_from(status_code).unwrap_or(u8::MAX),
+            );
         }
     }
 
@@ -689,6 +708,13 @@ impl World {
             position,
         );
         self.send_to_tracking_players_and_self(entity, &je_packet);
+        if let Some(server) = self.server.upgrade() {
+            crate::server::cluster_entity_emit::stage_combat_if_cluster(
+                &server,
+                entity,
+                u8::try_from(damage_type_id).unwrap_or(u8::MAX),
+            );
+        }
     }
 
     /// Sends an entity status update to all players tracking the specified entity.
@@ -1477,6 +1503,11 @@ impl World {
 
     #[expect(clippy::too_many_lines)]
     pub fn tick(self: &Arc<Self>, server: &Arc<Server>) {
+        if pumpkin_world::level::is_cluster_secondary() {
+            self.tick_cluster_secondary(server);
+            return;
+        }
+
         const ENTITY_TICK_BATCH_SIZE: usize = 16;
 
         let start = std::time::Instant::now();
@@ -1649,6 +1680,22 @@ impl World {
                 block_entity_elapsed,
             );
         }
+    }
+
+    fn tick_cluster_secondary(self: &Arc<Self>, server: &Arc<Server>) {
+        let players = self.players.load();
+        if secondary_tick_is_idle(true, players.len()) {
+            return;
+        }
+
+        self.flush_block_updates();
+        self.flush_synced_block_events();
+
+        let handle = server.runtime.clone();
+        players.par_iter().for_each(|player| {
+            let _guard = handle.enter();
+            player.tick(server);
+        });
     }
 
     pub fn register_block_change(&self, position: BlockPos, block_state_id: BlockStateId) {
@@ -1976,6 +2023,13 @@ impl World {
             });
 
         // 3. Parallel Random Ticks via Rayon
+        let delta_secondary = pumpkin_world::level::is_cluster_secondary();
+        let delta_mesh =
+            !delta_secondary && crate::server::cluster_world_delta::mesh_active();
+        let delta_holder =
+            pumpkin_cluster::identity::ServerId(server.advanced_config.cluster.server_id);
+        let delta_tick = pumpkin_cluster::time::TickStamp::now();
+        if !delta_secondary {
         let world = self.clone();
         let random_handle = handle.clone();
         tick_data
@@ -1984,8 +2038,20 @@ impl World {
             .for_each(|batch| {
                 let _guard = random_handle.enter();
                 let world = world.clone();
+                let mut transitions: Vec<(
+                    pumpkin_cluster::protocol::BlockPos,
+                    u16,
+                    u16,
+                )> = Vec::new();
                 for scheduled_tick in batch {
                     let pos = scheduled_tick.position;
+                    let watch_delta = delta_mesh
+                        && (scheduled_tick.tick_block || scheduled_tick.tick_fluid);
+                    let before_delta = if watch_delta {
+                        Some(world.get_block_state_id(&pos))
+                    } else {
+                        None
+                    };
                     let (block, fluid) =
                         match (scheduled_tick.tick_block, scheduled_tick.tick_fluid) {
                             (true, true) => {
@@ -2014,8 +2080,50 @@ impl World {
                     {
                         pumpkin_fluid.random_tick(fluid, &world, &pos);
                     }
+
+                    if let Some(before) = before_delta {
+                        let after = world.get_block_state_id(&pos);
+                        if before != after {
+                            transitions.push((
+                                pumpkin_cluster::protocol::BlockPos {
+                                    x: pos.0.x,
+                                    y: pos.0.y,
+                                    z: pos.0.z,
+                                },
+                                before.as_u16(),
+                                after.as_u16(),
+                            ));
+                        }
+                    }
+                }
+                if !transitions.is_empty() {
+                    let mut grouped: HashMap<
+                        pumpkin_cluster::protocol::ChunkAddr,
+                        Vec<pumpkin_cluster::world_delta::BlockDelta>,
+                    > = HashMap::new();
+                    for (delta_pos, old_state, new_state) in transitions {
+                        grouped
+                            .entry(pumpkin_cluster::world_delta::chunk_of_block(
+                                delta_pos.x, delta_pos.z,
+                            ))
+                            .or_default()
+                            .push(pumpkin_cluster::world_delta::BlockDelta {
+                                pos: delta_pos,
+                                old_state,
+                                new_state,
+                            });
+                    }
+                    for (chunk, edits) in grouped {
+                        crate::server::cluster_world_delta::emit_random_tick_delta(
+                            delta_holder,
+                            chunk,
+                            delta_tick,
+                            edits,
+                        );
+                    }
                 }
             });
+        }
 
         // 4. Calculate Spawn List (Sequential setup)
         let spawn_state = self.spawn_state.load();
@@ -2390,6 +2498,10 @@ impl World {
         spawn_list: &Vec<&'static MobCategory>,
         spawn_state: &Arc<SpawnState>,
     ) {
+        if pumpkin_world::level::is_cluster_secondary() {
+            return;
+        }
+
         // this.level.tickThunder(chunk);
         //TODO check in simulation distance
         let (is_raining, is_thundering) = (self.is_raining(), self.is_thundering());
@@ -3178,16 +3290,18 @@ impl World {
         };
 
         let gamemode = player.gamemode.load();
-        self.broadcast_packet_except_editioned(
-            &[gameprofile.id],
-            &CPlayerInfoUpdate::new(
-                (PlayerInfoFlags::ADD_PLAYER
-                    | PlayerInfoFlags::UPDATE_GAME_MODE
-                    | PlayerInfoFlags::UPDATE_LISTED
-                    | PlayerInfoFlags::UPDATE_LATENCY
-                    | PlayerInfoFlags::UPDATE_LIST_PRIORITY
-                    | PlayerInfoFlags::UPDATE_HAT)
-                    .bits(),
+        let player_hidden = crate::server::cluster_hide::is_hidden_player(&player);
+        if !player_hidden {
+            self.broadcast_packet_except_editioned(
+                &[gameprofile.id],
+                &CPlayerInfoUpdate::new(
+                    (PlayerInfoFlags::ADD_PLAYER
+                        | PlayerInfoFlags::UPDATE_GAME_MODE
+                        | PlayerInfoFlags::UPDATE_LISTED
+                        | PlayerInfoFlags::UPDATE_LATENCY
+                        | PlayerInfoFlags::UPDATE_LIST_PRIORITY
+                        | PlayerInfoFlags::UPDATE_HAT)
+                        .bits(),
                 &[pumpkin_protocol::java::client::play::Player {
                     uuid: gameprofile.id,
                     actions: &[
@@ -3200,11 +3314,12 @@ impl World {
                         PlayerAction::UpdateLatency(VarInt(0)),
                         PlayerAction::UpdateListOrder(VarInt(0)),
                         PlayerAction::UpdateHat(true),
-                    ],
-                }],
-            ),
-            &bedrock_player_list,
-        );
+                        ],
+                    }],
+                ),
+                &bedrock_player_list,
+            );
+        }
 
         let bedrock_add_player = CAddPlayer {
             uuid: gameprofile.id,
@@ -3240,10 +3355,11 @@ impl World {
             build_platform: BuildPlatform::Unknown,
         };
 
-        self.broadcast_packet_except_editioned(
-            &[gameprofile.id],
-            &CSpawnEntity::new(
-                (runtime_id as i32).into(),
+        if !player_hidden {
+            self.broadcast_packet_except_editioned(
+                &[gameprofile.id],
+                &CSpawnEntity::new(
+                    (runtime_id as i32).into(),
                 gameprofile.id,
                 i32::from(EntityType::PLAYER.id).into(),
                 position,
@@ -3254,7 +3370,8 @@ impl World {
                 velocity,
             ),
             &bedrock_add_player,
-        );
+            );
+        }
 
         self.send_player_equipment(&player);
         player
@@ -3264,20 +3381,22 @@ impl World {
         // Broadcast metadata to Java players so they can correctly interact with the new player
         let skin_parts = player.config.load().skin_parts;
 
-        self.broadcast_skin_parts(
-            &[gameprofile.id],
-            runtime_id as i32,
-            skin_parts,
-            &actor_data,
-        );
+        if !player_hidden {
+            self.broadcast_skin_parts(
+                &[gameprofile.id],
+                runtime_id as i32,
+                skin_parts,
+                &actor_data,
+            );
+        }
 
         // 2. Spawn existing players for our new Bedrock client
         let players = self.players.load();
 
-        for existing_player in players
-            .iter()
-            .filter(|p| p.gameprofile.id != gameprofile.id)
-        {
+        for existing_player in players.iter().filter(|p| {
+            p.gameprofile.id != gameprofile.id
+                && !crate::server::cluster_hide::is_hidden_player(p)
+        }) {
             let ex_profile = &existing_player.gameprofile;
             let ex_entity = &existing_player.get_entity();
             let ex_pos = ex_entity.pos.load();
@@ -3352,6 +3471,43 @@ impl World {
             client.send_packet(&ex_be_mob_equipment).await;
         }
 
+        {
+            let can_see_hidden = player.has_permission(
+                server,
+                crate::server::cluster_hide::HIDE_PERMISSION,
+            );
+            let mut remote_entries = Vec::new();
+            for (gid, entry) in crate::server::cluster_presence::remote_presence_entries() {
+                if !can_see_hidden
+                    && (crate::server::cluster_hide::is_hidden_gid(&gid)
+                        || crate::server::cluster_hide::is_hidden_uuid_bytes(&entry.uuid))
+                {
+                    continue;
+                }
+                remote_entries.push(PlayerListEntry {
+                    uuid: Uuid::from_bytes(entry.uuid),
+                    entity_unique_id: VarLong(0),
+                    username: entry.name,
+                    xuid: String::new(),
+                    platform_chat_id: String::new(),
+                    build_platform: BuildPlatform::Unknown,
+                    skin: Skin::steve(),
+                    is_teacher: false,
+                    is_host: false,
+                    is_sub_client: false,
+                    player_color: [0, 0, 0, 0],
+                });
+            }
+            if !remote_entries.is_empty() {
+                client
+                    .send_packet(&CPlayerList {
+                        action: CPlayerList::ACTION_ADD,
+                        entries: remote_entries,
+                    })
+                    .await;
+            }
+        }
+
         player.has_played_before.store(true, Ordering::Relaxed);
 
         // 3. Trigger Join Event and Broadcast Join Message
@@ -3365,7 +3521,9 @@ impl World {
         let mut event = PlayerJoinEvent::new(player.clone(), msg_comp);
         server.plugin_manager.fire(server, &mut event).await;
 
-        if !event.cancelled {
+        if !event.cancelled
+            && !crate::server::cluster_hide::is_hidden_player(&player)
+        {
             self.broadcast_system_message(&event.join_message, false);
             info!("{}", event.join_message.to_pretty_console());
         }
@@ -3506,30 +3664,40 @@ impl World {
         };
 
         // Load chunks around the real spawn position before teleporting the client there.
+        // Cluster lobby waiters keep their real server-side position but are only
+        // ever shown fake lobby chunks; no real-location chunk may go out during
+        // login, and the whole lobby burst is enqueued back-to-back so it flushes
+        // together with no loading-terrain delay.
         player.living_entity.entity.set_pos(position);
         player.living_entity.entity.set_rotation(yaw, pitch);
         player.living_entity.entity.last_pos.store(position);
-        chunker::update_position(player);
 
-        let center_chunk = player.living_entity.entity.chunk_pos.load();
-        let chunk = self
-            .level
-            .get_or_fetch_chunk(center_chunk, std::clone::Clone::clone)
-            .await;
-        if let Some(server) = self.server.upgrade() {
-            let mut event =
-                crate::plugin::world::chunk_send::ChunkSend::new(player.world(), chunk.clone());
-            server.plugin_manager.fire(&server, &mut event).await;
-            if event.cancelled {
-                return;
+        if crate::server::cluster_lobby::lobby_applies_to(player) {
+            crate::server::cluster_lobby::lobby_enter_on_login(player);
+        } else {
+            chunker::update_position(player);
+            let center_chunk = player.living_entity.entity.chunk_pos.load();
+            let chunk = self
+                .level
+                .get_or_fetch_chunk(center_chunk, std::clone::Clone::clone)
+                .await;
+            if let Some(server) = self.server.upgrade() {
+                let mut event = crate::plugin::world::chunk_send::ChunkSend::new(
+                    player.world(),
+                    chunk.clone(),
+                );
+                server.plugin_manager.fire(&server, &mut event).await;
+                if event.cancelled {
+                    return;
+                }
             }
+            client.send_chunks(&[chunk]).await;
+
+            debug!("Sending player teleport to {}", player.gameprofile.name);
+            player.request_teleport(position, yaw, pitch);
         }
-        client.send_chunks(&[chunk]).await;
 
         let velocity = player.living_entity.entity.velocity.load();
-
-        debug!("Sending player teleport to {}", player.gameprofile.name);
-        player.request_teleport(position, yaw, pitch);
 
         let gameprofile = &player.gameprofile;
         let bedrock_player_list = CPlayerList {
@@ -3575,10 +3743,13 @@ impl World {
             &java_player,
         );
 
-        self.broadcast_editioned(&player_info_update, &bedrock_player_list);
+        let joiner_hidden = crate::server::cluster_hide::is_hidden_player(player);
+        if !joiner_hidden {
+            self.broadcast_editioned(&player_info_update, &bedrock_player_list);
+        }
 
         // If the player has a custom tab_list_name, send an update for it
-        if let Some(tab_list_name) = player.get_tab_list_name() {
+        if !joiner_hidden && let Some(tab_list_name) = player.get_tab_list_name() {
             let actions = [PlayerAction::UpdateDisplayName(Some(&tab_list_name))];
             let java_player = [pumpkin_protocol::java::client::play::Player {
                 uuid: gameprofile.id,
@@ -3595,10 +3766,10 @@ impl World {
         {
             let players = self.players.load();
             let mut data_to_process = Vec::new();
-            for p in players
-                .iter()
-                .filter(|p| p.gameprofile.id != player.gameprofile.id)
-            {
+            for p in players.iter().filter(|p| {
+                p.gameprofile.id != player.gameprofile.id
+                    && !crate::server::cluster_hide::is_hidden_player(p)
+            }) {
                 let props_guard = p.gameprofile.properties.load();
                 data_to_process.push((props_guard, p));
             }
@@ -3692,6 +3863,65 @@ impl World {
             }
         };
 
+        {
+            let can_see_hidden = player.has_permission(
+                server,
+                crate::server::cluster_hide::HIDE_PERMISSION,
+            );
+            for (gid, entry) in crate::server::cluster_presence::remote_presence_entries() {
+                if !can_see_hidden
+                    && (crate::server::cluster_hide::is_hidden_gid(&gid)
+                        || crate::server::cluster_hide::is_hidden_uuid_bytes(&entry.uuid))
+                {
+                    continue;
+                }
+                let uuid = Uuid::from_bytes(entry.uuid);
+                let properties =
+                    crate::server::cluster_chat_pm::remote_player_properties(&gid);
+                let actions = [
+                    PlayerAction::AddPlayer {
+                        name: entry.name.as_str(),
+                        properties: properties.as_slice(),
+                    },
+                    PlayerAction::UpdateListed(true),
+                    PlayerAction::UpdateLatency(VarInt(0)),
+                ];
+                let java_player = [java::client::play::Player {
+                    uuid,
+                    actions: &actions,
+                }];
+                let bedrock_list = CPlayerList {
+                    action: CPlayerList::ACTION_ADD,
+                    entries: vec![PlayerListEntry {
+                        uuid,
+                        entity_unique_id: VarLong(0),
+                        username: entry.name.clone(),
+                        xuid: String::new(),
+                        platform_chat_id: String::new(),
+                        build_platform: BuildPlatform::Unknown,
+                        skin: Skin::steve(),
+                        is_teacher: false,
+                        is_host: false,
+                        is_sub_client: false,
+                        player_color: [0, 0, 0, 0],
+                    }],
+                };
+                player
+                    .client
+                    .enqueue_packet_editioned(
+                        &CPlayerInfoUpdate::new(
+                            (PlayerInfoFlags::ADD_PLAYER
+                                | PlayerInfoFlags::UPDATE_LISTED
+                                | PlayerInfoFlags::UPDATE_LATENCY)
+                                .bits(),
+                            &java_player,
+                        ),
+                        &bedrock_list,
+                    )
+                    .await;
+            }
+        };
+
         let gameprofile = &player.gameprofile;
 
         let bedrock_add_player = CAddPlayer {
@@ -3741,38 +3971,39 @@ impl World {
             velocity,
         );
 
-        self.broadcast_packet_except_editioned(
-            &[player.gameprofile.id],
-            &spawn_entity,
-            &bedrock_add_player,
-        );
+        if !joiner_hidden {
+            self.broadcast_packet_except_editioned(
+                &[player.gameprofile.id],
+                &spawn_entity,
+                &bedrock_add_player,
+            );
+        }
 
         // Broadcast metadata to Java players so they can correctly interact with the new player
         let skin_parts = player.config.load().skin_parts;
 
-        self.broadcast_skin_parts(
-            &[gameprofile.id],
-            entity_id,
-            skin_parts,
-            &CSetActorData {
+        if !joiner_hidden {
+            self.broadcast_skin_parts(
+                &[gameprofile.id],
+                entity_id,
+                skin_parts,
+                &CSetActorData {
                 target_runtime_id: VarULong(entity_id as u64),
                 actor_data: player.get_entity().bedrock_metadata(),
                 synced_properties: PropertySyncData {
                     int_entries_list: HashMap::new(),
                     float_entries_list: HashMap::new(),
                 },
-                tick: VarULong(0),
-            },
-        );
+                    tick: VarULong(0),
+                },
+            );
+        }
 
         // Spawn players for our client.
         let id = player.gameprofile.id;
-        for existing_player in self
-            .players
-            .load()
-            .iter()
-            .filter(|c| c.gameprofile.id != id)
-        {
+        for existing_player in self.players.load().iter().filter(|c| {
+            c.gameprofile.id != id && !crate::server::cluster_hide::is_hidden_player(c)
+        }) {
             let entity = &existing_player.get_entity();
             let pos = entity.pos.load();
             let gameprofile = &existing_player.gameprofile;
@@ -3961,7 +4192,11 @@ impl World {
             player.get_inventory().get_selected_slot() as i8,
         ));
 
-        if client.version.load() >= JavaMinecraftVersion::V_1_20_2 {
+        // Lobby waiters get a frozen clock inside the lobby burst instead; the
+        // real world settings (border, time, spawn, weather) follow at handoff.
+        let in_lobby = crate::server::cluster_lobby::lobby_applies_to(player)
+            && player.is_in_cluster_lobby();
+        if !in_lobby && client.version.load() >= JavaMinecraftVersion::V_1_20_2 {
             // Start waiting for level chunks. Sets the "Loading Terrain" screen (Added in 1.20.2)
             debug!("Sending waiting chunks to {}", player.gameprofile.name);
             client
@@ -3969,13 +4204,15 @@ impl World {
                 .await;
         }
 
-        self.worldborder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .init_client(client);
+        if !in_lobby {
+            self.worldborder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .init_client(client);
 
-        // Sends initial time
-        player.send_time(self);
+            // Sends initial time
+            player.send_time(self);
+        }
 
         // Sends initial scoreboard state
         player.send_scoreboard();
@@ -3993,14 +4230,16 @@ impl World {
             )
         };
 
-        client
-            .send_packet(&CPlayerSpawnPosition::new(
-                spawn_block_pos,
-                yaw,
-                pitch,
-                self.dimension.minecraft_name.to_owned(),
-            ))
-            .await;
+        if !in_lobby {
+            client
+                .send_packet(&CPlayerSpawnPosition::new(
+                    spawn_block_pos,
+                    yaw,
+                    pitch,
+                    self.dimension.minecraft_name.to_owned(),
+                ))
+                .await;
+        }
 
         // Send initial weather state
         let (is_raining, rain_level, thunder_level) = {
@@ -4014,7 +4253,7 @@ impl World {
                 weather.thunder_level.clamp(0.0, 1.0),
             )
         };
-        if is_raining {
+        if !in_lobby && is_raining {
             client
                 .enqueue_client_packet(&CGameEvent::new(GameEvent::BeginRaining, 0.0))
                 .await;
@@ -4077,9 +4316,13 @@ impl World {
         server.plugin_manager.fire(server, &mut event).await;
 
         if !event.cancelled {
-            self.broadcast_system_message(&event.join_message, false);
-            // TODO: Switch to structured logging, e.g. info!(player = %name, "connected")
-            info!("{}", event.join_message.to_pretty_console());
+            if crate::server::cluster_hide::is_hidden_player(player) {
+                info!("{}", event.join_message.to_pretty_console());
+            } else {
+                self.broadcast_system_message(&event.join_message, false);
+                // TODO: Switch to structured logging, e.g. info!(player = %name, "connected")
+                info!("{}", event.join_message.to_pretty_console());
+            }
         }
     }
 
@@ -4788,9 +5031,15 @@ impl World {
         None
     }
 
-    /// Gets a `Player` by a username
+    /// Gets a logged-in `Player` by username, skipping lobby waiters.
+    ///
+    /// Lobby clients are not logged in yet, so they stay invisible to name
+    /// selectors and entity-targeting commands until the real join.
     pub fn get_player_by_name(&self, name: &str) -> Option<Arc<Player>> {
         for player in self.players.load().iter() {
+            if player.is_in_cluster_lobby() {
+                continue;
+            }
             if player.gameprofile.name.eq_ignore_ascii_case(name) {
                 return Some(player.clone());
             }
@@ -5174,7 +5423,9 @@ impl World {
                 if let Some(server) = self.server.upgrade() {
                     server.plugin_manager.fire(&server, &mut event).await;
 
-                    if !event.cancelled {
+                    if !event.cancelled
+                        && !crate::server::cluster_hide::is_hidden_uuid(&player.gameprofile.id)
+                    {
                         for player in self.players.load().iter() {
                             player.send_system_message(&event.leave_message);
                         }
@@ -5197,6 +5448,9 @@ impl World {
             new_entities.push(entity.clone());
             new_entities
         });
+        if let Some(server) = self.server.upgrade() {
+            crate::server::cluster_entity_emit::stage_spawn_if_cluster(&server, entity.as_ref());
+        }
     }
 
     pub fn spawn_entity(self: &Arc<Self>, entity: Arc<dyn EntityBase>) {
@@ -5244,6 +5498,9 @@ impl World {
             new_entities.push(entity.clone());
             new_entities
         });
+        if let Some(server) = self.server.upgrade() {
+            crate::server::cluster_entity_emit::stage_spawn_if_cluster(&server, entity.as_ref());
+        }
     }
 
     pub fn remove_entity(&self, entity: &dyn EntityBase) {
@@ -5264,6 +5521,9 @@ impl World {
             new_entities.retain(|e| e.get_entity().entity_uuid != base_entity.entity_uuid);
             new_entities
         });
+        if let Some(server) = self.server.upgrade() {
+            crate::server::cluster_entity_emit::stage_despawn_if_cluster(&server, entity);
+        }
     }
 
     pub async fn remove_entities_in_chunks(
@@ -5529,6 +5789,7 @@ impl World {
         if broken_block_state.is_air() {
             return None;
         }
+        let expected_old_state: u16 = broken_block_state.id.as_u16();
 
         let mut flags = flags;
         if flags.contains(BlockFlags::SKIP_DROPS)
@@ -5582,6 +5843,12 @@ impl World {
         };
 
         let broken_state_id = self.set_block_state(position, new_state_id, flags);
+        let cluster_undo = pumpkin_cluster::break_emit::make_undo(broken_state_id.as_u16());
+        trace!(
+            expected_old_state = expected_old_state,
+            undo_old_state = cluster_undo.old_state,
+            "cluster break captured"
+        );
         let broken_block = Block::from_state_id(broken_state_id);
         if !broken_block.is_air()
             && broken_state_id != new_state_id
@@ -5617,6 +5884,35 @@ impl World {
         }
 
         Some(broken_state_id)
+    }
+
+    pub fn apply_cluster_remote_break(
+        self: &Arc<Self>,
+        update: pumpkin_cluster::protocol::BreakBlockUpdate,
+    ) -> Option<BlockStateId> {
+        use pumpkin_cluster::break_emit::{RemoteBreakDecision, apply_remote_break};
+
+        let position = BlockPos::new(update.pos.x, update.pos.y, update.pos.z);
+        if !self.is_in_build_limit(position) {
+            return None;
+        }
+        let current_state: u16 = self.get_block_state_id(&position).as_u16();
+        match apply_remote_break(current_state, &update, &CLUSTER_BREAK_METRICS) {
+            RemoteBreakDecision::Accept { .. } => self.break_block(
+                &position,
+                None,
+                BlockFlags::SKIP_DROPS | BlockFlags::NOTIFY_ALL,
+            ),
+            RemoteBreakDecision::RejectStale { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn cluster_remote_break_counts() -> (u64, u64) {
+        (
+            CLUSTER_BREAK_METRICS.accepted(),
+            CLUSTER_BREAK_METRICS.rejected_stale(),
+        )
     }
 
     #[must_use]
@@ -7205,6 +7501,9 @@ impl World {
     }
 
     pub async fn save(&self) {
+        if pumpkin_world::level::is_cluster_secondary() {
+            return;
+        }
         for entity in self.entities.load().iter() {
             self.save_entity(entity).await;
         }
@@ -7689,7 +7988,16 @@ mod tests {
     };
     use pumpkin_util::math::position::BlockPos;
 
-    use super::{World, bedrock_block_breaking_rate, bedrock_chest_block_actor};
+    use super::{
+        World, bedrock_block_breaking_rate, bedrock_chest_block_actor, secondary_tick_is_idle,
+    };
+
+    #[test]
+    fn empty_cluster_secondary_ticks_have_no_world_work() {
+        assert!(secondary_tick_is_idle(true, 0));
+        assert!(!secondary_tick_is_idle(true, 1));
+        assert!(!secondary_tick_is_idle(false, 0));
+    }
 
     #[test]
     fn liquid_block_states_preserve_source_flow_and_falling_depths() {

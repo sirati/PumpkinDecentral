@@ -31,6 +31,9 @@ impl CommandExecutor for GamemodeExecutor {
         let gamemode = GameModeArgumentType::get(context, "gamemode")?;
 
         let targets = if self.is_self {
+            if context.source.entity.is_none() {
+                return Err(ERROR_NOT_PLAYER.create_without_context());
+            }
             let player = context
                 .source
                 .output

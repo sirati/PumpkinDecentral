@@ -20,7 +20,7 @@ use std::mem::swap;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, trace, warn};
 
 pub(crate) struct TaskHeapNode(i8, NodeKey);
@@ -65,6 +65,9 @@ pub struct GenerationSchedule {
     /// Parked here and re-queued by `check_waiting_tasks()` as chunk data arrives.
     waiting_for_chunks: HashSetType<NodeKey>,
 
+    cluster_fetches: HashMapType<ChunkPos, Instant>,
+    cluster_level: Option<Arc<Level>>,
+
     io_lock: IOLock,
     running_task_count: u16,
     max_in_flight: u16,
@@ -76,7 +79,7 @@ pub struct GenerationSchedule {
     listener: Arc<ChunkListener>,
     lighting_config: LightingEngineConfig,
     last_unload: std::time::Instant,
-    generation_pool: Arc<rayon::ThreadPool>,
+    generation_pool: Option<Arc<rayon::ThreadPool>>,
 }
 
 impl GenerationSchedule {
@@ -134,13 +137,18 @@ impl GenerationSchedule {
 
         let cpus = thread::available_parallelism().map_or(1, std::num::NonZero::get);
         let gen_threads = (cpus / 2).clamp(2, 16);
-        let generation_pool = Arc::new(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(gen_threads)
-                .thread_name(|i| format!("ChunkGen-{i}"))
-                .build()
-                .expect("Failed to build Chunk Generation ThreadPool"),
-        );
+        let generation_pool = if crate::level::is_cluster_secondary() {
+            info!("Cluster secondary scheduler starting in no-generate mode: local chunk generation is disabled, chunks must arrive from the holding peer");
+            None
+        } else {
+            Some(Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(gen_threads)
+                    .thread_name(|i| format!("ChunkGen-{i}"))
+                    .build()
+                    .expect("Failed to build Chunk Generation ThreadPool"),
+            ))
+        };
         let max_in_flight = (gen_threads * 2) as u16;
 
         let level_sched = level;
@@ -158,6 +166,8 @@ impl GenerationSchedule {
                     loaded_chunk_changes: level_sched.loaded_chunk_changes.clone(),
                     unload_chunks: HashSetType::default(),
                     waiting_for_chunks: HashSetType::default(),
+                    cluster_fetches: HashMapType::default(),
+                    cluster_level: Some(level_sched.clone()),
                     io_lock,
                     running_task_count: 0,
                     max_in_flight,
@@ -255,6 +265,176 @@ impl GenerationSchedule {
         self.queue = BinaryHeap::from(tasks);
     }
 
+    fn resort_work_secondary(
+        &mut self,
+        new_data: (Option<LevelChange>, Option<Vec<ChunkPos>>),
+    ) -> bool {
+        if new_data.0.is_none() && new_data.1.is_none() {
+            return false;
+        }
+        if let Some(high_priority) = new_data.1 {
+            self.last_high_priority = high_priority;
+        }
+        let Some(new_level) = new_data.0 else {
+            return true;
+        };
+        for (pos, (_old_stage, new_stage)) in new_level.0 {
+            if new_stage == StagedChunkEnum::None {
+                self.cluster_fetches.remove(&pos);
+                if let Some(mut holder) = self.chunk_map.remove(&pos) {
+                    holder.target_stage = StagedChunkEnum::None;
+                    holder.dependency_stage = StagedChunkEnum::None;
+                    self.chunk_map.insert(pos, holder);
+                }
+                self.unload_chunks.insert(pos);
+                continue;
+            }
+            self.unload_chunks.remove(&pos);
+            if let Some(mut holder) = self.chunk_map.remove(&pos) {
+                let held = holder.public || matches!(holder.chunk, Some(Chunk::Level(_)));
+                if held {
+                    holder.target_stage = new_stage;
+                    holder.dependency_stage = StagedChunkEnum::None;
+                    self.chunk_map.insert(pos, holder);
+                }
+            }
+            self.secondary_request_fetch(pos);
+        }
+        self.last_level = new_level.1;
+        true
+    }
+
+    fn secondary_cluster_arrive(&mut self, pos: ChunkPos, snapshot: SyncChunk) {
+        let mut holder = self.chunk_map.remove(&pos).unwrap_or_default();
+        holder.target_stage = StagedChunkEnum::level_to_stage(
+            *self.last_level.get(&pos).unwrap_or(&ChunkLoading::MAX_LEVEL),
+        );
+        holder.dependency_stage = StagedChunkEnum::None;
+        let held = holder.public
+            || matches!(holder.chunk, Some(Chunk::Level(_)))
+            || self.public_chunk_map.contains_key(&pos);
+        if held {
+            self.chunk_map.insert(pos, holder);
+            return;
+        }
+        let stage = StagedChunkEnum::Full;
+        self.drop_satisfied_tasks(&mut holder, stage);
+        holder.current_stage = stage;
+        holder.occupied = NodeKey::null();
+        self.apply_lighting_override(&snapshot);
+        self.publish_chunk(pos, snapshot.clone());
+        holder.public = true;
+        trace!(
+            "Notifying players: chunk {:?} fetched from holding peer (Full status)",
+            pos
+        );
+        self.listener.process_new_chunk(pos, &snapshot);
+        holder.chunk = Some(Chunk::Level(snapshot));
+        self.chunk_map.insert(pos, holder);
+    }
+
+    fn secondary_request_fetch(&mut self, pos: ChunkPos) {
+        if self.cluster_fetches.contains_key(&pos) {
+            return;
+        }
+        let Some(level) = &self.cluster_level else {
+            return;
+        };
+        level.prefetch_cluster_chunk(pos);
+        if level.try_dispatch_cluster_fetch(pos) {
+            self.cluster_fetches.insert(pos, Instant::now());
+        }
+    }
+
+    fn secondary_poll_fetches(&mut self) {
+        if !crate::level::is_cluster_secondary() {
+            return;
+        }
+        let Some(fetch_level) = self.cluster_level.clone() else {
+            return;
+        };
+        let positions: Vec<_> = fetch_level
+            .cluster_snapshots
+            .iter()
+            .map(|entry| *entry.key())
+            .collect();
+        let mut completed: Vec<(ChunkPos, SyncChunk)> = Vec::with_capacity(positions.len());
+        for pos in positions {
+            if let Some((_, snapshot)) = fetch_level.cluster_snapshots.remove(&pos) {
+                self.cluster_fetches.remove(&pos);
+                completed.push((pos, snapshot));
+            }
+        }
+        for (pos, snapshot) in completed {
+            fetch_level.cluster_ingest_snapshot(pos, &snapshot);
+            self.receive_chunk(pos, RecvChunk::Cluster((pos, snapshot)));
+        }
+        let wanted: Vec<_> = fetch_level
+            .cluster_fetch_wanted
+            .iter()
+            .map(|entry| *entry.key())
+            .collect();
+        for pos in wanted {
+            if self.cluster_fetches.contains_key(&pos) {
+                continue;
+            }
+            if fetch_level.try_dispatch_cluster_fetch(pos) {
+                self.cluster_fetches.insert(pos, Instant::now());
+            }
+        }
+        self.secondary_discard_timed_out_partials();
+    }
+
+    fn secondary_discard_timed_out_partials(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<_> = self
+            .cluster_fetches
+            .iter()
+            .filter_map(|(pos, started)| {
+                (now.duration_since(*started) >= Duration::from_secs(30)).then_some(*pos)
+            })
+            .collect();
+        for pos in expired {
+            let Some(mut holder) = self.chunk_map.remove(&pos) else {
+                self.cluster_fetches.remove(&pos);
+                continue;
+            };
+            if holder.public
+                || holder.current_stage == StagedChunkEnum::Full
+                || matches!(holder.chunk, Some(Chunk::Level(_)))
+                || self.public_chunk_map.contains_key(&pos)
+            {
+                self.chunk_map.insert(pos, holder);
+                self.cluster_fetches.remove(&pos);
+                continue;
+            }
+            if !holder.occupied.is_null()
+                || holder.tasks.iter().any(|task| {
+                    self.graph
+                        .nodes
+                        .get(*task)
+                        .is_some_and(|node| node.in_flight)
+                })
+            {
+                self.chunk_map.insert(pos, holder);
+                continue;
+            }
+            for task in holder.tasks {
+                if !task.is_null() {
+                    self.waiting_for_chunks.remove(&task);
+                    self.drop_node(task);
+                }
+            }
+            self.graph.drop_edge_chain(holder.occupied_by);
+            holder.occupied_by = EdgeKey::null();
+            self.cluster_fetches.remove(&pos);
+            if let Some(level) = &self.cluster_level {
+                level.clear_cluster_fetch_wanted(&pos);
+            }
+            error!(chunk_x = pos.x, chunk_z = pos.y, "cluster chunk load timed out; discarded partial holder");
+        }
+    }
+
     /// TODO: will remove at some point
     pub(crate) fn restore_ready_tasks(
         graph: &mut DAG,
@@ -263,7 +443,11 @@ impl GenerationSchedule {
         last_level: &ChunkLevel,
         last_high_priority: &[ChunkPos],
         _waiting_for_chunks: &HashSetType<NodeKey>,
+        secondary: bool,
     ) -> usize {
+        if secondary {
+            return 0;
+        }
         debug_assert!(queue.is_empty());
 
         let mut to_drop = Vec::new();
@@ -306,7 +490,9 @@ impl GenerationSchedule {
                     && target_node.in_degree > 0
                 {
                     target_node.in_degree -= 1;
-                    if target_node.in_degree == 0 && !target_node.in_queue && !target_node.in_flight
+                    if target_node.in_degree == 0
+                        && !target_node.in_queue
+                        && !target_node.in_flight
                     {
                         target_node.in_queue = true;
                         queue.push(TaskHeapNode(
@@ -357,7 +543,11 @@ impl GenerationSchedule {
         chunk_pos: ChunkPos,
         holder: &mut ChunkHolder,
         req_stage: StagedChunkEnum,
+        secondary: bool,
     ) -> [bool; StagedChunkEnum::COUNT] {
+        if secondary {
+            return [false; StagedChunkEnum::COUNT];
+        }
         // Insert occupied_by edge head
         holder.occupied_by = graph.edges.insert(crate::chunk_system::dag::Edge::new(
             dependency_task,
@@ -468,7 +658,10 @@ impl GenerationSchedule {
     /// Check if any tasks parked in `waiting_for_chunks` now have all their neighbor
     /// chunk data available, and re-queue them if so.
     /// Must be called after every `receive_chunk` call.
-    fn check_waiting_tasks(&mut self) {
+    fn check_waiting_tasks(&mut self, secondary: bool) {
+        if secondary {
+            return;
+        }
         if self.waiting_for_chunks.is_empty() {
             return;
         }
@@ -535,6 +728,9 @@ impl GenerationSchedule {
 
     #[expect(clippy::too_many_lines)]
     fn resort_work(&mut self, new_data: (Option<LevelChange>, Option<Vec<ChunkPos>>)) -> bool {
+        if crate::level::is_cluster_secondary() {
+            return self.resort_work_secondary(new_data);
+        }
         if new_data.0.is_none() && new_data.1.is_none() {
             return false;
         }
@@ -629,6 +825,7 @@ impl GenerationSchedule {
                             pos,
                             &mut holder,
                             req_stage,
+                            crate::level::is_cluster_secondary(),
                         );
                         for (stage_i, &created) in newly_created.iter().enumerate() {
                             if created && stage_i > 1 {
@@ -679,6 +876,7 @@ impl GenerationSchedule {
                 pos,
                 &mut holder,
                 req_stage,
+                crate::level::is_cluster_secondary(),
             );
             for (stage_i, &created) in newly_created.iter().enumerate() {
                 if created && stage_i > 1 {
@@ -843,7 +1041,6 @@ impl GenerationSchedule {
         if self.unload_chunks.is_empty() {
             return;
         }
-
         let mut unload_chunks = HashSetType::default();
         swap(&mut unload_chunks, &mut self.unload_chunks);
         let mut chunks = Vec::with_capacity(unload_chunks.len());
@@ -851,6 +1048,14 @@ impl GenerationSchedule {
             let Some(mut holder) = self.chunk_map.remove(&pos) else {
                 continue;
             };
+            if self
+                .cluster_level
+                .as_ref()
+                .is_some_and(|level| level.is_cluster_pinned(&pos))
+            {
+                self.chunk_map.insert(pos, holder);
+                continue;
+            }
             if holder.target_stage != StagedChunkEnum::None
                 || holder.dependency_stage != StagedChunkEnum::None
             {
@@ -900,6 +1105,9 @@ impl GenerationSchedule {
         if chunks.is_empty() {
             return;
         }
+        if crate::level::is_cluster_secondary() {
+            return;
+        }
         let mut data = self
             .io_lock
             .0
@@ -918,6 +1126,9 @@ impl GenerationSchedule {
     }
 
     fn save_all_chunk(&mut self, save_proto_chunk: bool) {
+        if crate::level::is_cluster_secondary() {
+            return;
+        }
         let mut chunks = Vec::with_capacity(self.chunk_map.len());
 
         for (pos, holder) in &mut self.chunk_map {
@@ -1034,7 +1245,7 @@ impl GenerationSchedule {
                         self.apply_lighting_override(data);
                         let result = self.publish_chunk(pos, data.clone());
                         if result.is_some() {
-                            warn!(
+                            trace!(
                                 "receive_chunk(IO): replacing existing public chunk at {:?}",
                                 pos
                             );
@@ -1061,7 +1272,48 @@ impl GenerationSchedule {
                 self.chunk_map.insert(pos, holder);
 
                 // A new chunk arrived — unblock any waiting generation tasks
-                self.check_waiting_tasks();
+                self.check_waiting_tasks(crate::level::is_cluster_secondary());
+            }
+            RecvChunk::Cluster((cluster_pos, snapshot)) => {
+                if crate::level::is_cluster_secondary() {
+                    self.secondary_cluster_arrive(cluster_pos, snapshot);
+                    return;
+                }
+                let Some(mut holder) = self.chunk_map.remove(&cluster_pos) else {
+                    return;
+                };
+                let already_held = holder.public
+                    || matches!(holder.chunk, Some(Chunk::Level(_)))
+                    || self.public_chunk_map.contains_key(&cluster_pos);
+                if already_held {
+                    trace!(
+                        "receive_chunk(Cluster): discarding snapshot for already held chunk at {:?}",
+                        cluster_pos
+                    );
+                    self.chunk_map.insert(cluster_pos, holder);
+                    return;
+                }
+                let stage = StagedChunkEnum::Full;
+                self.drop_satisfied_tasks(&mut holder, stage);
+                holder.current_stage = stage;
+                if !holder.occupied.is_null()
+                    && self.graph.nodes.contains_key(holder.occupied)
+                {
+                    self.drop_node(holder.occupied);
+                }
+                holder.occupied = NodeKey::null();
+                self.apply_lighting_override(&snapshot);
+                self.publish_chunk(cluster_pos, snapshot.clone());
+                holder.public = true;
+                trace!(
+                    "Notifying players: chunk {:?} fetched from holding peer (Full status)",
+                    cluster_pos
+                );
+                self.listener.process_new_chunk(cluster_pos, &snapshot);
+                holder.chunk = Some(Chunk::Level(snapshot));
+                self.chunk_map.insert(cluster_pos, holder);
+                self.check_waiting_tasks(crate::level::is_cluster_secondary());
+                return;
             }
             RecvChunk::Generation(data) => {
                 let mut dx = 0;
@@ -1174,7 +1426,7 @@ impl GenerationSchedule {
                 }
 
                 // Neighbor chunks returned to holders — unblock waiting tasks
-                self.check_waiting_tasks();
+                self.check_waiting_tasks(crate::level::is_cluster_secondary());
             }
             RecvChunk::GenerationFailure {
                 pos: fail_pos,
@@ -1208,38 +1460,47 @@ impl GenerationSchedule {
                     holder.dependency_stage = StagedChunkEnum::None;
                     holder.chunk = None;
 
-                    for i in (StagedChunkEnum::None as usize + 1)..=(target_stage as usize) {
-                        let stage_enum = StagedChunkEnum::from(i as u8);
-                        let task_node = Node::new(pos, stage_enum);
-                        holder.tasks[i] = self.graph.nodes.insert(task_node);
+                    if crate::level::is_cluster_secondary() {
+                        self.chunk_map.insert(pos, holder);
+                        self.secondary_request_fetch(pos);
+                        warn!(
+                            "Chunk {:?} reset to None on cluster secondary; waiting for holder snapshot (target: {:?})",
+                            pos, target_stage
+                        );
+                    } else {
+                        for i in (StagedChunkEnum::None as usize + 1)..=(target_stage as usize) {
+                            let stage_enum = StagedChunkEnum::from(i as u8);
+                            let task_node = Node::new(pos, stage_enum);
+                            holder.tasks[i] = self.graph.nodes.insert(task_node);
 
-                        if i > (StagedChunkEnum::None as usize + 1) {
-                            self.graph.add_edge(holder.tasks[i - 1], holder.tasks[i]);
+                            if i > (StagedChunkEnum::None as usize + 1) {
+                                self.graph.add_edge(holder.tasks[i - 1], holder.tasks[i]);
+                            }
                         }
-                    }
 
-                    if target_stage > StagedChunkEnum::None {
-                        let first_task = holder.tasks[StagedChunkEnum::None as usize + 1];
-                        if let Some(node) = self.graph.nodes.get_mut(first_task) {
-                            node.in_queue = true;
+                        if target_stage > StagedChunkEnum::None {
+                            let first_task = holder.tasks[StagedChunkEnum::None as usize + 1];
+                            if let Some(node) = self.graph.nodes.get_mut(first_task) {
+                                node.in_queue = true;
+                            }
+                            self.queue.push(TaskHeapNode(
+                                Self::calc_priority(
+                                    &self.last_level,
+                                    &self.last_high_priority,
+                                    pos,
+                                    StagedChunkEnum::from(1),
+                                ) - 50,
+                                first_task,
+                            ));
                         }
-                        self.queue.push(TaskHeapNode(
-                            Self::calc_priority(
-                                &self.last_level,
-                                &self.last_high_priority,
-                                pos,
-                                StagedChunkEnum::from(1),
-                            ) - 50,
-                            first_task,
-                        ));
+
+                        self.chunk_map.insert(pos, holder);
+
+                        warn!(
+                            "Chunk {:?} reset to None and re-queued for regeneration (target: {:?})",
+                            pos, target_stage
+                        );
                     }
-
-                    self.chunk_map.insert(pos, holder);
-
-                    warn!(
-                        "Chunk {:?} reset to None and re-queued for regeneration (target: {:?})",
-                        pos, target_stage
-                    );
                 } else {
                     error!("Failed to find holder for failed chunk {:?}", pos);
                 }
@@ -1275,6 +1536,8 @@ impl GenerationSchedule {
             if self.resort_work(self.send_level.get()) {
                 self.garbage_collect_dependencies();
             }
+
+            self.secondary_poll_fetches();
 
             // Process unload queue periodically (every 1 second) to batch writes together
             // and act as a brief memory cache if a player walks back into the chunk.
@@ -1376,6 +1639,19 @@ impl GenerationSchedule {
                         continue;
                     }
 
+                    if crate::level::is_cluster_secondary() {
+                        self.waiting_for_chunks.remove(&task.1);
+                        self.drop_node(task.1);
+                        if let Some(holder) = self.chunk_map.get_mut(&node.pos) {
+                            let slot = &mut holder.tasks[node.stage as usize];
+                            if *slot == task.1 {
+                                *slot = NodeKey::null();
+                            }
+                        }
+                        self.secondary_request_fetch(node.pos);
+                        continue;
+                    }
+
                     if node.stage == StagedChunkEnum::Empty {
                         self.running_task_count += 1;
                         let holder = self.chunk_map.get_mut(&node.pos).expect("holder exists");
@@ -1447,7 +1723,7 @@ impl GenerationSchedule {
                                 // in this same loop iteration, before this task was parked.
                                 // If so, check_waiting_tasks() will immediately re-queue it
                                 // so it isn't stranded with running_task_count==0.
-                                self.check_waiting_tasks();
+                                self.check_waiting_tasks(crate::level::is_cluster_secondary());
                                 continue;
                             }
                         }
@@ -1547,12 +1823,15 @@ impl GenerationSchedule {
                         let send_chunk = self.send_chunk.clone();
                         let level = level.clone();
 
-                        self.generation_pool.spawn(move || {
-                            let result = crate::chunk_system::worker_logic::run_generation(
-                                pos, cache, stage, &level,
-                            );
-                            let _ = send_chunk.send((pos, result));
-                        });
+                        self.generation_pool
+                            .clone()
+                            .expect("Chunk generation pool is missing: the secondary dispatch gate must park generation tasks before reaching the pool")
+                            .spawn(move || {
+                                let result = crate::chunk_system::worker_logic::run_generation(
+                                    pos, cache, stage, &level,
+                                );
+                                let _ = send_chunk.send((pos, result));
+                            });
                     }
                 }
             }
@@ -1588,24 +1867,27 @@ impl GenerationSchedule {
                     }
                 } else {
                     // No tasks in flight, check for any unblocked waiting tasks or stranded ready tasks
-                    self.check_waiting_tasks();
-                    let restored = Self::restore_ready_tasks(
-                        &mut self.graph,
-                        &mut self.queue,
-                        &self.chunk_map,
-                        &self.last_level,
-                        &self.last_high_priority,
-                        &self.waiting_for_chunks,
-                    );
-                    if restored > 0 || !self.queue.is_empty() {
-                        debug!(
-                            "Restored {restored} stranded ready chunk tasks to generation queue"
+                    if !crate::level::is_cluster_secondary() {
+                        self.check_waiting_tasks(crate::level::is_cluster_secondary());
+                        let restored = Self::restore_ready_tasks(
+                            &mut self.graph,
+                            &mut self.queue,
+                            &self.chunk_map,
+                            &self.last_level,
+                            &self.last_high_priority,
+                            &self.waiting_for_chunks,
+                            crate::level::is_cluster_secondary(),
                         );
-                        if self.queue_dirty {
-                            self.sort_queue();
-                            self.queue_dirty = false;
+                        if restored > 0 || !self.queue.is_empty() {
+                            debug!(
+                                "Restored {restored} stranded ready chunk tasks to generation queue"
+                            );
+                            if self.queue_dirty {
+                                self.sort_queue();
+                                self.queue_dirty = false;
+                            }
+                            continue;
                         }
-                        continue;
                     }
                     debug_assert!(self.debug_check());
                     debug_assert_eq!(self.running_task_count, 0);
@@ -1740,4 +2022,361 @@ impl GenerationSchedule {
         }
         true
     }
+}
+
+#[cfg(test)]
+mod secondary_park_regression {
+    use super::*;
+
+    static SECONDARY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct SecondaryTestMode {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl SecondaryTestMode {
+        fn enable() -> Self {
+            let lock = SECONDARY_TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::level::set_cluster_secondary(true);
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for SecondaryTestMode {
+        fn drop(&mut self) {
+            crate::level::set_cluster_secondary(false);
+        }
+    }
+
+    fn secondary_test_schedule() -> GenerationSchedule {
+        let (send_chunk, recv_chunk) = crossbeam::channel::unbounded();
+        let (io_read_tx, _io_read_rx) = tokio::sync::mpsc::channel(8);
+        let (io_write_tx, _io_write_rx) = tokio::sync::mpsc::channel(8);
+        GenerationSchedule {
+            queue: BinaryHeap::new(),
+            graph: DAG::default(),
+            last_level: ChunkLevel::default(),
+            last_high_priority: Vec::new(),
+            send_level: Arc::new(LevelChannel::new()),
+            public_chunk_map: Arc::new(DashMap::new()),
+            loaded_chunk_changes: Arc::new(crossbeam::queue::SegQueue::new()),
+            chunk_map: HashMap::new(),
+            unload_chunks: HashSetType::default(),
+            waiting_for_chunks: HashSetType::default(),
+            io_lock: Arc::new((
+                Mutex::new(HashMapType::default()),
+                tokio::sync::Notify::new(),
+            )),
+            running_task_count: 0,
+            max_in_flight: 2,
+            queue_dirty: false,
+            recv_chunk,
+            io_read: io_read_tx,
+            io_write: io_write_tx,
+            send_chunk,
+            listener: Arc::new(ChunkListener::new()),
+            lighting_config: LightingEngineConfig::Default,
+            last_unload: std::time::Instant::now(),
+            generation_pool: None,
+            cluster_fetches: HashMapType::default(),
+            cluster_level: None,
+        }
+    }
+
+    fn parked_noise_task(schedule: &mut GenerationSchedule) -> NodeKey {
+        let pos = ChunkPos::new(0, 0);
+        let stage = StagedChunkEnum::Noise;
+        let node_key = schedule.graph.nodes.insert(Node::new(pos, stage));
+        let mut holder = ChunkHolder::default();
+        holder.target_stage = stage;
+        holder.dependency_stage = StagedChunkEnum::None;
+        holder.current_stage = StagedChunkEnum::Empty;
+        holder.chunk = Some(Chunk::Level(crate::chunk::ChunkData::empty_sync(
+            pos.x, pos.y,
+        )));
+        holder.tasks[stage as usize] = node_key;
+        schedule.chunk_map.insert(pos, holder);
+        schedule.waiting_for_chunks.insert(node_key);
+        node_key
+    }
+
+    #[test]
+    fn secondary_parked_generation_task_never_requeued_on_idle() {
+        let _secondary_mode = SecondaryTestMode::enable();
+        let mut schedule = secondary_test_schedule();
+        let parked = parked_noise_task(&mut schedule);
+        schedule.check_waiting_tasks(true);
+        assert!(schedule.queue.is_empty());
+        assert!(schedule.waiting_for_chunks.contains(&parked));
+        assert!(!schedule.graph.nodes.get(parked).expect("parked node exists").in_queue);
+        let waiting_snapshot = schedule.waiting_for_chunks.clone();
+        let restored = GenerationSchedule::restore_ready_tasks(
+            &mut schedule.graph,
+            &mut schedule.queue,
+            &schedule.chunk_map,
+            &schedule.last_level,
+            &schedule.last_high_priority,
+            &waiting_snapshot,
+            true,
+        );
+        assert_eq!(restored, 0);
+        assert!(schedule.queue.is_empty());
+        assert!(schedule.waiting_for_chunks.contains(&parked));
+        assert!(!schedule.graph.nodes.get(parked).expect("parked node exists").in_queue);
+    }
+
+    #[test]
+    fn secondary_resort_without_dispatcher_never_marks_fetch_in_flight() {
+        let _secondary_mode = SecondaryTestMode::enable();
+        let mut schedule = secondary_test_schedule();
+        let pos = ChunkPos::new(3, 5);
+        let mut changes = HashMapType::default();
+        changes.insert(pos, (StagedChunkEnum::None, StagedChunkEnum::Full));
+        let mut levels = ChunkLevel::default();
+        levels.insert(pos, ChunkLoading::FULL_CHUNK_LEVEL);
+        assert!(schedule.resort_work((Some((changes, levels)), None)));
+        assert!(schedule.graph.nodes.is_empty());
+        assert!(schedule.queue.is_empty());
+        assert!(schedule.waiting_for_chunks.is_empty());
+        assert!(schedule.chunk_map.get(&pos).is_none());
+        assert!(schedule.debug_check());
+        assert!(!schedule.cluster_fetches.contains_key(&pos));
+    }
+
+    #[test]
+    fn secondary_resort_unload_never_creates_schedule_nodes() {
+        let _secondary_mode = SecondaryTestMode::enable();
+        let mut schedule = secondary_test_schedule();
+        let pos = ChunkPos::new(3, 5);
+        let mut holder = ChunkHolder::default();
+        holder.target_stage = StagedChunkEnum::Full;
+        schedule.chunk_map.insert(pos, holder);
+        schedule.cluster_fetches.insert(pos, Instant::now());
+        let mut changes = HashMapType::default();
+        changes.insert(pos, (StagedChunkEnum::Full, StagedChunkEnum::None));
+        let levels = ChunkLevel::default();
+        assert!(schedule.resort_work((Some((changes, levels)), None)));
+        assert!(schedule.graph.nodes.is_empty());
+        assert!(schedule.queue.is_empty());
+        assert!(!schedule.cluster_fetches.contains_key(&pos));
+        let holder = schedule.chunk_map.get(&pos).expect("holder exists");
+        assert_eq!(holder.target_stage, StagedChunkEnum::None);
+        assert!(schedule.unload_chunks.contains(&pos));
+    }
+
+    #[test]
+    fn secondary_ensure_dependency_chain_creates_nothing() {
+        let _secondary_mode = SecondaryTestMode::enable();
+        let mut schedule = secondary_test_schedule();
+        let pos = ChunkPos::new(1, 2);
+        let dependency = schedule.graph.nodes.insert(Node::new(pos, StagedChunkEnum::Empty));
+        let mut holder = ChunkHolder::default();
+        let created = GenerationSchedule::ensure_dependency_chain(
+            &mut schedule.graph,
+            &mut schedule.queue,
+            &schedule.last_level,
+            &schedule.last_high_priority,
+            dependency,
+            pos,
+            &mut holder,
+            StagedChunkEnum::Full,
+            true,
+        );
+        assert!(created.iter().all(|done| !done));
+        assert_eq!(schedule.graph.nodes.len(), 1);
+        assert!(schedule.queue.is_empty());
+        assert_eq!(holder.dependency_stage, StagedChunkEnum::None);
+        assert!(holder.occupied_by.is_null());
+    }
+
+    #[test]
+    fn secondary_restore_ready_tasks_skips_generation_nodes() {
+        let _secondary_mode = SecondaryTestMode::enable();
+        let mut schedule = secondary_test_schedule();
+        let parked = parked_noise_task(&mut schedule);
+        let occupy = schedule.graph.nodes.insert(Node::new(
+            ChunkPos::new(i32::MAX, i32::MAX),
+            StagedChunkEnum::None,
+        ));
+        schedule.graph.add_edge(occupy, parked);
+        schedule
+            .graph
+            .nodes
+            .get_mut(parked)
+            .expect("parked node exists")
+            .in_degree = 1;
+        schedule.graph.nodes.remove(occupy);
+        let waiting_snapshot = schedule.waiting_for_chunks.clone();
+        let restored = GenerationSchedule::restore_ready_tasks(
+            &mut schedule.graph,
+            &mut schedule.queue,
+            &schedule.chunk_map,
+            &schedule.last_level,
+            &schedule.last_high_priority,
+            &waiting_snapshot,
+            true,
+        );
+        assert!(schedule.queue.is_empty());
+        assert_eq!(restored, 0);
+        let parked_node = schedule.graph.nodes.get(parked).expect("parked node exists");
+        assert!(!parked_node.in_queue);
+    }
+
+    fn fetching_surface_holder(schedule: &mut GenerationSchedule) -> (ChunkPos, NodeKey) {
+        let pos = ChunkPos::new(0, 0);
+        let stage = StagedChunkEnum::Surface;
+        let node_key = schedule.graph.nodes.insert(Node::new(pos, stage));
+        schedule
+            .graph
+            .nodes
+            .get_mut(node_key)
+            .expect("fetch node exists")
+            .in_flight = true;
+        let mut holder = ChunkHolder::default();
+        holder.target_stage = StagedChunkEnum::Full;
+        holder.dependency_stage = StagedChunkEnum::None;
+        holder.current_stage = StagedChunkEnum::Empty;
+        holder.tasks[stage as usize] = node_key;
+        schedule.chunk_map.insert(pos, holder);
+        schedule.waiting_for_chunks.insert(node_key);
+        (pos, node_key)
+    }
+
+    #[test]
+    fn secondary_fetch_poll_completes_holder_to_public() {
+        let _secondary_mode = SecondaryTestMode::enable();
+        let mut schedule = secondary_test_schedule();
+        let (pos, fetching) = fetching_surface_holder(&mut schedule);
+        schedule.cluster_fetches.insert(pos, Instant::now());
+        schedule.secondary_poll_fetches();
+        assert!(!schedule.cluster_fetches.is_empty());
+        let holder = schedule.chunk_map.get(&pos).expect("holder exists");
+        assert!(!holder.public);
+        assert!(schedule.waiting_for_chunks.contains(&fetching));
+        let missing = ChunkPos::new(7, 7);
+        schedule.receive_chunk(
+            missing,
+            RecvChunk::Cluster((missing, crate::chunk::ChunkData::empty_sync(7, 7))),
+        );
+        let arrived = schedule.chunk_map.get(&missing).expect("holder exists");
+        assert_eq!(arrived.current_stage, StagedChunkEnum::Full);
+        assert_eq!(arrived.target_stage, StagedChunkEnum::None);
+        assert!(arrived.public);
+        assert!(schedule.queue.is_empty());
+    }
+
+    #[test]
+    fn secondary_handoff_hold_then_arrive_then_unload_stays_consistent() {
+        let _secondary_mode = SecondaryTestMode::enable();
+        let mut schedule = secondary_test_schedule();
+        let pos = ChunkPos::new(3, 5);
+        let mut changes = HashMapType::default();
+        changes.insert(pos, (StagedChunkEnum::None, StagedChunkEnum::Full));
+        let mut levels = ChunkLevel::default();
+        levels.insert(pos, ChunkLoading::FULL_CHUNK_LEVEL);
+        assert!(schedule.resort_work((Some((changes, levels)), None)));
+        assert!(schedule.chunk_map.get(&pos).is_none());
+        assert!(schedule.debug_check());
+        schedule.receive_chunk(
+            pos,
+            RecvChunk::Cluster((pos, crate::chunk::ChunkData::empty_sync(3, 5))),
+        );
+        let held = schedule.chunk_map.get(&pos).expect("holder exists");
+        assert_eq!(held.current_stage, StagedChunkEnum::Full);
+        assert_eq!(held.target_stage, StagedChunkEnum::Full);
+        assert!(schedule.debug_check());
+        let mut changes = HashMapType::default();
+        changes.insert(pos, (StagedChunkEnum::Full, StagedChunkEnum::None));
+        let levels = ChunkLevel::default();
+        assert!(schedule.resort_work((Some((changes, levels)), None)));
+        assert!(schedule.debug_check());
+        schedule.process_unload_queue();
+        assert!(schedule.chunk_map.get(&pos).is_none());
+        assert!(schedule.debug_check());
+    }
+
+    #[test]
+    fn secondary_arrive_without_ticket_pins_consistent_holder() {
+        let _secondary_mode = SecondaryTestMode::enable();
+        let mut schedule = secondary_test_schedule();
+        let pos = ChunkPos::new(9, 9);
+        schedule.receive_chunk(
+            pos,
+            RecvChunk::Cluster((pos, crate::chunk::ChunkData::empty_sync(9, 9))),
+        );
+        let holder = schedule.chunk_map.get(&pos).expect("holder exists");
+        assert_eq!(holder.current_stage, StagedChunkEnum::Full);
+        assert_eq!(holder.target_stage, StagedChunkEnum::None);
+        assert!(schedule.graph.nodes.is_empty());
+        assert!(schedule.queue.is_empty());
+        assert!(schedule.debug_check());
+    }
+
+    #[test]
+    fn secondary_fetch_without_snapshot_stays_wanted() {
+        let _secondary_mode = SecondaryTestMode::enable();
+        let mut schedule = secondary_test_schedule();
+        let (pos, fetching) = fetching_surface_holder(&mut schedule);
+        schedule.cluster_fetches.insert(pos, Instant::now());
+        schedule.secondary_poll_fetches();
+        assert!(schedule.cluster_fetches.contains_key(&pos));
+        let node = schedule.graph.nodes.get(fetching).expect("fetch node exists");
+        assert!(node.in_flight);
+        assert!(!node.in_queue);
+        assert!(schedule.queue.is_empty());
+        schedule.secondary_poll_fetches();
+        schedule.check_waiting_tasks(true);
+        let restored = GenerationSchedule::restore_ready_tasks(
+            &mut schedule.graph,
+            &mut schedule.queue,
+            &schedule.chunk_map,
+            &schedule.last_level,
+            &schedule.last_high_priority,
+            &schedule.waiting_for_chunks,
+            true,
+        );
+        assert_eq!(restored, 0);
+        assert!(schedule.queue.is_empty());
+    }
+
+    #[test]
+    fn secondary_timeout_discards_only_partial_holder() {
+        let _secondary_mode = SecondaryTestMode::enable();
+        let mut schedule = secondary_test_schedule();
+        let pos = ChunkPos::new(3, 5);
+        let mut holder = ChunkHolder::default();
+        holder.current_stage = StagedChunkEnum::Surface;
+        schedule.chunk_map.insert(pos, holder);
+        schedule
+            .cluster_fetches
+            .insert(pos, Instant::now() - Duration::from_secs(31));
+        schedule.secondary_discard_timed_out_partials();
+        assert!(!schedule.cluster_fetches.contains_key(&pos));
+        assert!(!schedule.chunk_map.contains_key(&pos));
+    }
+
+    #[test]
+    fn secondary_timeout_keeps_full_holder() {
+        let _secondary_mode = SecondaryTestMode::enable();
+        let mut schedule = secondary_test_schedule();
+        let pos = ChunkPos::new(3, 5);
+        let snapshot = crate::chunk::ChunkData::empty_sync(pos.x, pos.y);
+        let mut holder = ChunkHolder::default();
+        holder.current_stage = StagedChunkEnum::Full;
+        holder.chunk = Some(Chunk::Level(snapshot.clone()));
+        holder.public = true;
+        schedule.public_chunk_map.insert(pos, snapshot);
+        schedule.chunk_map.insert(pos, holder);
+        schedule
+            .cluster_fetches
+            .insert(pos, Instant::now() - Duration::from_secs(31));
+        schedule.secondary_discard_timed_out_partials();
+        assert!(!schedule.cluster_fetches.contains_key(&pos));
+        assert!(schedule.chunk_map.contains_key(&pos));
+        assert!(schedule.public_chunk_map.contains_key(&pos));
+    }
+
+
 }

@@ -27,10 +27,18 @@ fn toggle_lever(world: &Arc<World>, block_pos: &BlockPos) {
 
     let mut lever_props = LeverLikeProperties::from_state_id(state);
     lever_props.powered = !lever_props.powered;
-    world.set_block_state(
+    let new_lever_state = lever_props.to_state_id(block);
+    let replaced_lever_state = world.set_block_state(
         block_pos,
-        lever_props.to_state_id(block),
+        new_lever_state,
         BlockFlags::NOTIFY_ALL,
+    );
+    crate::server::cluster_world_delta::emit_redstone_write(
+        world,
+        block_pos,
+        block_pos,
+        replaced_lever_state.as_u16(),
+        new_lever_state.as_u16(),
     );
 
     LeverBlock::update_neighbors(world, block_pos, lever_props);

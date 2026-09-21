@@ -641,3 +641,40 @@ impl EntityTracker {
         }
     }
 }
+
+impl EntityTracker {
+    pub fn apply_cluster_ghost_samples(
+        &self,
+        world: &World,
+        local_server: u16,
+        samples: &[pumpkin_cluster::movement::AcceptedPos],
+    ) {
+        let players = world.players.load();
+        for sample in samples {
+            if sample.gid.server.0 == local_server {
+                continue;
+            }
+            for player in players.iter() {
+                if player.cluster_gid() == Some(sample.gid) {
+                    let entity = player.get_entity();
+                    entity.pos.store(Vector3::new(
+                        sample.pos[0],
+                        sample.pos[1],
+                        sample.pos[2],
+                    ));
+                    entity.velocity.store(Vector3::new(
+                        sample.vel[0],
+                        sample.vel[1],
+                        sample.vel[2],
+                    ));
+                    entity.yaw.store(sample.yaw);
+                    entity.pitch.store(sample.pitch);
+                    entity
+                        .velocity_dirty
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+    }
+}

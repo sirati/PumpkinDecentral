@@ -54,6 +54,9 @@ impl UserCache {
     }
 
     pub fn save(&self) {
+        if pumpkin_world::level::is_cluster_secondary() {
+            return;
+        }
         let path = Self::path();
         if let Some(parent) = path.parent()
             && let Err(error) = fs::create_dir_all(parent)

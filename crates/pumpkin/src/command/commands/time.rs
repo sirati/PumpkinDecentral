@@ -147,6 +147,7 @@ impl CommandExecutor for ActionExecutor {
         };
 
         let world = context.source.world();
+        let server = context.server();
 
         match self.action {
             Action::Set(preset) => {
@@ -164,6 +165,7 @@ impl CommandExecutor for ActionExecutor {
                     guard.clone()
                 };
                 level_time.send_time(world);
+                crate::server::cluster_world_time::publish_time_for_world(server, world);
                 context.source.send_feedback(
                     pumpkin_macros::translate_cross!(
                         translation::java::COMMANDS_TIME_SET_ABSOLUTE,
@@ -187,6 +189,7 @@ impl CommandExecutor for ActionExecutor {
                     (guard.clone(), total_ticks)
                 };
                 level_time.send_time(world);
+                crate::server::cluster_world_time::publish_time_for_world(server, world);
                 context.source.send_feedback(
                     pumpkin_macros::translate_cross!(
                         translation::java::COMMANDS_TIME_SET_ABSOLUTE,
@@ -208,6 +211,7 @@ impl CommandExecutor for ActionExecutor {
                     guard.clone()
                 };
                 level_time.send_time(world);
+                crate::server::cluster_world_time::publish_time_for_world(server, world);
                 context.source.send_feedback(
                     pumpkin_macros::translate_cross!(
                         translation::java::COMMANDS_TIME_PAUSE,
@@ -228,6 +232,7 @@ impl CommandExecutor for ActionExecutor {
                     guard.clone()
                 };
                 level_time.send_time(world);
+                crate::server::cluster_world_time::publish_time_for_world(server, world);
                 context.source.send_feedback(
                     pumpkin_macros::translate_cross!(
                         translation::java::COMMANDS_TIME_RESUME,
@@ -249,6 +254,7 @@ impl CommandExecutor for ActionExecutor {
                     guard.clone()
                 };
                 level_time.send_time(world);
+                crate::server::cluster_world_time::publish_time_for_world(server, world);
                 context.source.send_feedback(
                     pumpkin_macros::translate_cross!(
                         translation::java::COMMANDS_TIME_RATE,

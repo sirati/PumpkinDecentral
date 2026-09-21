@@ -11,6 +11,7 @@ use crate::command::argument_builder::{ArgumentBuilder, argument, command, liter
 use crate::command::argument_types::coordinates::rotation::RotationArgumentType;
 use crate::command::argument_types::coordinates::vec3::Vec3ArgumentType;
 use crate::command::argument_types::entity::EntityArgumentType;
+use crate::command::argument_types::entity_selector::EntitySelector;
 use crate::command::argument_types::entity_anchor::{
     EntityAnchor, EntityAnchorArgumentType, EntityAnchorExt,
 };
@@ -56,6 +57,51 @@ fn success_key_and_arg(
     }
 }
 
+struct TeleportDestination {
+    pos: Vector3<f64>,
+    yaw: f32,
+    pitch: f32,
+    world: Arc<World>,
+    display_name: TextComponent,
+}
+
+fn remote_destination(
+    context: &CommandContext,
+    argument: &str,
+) -> Option<TeleportDestination> {
+    let selector = context.get_argument::<EntitySelector>(argument).ok()?;
+    let name = selector.player_name.as_deref()?;
+    if crate::server::cluster_presence::remote_player_in_lobby(name) {
+        return None;
+    }
+    let (gid, entry) = crate::server::cluster_presence::remote_presence_entries()
+        .into_iter()
+        .find(|(_, entry)| entry.name.eq_ignore_ascii_case(name))?;
+    let sample = crate::server::cluster_ghost::remote_player_position(gid)?;
+    Some(TeleportDestination {
+        pos: Vector3::new(sample.pos[0], sample.pos[1], sample.pos[2]),
+        yaw: sample.yaw,
+        pitch: sample.pitch,
+        world: context.source.world().clone(),
+        display_name: TextComponent::text(entry.name),
+    })
+}
+
+fn destination_or_lobby_error(
+    context: &CommandContext,
+    argument: &str,
+) -> Option<CommandExecutorResult> {
+    let selector = context.get_argument::<EntitySelector>(argument).ok()?;
+    let name = selector.player_name.as_deref()?;
+    if !crate::server::cluster_presence::remote_player_in_lobby(name) {
+        return None;
+    }
+    context.source.send_error(TextComponent::text(format!(
+        "{name} is currently in the lobby, and not in the game world"
+    )));
+    Some(Ok(0))
+}
+
 struct SelfToPosExecutor;
 
 impl CommandExecutor for SelfToPosExecutor {
@@ -96,18 +142,39 @@ impl CommandExecutor for SelfToEntityExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let entity = context.source.entity_or_err()?;
 
-        let destination = EntityArgumentType::get_entity(context, "destination")?;
-        let destination_entity = destination.get_entity();
-        let pos = destination_entity.pos.load();
-        let yaw = destination_entity.yaw.load();
-        let pitch = destination_entity.pitch.load();
-        let world = destination_entity.world.load_full();
+        let destination = match EntityArgumentType::get_entity(context, "destination") {
+            Ok(destination) => {
+                let entity = destination.get_entity();
+                TeleportDestination {
+                    pos: entity.pos.load(),
+                    yaw: entity.yaw.load(),
+                    pitch: entity.pitch.load(),
+                    world: entity.world.load_full(),
+                    display_name: entity.get_display_name(),
+                }
+            }
+            Err(error) => match remote_destination(context, "destination") {
+                Some(destination) => destination,
+                None => {
+                    if let Some(result) = destination_or_lobby_error(context, "destination") {
+                        return result;
+                    }
+                    return Err(error);
+                }
+            },
+        };
+        let pos = destination.pos;
 
         if !World::is_valid(BlockPos(pos.floor_to_i32())) {
             return Err(ERROR_INVALID_POSITION.create_without_context());
         }
 
-        entity.teleport(pos, Some(yaw), Some(pitch), world);
+        entity.teleport(
+            pos,
+            Some(destination.yaw),
+            Some(destination.pitch),
+            destination.world,
+        );
 
         context.source.send_feedback(
             TextComponent::translate_cross(
@@ -115,7 +182,7 @@ impl CommandExecutor for SelfToEntityExecutor {
                 translation::bedrock::COMMANDS_TP_SUCCESSVICTIM,
                 [
                     entity.get_display_name(),
-                    destination_entity.get_display_name(),
+                    destination.display_name,
                 ],
             ),
             true,
@@ -130,19 +197,40 @@ struct EntitiesToEntityExecutor;
 impl CommandExecutor for EntitiesToEntityExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let targets = EntityArgumentType::get_entities(context, "targets")?;
-        let destination = EntityArgumentType::get_entity(context, "destination")?;
-        let destination_entity = destination.get_entity();
-        let pos = destination_entity.pos.load();
-        let yaw = destination_entity.yaw.load();
-        let pitch = destination_entity.pitch.load();
-        let world = destination_entity.world.load_full();
+        let destination = match EntityArgumentType::get_entity(context, "destination") {
+            Ok(destination) => {
+                let entity = destination.get_entity();
+                TeleportDestination {
+                    pos: entity.pos.load(),
+                    yaw: entity.yaw.load(),
+                    pitch: entity.pitch.load(),
+                    world: entity.world.load_full(),
+                    display_name: entity.get_display_name(),
+                }
+            }
+            Err(error) => match remote_destination(context, "destination") {
+                Some(destination) => destination,
+                None => {
+                    if let Some(result) = destination_or_lobby_error(context, "destination") {
+                        return result;
+                    }
+                    return Err(error);
+                }
+            },
+        };
+        let pos = destination.pos;
 
         if !World::is_valid(BlockPos(pos.floor_to_i32())) {
             return Err(ERROR_INVALID_POSITION.create_without_context());
         }
 
         for target in &targets {
-            target.teleport(pos, Some(yaw), Some(pitch), world.clone());
+            target.teleport(
+                pos,
+                Some(destination.yaw),
+                Some(destination.pitch),
+                destination.world.clone(),
+            );
         }
 
         let (key, target_arg) = success_key_and_arg(
@@ -154,7 +242,7 @@ impl CommandExecutor for EntitiesToEntityExecutor {
             TextComponent::translate_cross(
                 key,
                 translation::bedrock::COMMANDS_TP_SUCCESSVICTIM,
-                [target_arg, destination_entity.get_display_name()],
+                [target_arg, destination.display_name],
             ),
             true,
         );

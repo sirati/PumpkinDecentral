@@ -1,0 +1,96 @@
+# Decentral Player-Action Mesh — Plan v2
+
+Supersedes `docs/cluster-plan.md` and `docs/outdated-plan-2026-09-17.md`.
+Operator verbatim lives in `docs/operator-messages-2026-09-18.md`.
+
+## Part 1 — Operator collage (highest authority; verbatim except `[...]` omissions and `{connectors}`)
+
+### Model and roles
+> "currently pumpkin runs as a single process on a single computer. i would to change this to a decentral model. the focus here is only player actions i.e. we wont run mobs decentraly or tnt explosions. the idea is that all servers connect with each other via QUIC with max streams set to a high number. {and} there is one primary, the primary is responsible for saving / loading the world and playerdata."
+> "important: there is nothing like an authorative primary. [...] (that one does not accept any players, instead it just gets the whole copy of an accepted tick)."
+> "no my goal ask ed for two processes. primary and secondary are seperate processes as by my spec!"
+> "why does primary even listen to a mc port?!" {it listens on none;} "while also hogging the default port delegating the real server to another" {the local secondary takes the defaults.}
+> "the whole idea here is that each server has a local copy of everything, so it authoritatively resolves any player interaction [...] and accept the action optimistically."
+
+### Identity, streams, encoding
+> "players on login get assigned a global id which is comprised of u16 server id and u16 player id i.e. this way no communication needs to be made to assign player ids [...]"
+> "to make this work we use multiple unidirectional streams per player for events. first and most important is every tick we send a packet over the datagram (i.e. delivery not ensured) of the players position, head facing, and velocity. [...] so the player update package on the datagram that is sent out once per tick is u16 len updated [PosUpdate] struct posupdate {newtype(server_id, server_player_id), perplayer_wrapping_increment_counter u16 newtype, pos, vel, facing}."
+> "the per player we use a stream to send Updated about actions that update the player visual stuff (armor, hands, start/stop sneak/sprint, blocking start/end, swinging arm, changing skin layer) [...] start eating, abort eating, (finish not needed that time+absense of abort), start/stop block break animation, then there are actions that affect the world: break block, place block (atomic together with updating the stack size in the inventory), and then on the next channel interactions hit player, hit other entity, fire box/crossbow. all of these should be encoded zero-copy [...]"
+> "as for updates they should be small focusses structs each focussing on a single update. when sending the update an array should be sent per struct so that the type doesnt need to be repeated over and over."
+
+### Time, conflicts, acceptance
+> "each per tick update block on a stream comes with a rounded to 1/20s timestamp (as u16 wrapping) this timestamp is calculated from realtime getting from time servers [...] i.e. all secondaries are to have a sync clock." {Interview:} "use online timeservers directly".
+> "if there is a conflict like two players placing a block at the same position at the same timestamp a deterministic pseudorandom number is generated based on the timestamp and all involved players in the conflict. [...] the random win is decided by if hash(tick .. playerA) > hash(tick .. playerB) and on equals their server+player id break the ordering [...]"
+> "for a block to be broken the player has to be breaking that block type exactly i.e. if the player A, B start breaking block dirt with B two ticks late, then A break it first and 1 tick later places wood, then the late breaking of player B is rejected as they tried breaking dirt not wood."
+> "updates are always send over onedirectional channels (i.e. never confirmed) updates instead are only confirmed by the global update type inspecific of accepting updates and mutating the ground truth."
+> {Interview on acceptance:} "accepts are also send as a big batch once per tick" {queued per chunk, late holders added on acquire with holder lists attached to resolutions.}
+> {Interview on fallibility:} "important for each update to always consider if it is possible at all to be fallible. [...] movement is always infallible - movement is checked by the server the player is connected to [...] but if the server accepted it, its accepted."
+
+### Chunks
+> "as for secondaries getting chunks, use 1 uni_dir stream to request a chunk for a peer and another stream stream for the chunk-data. all secondaries also communicate which peer has which chunk available (and also when they drop a chunk) [...] if a peer get a request for a dropped chunk they just reply that they dont have it anymore."
+> "a peer broadcasts that it holds a chunk AFTER it received it. and broadcasts when dropped it. as such any server waiting for chunk just requests it a single time, and doesnt do it again by marking from which peer it requested and when. now it will either get the chunk from that peer OR it will get the message that the peer dropped it, in that case it can request it again from another peer. if no peer holds it the chunk gets requested from the primary. so there is no ambiguity at all, and no need for timeouts or automatic retried either" / "fetch from lowest ping holder was what i specified".
+> {Interview:} "current ground truth send via existing chunkdata snapshot, attached all updates the providing peers knows about rn as well as all peers that also hold the chunk. the requester can then get the local ground truth by replaying the attached updates".
+> "i mean it looks like the secondaries generating chucks, which ought to be 100% impossible" / "secondaries ought not even have a generated world or save any chunks or playerdata to disk".
+> {PRIMARY 30S RETENTION: the primary keeps in memory every chunk secondaries use, since it runs random ticks. A chunk request to the primary counts as a claim announcement: the primary retains that chunk for 30 seconds. Combined with mandatory hold/drop broadcasts from every peer, this is all the tracking needed. No timeouts or retries elsewhere.} {A request unanswered after 30s logs an ERROR: per spec this is impossible unless a peer went down.}
+
+### Truth, buckets, undo
+> "each secondary has two copies of a chunk: the ground truth and the local truth based on all updates applied. the local truth is not regenerated by replaying the update queue. instead if there is a conflict we preform only the undo operation of the local action, then apply the accepted resolution. once an update has been applied / accepted by all peers it is applied to the ground truth. [...] they get into bucket based on tick they happened in. [...] once a tick is marked globally resolved [...] they are all applied at once to the local ground truth copy."
+
+### Membership, entities, always-synced regions
+> "peers cannot join or leave on their own at any time. a peer can only start accepting players once all other peers have accepted them joining, and they can only leave if they host not players or entities."
+> "regrading entities: their logic for now is done always by the peer who spawned them. when asking to leave the network, such entities are transferred to other peers that hold the chunk, for now that is the only time that can happen. [...] all entities get a single stream by stream type, peers only get updates if they hold the chunk [...]"
+> "this should not mirror the chat pattern. it ought to mirror the player wiring" {entity emit.}
+> "rn it looks like void damage is applied by all peers not only the peer owning the entity" {so only the owning peer applies it.}
+> {always-synced regions:} "a system to mark certain regions of a world as always to be synced, where the spawn chunk are automatically registered as such a region."
+
+### World-driven and interaction updates
+> "random ticks only are done on the primary never on secondaries" / "we need specialised packets for updates to chunks due to random tick updates, changes due to redstone (calculated as a fallible (i.e. revertable) update by the server holding the entity triggering), and block changes due to explosions again as an update (fallible [...])".
+> "player interactions like opening/closing a door/dropdoor, placing endereye in end frame, respawn anchor adding glowstone, need specialised update packages. stuff like a comparator or observer triggering are delayed dependent updates to have such a dependency is a new thing we need to model".
+
+### Inventory
+> "these must be semantic updated like x was moved from y to cursor, or x was moved from inv a slot b half stack to inv c slot d so that they can be replayed even on conflict. they must not be undates just matching the player actions the client sends. this is also to ensure that we cannot accidentally dublicate items. that also means item use / block place has a dependency on the inv content i.e. another way to be fallible. the /invsee must properly use this API".
+
+### Login lobby
+{Send-world reference: `docs/lobby-send-world-research.md` (researched from NanoLimbo/Limbo code; Dalton implementing.)}
+{LOBBY HEIGHT IS NORMAL: the 1m figures are X/Z only. The fake portal platform sits at a normal Y inside build limits (e.g. platform 100, head one block above the portal top), never at absurd heights like 480 which is above build limit and renders as sky. No fake world height is ever sent: no teleport without dimension switch can change world height, and old clients (e.g. 1.8) cannot take such heights at all.}
+{LOBBY ANCHOR IS CHUNK MIDDLE: the waiting player (and camera) is placed at the middle of the chunk containing X/Z 1m 1m, i.e. block (1000008, *, 1000008), head one block above the portal top looking straight down — never at a chunk corner or edge.}
+{LOBBY WAITER HAS NO PLAYER ENTITY AND LOADS NO PLAYER DATA: a virtual player in the lobby is not logged in yet. No player entity exists server-side, no playerdata is loaded, entity-requiring commands (/gamemode, /kill, /tp pos) have no target. Chat and entity-free commands work. The entity and data are created only at handoff.}
+{LOBBY IS FULLY VIRTUAL AND INDEPENDENT: entering and displaying the lobby requires zero chunks and not even a connection to the primary. All lobby content is fake client-side data. Chunk fetching is a separate issue; the lobby must never stall, degrade, or refuse entry because chunks are missing or the primary is unreachable. Handoff to the real world happens when chunks are ready, but the lobby itself never waits on them.}
+> "a lobby wait room, it answers a loggin in player with that they are in spectator mode, spectating a third entity (so that they cannot move) and that they are at a very high coordinate like 1m 1m standing 1 block above end portal looking straight down. [...] loaded chunks are directly sent to the client [...] so once all chunks are loaded by the server, and all are sent to the client, we just need to teleport them, send the inv, fix gamemode and other player data, and they get an instant load" / "all of this is never kept on the server, we just sent the client fake data the server doesnt know and doesnt track" / "we can use [...] title message [...] we can give live updated once per tick" / "the title can be Loading... and the subtitle the percentage".
+
+### Global features
+> "spawn a subagent so that stuff like op/deop ban/unban are also globally synced and saved on the primary. also so that stuff like /spectate /kick work globally" / {later, on seeing the seed-grant log:} "says the name, that suggest to me that ops are synced by name string not by player UUID as they must" {so ops sync by UUID; and logins are broadcast since} "on the primary i do not see any players joining via a secondary".
+> "spawn another suabgent to impl /invsee {player} command" / "invsee should also show the armor slots top left and offhand top right, and inbetween have the slots blocked by a light grey glass panel renamed so it has a display name that renders as an empty string. invsee also under a separate permission is to allow editing the inv. again this must work globally. both perms are included in op by default"
+> "oh we need to impl global chat including pm and tm also the player autocomplete is to be global"
+> "btw so far the motd also didnt show the synced player count, that needs to be fixed (new subagent)" {so the MOTD count is cluster-global.}
+> "for clients its important to know what players are online and this is partially separate from the player list shown with {tap}. this needs to be kept consistent between peers, but players should only get to see what they need. e.g. add a /hide command, ops have that permission by default, when doing /hide the player entity is removed from the players send to to clients as online, removed from the player tap list, removed from the modt player list, removed from the player count, and a player logged out message is broadcasted (btw these also need to be cross peer!) doing /hide again undoes that. its very important that the player is removed from the list of online players (i think entity list knows by client) - as hacked client use that detect /hide moderation functionality"
+> "spawn a suabgent to impl a new command /syncstats optional all|(chunk optional chunk coordinate 2d) by default its all, for chunk by default its the chunk the player is in. it should lists stats about how many actions exist for a chunk / overall - and how many ticks behind the ground truth is".
+
+### Threading, certs, code rules
+> "accum updates threadlocal during a tick, once a tick would end a new task runs that collects all threadlocal queues and fuses them. [...] each thread has two banks, so while bank A accumulated, the next tick is already running using bank B. [...] we must never use locks for anything. we use the paradigm or mpsc and onehots. [...] the bank switch happen by taking the threadlocal owning reference i.e. Box<X> and sending it to the consumer, replacing it with the owning reference that came back via a channel with a queue allocation of fixed length 1. [...] (having to wait there ought to be logged (cooldown one log per minute) i.e. the hot path is without await)".
+> "for quinn every server generated the certs locally. then the public cert need to be shared with the other peers via a third channel i.e. whoever is doing the setup".
+> "rule: code as docs. comments or docs strings are not allowed. code that requires them must be rewritten to be self-evident and fulfil code as docs" / "must not strip docs that already exist in the code upstream".
+> "further waiting for something is always forbidden, locks are completely banned" / "binding for all work. violation are not allowed".
+
+## Part 2 — Elaboration (EXPLICITLY LOWER AUTHORITY than the operator's words above; details and hammered-down consequences only)
+
+### 2.1 No locks, no waiting, no replies — what it means in code
+- New cluster code uses `mpsc`/`oneshot` fire-and-forget, atomics, `try_send`/`try_recv`, and thread-local bank swaps. No `Mutex`/`RwLock`/blocking call is allowed on any path that must make progress: tick, login, logout, disconnect, ping, chunk request handling.
+- Waiting for something is forbidden. A peer never waits for an answer to an update because answers do not exist. Arrival of data and arrival of drop/advert notices are inbound events; a recorded single request completes on either event. Anything shaped like request/response, ACK, timeout-then-retry, or await-on-state is a spec violation by construction.
+- Disconnects, logins, and status pings make progress with zero chunks available. Awaiting a chunk while holding player or world context is forbidden; presence/logout announces still go out when fetches are pending.
+
+### 2.2 Single action resolution and the ground-truth mechanism
+- Every optimistic local action enters the per-tick bucket for the tick it happened in. Peers exchange resolutions; conflicts resolve pairwise through the deterministic per-tick player ordering (`hash(tick .. player)`, ties by server+player id), so 3-way conflicts commute regardless of processing order.
+- A tick is globally resolved once every peer known to hold the affected chunks has accepted. Only then are that tick's updates applied at once to the local ground-truth copy. The global tick acceptance is the ONLY confirmation in the system.
+- State-conditional actions (break with exact expected block type, place against exact target, item-use against exact inventory content) reject cleanly when the world moved under them; the loser path is mechanical, never a re-fetch or a replay.
+
+### 2.3 All fallible actions are undoable; local truth never replays
+- Every fallible update (block break/place, redstone, explosion deltas, interaction toggles, inventory ops, dependent comparator/observer firings) carries or references its undo. On conflict loss the peer performs ONLY the undo of the local action, then applies the accepted resolution. Ground truth is never rebuilt from queues and chunks are never resent whole to repair a conflict.
+- Because conflicts resolve to iterative updates, clients receive iterative block/inventory deltas even when a fallible resolution changed the outcome — never a full chunk resend as conflict repair.
+- Inventory ops are semantic and replayable (source/destination inventory+slot, item, count, op kind), validated against live content so conflicts reject instead of duplicating. Item-use and block-place carry the inventory precondition as one more fallibility axis.
+
+### 2.4 Common mistakes (all observed during v1; treat as review checklist)
+- NOT FULLY WIRING: protocol exists and is unit-tested but nothing at runtime calls it — no broadcast hook in the gameplay handler, no delivery/apply task on receive, drained-and-discarded streams. Every producer and every apply path must be proven in RUNNING processes (logs showing serve/fetch/apply/deliver), never by test counts alone. An agent is done only when processes prove the behavior.
+- KEEPING CENTRALISED SERVER LOGIC: any design where one server answers, acknowledges, arbitrates, or holds authoritative game state reintroduces the single process through the back door. The primary is disk duty only: no players, no MC listeners, no game decisions. Peers resolve their own players authoritatively; convergence comes from deterministic ordering plus global tick acceptance, never from asking permission.
+- GENERATION OR PERSISTENCE ON SECONDARIES: secondaries must be physically incapable of generating a chunk or writing chunks/playerdata to disk; the code path must not exist, not merely be avoided. Same for the primary hosting players or opening game ports.
+- SILENT FAILURE PATHS: every bail (decode failure, empty holders, rejected op, dropped chunk) gets a rate-limited log line with the identifiers needed to diagnose it. A failure mode with no log line is a bug.

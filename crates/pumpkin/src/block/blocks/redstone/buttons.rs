@@ -52,10 +52,18 @@ fn click_button(world: &Arc<World>, block_pos: &BlockPos) -> bool {
     }
 
     button_props.powered = true;
-    world.set_block_state(
+    let new_button_state = button_props.to_state_id(block);
+    let replaced_button_state = world.set_block_state(
         block_pos,
-        button_props.to_state_id(block),
+        new_button_state,
         BlockFlags::NOTIFY_ALL,
+    );
+    crate::server::cluster_world_delta::emit_redstone_write(
+        world,
+        block_pos,
+        block_pos,
+        replaced_button_state.as_u16(),
+        new_button_state.as_u16(),
     );
     let delay = if block == &Block::STONE_BUTTON {
         20
@@ -86,10 +94,18 @@ impl BlockBehaviour for ButtonBlock {
         let mut props = ButtonLikeProperties::from_state_id(state.id);
         if props.powered {
             props.powered = false;
-            args.world.set_block_state(
+            let released_button_state = props.to_state_id(args.block);
+            let replaced_release_state = args.world.set_block_state(
                 args.position,
-                props.to_state_id(args.block),
+                released_button_state,
                 BlockFlags::NOTIFY_ALL,
+            );
+            crate::server::cluster_world_delta::emit_redstone_write(
+                args.world,
+                args.position,
+                args.position,
+                replaced_release_state.as_u16(),
+                released_button_state.as_u16(),
             );
             Self::update_neighbors(args.world, args.position, props);
             args.world.play_block_sound(

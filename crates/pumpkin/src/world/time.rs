@@ -124,7 +124,15 @@ impl LevelTime {
 
         let (total_ticks, partial_tick, rate) = self.pack_network_state(advance_time);
 
-        world.broadcast_editioned(
+        let lobby_waiters: Vec<_> = world
+            .players
+            .load()
+            .iter()
+            .filter(|player| player.is_in_cluster_lobby())
+            .map(|player| player.gameprofile.id)
+            .collect();
+        world.broadcast_packet_except_editioned(
+            &lobby_waiters,
             &CUpdateTime::new_clock(self.world_age, 0, total_ticks, partial_tick, rate),
             &CSetTime::new(self.time_of_day as _), // TODO do we need to tell bedrock that time is frozen?
         );

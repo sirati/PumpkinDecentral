@@ -29,7 +29,7 @@ use pumpkin::{
 };
 use pumpkin::{PumpkinServer, stop_server};
 
-use pumpkin_config::{LoadConfiguration, PumpkinConfig};
+use pumpkin_config::{ClusterRole, LoadConfiguration, PumpkinConfig};
 use pumpkin_util::text::{
     TextComponent,
     color::{Color, NamedColor},
@@ -67,9 +67,19 @@ async fn main() {
 
     let exec_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
 
-    let config = PumpkinConfig::load(&exec_dir);
+    let mut config = PumpkinConfig::load(&exec_dir);
+    apply_cluster_cli_overrides(&mut config);
 
-    let vanilla_data = VanillaData::load();
+    pumpkin_world::level::set_cluster_secondary(
+        config.advanced.cluster.enabled
+            && matches!(config.advanced.cluster.role, ClusterRole::Secondary),
+    );
+
+    let vanilla_data = if pumpkin_world::level::is_cluster_secondary() {
+        VanillaData::empty()
+    } else {
+        VanillaData::load()
+    };
 
     pumpkin::init_logger(&config.advanced);
 
@@ -187,6 +197,38 @@ async fn main() {
 
     exit(SERVER_EXIT_CODE.load(Ordering::Acquire));
 }
+
+fn apply_cluster_cli_overrides(config: &mut PumpkinConfig) {
+    let mut cluster_off = false;
+    let mut role_arg: Option<String> = None;
+    let mut expect_role_value = false;
+    for arg in std::env::args().skip(1) {
+        if expect_role_value {
+            expect_role_value = false;
+            role_arg = Some(arg.to_lowercase());
+        } else if arg == "--cluster-off" {
+            cluster_off = true;
+        } else if let Some(value) = arg.strip_prefix("--cluster-role=") {
+            role_arg = Some(value.to_lowercase());
+        } else if arg == "--cluster-role" {
+            expect_role_value = true;
+        }
+    }
+    if expect_role_value {
+        warn!("--cluster-role needs a value (primary|secondary); ignoring flag");
+    }
+    if cluster_off {
+        config.advanced.cluster.enabled = false;
+    }
+    if let Some(role) = role_arg {
+        match role.as_str() {
+            "primary" => config.advanced.cluster.role = ClusterRole::Primary,
+            "secondary" => config.advanced.cluster.role = ClusterRole::Secondary,
+            _ => warn!("Unknown --cluster-role '{role}'; expected primary|secondary"),
+        }
+    }
+}
+
 fn print_support_links_and_warning() {
     warn!(
         "{}",
@@ -196,7 +238,7 @@ fn print_support_links_and_warning() {
     );
     info!(
         "Report issues on {}",
-        TextComponent::text("https://github.com/Pumpkin-MC/Pumpkin/issues")
+        TextComponent::text("https://github.com/sirati/PumpkinDecentral/issues")
             .color_named(NamedColor::DarkAqua)
             .to_pretty_console()
     );

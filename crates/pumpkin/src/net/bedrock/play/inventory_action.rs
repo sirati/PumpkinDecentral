@@ -370,6 +370,18 @@ impl BedrockClient {
                                         held.clone(),
                                         held.get_max_use_time(),
                                     );
+                                    if held
+                                        .get_data_component::<BlocksAttacksImpl>()
+                                        .is_some()
+                                    {
+                                        pumpkin_cluster::visual::emit_blocking(
+                                            player.cluster_gid(),
+                                            pumpkin_cluster::visual::tick_from_counter(
+                                                player.tick_counter.load(Ordering::Relaxed),
+                                            ),
+                                            true,
+                                        );
+                                    }
                                 } else {
                                     // Correct predicted eating when the server's food
                                     // level is already full, even if it has not changed.
@@ -494,7 +506,18 @@ impl BedrockClient {
                         }
                         player.inventory().set_held_item(stack);
                     }
-                    ActionType::Attack => player.attack(&event.target),
+                    ActionType::Attack => {
+                        let victim = world.get_player_by_id(target_runtime_id);
+                        let victim_gid =
+                            victim.as_ref().and_then(|victim| victim.cluster_gid());
+                        crate::net::java::play::attack::attack_and_replicate(
+                            player,
+                            &event.target,
+                            victim.is_some(),
+                            victim_gid,
+                            &server,
+                        );
+                    }
                 }
             }
             TransactionData::ReleaseItem(_data) => {
@@ -508,6 +531,15 @@ impl BedrockClient {
                     let Some(server) = player.world().server.upgrade() else {
                         return;
                     };
+                    if stack.get_data_component::<BlocksAttacksImpl>().is_some() {
+                        pumpkin_cluster::visual::emit_blocking(
+                            player.cluster_gid(),
+                            pumpkin_cluster::visual::tick_from_counter(
+                                player.tick_counter.load(Ordering::Relaxed),
+                            ),
+                            false,
+                        );
+                    }
                     server.item_registry.on_stopped_using(&stack, player);
                 }
                 player.living_entity.clear_active_hand();
