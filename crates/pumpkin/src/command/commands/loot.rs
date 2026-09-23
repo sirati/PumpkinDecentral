@@ -34,6 +34,11 @@ const DESCRIPTION: &str =
     "Drops the given loot table into the specified inventory or into the world.";
 const PERMISSION: &str = "minecraft:command.loot";
 
+const ERROR_CLUSTER_INVENTORY_UNAVAILABLE: CommandErrorType<0> = CommandErrorType::new(
+    "commands.inventory.unavailable",
+    "Inventory change unavailable",
+);
+
 static ERROR_INVALID_LOOT_TABLE: CommandErrorType<1> = CommandErrorType::new(
     translation::bedrock::COMMANDS_LOOT_FAILURE_INVALIDLOOTTABLE,
     "Loot table '%s' not found",
@@ -149,8 +154,11 @@ fn replace_entity_slots(
     count: usize,
     drops: &[ItemStack],
     used_items: &mut Vec<ItemStack>,
-) {
+) -> Result<(), CommandSyntaxError> {
     if let Some(player) = entity.get_player() {
+        if player.cluster_gid().is_some() {
+            return Err(ERROR_CLUSTER_INVENTORY_UNAVAILABLE.create_without_context());
+        }
         if let Some(player_arc) = player.world().get_player_by_uuid(player.gameprofile.id) {
             for i in 0..count {
                 let mojang_slot = start_slot + i;
@@ -260,6 +268,7 @@ fn replace_entity_slots(
             }
         }
     }
+    Ok(())
 }
 
 fn send_callback(context: &CommandContext, drops: &[ItemStack], table_id: Option<&str>) {
@@ -325,6 +334,15 @@ fn send_callback(context: &CommandContext, drops: &[ItemStack], table_id: Option
 impl CommandExecutor for LootExecutor {
     #[expect(clippy::too_many_lines)]
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
+        if context
+            .source
+            .world()
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            return Err(ERROR_CLUSTER_INVENTORY_UNAVAILABLE.create_without_context());
+        }
         let mut drops = Vec::new();
         let mut table_id_for_callback: Option<String> = None;
 
@@ -571,7 +589,7 @@ impl CommandExecutor for LootExecutor {
 
                 let mut used_items = Vec::new();
                 for target in &entities {
-                    replace_entity_slots(target.as_ref(), slot, count, &drops, &mut used_items);
+                    replace_entity_slots(target.as_ref(), slot, count, &drops, &mut used_items)?;
                 }
 
                 if used_items.is_empty() && !entities.is_empty() {

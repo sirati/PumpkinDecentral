@@ -3,6 +3,23 @@ use super::*;
 
 impl JavaClient {
     pub fn handle_edit_book(&self, player: &Player, packet: &SEditBook<'_>) {
+        if player
+            .world()
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            crate::server::cluster_inventory_protocol::stage_book_edit(
+                player,
+                packet
+                    .pages
+                    .iter()
+                    .map(|page| (*page).to_string())
+                    .collect(),
+                packet.title.map(std::string::ToString::to_string),
+            );
+            return;
+        }
         let held_stack = player.inventory().held_item();
         if held_stack.item.id != Item::WRITABLE_BOOK.id {
             return;

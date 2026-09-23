@@ -18,6 +18,29 @@ impl JavaClient {
         if !player.has_client_loaded() {
             return Ok(());
         }
+        if server.advanced_config.cluster.enabled {
+            crate::server::cluster_inventory_protocol::stage_item_action(
+                player,
+                use_item_on.hand.0 as u8,
+                crate::server::cluster_inventory_protocol::StagedItemActionKind::UseOnBlock {
+                    block: use_item_on.position,
+                    hit: pumpkin_cluster::item_action::ClaimedHit {
+                        position: [
+                            use_item_on.cursor_pos.x,
+                            use_item_on.cursor_pos.y,
+                            use_item_on.cursor_pos.z,
+                        ],
+                        face: use_item_on.face.0 as u8,
+                    },
+                },
+                Some(
+                    crate::server::cluster_inventory_protocol::java_item_action_origin(
+                        use_item_on.sequence.0,
+                    ),
+                ),
+            );
+            return Ok(());
+        }
         player.update_last_action_time();
         self.update_sequence(use_item_on.sequence.0);
 
@@ -25,7 +48,11 @@ impl JavaClient {
         let cursor_pos = use_item_on.cursor_pos;
 
         let mut should_try_decrement = false;
-        let mut placed: Option<(BlockPos, pumpkin_data::BlockStateId)> = None;
+        let mut placed: Option<(
+            BlockPos,
+            pumpkin_data::BlockStateId,
+            pumpkin_data::BlockStateId,
+        )> = None;
 
         if !player.can_interact_with_block_at(&position, 1.0) {
             // TODO: maybe log?
@@ -69,7 +96,10 @@ impl JavaClient {
                 .block_registry
                 .get_screen_handler_factory(block, player, &position, server, &world)
             {
-                player.open_handled_screen(factory.as_ref(), Some(position));
+                player.open_handled_screen(
+                    factory.as_ref(),
+                    crate::entity::player::InventoryScreenSource::Block(position),
+                );
             }
             return Ok(());
         }
@@ -172,10 +202,16 @@ impl JavaClient {
             // Decrease block count
             let consume = player.gamemode.load() != GameMode::Creative;
             let mut consumed_atomically = false;
-            if let Some((final_pos, new_state)) = placed {
-                if let Some(refreshed) =
-                    Self::emit_cluster_place(player, server, hand, final_pos, new_state, consume)
-                {
+            if let Some((final_pos, new_state, expected_old_state)) = placed {
+                if let Some(refreshed) = Self::emit_cluster_place(
+                    player,
+                    server,
+                    hand,
+                    final_pos,
+                    new_state,
+                    expected_old_state,
+                    consume,
+                ) {
                     item = refreshed;
                     consumed_atomically = true;
                 }
@@ -277,17 +313,24 @@ impl JavaClient {
         use_item_on: &SUseItemOn,
         location: BlockPos,
         face: BlockDirection,
-    ) -> Result<Option<(BlockPos, pumpkin_data::BlockStateId)>, BlockPlacingError> {
+    ) -> Result<
+        Option<(
+            BlockPos,
+            pumpkin_data::BlockStateId,
+            pumpkin_data::BlockStateId,
+        )>,
+        BlockPlacingError,
+    > {
         match server
             .block_registry
             .place_block(player, block, server, use_item_on, location, face)
         {
-            Ok(Some((final_block_pos, new_state))) => {
+            Ok(Some((final_block_pos, new_state, replaced_state))) => {
                 player.try_send_client_packet(&CBlockUpdate::new(
                     final_block_pos,
                     VarInt(i32::from(new_state.as_u16())),
                 ));
-                Ok(Some((final_block_pos, new_state)))
+                Ok(Some((final_block_pos, new_state, replaced_state)))
             }
             Ok(None) => Ok(None),
             Err(crate::block::registry::BlockPlacingError::InvalidGamemode) => {
@@ -322,6 +365,7 @@ impl JavaClient {
         hand: Hand,
         final_pos: BlockPos,
         new_state: pumpkin_data::BlockStateId,
+        expected_old_state: pumpkin_data::BlockStateId,
         consume: bool,
     ) -> Option<ItemStack> {
         let cluster = &server.advanced_config.cluster;
@@ -333,7 +377,9 @@ impl JavaClient {
             PlayerSlot(Self::cluster_player_slot(player)),
         );
         let tick = Self::cluster_tick_stamp();
-        let chunk = chunk_of_block(final_pos.0.x, final_pos.0.z);
+        let world_id = crate::server::cluster_world_delta::world_id(&player.world());
+        let chunk = chunk_of_block(world_id, final_pos.0.x, final_pos.0.z);
+        let actor = player.get_entity().chunk_pos.load();
         let update_pos = pumpkin_cluster::protocol::BlockPos {
             x: final_pos.0.x,
             y: final_pos.0.y,
@@ -355,12 +401,14 @@ impl JavaClient {
                 seq,
                 tick,
                 update_pos,
+                expected_old_state.as_u16(),
                 new_state_id,
                 inv,
                 slot,
                 before_item,
                 before_count,
                 count_after,
+                pumpkin_cluster::protocol::ChunkKey::new(world_id, actor.x, actor.y),
                 chunk,
             );
             PLACE_OUTBOX.push(update);

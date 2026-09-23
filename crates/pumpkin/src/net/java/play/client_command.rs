@@ -1,13 +1,26 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 use pumpkin_data::game_rules::GameRule;
-use pumpkin_protocol::java::client::play::CGameRuleValues;
+use pumpkin_protocol::codec::var_int::VarInt;
+use pumpkin_protocol::java::client::play::{CAwardStats, CGameRuleValues, Statistic};
 
 impl JavaClient {
     pub fn handle_client_status(&self, player: &Arc<Player>, client_status: &SClientCommand) {
         player.update_last_action_time();
         match client_status.action_id.0 {
             SClientCommand::PERFORM_RESPAWN => {
+                if player
+                    .world()
+                    .server
+                    .upgrade()
+                    .is_some_and(|server| server.advanced_config.cluster.enabled)
+                {
+                    player.client.try_kick(
+                        crate::net::DisconnectReason::Unknown,
+                        &TextComponent::text("Respawn could not be verified"),
+                    );
+                    return;
+                }
                 // Perform respawn
                 if player.living_entity.health.load() > 0.0 {
                     return;
@@ -46,6 +59,36 @@ impl JavaClient {
                 });
             }
             SClientCommand::REQUEST_STATS => {
+                if let Some(server) = player.world().server.upgrade()
+                    && server.advanced_config.cluster.enabled
+                {
+                    let Some(snapshot) = player
+                        .cluster_gid()
+                        .and_then(|gid| server.cluster_actor_statistics.load().get(&gid).cloned())
+                    else {
+                        player.client.try_kick(
+                            crate::net::DisconnectReason::Unknown,
+                            &TextComponent::text("Statistics could not be verified"),
+                        );
+                        return;
+                    };
+                    let packet_stats = snapshot
+                        .values
+                        .iter()
+                        .map(|((category, stat), value)| Statistic {
+                            category_id: VarInt(*category),
+                            statistic_id: VarInt(*stat),
+                            value: VarInt(*value),
+                        })
+                        .collect::<Vec<_>>();
+                    let packet = CAwardStats {
+                        stats: &packet_stats,
+                    };
+                    if let Ok(data) = self.serialize_packet(&packet) {
+                        self.try_enqueue_packet(data);
+                    }
+                    return;
+                }
                 // Request stats
                 player.send_stats();
             }

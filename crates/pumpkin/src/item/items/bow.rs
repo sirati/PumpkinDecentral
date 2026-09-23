@@ -149,6 +149,15 @@ impl BowItem {
             gid,
             pumpkin_cluster::combat::next_combat_seq(gid),
             crate::net::java::play::attack::combat_tick(),
+            {
+                let world = player.world();
+                let pos = player.get_entity().pos.load();
+                pumpkin_cluster::combat::chunk_of_pos(
+                    crate::server::cluster_world_delta::world_id(&world),
+                    pos.x,
+                    pos.z,
+                )
+            },
             kind,
             (power * 1000.0).clamp(0.0, 5000.0) as u16,
             dir,

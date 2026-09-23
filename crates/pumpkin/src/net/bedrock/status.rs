@@ -207,12 +207,8 @@ pub async fn handle_packet(
         return Ok(());
     }
 
-    let players = crate::server::cluster_status::cluster_status_online() as i32;
-    let game_mode = server
-        .defaultgamemode
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .gamemode;
+    let players = crate::server::cluster_status::cluster_status_online(server) as i32;
+    let game_mode = server.defaultgamemode.load().gamemode;
     let info = ServerInfo {
         motd: &server.advanced_config.networking.bedrock.motd,
         protocol: CURRENT_BEDROCK_MC_PROTOCOL,

@@ -47,6 +47,7 @@ impl JavaClient {
             ));
             return;
         };
+        let replica_gid = crate::server::cluster_ghost::remote_player_gid(target.as_ref());
         if let Some(player_victim) = &player_target {
             if player_victim.living_entity.health.load() <= 0.0 {
                 return;
@@ -63,10 +64,11 @@ impl JavaClient {
         attack_and_replicate(
             player,
             &target,
-            player_target.is_some(),
+            player_target.is_some() || replica_gid.is_some(),
             player_target
                 .as_ref()
-                .and_then(|victim| victim.cluster_gid()),
+                .and_then(|victim| victim.cluster_gid())
+                .or(replica_gid),
             server,
         );
     }
@@ -87,7 +89,10 @@ fn living_health(victim: &Arc<dyn EntityBase>) -> f32 {
 }
 
 fn damage_dealt_milli(before: f32, after: f32) -> u16 {
-    (before - after).max(0.0).mul_add(1000.0, 0.0).clamp(0.0, f32::from(u16::MAX)) as u16
+    (before - after)
+        .max(0.0)
+        .mul_add(1000.0, 0.0)
+        .clamp(0.0, f32::from(u16::MAX)) as u16
 }
 
 pub(crate) fn attack_and_replicate(
@@ -108,23 +113,64 @@ pub(crate) fn attack_and_replicate(
     let damage_milli = damage_dealt_milli(before, living_health(victim));
     let seq = next_combat_seq(gid);
     let tick = combat_tick();
+    let attacker_world = attacker.world();
+    let attacker_pos = attacker.get_entity().pos.load();
+    let actor_chunk = chunk_of_pos(
+        crate::server::cluster_world_delta::world_id(&attacker_world),
+        attacker_pos.x,
+        attacker_pos.z,
+    );
+    let victim_world = victim.get_entity().world.load();
     if victim_is_player {
         let Some(target) = victim_gid else {
             return;
         };
-        stage_hit_player(capture_hit_player(gid, seq, tick, target, damage_milli));
+        let target_chunk = chunk_of_pos(
+            crate::server::cluster_world_delta::world_id(&victim_world),
+            victim.get_entity().pos.load().x,
+            victim.get_entity().pos.load().z,
+        );
+        stage_hit_player(capture_hit_player(
+            gid,
+            seq,
+            tick,
+            actor_chunk,
+            target,
+            target_chunk,
+            damage_milli,
+        ));
     } else {
         let entity = victim.get_entity();
         let pos = entity.pos.load();
+        let target = victim
+            .cast_any()
+            .downcast_ref::<crate::entity::cluster_entity_replica::RemoteEntityReplica>()
+            .map_or(
+                EntityRef {
+                    origin: ServerId(server.advanced_config.cluster.server_id),
+                    local_id: entity.entity_id,
+                    generation: entity.cluster_generation(),
+                    chunk: chunk_of_pos(
+                        crate::server::cluster_world_delta::world_id(&victim_world),
+                        pos.x,
+                        pos.z,
+                    ),
+                },
+                |replica| EntityRef {
+                    chunk: chunk_of_pos(
+                        crate::server::cluster_world_delta::world_id(&victim_world),
+                        pos.x,
+                        pos.z,
+                    ),
+                    ..replica.cluster_ref
+                },
+            );
         stage_hit_entity(capture_hit_entity(
             gid,
             seq,
             tick,
-            EntityRef {
-                owner: ServerId(server.advanced_config.cluster.server_id),
-                local_id: entity.entity_id,
-                chunk: chunk_of_pos(pos.x, pos.z),
-            },
+            actor_chunk,
+            target,
             damage_milli,
         ));
     }

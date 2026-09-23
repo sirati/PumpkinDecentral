@@ -90,14 +90,29 @@ impl TrackedEntity {
         effective_range
     }
 
-    fn broadcast_to_player(&self, player: &Player) -> bool {
-        self.entity.get_player().is_none_or(|target_player| {
+    fn broadcast_to_player(&self, player: &Arc<Player>, world: &World) -> bool {
+        let spectator_visible = self.entity.get_player().is_none_or(|target_player| {
             player.gamemode.load() == GameMode::Spectator
                 || target_player.gamemode.load() != GameMode::Spectator
-        })
+        });
+        if !spectator_visible {
+            return false;
+        }
+        let Some(server) = world.server.upgrade() else {
+            return true;
+        };
+        if let Some(gid) = crate::server::cluster_ghost::remote_player_gid(self.entity.as_ref()) {
+            let snapshot = server.cluster_presence.snapshot();
+            return snapshot.entries.get(&gid).is_some_and(|entry| {
+                snapshot.is_visible_to(&gid, &entry.uuid, Some(player.gameprofile.id.as_bytes()))
+            });
+        }
+        self.entity
+            .get_player()
+            .is_none_or(|target| !crate::server::cluster_hide::is_hidden_player(&server, target))
     }
 
-    pub fn update_player(&self, player: &Arc<Player>, _world: &World) {
+    pub fn update_player(&self, player: &Arc<Player>, world: &World) {
         if player.get_entity().entity_id == self.entity_id {
             return;
         }
@@ -122,7 +137,7 @@ impl TrackedEntity {
 
         // Vanilla `isChunkTracked`: never spawn before the chunk packet.
         let is_visible = dist_sq <= range_sq
-            && self.broadcast_to_player(player)
+            && self.broadcast_to_player(player, world)
             && in_view
             && player
                 .chunk_sender
@@ -657,11 +672,9 @@ impl EntityTracker {
             for player in players.iter() {
                 if player.cluster_gid() == Some(sample.gid) {
                     let entity = player.get_entity();
-                    entity.pos.store(Vector3::new(
-                        sample.pos[0],
-                        sample.pos[1],
-                        sample.pos[2],
-                    ));
+                    entity
+                        .pos
+                        .store(Vector3::new(sample.pos[0], sample.pos[1], sample.pos[2]));
                     entity.velocity.store(Vector3::new(
                         sample.vel[0],
                         sample.vel[1],

@@ -4,6 +4,7 @@ use pumpkin_util::permission::{Permission, PermissionDefault, PermissionRegistry
 use pumpkin_util::text::TextComponent;
 use pumpkin_util::text::color::NamedColor;
 
+use crate::command::CommandSender;
 use crate::command::argument_builder::{ArgumentBuilder, argument, command};
 use crate::command::argument_types::core::string::StringArgumentType;
 use crate::command::argument_types::entity::{EntityArgumentType, NO_PLAYERS_ERROR_TYPE};
@@ -53,7 +54,7 @@ impl CommandExecutor for KickExecutor {
             };
             let directory =
                 crate::server::cluster_presence::admin_directory_snapshot(&cluster_server);
-            let Some(delivery) = pumpkin_cluster::admin_sync::resolve_kick_by_name(
+            let Some(mut delivery) = pumpkin_cluster::admin_sync::resolve_kick_by_name(
                 &directory,
                 &requested,
                 reason_text.clone(),
@@ -61,20 +62,43 @@ impl CommandExecutor for KickExecutor {
             ) else {
                 return Err(NO_PLAYERS_ERROR_TYPE.create_without_context());
             };
+            let issuer_identity = match &context.source.output {
+                CommandSender::Player(player) | CommandSender::Lobby(player) => player
+                    .cluster_gid()
+                    .map(|gid| (gid, *player.gameprofile.id.as_bytes())),
+                CommandSender::PreJoin(lobby) => Some((lobby.gid, *lobby.profile.id.as_bytes())),
+                _ => None,
+            };
+            delivery.request.issuer_identity = issuer_identity.map(|(gid, uuid)| {
+                pumpkin_cluster::admin_sync::KickIssuerIdentity {
+                    gid,
+                    uuid,
+                    permission_revision: crate::server::cluster_presence::permission_revision(
+                        &cluster_server,
+                    ),
+                }
+            });
             if !crate::server::cluster_admin_apply::route_kick_request(
                 &cluster_server,
                 &delivery.request,
             ) {
                 return Err(NO_PLAYERS_ERROR_TYPE.create_without_context());
             }
-            let feedback = TextComponent::translate_cross(
-                translation::java::COMMANDS_KICK_SUCCESS,
-                translation::bedrock::COMMANDS_KICK_SUCCESS,
-                [
-                    TextComponent::text(delivery.request.target_name.clone()),
-                    reason.clone(),
-                ],
-            );
+            let feedback = if delivery.local {
+                TextComponent::translate_cross(
+                    translation::java::COMMANDS_KICK_SUCCESS,
+                    translation::bedrock::COMMANDS_KICK_SUCCESS,
+                    [
+                        TextComponent::text(delivery.request.target_name.clone()),
+                        reason.clone(),
+                    ],
+                )
+            } else {
+                TextComponent::text(format!(
+                    "Kick request queued for {}",
+                    delivery.request.target_name
+                ))
+            };
             context
                 .source
                 .send_feedback(feedback.color_named(NamedColor::Blue), true);
@@ -82,14 +106,6 @@ impl CommandExecutor for KickExecutor {
         }
         for target in &targets {
             target.kick(DisconnectReason::Kicked, &reason);
-            crate::server::cluster_admin_apply::broadcast_kick_for_local_player(
-                &cluster_server,
-                target.cluster_gid(),
-                &target.gameprofile.name,
-                &reason_text,
-                &issuer,
-            );
-
             let feedback = if self.has_reason {
                 TextComponent::translate_cross(
                     translation::java::COMMANDS_KICK_SUCCESS,

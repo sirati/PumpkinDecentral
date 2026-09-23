@@ -4,6 +4,7 @@ use pumpkin_data::translation;
 use pumpkin_nbt::compound::NbtCompound;
 use pumpkin_util::text::TextComponent;
 
+use crate::entity::Entity;
 use crate::entity::player::Player;
 
 use super::container::{self, MinecartInventory};
@@ -27,10 +28,12 @@ impl ChestMinecart {
     pub(super) fn interact(
         &self,
         custom_name: Option<TextComponent>,
+        entity: &Entity,
         player: &Arc<Player>,
     ) -> bool {
         container::open(
             custom_name,
+            entity,
             player,
             &self.inventory,
             TextComponent::translate_cross(

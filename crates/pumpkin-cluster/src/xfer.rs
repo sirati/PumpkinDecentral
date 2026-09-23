@@ -2,26 +2,27 @@ use serde::{Deserialize, Serialize};
 
 use crate::chunks::{ChunkAnnounce, ChunkFetch};
 use crate::codec::CodecError;
-use crate::protocol::{ChunkAddr, StreamKind};
+use crate::protocol::{ChunkKey, StreamKind};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingRef {
-    pub bytes: Vec<u8>,
+    pub state: crate::completion::ChunkPendingTick,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChunkPayload {
-    pub chunk: ChunkAddr,
+    pub chunk: ChunkKey,
     pub holder: u16,
     pub snapshot: Vec<u8>,
     pub pendings: Vec<PendingRef>,
     pub holders: Vec<u16>,
+    pub inventory: Vec<crate::inventory::ChunkInventoryState>,
 }
 
 impl ChunkPayload {
     #[must_use]
     pub fn new(
-        chunk: ChunkAddr,
+        chunk: ChunkKey,
         holder: u16,
         snapshot: Vec<u8>,
         pendings: Vec<PendingRef>,
@@ -30,7 +31,23 @@ impl ChunkPayload {
         let mut sorted = holders;
         sorted.sort_unstable();
         sorted.dedup();
-        Self { chunk, holder, snapshot, pendings, holders: sorted }
+        Self {
+            chunk,
+            holder,
+            snapshot,
+            pendings,
+            holders: sorted,
+            inventory: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_inventory(
+        mut self,
+        inventory: Vec<crate::inventory::ChunkInventoryState>,
+    ) -> Self {
+        self.inventory = inventory;
+        self
     }
 }
 
@@ -89,14 +106,13 @@ pub fn decode_payload(bytes: &[u8]) -> Result<ChunkPayload, CodecError> {
     })
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::chunks::{ChunkAdvert, ChunkDrop};
 
-    fn chunk(x: i32, z: i32) -> ChunkAddr {
-        ChunkAddr { x, z }
+    fn chunk(x: i32, z: i32) -> ChunkKey {
+        ChunkKey::new(crate::protocol::WorldId::new(0, 7), x, z)
     }
 
     #[test]
@@ -131,13 +147,75 @@ mod tests {
             chunk(5, 6),
             2,
             vec![9, 8, 7],
-            vec![PendingRef { bytes: vec![1] }],
+            vec![PendingRef {
+                state: crate::completion::ChunkPendingTick {
+                    tick: crate::time::TickStamp(7),
+                    chunk: chunk(5, 6),
+                    holders: vec![crate::identity::ServerId(2)],
+                    finishes: Vec::new(),
+                    batches: Vec::new(),
+                },
+            }],
             vec![3, 1, 2, 1],
         );
         let bytes = encode_payload(&payload).expect("encode");
         let back = decode_payload(&bytes).expect("decode");
         assert_eq!(back, payload);
         assert_eq!(back.holders, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn payload_carries_virtual_input_and_beacon_revision() {
+        use crate::actor::ActorId;
+        use crate::identity::{GlobalPlayerId, PlayerSlot, ServerId};
+        use crate::inventory::{
+            BeaconMenuState, ChunkInventoryState, InvLoc, InventoryCell,
+            InventoryStateSnapshot, InventoryTarget, INV_MAIN,
+        };
+        let chunk = chunk(5, 6);
+        let virtual_target = InventoryTarget::Virtual {
+            host: ServerId(2),
+            owner: ActorId::Player(GlobalPlayerId::new(ServerId(2), PlayerSlot(4))),
+            session: 17,
+            kind: 1,
+        };
+        let beacon_target = InventoryTarget::Block {
+            chunk,
+            position: crate::protocol::BlockPos { x: 80, y: 80, z: 96 },
+        };
+        let inventory = vec![
+            ChunkInventoryState {
+                snapshot: InventoryStateSnapshot {
+                    target: virtual_target,
+                    revision: 7,
+                    cells: vec![InventoryCell {
+                        loc: InvLoc::new(INV_MAIN, 0),
+                        item: 4,
+                        count: 2,
+                        nbt: vec![1, 2],
+                    }],
+                },
+                chunks: vec![chunk],
+                beacon: None,
+            },
+            ChunkInventoryState {
+                snapshot: InventoryStateSnapshot {
+                    target: beacon_target,
+                    revision: 9,
+                    cells: vec![InventoryCell::empty(InvLoc::new(INV_MAIN, 0))],
+                },
+                chunks: vec![chunk],
+                beacon: Some(BeaconMenuState {
+                    revision: 11,
+                    levels: 1,
+                    primary_effect: Some(1),
+                    secondary_effect: None,
+                }),
+            },
+        ];
+        let payload = ChunkPayload::new(chunk, 2, vec![9], Vec::new(), vec![2])
+            .with_inventory(inventory.clone());
+        assert_eq!(decode_payload(&encode_payload(&payload).unwrap()).unwrap().inventory, inventory);
     }
 
     #[test]

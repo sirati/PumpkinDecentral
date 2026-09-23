@@ -48,7 +48,9 @@ impl CommandExecutor for DefaultGamemodeExecutor {
             true,
         );
 
-        server.defaultgamemode.lock().unwrap().gamemode = gamemode;
+        server
+            .defaultgamemode
+            .store(std::sync::Arc::new(DefaultGamemode { gamemode }));
 
         Ok(successful_changes)
     }

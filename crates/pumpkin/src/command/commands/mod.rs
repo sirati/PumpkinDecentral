@@ -14,6 +14,8 @@ mod banlist;
 mod bossbar;
 mod clear;
 mod clone;
+#[cfg(feature = "cluster-e2e")]
+mod clustertest;
 mod damage;
 mod data;
 mod datapack;
@@ -159,6 +161,8 @@ pub fn default_dispatcher(
     playsound::register(&mut dispatcher, registry);
     fill::register(&mut dispatcher, registry);
     clear::register(&mut dispatcher, registry);
+    #[cfg(feature = "cluster-e2e")]
+    clustertest::register(&mut dispatcher, registry);
     pumpkin::register(&mut dispatcher, registry);
     me::register(&mut dispatcher, registry);
     msg::register(&mut dispatcher, registry);

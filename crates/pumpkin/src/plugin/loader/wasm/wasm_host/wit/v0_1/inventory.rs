@@ -29,6 +29,40 @@ const fn from_wasm_hand(hand: WitHand) -> pumpkin_util::Hand {
 impl InventoryHost for PluginHostState {}
 
 impl PluginHostState {
+    fn reject_cluster_generic_inventory_read(
+        &self,
+        provider: &InventoryProvider,
+    ) -> wasmtime::Result<()> {
+        if matches!(provider, InventoryProvider::Generic(_))
+            && self
+                .server
+                .as_ref()
+                .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            return Err(wasmtime::Error::msg(
+                "Cluster generic inventory read requires an immutable snapshot",
+            ));
+        }
+        Ok(())
+    }
+
+    fn reject_cluster_inventory_mutation(
+        &self,
+        provider: &InventoryProvider,
+    ) -> wasmtime::Result<()> {
+        if self
+            .server
+            .as_ref()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+            || matches!(provider, InventoryProvider::PlayerMain(player) | InventoryProvider::PlayerEnderChest(player) if player.cluster_gid().is_some())
+        {
+            return Err(wasmtime::Error::msg(
+                "Cluster inventory mutation requires the semantic inventory service",
+            ));
+        }
+        Ok(())
+    }
+
     fn get_inventory_provider(
         &self,
         res: &Resource<WitInventory>,
@@ -55,6 +89,7 @@ impl PluginHostState {
 impl HostInventory for PluginHostState {
     async fn get_size(&mut self, res: Resource<WitInventory>) -> wasmtime::Result<u32> {
         let provider = self.get_inventory_provider(&res)?;
+        self.reject_cluster_generic_inventory_read(&provider)?;
         let size = match provider {
             InventoryProvider::Generic(inv) => inv.size() as u32,
             InventoryProvider::PlayerMain(_) => 36,
@@ -65,6 +100,7 @@ impl HostInventory for PluginHostState {
 
     async fn is_empty(&mut self, res: Resource<WitInventory>) -> wasmtime::Result<bool> {
         let provider = self.get_inventory_provider(&res)?;
+        self.reject_cluster_generic_inventory_read(&provider)?;
         let empty = match provider {
             InventoryProvider::Generic(inv) => inv.is_empty(),
             InventoryProvider::PlayerMain(player) => {
@@ -85,6 +121,7 @@ impl HostInventory for PluginHostState {
         slot: u32,
     ) -> wasmtime::Result<Option<Resource<WitHostItemStack>>> {
         let provider = self.get_inventory_provider(&res)?;
+        self.reject_cluster_generic_inventory_read(&provider)?;
         let stack = match provider {
             InventoryProvider::Generic(inv) => {
                 let s = inv.get_stack(slot as usize);
@@ -121,13 +158,14 @@ impl HostInventory for PluginHostState {
         slot: u32,
         item: Option<Resource<WitHostItemStack>>,
     ) -> wasmtime::Result<()> {
+        let provider = self.get_inventory_provider(&res)?;
+        self.reject_cluster_inventory_mutation(&provider)?;
         let stack = if let Some(stack_res) = item {
             self.get_item_stack(&stack_res)?.lock().await.clone()
         } else {
             pumpkin_data::item_stack::ItemStack::EMPTY.clone()
         };
 
-        let provider = self.get_inventory_provider(&res)?;
         match provider {
             InventoryProvider::Generic(inv) => {
                 inv.set_stack(slot as usize, stack);
@@ -157,6 +195,7 @@ impl HostInventory for PluginHostState {
         slot: u32,
     ) -> wasmtime::Result<Option<Resource<WitHostItemStack>>> {
         let provider = self.get_inventory_provider(&res)?;
+        self.reject_cluster_inventory_mutation(&provider)?;
         let old_stack = match provider {
             InventoryProvider::Generic(inv) => {
                 let s = inv.remove_stack(slot as usize);
@@ -202,6 +241,7 @@ impl HostInventory for PluginHostState {
 
     async fn clear(&mut self, res: Resource<WitInventory>) -> wasmtime::Result<()> {
         let provider = self.get_inventory_provider(&res)?;
+        self.reject_cluster_inventory_mutation(&provider)?;
         match provider {
             InventoryProvider::Generic(inv) => {
                 inv.clear();
@@ -257,6 +297,7 @@ impl HostInventory for PluginHostState {
         item_id: String,
     ) -> wasmtime::Result<u32> {
         let provider = self.get_inventory_provider(&res)?;
+        self.reject_cluster_generic_inventory_read(&provider)?;
         let mut total = 0u32;
         let is_matching =
             |key: &str| key == item_id || key.strip_prefix("minecraft:") == Some(&item_id);
@@ -339,6 +380,7 @@ impl HostPlayerInventory for PluginHostState {
         item: Option<Resource<WitHostItemStack>>,
     ) -> wasmtime::Result<()> {
         let player = self.get_player_inventory_player(&res)?;
+        self.reject_cluster_inventory_mutation(&InventoryProvider::PlayerMain(player.clone()))?;
         let stack = if let Some(stack_res) = item {
             self.get_item_stack(&stack_res)?.lock().await.clone()
         } else {
@@ -376,7 +418,31 @@ impl HostPlayerInventory for PluginHostState {
     ) -> wasmtime::Result<()> {
         let player = self.get_player_inventory_player(&res)?;
         if slot < 9 {
-            player.inventory().set_selected_slot(slot);
+            let Some(server) = self.server.as_ref() else {
+                return Err(wasmtime::Error::msg("server is unavailable"));
+            };
+            if server.advanced_config.cluster.enabled {
+                let gid = player
+                    .cluster_gid()
+                    .ok_or_else(|| wasmtime::Error::msg("player has no cluster identity"))?;
+                let position = player.position();
+                let affected = vec![pumpkin_cluster::protocol::ChunkKey::new(
+                    crate::server::cluster_world_delta::world_id(&player.world()),
+                    (position.x.floor() as i32).div_euclid(16),
+                    (position.z.floor() as i32).div_euclid(16),
+                )];
+                crate::server::cluster_invsee::submit_selected_slot_mutation(
+                    server,
+                    gid,
+                    pumpkin_cluster::time::TickStamp::now(),
+                    slot,
+                    affected,
+                    None,
+                )
+                .map_err(|error| wasmtime::Error::msg(format!("{error:?}")))?;
+            } else {
+                player.inventory().set_selected_slot(slot);
+            }
         }
         Ok(())
     }

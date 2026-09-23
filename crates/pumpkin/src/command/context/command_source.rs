@@ -385,7 +385,7 @@ impl CommandSource {
         };
         if server.level_info.load().game_rules.send_command_feedback {
             let output_player = match &self.output {
-                CommandSender::Player(sender) => Some(sender),
+                CommandSender::Player(sender) | CommandSender::Lobby(sender) => Some(sender),
                 _ => None,
             };
             for player in server.get_all_players() {

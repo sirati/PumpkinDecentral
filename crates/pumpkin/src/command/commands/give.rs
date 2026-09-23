@@ -8,6 +8,7 @@ use crate::command::argument_types::core::integer::IntegerArgumentType;
 use crate::command::argument_types::entity::EntityArgumentType;
 use crate::command::argument_types::item::ItemStackArgumentType;
 use crate::command::context::command_context::CommandContext;
+use crate::command::errors::error_types::CommandErrorType;
 use crate::command::node::dispatcher::CommandDispatcher;
 use crate::command::node::{CommandExecutor, CommandExecutorResult};
 use crate::entity::EntityBase;
@@ -15,12 +16,26 @@ use crate::entity::EntityBase;
 const DESCRIPTION: &str = "Give items to player(s).";
 const PERMISSION: &str = "minecraft:command.give";
 
+const ERROR_CLUSTER_INVENTORY_UNAVAILABLE: CommandErrorType<0> = CommandErrorType::new(
+    "commands.inventory.unavailable",
+    "Inventory change unavailable",
+);
+
 struct GiveExecutor {
     has_count: bool,
 }
 
 impl CommandExecutor for GiveExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
+        if context
+            .source
+            .world()
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            return Err(ERROR_CLUSTER_INVENTORY_UNAVAILABLE.create_without_context());
+        }
         let targets = EntityArgumentType::get_players(context, "targets")?;
         let parsed_stack = ItemStackArgumentType::get(context, "item")?;
         let item = parsed_stack.item;

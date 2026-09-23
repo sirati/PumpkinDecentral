@@ -56,10 +56,7 @@ fn broadcast_warn_cooldown_elapsed() -> bool {
         .is_ok()
 }
 
-pub fn install_world_time_outbox(
-    peers: Vec<u16>,
-    outbound: mpsc::Sender<OutboundParcel>,
-) {
+pub fn install_world_time_outbox(peers: Vec<u16>, outbound: mpsc::Sender<OutboundParcel>) {
     let _ = WORLD_TIME_OUTBOX.set(WorldTimeOutbox { peers, outbound });
 }
 
@@ -312,7 +309,10 @@ pub fn handle_world_time_parcel(server: &Arc<Server>, parcel: &InboundParcel) ->
     apply_world_time_bytes(server, &parcel.bytes)
 }
 
-pub async fn world_time_task(server: Arc<Server>, mut world_time_rx: mpsc::Receiver<InboundParcel>) {
+pub async fn world_time_task(
+    server: Arc<Server>,
+    mut world_time_rx: mpsc::Receiver<InboundParcel>,
+) {
     let mut first = true;
     while let Some(parcel) = world_time_rx.recv().await {
         if parcel.header.kind != StreamKind::Control {

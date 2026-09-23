@@ -36,6 +36,11 @@ const ERROR_NOT_PLAYER: CommandErrorType<0> = CommandErrorType::new(
     translation::java::PERMISSIONS_REQUIRES_PLAYER,
 );
 
+const ERROR_CLUSTER_INVENTORY_UNAVAILABLE: CommandErrorType<0> = CommandErrorType::new(
+    "commands.inventory.unavailable",
+    "Inventory change unavailable",
+);
+
 const MAX_NO_UPPER_LIMIT: i32 = -1;
 const MAX_NO_CLEAR_BUT_SIMULATE: i32 = 0;
 
@@ -108,6 +113,14 @@ fn clear_inventory(
     predicate: &ItemPredicate,
     max_count: i32,
 ) -> Result<i32, CommandSyntaxError> {
+    if source
+        .world()
+        .server
+        .upgrade()
+        .is_some_and(|server| server.advanced_config.cluster.enabled)
+    {
+        return Err(ERROR_CLUSTER_INVENTORY_UNAVAILABLE.create_without_context());
+    }
     let mut total_count = 0;
 
     for player in players {

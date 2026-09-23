@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use crate::protocol::ChunkAddr;
+use crate::protocol::ChunkKey;
 
 /// Ground-truth plus local-truth dual copy for one chunk.
 ///
@@ -126,8 +126,8 @@ impl<C> Clone for DualChunk<C> {
 /// Dual-copy registry tracking optimistic edits per chunk.
 #[derive(Debug)]
 pub struct DualStore<C> {
-    chunks: Mutex<HashMap<ChunkAddr, DualChunk<C>>>,
-    pending: Mutex<HashMap<ChunkAddr, Vec<BlockEdit>>>,
+    chunks: Mutex<HashMap<ChunkKey, DualChunk<C>>>,
+    pending: Mutex<HashMap<ChunkKey, Vec<BlockEdit>>>,
 }
 
 impl<C> Default for DualStore<C> {
@@ -147,7 +147,7 @@ impl<C> DualStore<C> {
 }
 
 impl<C: DualChunkData> DualStore<C> {
-    pub fn ingest(&self, chunk: ChunkAddr, pair: DualChunk<C>, pending: Vec<BlockEdit>) {
+    pub fn ingest(&self, chunk: ChunkKey, pair: DualChunk<C>, pending: Vec<BlockEdit>) {
         if let Ok(mut chunks) = self.chunks.lock() {
             chunks.insert(chunk, pair);
         }
@@ -157,7 +157,7 @@ impl<C: DualChunkData> DualStore<C> {
     }
 
     #[must_use]
-    pub fn remove(&self, chunk: ChunkAddr) -> bool {
+    pub fn remove(&self, chunk: ChunkKey) -> bool {
         let had_pair = if let Ok(mut chunks) = self.chunks.lock() {
             chunks.remove(&chunk).is_some()
         } else {
@@ -172,7 +172,7 @@ impl<C: DualChunkData> DualStore<C> {
     }
 
     #[must_use]
-    pub fn contains(&self, chunk: ChunkAddr) -> bool {
+    pub fn contains(&self, chunk: ChunkKey) -> bool {
         if let Ok(chunks) = self.chunks.lock() {
             chunks.contains_key(&chunk)
         } else {
@@ -181,7 +181,7 @@ impl<C: DualChunkData> DualStore<C> {
     }
 
     #[must_use]
-    pub fn pair(&self, chunk: ChunkAddr) -> Option<DualChunk<C>> {
+    pub fn pair(&self, chunk: ChunkKey) -> Option<DualChunk<C>> {
         if let Ok(chunks) = self.chunks.lock() {
             chunks.get(&chunk).cloned()
         } else {
@@ -190,7 +190,7 @@ impl<C: DualChunkData> DualStore<C> {
     }
 
     #[must_use]
-    pub fn pending_for(&self, chunk: ChunkAddr) -> Vec<BlockEdit> {
+    pub fn pending_for(&self, chunk: ChunkKey) -> Vec<BlockEdit> {
         if let Ok(pendings) = self.pending.lock() {
             pendings.get(&chunk).cloned().unwrap_or_default()
         } else {
@@ -201,7 +201,7 @@ impl<C: DualChunkData> DualStore<C> {
     /// Applies optimistic edits to local-truth immediately and tracks them as pending.
     ///
     /// Ground-truth stays untouched until promotion agrees on the tick.
-    pub fn apply_local(&self, chunk: ChunkAddr, edits: &[BlockEdit]) -> bool {
+    pub fn apply_local(&self, chunk: ChunkKey, edits: &[BlockEdit]) -> bool {
         let Some(pair) = self.pair(chunk) else {
             return false;
         };
@@ -239,7 +239,7 @@ impl<C: DualChunkData> DualStore<C> {
     /// is never rebuilt by full copy or replay regeneration here.
     pub fn promote_tick(
         &self,
-        chunk: ChunkAddr,
+        chunk: ChunkKey,
         accepted: &[BlockEdit],
         still_pending: &[BlockEdit],
     ) -> bool {
@@ -266,10 +266,8 @@ impl<C: DualChunkData> DualStore<C> {
             .copied()
             .filter(BlockEdit::is_in_bounds)
             .collect();
-        let survivor_positions: HashSet<(usize, i32, usize)> = survivors
-            .iter()
-            .map(BlockEdit::as_position)
-            .collect();
+        let survivor_positions: HashSet<(usize, i32, usize)> =
+            survivors.iter().map(BlockEdit::as_position).collect();
         let mut superseded_positions: HashSet<(usize, i32, usize)> = HashSet::new();
         for edit in previous_pending.iter().chain(accepted.iter()) {
             if !edit.is_in_bounds() {
@@ -388,16 +386,25 @@ mod tests {
         }
     }
 
-    fn addr() -> ChunkAddr {
-        ChunkAddr { x: 3, z: -2 }
+    fn addr() -> ChunkKey {
+        ChunkKey::new(crate::protocol::WorldId::new(0, 7), 3, -2)
     }
 
-    fn store_with_pair() -> (DualStore<MockChunk>, ChunkAddr, Arc<MockChunk>, Arc<MockChunk>) {
+    fn store_with_pair() -> (
+        DualStore<MockChunk>,
+        ChunkKey,
+        Arc<MockChunk>,
+        Arc<MockChunk>,
+    ) {
         let store = DualStore::new();
         let chunk = addr();
         let ground = MockChunk::tracked(&[((1, 0, 1), 7)]);
         let local = MockChunk::tracked(&[((1, 0, 1), 7)]);
-        store.ingest(chunk, DualChunk::new(Arc::clone(&ground), Arc::clone(&local)), Vec::new());
+        store.ingest(
+            chunk,
+            DualChunk::new(Arc::clone(&ground), Arc::clone(&local)),
+            Vec::new(),
+        );
         (store, chunk, ground, local)
     }
 

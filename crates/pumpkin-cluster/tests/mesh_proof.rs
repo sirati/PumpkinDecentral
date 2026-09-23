@@ -10,10 +10,10 @@ use std::time::Duration;
 
 use pumpkin_cluster::chunks::{ChunkAdvert, ChunkAnnounce, ChunkFetch, Directory};
 use pumpkin_cluster::primary::{check_player_login, primary_accepts_players};
-use pumpkin_cluster::protocol::{ChunkAddr, StreamKind};
+use pumpkin_cluster::protocol::{ChunkKey, StreamKind, WorldId};
 use pumpkin_cluster::xfer::{
-    ChunkPayload, decode_announce, decode_payload, decode_request, encode_announce,
-    encode_payload, encode_request,
+    ChunkPayload, decode_announce, decode_payload, decode_request, encode_announce, encode_payload,
+    encode_request,
 };
 use tokio::sync::mpsc;
 
@@ -22,38 +22,39 @@ const SECONDARY_ID: u16 = 1;
 const EXTRA_PEER_ID: u16 = 7;
 const PROOF_TIMEOUT_SECS: u64 = 5;
 const PROOF_CHANNEL_DEPTH: usize = 32;
+const WORLD: WorldId = WorldId::new(0, 7);
 
-fn login_chunks() -> Vec<ChunkAddr> {
+fn login_chunks() -> Vec<ChunkKey> {
     vec![
-        ChunkAddr { x: 0, z: 0 },
-        ChunkAddr { x: 1, z: 0 },
-        ChunkAddr { x: 0, z: 1 },
-        ChunkAddr { x: 1, z: 1 },
-        ChunkAddr { x: -1, z: 0 },
-        ChunkAddr { x: 0, z: -1 },
+        ChunkKey::new(WORLD, 0, 0),
+        ChunkKey::new(WORLD, 1, 0),
+        ChunkKey::new(WORLD, 0, 1),
+        ChunkKey::new(WORLD, 1, 1),
+        ChunkKey::new(WORLD, -1, 0),
+        ChunkKey::new(WORLD, 0, -1),
     ]
 }
 
-fn snapshot_bytes(chunk: &ChunkAddr) -> Vec<u8> {
+fn snapshot_bytes(chunk: &ChunkKey) -> Vec<u8> {
     let mut out = Vec::with_capacity(16);
-    out.extend_from_slice(&chunk.x.to_le_bytes());
-    out.extend_from_slice(&chunk.z.to_le_bytes());
+    out.extend_from_slice(&chunk.x().to_le_bytes());
+    out.extend_from_slice(&chunk.z().to_le_bytes());
     out.extend_from_slice(&[0xC1, 0x75, 0x6E, 0x6B, 0x5F, 0x44, 0x41, 0x54]);
     out
 }
 
-fn sorted_addrs(addrs: Vec<ChunkAddr>) -> Vec<ChunkAddr> {
+fn sorted_addrs(addrs: Vec<ChunkKey>) -> Vec<ChunkKey> {
     let mut out = addrs;
-    out.sort_by(|left, right| (left.x, left.z).cmp(&(right.x, right.z)));
+    out.sort_by(|left, right| left.cmp(right));
     out
 }
 
 struct PrimaryNode {
-    snapshots: HashMap<ChunkAddr, Vec<u8>>,
+    snapshots: HashMap<ChunkKey, Vec<u8>>,
 }
 
 impl PrimaryNode {
-    fn new(chunks: &[ChunkAddr]) -> Self {
+    fn new(chunks: &[ChunkKey]) -> Self {
         let mut snapshots = HashMap::new();
         for chunk in chunks {
             snapshots.insert(*chunk, snapshot_bytes(chunk));
@@ -74,19 +75,18 @@ impl PrimaryNode {
     fn serve_frame(&self, holder: u16, frame: &[u8]) -> Option<Vec<u8>> {
         let fetch: ChunkFetch = decode_request(frame).ok()?;
         let snapshot = self.snapshots.get(&fetch.chunk)?.clone();
-        let payload =
-            ChunkPayload::new(fetch.chunk, holder, snapshot, Vec::new(), vec![holder]);
+        let payload = ChunkPayload::new(fetch.chunk, holder, snapshot, Vec::new(), vec![holder]);
         encode_payload(&payload).ok()
     }
 
-    fn snapshot(&self, chunk: &ChunkAddr) -> Option<Vec<u8>> {
+    fn snapshot(&self, chunk: &ChunkKey) -> Option<Vec<u8>> {
         self.snapshots.get(chunk).cloned()
     }
 }
 
 struct SecondaryNode {
     directory: Directory,
-    store: HashMap<ChunkAddr, Vec<u8>>,
+    store: HashMap<ChunkKey, Vec<u8>>,
     fetched: u64,
     generated: u64,
 }
@@ -115,12 +115,12 @@ impl SecondaryNode {
         }
     }
 
-    fn request_frame(&self, chunk: &ChunkAddr) -> Option<Vec<u8>> {
+    fn request_frame(&self, chunk: &ChunkKey) -> Option<Vec<u8>> {
         let fetch = self.directory.fetch_for(chunk)?;
         encode_request(&fetch).ok()
     }
 
-    fn ingest_frame(&mut self, frame: &[u8]) -> Option<ChunkAddr> {
+    fn ingest_frame(&mut self, frame: &[u8]) -> Option<ChunkKey> {
         let payload = decode_payload(frame).unwrap();
         let chunk = payload.chunk;
         self.store.insert(chunk, payload.snapshot.clone());
@@ -140,11 +140,11 @@ impl SecondaryNode {
         self.store.len()
     }
 
-    fn has(&self, chunk: &ChunkAddr) -> bool {
+    fn has(&self, chunk: &ChunkKey) -> bool {
         self.store.contains_key(chunk)
     }
 
-    fn snapshot(&self, chunk: &ChunkAddr) -> Option<Vec<u8>> {
+    fn snapshot(&self, chunk: &ChunkKey) -> Option<Vec<u8>> {
         self.store.get(chunk).cloned()
     }
 }
@@ -175,7 +175,7 @@ async fn secondary_login_fetches_every_chunk_without_generating() {
         assert!(secondary.apply_frame(&frame));
     }
 
-    let mut requested: HashSet<ChunkAddr> = HashSet::new();
+    let mut requested: HashSet<ChunkKey> = HashSet::new();
     for chunk in &wanted {
         let frame = secondary.request_frame(chunk).unwrap();
         let fetch: ChunkFetch = decode_request(&frame).unwrap();
@@ -197,13 +197,10 @@ async fn secondary_login_fetches_every_chunk_without_generating() {
     drop(data_tx);
 
     for _ in 0..wanted.len() {
-        let frame = tokio::time::timeout(
-            Duration::from_secs(PROOF_TIMEOUT_SECS),
-            data_rx.recv(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(PROOF_TIMEOUT_SECS), data_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         let chunk = secondary.ingest_frame(&frame).unwrap();
         assert!(wanted.contains(&chunk));
     }

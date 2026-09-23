@@ -125,8 +125,8 @@ use pumpkin_protocol::{
         self,
         client::play::{
             CBlockEntityData, CDamageEvent, CEntityStatus, CGameEvent, CLogin, CMultiBlockUpdate,
-            CPlayerInfoUpdate, CRemoveEntities, CRemovePlayerInfo, CSetSelectedSlot, CSoundEffect,
-            CSpawnEntity, GameEvent, InitChat, PlayerAction, PlayerInfoFlags,
+            CPlayerInfoUpdate, CRemoveEntities, CRemovePlayerInfo, CSetCamera, CSetSelectedSlot,
+            CSoundEffect, CSpawnEntity, GameEvent, InitChat, PlayerAction, PlayerInfoFlags,
         },
         server::play::SChatMessage,
     },
@@ -158,7 +158,7 @@ use pumpkin_world::{level::Level, tick::TickPriority};
 pub use pumpkin_world::{world::BlockFlags, world_info::LevelData};
 use rand::seq::SliceRandom;
 use rand::{RngExt, rng};
-use scoreboard::Scoreboard;
+use scoreboard::{Scoreboard, Team};
 use time::LevelTime;
 
 pub mod block_placer;
@@ -258,6 +258,7 @@ pub struct World {
     pub entities: ArcSwap<Vec<Arc<dyn EntityBase>>>,
     /// The world's scoreboard, used for tracking scores, objectives, and display information.
     pub scoreboard: std::sync::Mutex<Scoreboard>,
+    pub team_chat_snapshot: Arc<ArcSwap<FxHashMap<String, Team>>>,
     /// The world's worldborder, defining the playable area and controlling its expansion or contraction.
     pub worldborder: std::sync::Mutex<Worldborder>,
     /// The world's time, including counting ticks for weather, time cycles, and statistics.
@@ -392,13 +393,17 @@ impl World {
             NbtCompound::new()
         };
 
+        let team_chat_snapshot = Arc::new(ArcSwap::from_pointee(FxHashMap::default()));
         Self {
             uuid: Uuid::new_v4(),
             level,
             level_info,
             players: ArcSwap::new(Arc::new(Vec::new())),
             entities: ArcSwap::new(Arc::new(Vec::new())),
-            scoreboard: std::sync::Mutex::new(Scoreboard::default()),
+            scoreboard: std::sync::Mutex::new(Scoreboard::with_team_snapshot(Arc::clone(
+                &team_chat_snapshot,
+            ))),
+            team_chat_snapshot,
             worldborder: std::sync::Mutex::new(Worldborder::new(
                 0.0,
                 0.0,
@@ -668,6 +673,23 @@ impl World {
         bedrock_status: Option<ActorEventID>,
     ) {
         let status_code = java_status as i8;
+        self.broadcast_cluster_entity_event(entity, status_code, bedrock_status);
+        if let Some(server) = self.server.upgrade() {
+            crate::server::cluster_entity_emit::stage_transient_if_cluster(
+                &server,
+                entity,
+                u8::try_from(status_code).unwrap_or(u8::MAX),
+                bedrock_status.map(|status| status as u8),
+            );
+        }
+    }
+
+    pub fn broadcast_cluster_entity_event(
+        &self,
+        entity: &Entity,
+        status_code: i8,
+        bedrock_status: Option<ActorEventID>,
+    ) {
         let je_packet = CEntityStatus::new(entity.entity_id, status_code);
         if let Some(be_event) = bedrock_status {
             let be_packet = SActorEvent {
@@ -679,13 +701,6 @@ impl World {
             self.send_to_tracking_players_and_self_editioned(entity, &je_packet, &be_packet);
         } else {
             self.send_to_tracking_players_and_self(entity, &je_packet);
-        }
-        if let Some(server) = self.server.upgrade() {
-            crate::server::cluster_entity_emit::stage_transient_if_cluster(
-                &server,
-                entity,
-                u8::try_from(status_code).unwrap_or(u8::MAX),
-            );
         }
     }
 
@@ -2024,105 +2039,103 @@ impl World {
 
         // 3. Parallel Random Ticks via Rayon
         let delta_secondary = pumpkin_world::level::is_cluster_secondary();
-        let delta_mesh =
-            !delta_secondary && crate::server::cluster_world_delta::mesh_active();
+        let delta_mesh = !delta_secondary && crate::server::cluster_world_delta::mesh_active();
         let delta_holder =
             pumpkin_cluster::identity::ServerId(server.advanced_config.cluster.server_id);
         let delta_tick = pumpkin_cluster::time::TickStamp::now();
         if !delta_secondary {
-        let world = self.clone();
-        let random_handle = handle.clone();
-        tick_data
-            .random_ticks
-            .par_chunks(BATCH_SIZE)
-            .for_each(|batch| {
-                let _guard = random_handle.enter();
-                let world = world.clone();
-                let mut transitions: Vec<(
-                    pumpkin_cluster::protocol::BlockPos,
-                    u16,
-                    u16,
-                )> = Vec::new();
-                for scheduled_tick in batch {
-                    let pos = scheduled_tick.position;
-                    let watch_delta = delta_mesh
-                        && (scheduled_tick.tick_block || scheduled_tick.tick_fluid);
-                    let before_delta = if watch_delta {
-                        Some(world.get_block_state_id(&pos))
-                    } else {
-                        None
-                    };
-                    let (block, fluid) =
-                        match (scheduled_tick.tick_block, scheduled_tick.tick_fluid) {
-                            (true, true) => {
-                                let (b, f) = world.get_block_and_fluid(&pos);
-                                (Some(b), Some(f))
-                            }
-                            (true, false) => (Some(world.get_block(&pos)), None),
-                            (false, true) => (None, Some(world.get_fluid(&pos))),
-                            (false, false) => (None, None),
+            let world = self.clone();
+            let random_handle = handle.clone();
+            tick_data
+                .random_ticks
+                .par_chunks(BATCH_SIZE)
+                .for_each(|batch| {
+                    let _guard = random_handle.enter();
+                    let world = world.clone();
+                    let mut transitions: Vec<(pumpkin_cluster::protocol::BlockPos, u16, u16)> =
+                        Vec::new();
+                    for scheduled_tick in batch {
+                        let pos = scheduled_tick.position;
+                        let watch_delta =
+                            delta_mesh && (scheduled_tick.tick_block || scheduled_tick.tick_fluid);
+                        let before_delta = if watch_delta {
+                            Some(world.get_block_state_id(&pos))
+                        } else {
+                            None
                         };
+                        let (block, fluid) =
+                            match (scheduled_tick.tick_block, scheduled_tick.tick_fluid) {
+                                (true, true) => {
+                                    let (b, f) = world.get_block_and_fluid(&pos);
+                                    (Some(b), Some(f))
+                                }
+                                (true, false) => (Some(world.get_block(&pos)), None),
+                                (false, true) => (None, Some(world.get_fluid(&pos))),
+                                (false, false) => (None, None),
+                            };
 
-                    if let Some(block) = block
-                        && let Some(pumpkin_block) =
-                            world.block_registry.get_pumpkin_block(block.id)
-                    {
-                        pumpkin_block.random_tick(RandomTickArgs {
-                            world: &world,
-                            block,
-                            position: &pos,
-                        });
-                    }
+                        if let Some(block) = block
+                            && let Some(pumpkin_block) =
+                                world.block_registry.get_pumpkin_block(block.id)
+                        {
+                            pumpkin_block.random_tick(RandomTickArgs {
+                                world: &world,
+                                block,
+                                position: &pos,
+                            });
+                        }
 
-                    if let Some(fluid) = fluid
-                        && let Some(pumpkin_fluid) =
-                            world.block_registry.get_pumpkin_fluid(fluid.id)
-                    {
-                        pumpkin_fluid.random_tick(fluid, &world, &pos);
-                    }
+                        if let Some(fluid) = fluid
+                            && let Some(pumpkin_fluid) =
+                                world.block_registry.get_pumpkin_fluid(fluid.id)
+                        {
+                            pumpkin_fluid.random_tick(fluid, &world, &pos);
+                        }
 
-                    if let Some(before) = before_delta {
-                        let after = world.get_block_state_id(&pos);
-                        if before != after {
-                            transitions.push((
-                                pumpkin_cluster::protocol::BlockPos {
-                                    x: pos.0.x,
-                                    y: pos.0.y,
-                                    z: pos.0.z,
-                                },
-                                before.as_u16(),
-                                after.as_u16(),
-                            ));
+                        if let Some(before) = before_delta {
+                            let after = world.get_block_state_id(&pos);
+                            if before != after {
+                                transitions.push((
+                                    pumpkin_cluster::protocol::BlockPos {
+                                        x: pos.0.x,
+                                        y: pos.0.y,
+                                        z: pos.0.z,
+                                    },
+                                    before.as_u16(),
+                                    after.as_u16(),
+                                ));
+                            }
                         }
                     }
-                }
-                if !transitions.is_empty() {
-                    let mut grouped: HashMap<
-                        pumpkin_cluster::protocol::ChunkAddr,
-                        Vec<pumpkin_cluster::world_delta::BlockDelta>,
-                    > = HashMap::new();
-                    for (delta_pos, old_state, new_state) in transitions {
-                        grouped
-                            .entry(pumpkin_cluster::world_delta::chunk_of_block(
-                                delta_pos.x, delta_pos.z,
-                            ))
-                            .or_default()
-                            .push(pumpkin_cluster::world_delta::BlockDelta {
-                                pos: delta_pos,
-                                old_state,
-                                new_state,
-                            });
+                    if !transitions.is_empty() {
+                        let mut grouped: HashMap<
+                            pumpkin_cluster::protocol::ChunkKey,
+                            Vec<pumpkin_cluster::world_delta::BlockDelta>,
+                        > = HashMap::new();
+                        for (delta_pos, old_state, new_state) in transitions {
+                            grouped
+                                .entry(pumpkin_cluster::world_delta::chunk_of_block(
+                                    crate::server::cluster_world_delta::world_id(self),
+                                    delta_pos.x,
+                                    delta_pos.z,
+                                ))
+                                .or_default()
+                                .push(pumpkin_cluster::world_delta::BlockDelta {
+                                    pos: delta_pos,
+                                    old_state,
+                                    new_state,
+                                });
+                        }
+                        for (chunk, edits) in grouped {
+                            crate::server::cluster_world_delta::emit_random_tick_delta(
+                                delta_holder,
+                                chunk,
+                                delta_tick,
+                                edits,
+                            );
+                        }
                     }
-                    for (chunk, edits) in grouped {
-                        crate::server::cluster_world_delta::emit_random_tick_delta(
-                            delta_holder,
-                            chunk,
-                            delta_tick,
-                            edits,
-                        );
-                    }
-                }
-            });
+                });
         }
 
         // 4. Calculate Spawn List (Sequential setup)
@@ -2780,12 +2793,7 @@ impl World {
             custom_biome_name: String::new(),
             dimension: VarInt(0),
             generator_type: VarInt(1),
-            world_gamemode: server
-                .defaultgamemode
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .gamemode
-                .into(),
+            world_gamemode: server.defaultgamemode.load().gamemode.into(),
             hardcore: base_config.hardcore,
             difficulty: VarInt(level_info.difficulty as i32),
             spawn_position: BlockPos::new(
@@ -3190,7 +3198,9 @@ impl World {
         if let Ok(data) = client.serialize_packet(&actor_data) {
             client.send_game_packet(data).await;
         }
-        player.send_abilities_update();
+        if !server.advanced_config.cluster.enabled || !already_logged_in {
+            player.send_abilities_update();
+        }
 
         {
             let command_dispatcher = server.command_dispatcher.load();
@@ -3290,7 +3300,7 @@ impl World {
         };
 
         let gamemode = player.gamemode.load();
-        let player_hidden = crate::server::cluster_hide::is_hidden_player(&player);
+        let player_hidden = crate::server::cluster_hide::is_hidden_player(server, &player);
         if !player_hidden {
             self.broadcast_packet_except_editioned(
                 &[gameprofile.id],
@@ -3302,18 +3312,18 @@ impl World {
                         | PlayerInfoFlags::UPDATE_LIST_PRIORITY
                         | PlayerInfoFlags::UPDATE_HAT)
                         .bits(),
-                &[pumpkin_protocol::java::client::play::Player {
-                    uuid: gameprofile.id,
-                    actions: &[
-                        PlayerAction::AddPlayer {
-                            name: &gameprofile.name,
-                            properties: &gameprofile.properties.load(),
-                        },
-                        PlayerAction::UpdateGameMode(VarInt(gamemode as i32)),
-                        PlayerAction::UpdateListed(true),
-                        PlayerAction::UpdateLatency(VarInt(0)),
-                        PlayerAction::UpdateListOrder(VarInt(0)),
-                        PlayerAction::UpdateHat(true),
+                    &[pumpkin_protocol::java::client::play::Player {
+                        uuid: gameprofile.id,
+                        actions: &[
+                            PlayerAction::AddPlayer {
+                                name: &gameprofile.name,
+                                properties: &gameprofile.properties.load(),
+                            },
+                            PlayerAction::UpdateGameMode(VarInt(gamemode as i32)),
+                            PlayerAction::UpdateListed(true),
+                            PlayerAction::UpdateLatency(VarInt(0)),
+                            PlayerAction::UpdateListOrder(VarInt(0)),
+                            PlayerAction::UpdateHat(true),
                         ],
                     }],
                 ),
@@ -3360,16 +3370,16 @@ impl World {
                 &[gameprofile.id],
                 &CSpawnEntity::new(
                     (runtime_id as i32).into(),
-                gameprofile.id,
-                i32::from(EntityType::PLAYER.id).into(),
-                position,
-                pitch,
-                yaw,
-                yaw,
-                0.into(),
-                velocity,
-            ),
-            &bedrock_add_player,
+                    gameprofile.id,
+                    i32::from(EntityType::PLAYER.id).into(),
+                    position,
+                    pitch,
+                    yaw,
+                    yaw,
+                    0.into(),
+                    velocity,
+                ),
+                &bedrock_add_player,
             );
         }
 
@@ -3395,7 +3405,7 @@ impl World {
 
         for existing_player in players.iter().filter(|p| {
             p.gameprofile.id != gameprofile.id
-                && !crate::server::cluster_hide::is_hidden_player(p)
+                && !crate::server::cluster_hide::is_hidden_player(server, p)
         }) {
             let ex_profile = &existing_player.gameprofile;
             let ex_entity = &existing_player.get_entity();
@@ -3472,15 +3482,10 @@ impl World {
         }
 
         {
-            let can_see_hidden = player.has_permission(
-                server,
-                crate::server::cluster_hide::HIDE_PERMISSION,
-            );
             let mut remote_entries = Vec::new();
-            for (gid, entry) in crate::server::cluster_presence::remote_presence_entries() {
-                if !can_see_hidden
-                    && (crate::server::cluster_hide::is_hidden_gid(&gid)
-                        || crate::server::cluster_hide::is_hidden_uuid_bytes(&entry.uuid))
+            for (gid, entry) in crate::server::cluster_presence::remote_presence_entries(server) {
+                if crate::server::cluster_hide::is_hidden_gid(server, &gid)
+                    || crate::server::cluster_hide::is_hidden_uuid_bytes(server, &entry.uuid)
                 {
                     continue;
                 }
@@ -3521,9 +3526,7 @@ impl World {
         let mut event = PlayerJoinEvent::new(player.clone(), msg_comp);
         server.plugin_manager.fire(server, &mut event).await;
 
-        if !event.cancelled
-            && !crate::server::cluster_hide::is_hidden_player(&player)
-        {
+        if !event.cancelled && !crate::server::cluster_hide::is_hidden_player(server, &player) {
             self.broadcast_system_message(&event.join_message, false);
             info!("{}", event.join_message.to_pretty_console());
         }
@@ -3535,6 +3538,8 @@ impl World {
         base_config: &BasicConfiguration,
         player: &Arc<Player>,
         server: &Arc<Server>,
+        already_logged_in: bool,
+        announce_join: bool,
     ) {
         let dimensions: Vec<ResourceLocation> = server
             .dimensions
@@ -3554,55 +3559,84 @@ impl World {
             return;
         };
         // Send the login packet for our new player
-        client
-            .send_packet(&CLogin::new(
-                entity_id,
-                base_config.hardcore,
-                &dimensions,
-                server
-                    .advanced_config
-                    .networking
-                    .java
-                    .max_players
-                    .try_into()
-                    .unwrap_or(u16::MAX.into()),
-                server
-                    .advanced_config
-                    .networking
-                    .java
-                    .view_distance
-                    .get()
-                    .into(), //  TODO: view distance
-                server
-                    .advanced_config
-                    .networking
-                    .java
-                    .simulation_distance
-                    .get()
-                    .into(), // TODO: sim view dinstance
-                false,
-                true,
-                false,
-                PlayerSpawnData::new(
-                    self.dimension.clone(),
-                    biome::hash_seed(self.level.seed.0), // seed
-                    gamemode as u8,
-                    player
-                        .previous_gamemode
-                        .load()
-                        .map_or(-1, |gamemode| gamemode as i8),
+        if !already_logged_in {
+            client
+                .send_packet(&CLogin::new(
+                    entity_id,
+                    base_config.hardcore,
+                    &dimensions,
+                    server
+                        .advanced_config
+                        .networking
+                        .java
+                        .max_players
+                        .try_into()
+                        .unwrap_or(u16::MAX.into()),
+                    server
+                        .advanced_config
+                        .networking
+                        .java
+                        .view_distance
+                        .get()
+                        .into(), //  TODO: view distance
+                    server
+                        .advanced_config
+                        .networking
+                        .java
+                        .simulation_distance
+                        .get()
+                        .into(), // TODO: sim view dinstance
                     false,
+                    true,
                     false,
-                    None,
-                    VarInt(player.get_entity().portal_cooldown.load(Ordering::Relaxed) as i32),
-                    self.sea_level.into(),
-                ),
-                server.advanced_config.networking.java.online_mode,
-                // This should stay true even when reports are disabled.
-                // It prevents the annoying popup when joining the server.
-                true,
-            ))
-            .await;
+                    PlayerSpawnData::new(
+                        self.dimension.clone(),
+                        biome::hash_seed(self.level.seed.0), // seed
+                        gamemode as u8,
+                        player
+                            .previous_gamemode
+                            .load()
+                            .map_or(-1, |gamemode| gamemode as i8),
+                        false,
+                        false,
+                        None,
+                        VarInt(player.get_entity().portal_cooldown.load(Ordering::Relaxed) as i32),
+                        self.sea_level.into(),
+                    ),
+                    server.advanced_config.networking.java.online_mode,
+                    // This should stay true even when reports are disabled.
+                    // It prevents the annoying popup when joining the server.
+                    true,
+                ))
+                .await;
+        }
+
+        if already_logged_in {
+            let position = player.position();
+            let yaw = player.get_entity().yaw.load();
+            let pitch = player.get_entity().pitch.load();
+            player.request_lobby_handoff_teleport(position, yaw, pitch);
+            if let Err(error) =
+                crate::server::cluster_inventory_protocol::publish_session_zero_content(player)
+            {
+                error!(uuid = %player.gameprofile.id, ?error, "cluster lobby inventory publication failed");
+                player.client.try_kick(
+                    crate::net::DisconnectReason::Kicked,
+                    &TextComponent::text("Inventory handoff unavailable"),
+                );
+                return;
+            }
+            player.send_handoff_health();
+            player.send_cluster_handoff_abilities();
+            player.try_send_client_packet(&CGameEvent::new(
+                GameEvent::ChangeGameMode,
+                gamemode as i32 as f32,
+            ));
+            player.try_send_client_packet(&CSetCamera::new(player.entity_id().into()));
+            player.try_send_client_packet(&CRemoveEntities::new(&[VarInt(
+                crate::server::cluster_lobby::lobby_anchor_id(),
+            )]));
+        }
 
         self.pair_new_player_with_tracked_entities(player);
 
@@ -3633,35 +3667,40 @@ impl World {
             }
             let packet = pumpkin_protocol::java::client::play::CUpdateTagsPlay::new(&tags);
             if let Ok(packet_data) = JavaClient::serialize_packet_for_version(&packet, version) {
-                client.send_packet_now(packet_data).await;
+                if server.advanced_config.cluster.enabled && already_logged_in {
+                    client.try_enqueue_packet(packet_data);
+                } else {
+                    client.send_packet_now(packet_data).await;
+                }
             }
         }
 
-        let (position, yaw, pitch) = if player.has_played_before.load(Ordering::Relaxed) {
-            let position = player.position();
-            let yaw = player.get_entity().yaw.load(); //info.spawn_angle;
-            let pitch = player.get_entity().pitch.load();
+        let (position, yaw, pitch) =
+            if already_logged_in || player.has_played_before.load(Ordering::Relaxed) {
+                let position = player.position();
+                let yaw = player.get_entity().yaw.load(); //info.spawn_angle;
+                let pitch = player.get_entity().pitch.load();
 
-            (position, yaw, pitch)
-        } else {
-            let info = &self.level_info.load();
-            let spawn_position = Vector2::new(info.spawn_x, info.spawn_z);
-            let chunk_pos = Vector2::new(info.spawn_x >> 4, info.spawn_z >> 4);
-            self.level.get_or_fetch_chunk(chunk_pos, |_| ()).await;
-            let top = self.get_top_block(spawn_position);
-            let pos_y = if top > self.dimension.min_y {
-                top + 1
+                (position, yaw, pitch)
             } else {
-                info.spawn_y
-            };
+                let info = &self.level_info.load();
+                let spawn_position = Vector2::new(info.spawn_x, info.spawn_z);
+                let chunk_pos = Vector2::new(info.spawn_x >> 4, info.spawn_z >> 4);
+                self.level.get_or_fetch_chunk(chunk_pos, |_| ()).await;
+                let top = self.get_top_block(spawn_position);
+                let pos_y = if top > self.dimension.min_y {
+                    top + 1
+                } else {
+                    info.spawn_y
+                };
 
-            let position = Vector3::new(
-                f64::from(info.spawn_x) + 0.5,
-                f64::from(pos_y),
-                f64::from(info.spawn_z) + 0.5,
-            );
-            (position, info.spawn_yaw, info.spawn_pitch)
-        };
+                let position = Vector3::new(
+                    f64::from(info.spawn_x) + 0.5,
+                    f64::from(pos_y),
+                    f64::from(info.spawn_z) + 0.5,
+                );
+                (position, info.spawn_yaw, info.spawn_pitch)
+            };
 
         // Load chunks around the real spawn position before teleporting the client there.
         // Cluster lobby waiters keep their real server-side position but are only
@@ -3672,9 +3711,7 @@ impl World {
         player.living_entity.entity.set_rotation(yaw, pitch);
         player.living_entity.entity.last_pos.store(position);
 
-        if crate::server::cluster_lobby::lobby_applies_to(player) {
-            crate::server::cluster_lobby::lobby_enter_on_login(player);
-        } else {
+        if !already_logged_in {
             chunker::update_position(player);
             let center_chunk = player.living_entity.entity.chunk_pos.load();
             let chunk = self
@@ -3682,10 +3719,8 @@ impl World {
                 .get_or_fetch_chunk(center_chunk, std::clone::Clone::clone)
                 .await;
             if let Some(server) = self.server.upgrade() {
-                let mut event = crate::plugin::world::chunk_send::ChunkSend::new(
-                    player.world(),
-                    chunk.clone(),
-                );
+                let mut event =
+                    crate::plugin::world::chunk_send::ChunkSend::new(player.world(), chunk.clone());
                 server.plugin_manager.fire(&server, &mut event).await;
                 if event.cancelled {
                     return;
@@ -3743,7 +3778,7 @@ impl World {
             &java_player,
         );
 
-        let joiner_hidden = crate::server::cluster_hide::is_hidden_player(player);
+        let joiner_hidden = crate::server::cluster_hide::is_hidden_player(server, player);
         if !joiner_hidden {
             self.broadcast_editioned(&player_info_update, &bedrock_player_list);
         }
@@ -3768,7 +3803,7 @@ impl World {
             let mut data_to_process = Vec::new();
             for p in players.iter().filter(|p| {
                 p.gameprofile.id != player.gameprofile.id
-                    && !crate::server::cluster_hide::is_hidden_player(p)
+                    && !crate::server::cluster_hide::is_hidden_player(server, p)
             }) {
                 let props_guard = p.gameprofile.properties.load();
                 data_to_process.push((props_guard, p));
@@ -3776,10 +3811,6 @@ impl World {
 
             let mut current_player_data = Vec::new();
             for (properties, player) in &data_to_process {
-                let chat_session = player
-                    .chat_session
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 let tab_list_name = player.get_tab_list_name();
 
                 let mut player_actions = vec![PlayerAction::AddPlayer {
@@ -3788,17 +3819,32 @@ impl World {
                 }];
 
                 if base_config.allow_chat_reports {
-                    let initialized = chat_session.session_id != uuid::Uuid::nil()
-                        && !chat_session.public_key.is_empty()
-                        && !chat_session.signature.is_empty();
-                    player_actions.push(PlayerAction::InitializeChat(initialized.then(|| {
-                        InitChat {
+                    let chat = if server.advanced_config.cluster.enabled {
+                        server
+                            .cluster_secure_chat
+                            .views
+                            .load()
+                            .get(&player.gameprofile.id)
+                            .filter(|view| view.player_ptr == Arc::as_ptr(player) as usize)
+                            .and_then(
+                                crate::server::cluster_secure_chat::ChatSessionView::init_chat,
+                            )
+                    } else {
+                        let chat_session = player
+                            .chat_session
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        (chat_session.session_id != uuid::Uuid::nil()
+                            && !chat_session.public_key.is_empty()
+                            && !chat_session.signature.is_empty())
+                        .then(|| InitChat {
                             session_id: chat_session.session_id,
                             expires_at: chat_session.expires_at,
                             public_key: chat_session.public_key.clone(),
                             signature: chat_session.signature.clone(),
-                        }
-                    })));
+                        })
+                    };
+                    player_actions.push(PlayerAction::InitializeChat(chat));
                 }
 
                 player_actions.extend([
@@ -3812,7 +3858,6 @@ impl World {
                     )),
                     PlayerAction::UpdateHat(true),
                 ]);
-                drop(chat_session);
 
                 current_player_data.push((&player.gameprofile.id, player_actions));
 
@@ -3864,20 +3909,15 @@ impl World {
         };
 
         {
-            let can_see_hidden = player.has_permission(
-                server,
-                crate::server::cluster_hide::HIDE_PERMISSION,
-            );
-            for (gid, entry) in crate::server::cluster_presence::remote_presence_entries() {
-                if !can_see_hidden
-                    && (crate::server::cluster_hide::is_hidden_gid(&gid)
-                        || crate::server::cluster_hide::is_hidden_uuid_bytes(&entry.uuid))
+            for (gid, entry) in crate::server::cluster_presence::remote_presence_entries(server) {
+                if crate::server::cluster_hide::is_hidden_gid(server, &gid)
+                    || crate::server::cluster_hide::is_hidden_uuid_bytes(server, &entry.uuid)
                 {
                     continue;
                 }
                 let uuid = Uuid::from_bytes(entry.uuid);
                 let properties =
-                    crate::server::cluster_chat_pm::remote_player_properties(&gid);
+                    crate::server::cluster_chat_pm::remote_player_properties(server, &gid);
                 let actions = [
                     PlayerAction::AddPlayer {
                         name: entry.name.as_str(),
@@ -3988,12 +4028,12 @@ impl World {
                 entity_id,
                 skin_parts,
                 &CSetActorData {
-                target_runtime_id: VarULong(entity_id as u64),
-                actor_data: player.get_entity().bedrock_metadata(),
-                synced_properties: PropertySyncData {
-                    int_entries_list: HashMap::new(),
-                    float_entries_list: HashMap::new(),
-                },
+                    target_runtime_id: VarULong(entity_id as u64),
+                    actor_data: player.get_entity().bedrock_metadata(),
+                    synced_properties: PropertySyncData {
+                        int_entries_list: HashMap::new(),
+                        float_entries_list: HashMap::new(),
+                    },
                     tick: VarULong(0),
                 },
             );
@@ -4002,7 +4042,7 @@ impl World {
         // Spawn players for our client.
         let id = player.gameprofile.id;
         for existing_player in self.players.load().iter().filter(|c| {
-            c.gameprofile.id != id && !crate::server::cluster_hide::is_hidden_player(c)
+            c.gameprofile.id != id && !crate::server::cluster_hide::is_hidden_player(server, c)
         }) {
             let entity = &existing_player.get_entity();
             let pos = entity.pos.load();
@@ -4192,11 +4232,7 @@ impl World {
             player.get_inventory().get_selected_slot() as i8,
         ));
 
-        // Lobby waiters get a frozen clock inside the lobby burst instead; the
-        // real world settings (border, time, spawn, weather) follow at handoff.
-        let in_lobby = crate::server::cluster_lobby::lobby_applies_to(player)
-            && player.is_in_cluster_lobby();
-        if !in_lobby && client.version.load() >= JavaMinecraftVersion::V_1_20_2 {
+        if !already_logged_in && client.version.load() >= JavaMinecraftVersion::V_1_20_2 {
             // Start waiting for level chunks. Sets the "Loading Terrain" screen (Added in 1.20.2)
             debug!("Sending waiting chunks to {}", player.gameprofile.name);
             client
@@ -4204,15 +4240,13 @@ impl World {
                 .await;
         }
 
-        if !in_lobby {
-            self.worldborder
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .init_client(client);
+        self.worldborder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .init_client(client);
 
-            // Sends initial time
-            player.send_time(self);
-        }
+        // Sends initial time
+        player.send_time(self);
 
         // Sends initial scoreboard state
         player.send_scoreboard();
@@ -4230,15 +4264,16 @@ impl World {
             )
         };
 
-        if !in_lobby {
-            client
-                .send_packet(&CPlayerSpawnPosition::new(
-                    spawn_block_pos,
-                    yaw,
-                    pitch,
-                    self.dimension.minecraft_name.to_owned(),
-                ))
-                .await;
+        let spawn_position_packet = CPlayerSpawnPosition::new(
+            spawn_block_pos,
+            yaw,
+            pitch,
+            self.dimension.minecraft_name.to_owned(),
+        );
+        if server.advanced_config.cluster.enabled && already_logged_in {
+            client.try_send_packet(&spawn_position_packet);
+        } else {
+            client.send_packet(&spawn_position_packet).await;
         }
 
         // Send initial weather state
@@ -4253,7 +4288,7 @@ impl World {
                 weather.thunder_level.clamp(0.0, 1.0),
             )
         };
-        if !in_lobby && is_raining {
+        if is_raining {
             client
                 .enqueue_client_packet(&CGameEvent::new(GameEvent::BeginRaining, 0.0))
                 .await;
@@ -4282,7 +4317,9 @@ impl World {
         }
 
         player.has_played_before.store(true, Ordering::Relaxed);
-        player.on_screen_handler_opened(&player.player_screen_handler);
+        if !already_logged_in {
+            player.on_screen_handler_opened(&player.player_screen_handler);
+        }
 
         player.send_active_effects();
         player.breath_manager.send_air_supply(player);
@@ -4297,31 +4334,45 @@ impl World {
         {
             let settings_packet = CRecipeBookSettings::default_closed();
             if let Ok(data) = java_client.serialize_packet(&settings_packet) {
-                java_client.send_packet_now(data).await;
+                if server.advanced_config.cluster.enabled && already_logged_in {
+                    java_client.try_enqueue_packet(data);
+                } else {
+                    java_client.send_packet_now(data).await;
+                }
             }
-            let dynamic_recipes = server.recipe_manager.get_dynamic_recipes();
-            let add_packet = CRecipeBookAdd::new(true, &dynamic_recipes);
+            let dynamic_recipes = if server.advanced_config.cluster.enabled && already_logged_in {
+                server.recipe_manager.cluster_dynamic_recipes_snapshot()
+            } else {
+                Arc::new(server.recipe_manager.get_dynamic_recipes())
+            };
+            let add_packet = CRecipeBookAdd::new(true, dynamic_recipes.as_ref());
             if let Ok(data) = java_client.serialize_packet(&add_packet) {
-                java_client.send_packet_now(data).await;
+                if server.advanced_config.cluster.enabled && already_logged_in {
+                    java_client.try_enqueue_packet(data);
+                } else {
+                    java_client.send_packet_now(data).await;
+                }
             }
         }
-        let msg_comp = TextComponent::translate_cross(
-            translation::java::MULTIPLAYER_PLAYER_JOINED,
-            translation::bedrock::MULTIPLAYER_PLAYER_JOINED,
-            [TextComponent::text(player.gameprofile.name.clone())],
-        )
-        .color_named(NamedColor::Yellow);
-        let mut event = PlayerJoinEvent::new(player.clone(), msg_comp);
+        if announce_join {
+            let msg_comp = TextComponent::translate_cross(
+                translation::java::MULTIPLAYER_PLAYER_JOINED,
+                translation::bedrock::MULTIPLAYER_PLAYER_JOINED,
+                [TextComponent::text(player.gameprofile.name.clone())],
+            )
+            .color_named(NamedColor::Yellow);
+            let mut event = PlayerJoinEvent::new(player.clone(), msg_comp);
 
-        server.plugin_manager.fire(server, &mut event).await;
+            server.plugin_manager.fire(server, &mut event).await;
 
-        if !event.cancelled {
-            if crate::server::cluster_hide::is_hidden_player(player) {
-                info!("{}", event.join_message.to_pretty_console());
-            } else {
-                self.broadcast_system_message(&event.join_message, false);
-                // TODO: Switch to structured logging, e.g. info!(player = %name, "connected")
-                info!("{}", event.join_message.to_pretty_console());
+            if !event.cancelled {
+                if crate::server::cluster_hide::is_hidden_player(server, player) {
+                    info!("{}", event.join_message.to_pretty_console());
+                } else {
+                    self.broadcast_system_message(&event.join_message, false);
+                    // TODO: Switch to structured logging, e.g. info!(player = %name, "connected")
+                    info!("{}", event.join_message.to_pretty_console());
+                }
             }
         }
     }
@@ -5009,7 +5060,7 @@ impl World {
     /// Gets a `Player` by an entity id
     pub fn get_player_by_id(&self, id: i32) -> Option<Arc<Player>> {
         for player in self.players.load().iter() {
-            if player.entity_id() == id {
+            if player.entity_id() == id && !player.cluster_departing.load(Ordering::Acquire) {
                 return Some(player.clone());
             }
         }
@@ -5024,7 +5075,9 @@ impl World {
             }
         }
         for player in self.players.load().iter() {
-            if player.get_entity().entity_id == id {
+            if player.get_entity().entity_id == id
+                && !player.cluster_departing.load(Ordering::Acquire)
+            {
                 return Some(player.clone() as Arc<dyn EntityBase>);
             }
         }
@@ -5037,7 +5090,7 @@ impl World {
     /// selectors and entity-targeting commands until the real join.
     pub fn get_player_by_name(&self, name: &str) -> Option<Arc<Player>> {
         for player in self.players.load().iter() {
-            if player.is_in_cluster_lobby() {
+            if player.is_in_cluster_lobby() || player.cluster_departing.load(Ordering::Acquire) {
                 continue;
             }
             if player.gameprofile.name.eq_ignore_ascii_case(name) {
@@ -5058,6 +5111,7 @@ impl World {
             .chain(
                 players_guard
                     .iter()
+                    .filter(|p| !p.cluster_departing.load(Ordering::Acquire))
                     .map(|p| p.clone() as Arc<dyn EntityBase>),
             )
             .filter(|entity| entity.get_entity().bounding_box.load().intersects(aabb))
@@ -5079,7 +5133,10 @@ impl World {
         let players_guard = self.players.load();
         players_guard
             .iter()
-            .filter(|player| player.get_entity().bounding_box.load().intersects(aabb))
+            .filter(|player| {
+                !player.cluster_departing.load(Ordering::Acquire)
+                    && player.get_entity().bounding_box.load().intersects(aabb)
+            })
             .cloned()
             .collect()
     }
@@ -5100,7 +5157,7 @@ impl World {
         self.players
             .load()
             .iter()
-            .find(|p| p.gameprofile.id == id)
+            .find(|p| p.gameprofile.id == id && !p.cluster_departing.load(Ordering::Acquire))
             .cloned()
     }
 
@@ -5333,8 +5390,10 @@ impl World {
             new_list.push(player.clone());
             new_list
         });
-        self.entity_tracker
-            .add_entity(&(player.clone() as Arc<dyn EntityBase>), self);
+        if !player.cluster_departing.load(Ordering::Acquire) {
+            self.entity_tracker
+                .add_entity(&(player.clone() as Arc<dyn EntityBase>), self);
+        }
         Ok(())
     }
 
@@ -5342,6 +5401,11 @@ impl World {
     pub fn pair_new_player_with_tracked_entities(&self, player: &Arc<Player>) {
         self.entity_tracker
             .pair_new_player_with_tracked_entities(player, self);
+    }
+
+    pub fn suspend_player_visibility(&self, player: &Arc<Player>) {
+        self.entity_tracker
+            .remove_entity(player.as_ref() as &dyn EntityBase, self);
     }
 
     /// Removes a player from the world and broadcasts a disconnect message if enabled.
@@ -5404,12 +5468,16 @@ impl World {
                 }],
             };
 
-            self.broadcast_editioned(&CRemovePlayerInfo::new(&[uuid]), &bedrock_remove_player);
+            if fire_event {
+                self.broadcast_editioned(&CRemovePlayerInfo::new(&[uuid]), &bedrock_remove_player);
+            }
 
-            self.broadcast_editioned(
-                &CRemoveEntities::new(&[entity_id.into()]),
-                &CRemoveActor::new(VarLong(entity_id as i64)),
-            );
+            if !player.cluster_departing.load(Ordering::Acquire) {
+                self.broadcast_editioned(
+                    &CRemoveEntities::new(&[entity_id.into()]),
+                    &CRemoveActor::new(VarLong(entity_id as i64)),
+                );
+            }
 
             if fire_event {
                 let msg_comp = TextComponent::translate_cross(
@@ -5424,7 +5492,10 @@ impl World {
                     server.plugin_manager.fire(&server, &mut event).await;
 
                     if !event.cancelled
-                        && !crate::server::cluster_hide::is_hidden_uuid(&player.gameprofile.id)
+                        && !crate::server::cluster_hide::is_hidden_uuid(
+                            &server,
+                            &player.gameprofile.id,
+                        )
                     {
                         for player in self.players.load().iter() {
                             player.send_system_message(&event.leave_message);
@@ -5501,6 +5572,34 @@ impl World {
         if let Some(server) = self.server.upgrade() {
             crate::server::cluster_entity_emit::stage_spawn_if_cluster(&server, entity.as_ref());
         }
+    }
+
+    pub fn add_cluster_replica(&self, entity: Arc<dyn EntityBase>) {
+        let base_entity = entity.get_entity();
+        if self
+            .entities
+            .load()
+            .iter()
+            .any(|existing| existing.get_entity().entity_uuid == base_entity.entity_uuid)
+        {
+            return;
+        }
+        self.entity_tracker.add_entity(&entity, self);
+        self.entities.rcu(|current_entities| {
+            let mut new_entities = (**current_entities).clone();
+            new_entities.push(entity.clone());
+            new_entities
+        });
+    }
+
+    pub fn remove_cluster_replica(&self, entity: &dyn EntityBase) {
+        self.entity_tracker.remove_entity(entity, self);
+        let uuid = entity.get_entity().entity_uuid;
+        self.entities.rcu(|current_entities| {
+            let mut new_entities = (**current_entities).clone();
+            new_entities.retain(|existing| existing.get_entity().entity_uuid != uuid);
+            new_entities
+        });
     }
 
     pub fn remove_entity(&self, entity: &dyn EntityBase) {

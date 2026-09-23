@@ -51,6 +51,48 @@ use tokio_util::task::TaskTracker;
 pub type SyncChunk = Arc<ChunkData>;
 pub type SyncEntityChunk = Arc<ChunkEntityData>;
 
+struct ClusterLobbyNeedCounts {
+    counts: ArcSwap<rustc_hash::FxHashMap<Vector2<i32>, u32>>,
+}
+
+impl ClusterLobbyNeedCounts {
+    fn new() -> Self {
+        Self {
+            counts: ArcSwap::from_pointee(rustc_hash::FxHashMap::default()),
+        }
+    }
+
+    fn contains(&self, position: &Vector2<i32>) -> bool {
+        self.counts.load().contains_key(position)
+    }
+
+    fn acquire(&self, positions: &[Vector2<i32>]) {
+        self.counts.rcu(|current| {
+            let mut next = (**current).clone();
+            for position in positions {
+                let count = next.entry(*position).or_default();
+                *count = count.saturating_add(1);
+            }
+            Arc::new(next)
+        });
+    }
+
+    fn release(&self, positions: &[Vector2<i32>]) {
+        self.counts.rcu(|current| {
+            let mut next = (**current).clone();
+            for position in positions {
+                if let Some(count) = next.get_mut(position) {
+                    *count -= 1;
+                    if *count == 0 {
+                        next.remove(position);
+                    }
+                }
+            }
+            Arc::new(next)
+        });
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoadedChunkChange {
     Loaded(Vector2<i32>),
@@ -79,6 +121,8 @@ pub struct Level {
     pub seed: Seed,
     pub world_portal: ArcSwap<Option<Arc<dyn WorldPortalExt>>>,
     pub level_folder: Arc<LevelFolder>,
+    pub cluster_dimension: u8,
+    pub cluster_world_key: u64,
     pub lighting_config: LightingEngineConfig,
 
     /// Counts the number of ticks that have been scheduled for this world
@@ -89,6 +133,7 @@ pub struct Level {
     pub loaded_chunks: Arc<DashMap<Vector2<i32>, SyncChunk>>,
     pub cluster_snapshots: Arc<DashMap<Vector2<i32>, SyncChunk>>,
     pub cluster_pinned: Arc<dashmap::DashSet<Vector2<i32>>>,
+    cluster_lobby_pins: ClusterLobbyNeedCounts,
     pub cluster_fetch_wanted: Arc<dashmap::DashSet<Vector2<i32>>>,
     pub cluster_dual: ClusterDualState,
     pub(crate) loaded_chunk_changes: Arc<SegQueue<LoadedChunkChange>>,
@@ -158,6 +203,11 @@ impl Level {
         seed: i64,
         dimension: Dimension,
     ) -> Arc<Self> {
+        let cluster_world_key = root_folder
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map_or(0, |name| xxhash_rust::xxh64::xxh64(name.as_bytes(), 0));
+        let cluster_dimension = dimension.id;
         let (namespace, name) = match dimension.minecraft_name.split_once(':') {
             Some((ns, n)) => (ns, n),
             None => ("minecraft", dimension.minecraft_name),
@@ -279,6 +329,8 @@ impl Level {
             world_portal: ArcSwap::new(Arc::new(None)),
             world_gen: ArcSwap::new(world_gen),
             level_folder,
+            cluster_dimension,
+            cluster_world_key,
             lighting_config: level_config.lighting,
             light_engine: DynamicLightEngine::new(dim_min_y, dim_min_y + dim_height),
             chunk_saver,
@@ -287,6 +339,7 @@ impl Level {
             loaded_chunks: Arc::new(DashMap::new()),
             cluster_snapshots: Arc::new(DashMap::new()),
             cluster_pinned: Arc::new(dashmap::DashSet::new()),
+            cluster_lobby_pins: ClusterLobbyNeedCounts::new(),
             cluster_fetch_wanted: Arc::new(dashmap::DashSet::new()),
             cluster_dual: ClusterDualState::new(),
             loaded_chunk_changes: Arc::new(SegQueue::new()),
@@ -792,8 +845,9 @@ impl Level {
                                     let sender_clone = sender.clone();
                                     tokio::spawn(async move {
                                         if let Ok(chunk) = rx.await {
-                                            let _ =
-                                                sender_clone.send((Arc::downgrade(&chunk), true)).await;
+                                            let _ = sender_clone
+                                                .send((Arc::downgrade(&chunk), true))
+                                                .await;
                                         }
                                     });
                                 }
@@ -885,7 +939,6 @@ impl Level {
         })
         .unwrap_or(Block::VOID_AIR.default_state.id)
     }
-
 }
 
 fn cluster_fetch_sender_for(pos: Vector2<i32>) -> Option<mpsc::Sender<ClusterFetchRequest>> {
@@ -910,11 +963,22 @@ impl Level {
     }
 
     pub fn is_cluster_pinned(&self, pos: &Vector2<i32>) -> bool {
-        self.cluster_pinned.contains(pos)
+        self.cluster_pinned.contains(pos) || self.cluster_lobby_pins.contains(pos)
     }
 
     pub fn unpin_cluster_chunk(&self, pos: &Vector2<i32>) {
         self.cluster_pinned.remove(pos);
+    }
+
+    pub fn acquire_cluster_lobby_need(&self, positions: &[Vector2<i32>]) {
+        self.cluster_lobby_pins.acquire(positions);
+        for position in positions {
+            self.prefetch_cluster_chunk(*position);
+        }
+    }
+
+    pub fn release_cluster_lobby_need(&self, positions: &[Vector2<i32>]) {
+        self.cluster_lobby_pins.release(positions);
     }
 
     pub fn is_cluster_held(&self, pos: &Vector2<i32>) -> bool {
@@ -930,6 +994,24 @@ impl Level {
         }
     }
 
+    pub fn prefetch_cluster_chunk_from(&self, pos: Vector2<i32>, preferred: u16) -> bool {
+        if self.is_cluster_held(&pos) || self.cluster_snapshots.contains_key(&pos) {
+            return true;
+        }
+        self.cluster_fetch_wanted.insert(pos);
+        let Some(sender) = cluster_fetch_sender_for(pos) else {
+            return false;
+        };
+        sender
+            .try_send(ClusterFetchRequest {
+                dimension: self.cluster_dimension,
+                world: self.cluster_world_key,
+                pos,
+                preferred: Some(preferred),
+            })
+            .is_ok()
+    }
+
     pub fn try_dispatch_cluster_fetch(&self, pos: Vector2<i32>) -> bool {
         if !self.cluster_fetch_wanted.contains(&pos) {
             return false;
@@ -937,7 +1019,15 @@ impl Level {
         let Some(sender) = cluster_fetch_sender_for(pos) else {
             return false;
         };
-        if sender.try_send(ClusterFetchRequest { pos }).is_ok() {
+        if sender
+            .try_send(ClusterFetchRequest {
+                dimension: self.cluster_dimension,
+                world: self.cluster_world_key,
+                pos,
+                preferred: None,
+            })
+            .is_ok()
+        {
             return true;
         }
         if fetch_warn_cooldown_elapsed() {
@@ -957,7 +1047,12 @@ impl Level {
     pub fn unwant_cluster_chunk(&self, pos: Vector2<i32>) {
         self.cluster_fetch_wanted.remove(&pos);
         if let Some(sender) = CLUSTER_UNWANT_SENDER.get().cloned() {
-            let _ = sender.try_send(ClusterFetchRequest { pos });
+            let _ = sender.try_send(ClusterFetchRequest {
+                dimension: self.cluster_dimension,
+                world: self.cluster_world_key,
+                pos,
+                preferred: None,
+            });
         }
     }
 
@@ -970,6 +1065,8 @@ impl Level {
         }
         if let Some(sender) = CLUSTER_LOGOUT_SENDER.get().cloned() {
             let _ = sender.try_send(ClusterLogoutGrace {
+                dimension: self.cluster_dimension,
+                world: self.cluster_world_key,
                 chunks,
                 expires_millis,
             });
@@ -994,7 +1091,10 @@ fn fetch_warn_cooldown_elapsed() -> bool {
 }
 
 pub struct ClusterFetchRequest {
+    pub dimension: u8,
+    pub world: u64,
     pub pos: Vector2<i32>,
+    pub preferred: Option<u16>,
 }
 
 static CLUSTER_SECONDARY_MODE: AtomicBool = AtomicBool::new(false);
@@ -1004,6 +1104,8 @@ static CLUSTER_UNWANT_SENDER: OnceLock<mpsc::Sender<ClusterFetchRequest>> = Once
 static CLUSTER_LOGOUT_SENDER: OnceLock<mpsc::Sender<ClusterLogoutGrace>> = OnceLock::new();
 
 pub struct ClusterLogoutGrace {
+    pub dimension: u8,
+    pub world: u64,
     pub chunks: Vec<Vector2<i32>>,
     pub expires_millis: u64,
 }
@@ -1088,6 +1190,42 @@ pub fn cluster_decode_snapshot(x: i32, z: i32, bytes: &[u8]) -> Option<SyncChunk
     let body = bytes::Bytes::copy_from_slice(body);
     match ChunkData::from_bytes(&body, Vector2::new(x, z)) {
         Ok(chunk) => Some(Arc::new(chunk)),
+        Err(error) => {
+            warn!(
+                chunk_x = x,
+                chunk_z = z,
+                error = error.to_string(),
+                "cluster chunk snapshot decode failed"
+            );
+            None
+        }
+    }
+}
+
+#[must_use]
+pub fn cluster_decode_snapshot_with_blocks(
+    x: i32,
+    z: i32,
+    bytes: &[u8],
+) -> Option<(
+    SyncChunk,
+    i32,
+    Box<[crate::chunk::palette::BlockPalette]>,
+    Box<[crate::chunk::palette::BiomePalette]>,
+)> {
+    let (version, body) = bytes.split_first()?;
+    if *version != CLUSTER_SNAPSHOT_VERSION {
+        error!(
+            chunk_x = x,
+            chunk_z = z,
+            version,
+            expected = CLUSTER_SNAPSHOT_VERSION,
+            "cluster chunk snapshot version mismatch, refusing decode"
+        );
+        return None;
+    }
+    match ChunkData::internal_from_bytes_with_palettes(body, Vector2::new(x, z)) {
+        Ok((chunk, min_y, blocks, biomes)) => Some((Arc::new(chunk), min_y, blocks, biomes)),
         Err(error) => {
             warn!(
                 chunk_x = x,
@@ -1284,7 +1422,11 @@ impl Level {
             if !ClusterDual::edit_in_bounds(edit) {
                 continue;
             }
-            if pair.local.set_block_absolute_y(edit.x, edit.y, edit.z, edit.state) != edit.state {
+            if pair
+                .local
+                .set_block_absolute_y(edit.x, edit.y, edit.z, edit.state)
+                != edit.state
+            {
                 changed = true;
             }
         }
@@ -1296,7 +1438,11 @@ impl Level {
         } else {
             self.cluster_dual.pending.insert(
                 *pos,
-                edits.iter().copied().filter(ClusterDual::edit_in_bounds).collect(),
+                edits
+                    .iter()
+                    .copied()
+                    .filter(ClusterDual::edit_in_bounds)
+                    .collect(),
             );
         }
         true
@@ -1322,14 +1468,22 @@ impl Level {
         }
         self.cluster_dual.pending.insert(
             *pos,
-            still_pending.iter().copied().filter(ClusterDual::edit_in_bounds).collect(),
+            still_pending
+                .iter()
+                .copied()
+                .filter(ClusterDual::edit_in_bounds)
+                .collect(),
         );
         let mut local_changed = cluster_copy_blocks(&pair.ground, &pair.local);
         for edit in still_pending {
             if !ClusterDual::edit_in_bounds(edit) {
                 continue;
             }
-            if pair.local.set_block_absolute_y(edit.x, edit.y, edit.z, edit.state) != edit.state {
+            if pair
+                .local
+                .set_block_absolute_y(edit.x, edit.y, edit.z, edit.state)
+                != edit.state
+            {
                 local_changed = true;
             }
         }
@@ -1379,6 +1533,26 @@ impl Level {
         self.get_block_state(position)
     }
 
+    pub fn cluster_get_ground_block_state(&self, position: &BlockPos) -> BlockStateId {
+        if self.cluster_dual_enabled() {
+            let (chunk_coordinate, relative) = position.chunk_and_chunk_relative_position();
+            if relative.x >= 0
+                && relative.x < CLUSTER_DUAL_WIDTH
+                && relative.z >= 0
+                && relative.z < CLUSTER_DUAL_WIDTH
+                && let Some(pair) = self.cluster_pair_or_fork(&chunk_coordinate)
+                && let Some(id) = pair.ground.section.get_block_absolute_y(
+                    relative.x as usize,
+                    relative.y,
+                    relative.z as usize,
+                )
+            {
+                return id;
+            }
+        }
+        self.get_block_state(position)
+    }
+
     pub fn cluster_set_block_state(
         &self,
         position: &BlockPos,
@@ -1399,16 +1573,25 @@ impl Level {
                     .section
                     .get_block_absolute_y(x, relative.y, z)
                     .unwrap_or(Block::VOID_AIR.default_state.id);
-                if pair.local.set_block_absolute_y(x, relative.y, z, block_state_id)
+                if pair
+                    .local
+                    .set_block_absolute_y(x, relative.y, z, block_state_id)
                     != block_state_id
                 {
                     pair.local.mark_dirty(true);
                 }
-                let edit = ClusterBlockEdit { x, y: relative.y, z, state: block_state_id };
+                let edit = ClusterBlockEdit {
+                    x,
+                    y: relative.y,
+                    z,
+                    state: block_state_id,
+                };
                 if let Some(mut pendings) = self.cluster_dual.pending.get_mut(&chunk_coordinate) {
                     pendings.push(edit);
                 } else {
-                    self.cluster_dual.pending.insert(chunk_coordinate, vec![edit]);
+                    self.cluster_dual
+                        .pending
+                        .insert(chunk_coordinate, vec![edit]);
                 }
                 return replaced;
             }
@@ -1418,7 +1601,6 @@ impl Level {
 }
 
 impl Level {
-
     pub async fn write_chunks(&self, chunks_to_write: Vec<(Vector2<i32>, SyncChunk)>) {
         if chunks_to_write.is_empty() {
             return;
@@ -1620,10 +1802,8 @@ mod tests {
         {
             let mut light = chunk.light_engine.lock().unwrap();
             let count = chunk.section.count;
-            light.block_light =
-                vec![crate::chunk::format::LightContainer::Empty(0); count].into();
-            light.sky_light =
-                vec![crate::chunk::format::LightContainer::Empty(0); count].into();
+            light.block_light = vec![crate::chunk::format::LightContainer::Empty(0); count].into();
+            light.sky_light = vec![crate::chunk::format::LightContainer::Empty(0); count].into();
             light.block_light[4] =
                 crate::chunk::format::LightContainer::Full(vec![0xAB; 2048].into());
             light.sky_light[4] =
@@ -1650,12 +1830,9 @@ mod tests {
                 position: BlockPos::new(17, 0, -110),
                 value: &Block::STONE,
             };
-            chunk.block_ticks =
-                crate::tick::scheduler::ChunkTickScheduler::from_iter([tick]);
+            chunk.block_ticks = crate::tick::scheduler::ChunkTickScheduler::from_iter([tick]);
         }
-        chunk
-            .inhabited_time
-            .store(12345, Ordering::Relaxed);
+        chunk.inhabited_time.store(12345, Ordering::Relaxed);
         {
             let mut custom = chunk.custom_data.lock().unwrap();
             custom.put_int("cluster_probe", 7);
@@ -1664,16 +1841,18 @@ mod tests {
         let chunk = Arc::new(chunk);
         let bytes = cluster_encode_snapshot(&chunk);
         assert_eq!(bytes[0], 1);
-        let back = cluster_decode_snapshot(3, -7, &bytes).expect("snapshot decodes");
+        let (back, block_min_y, owned_blocks, owned_biomes) =
+            cluster_decode_snapshot_with_blocks(3, -7, &bytes).expect("snapshot decodes");
 
         assert_eq!(back.x, 3);
         assert_eq!(back.z, -7);
         assert_eq!(back.section.min_y, chunk.section.min_y);
         assert_eq!(back.section.count, chunk.section.count);
-        assert_eq!(
-            back.section.get_block_absolute_y(1, 0, 2),
-            Some(stone)
-        );
+        assert_eq!(back.section.get_block_absolute_y(1, 0, 2), Some(stone));
+        assert_eq!(block_min_y, back.section.min_y);
+        assert_eq!(owned_blocks[4].get(1, 0, 2), stone);
+        let desert = pumpkin_data::biome::Biome::from_name("desert").unwrap().id;
+        assert_eq!(owned_biomes[4].get(0, 0, 0), desert);
         {
             let biomes = back.section.biome_sections.read().unwrap();
             let desert = pumpkin_data::biome::Biome::from_name("desert").unwrap().id;
@@ -1704,7 +1883,9 @@ mod tests {
         }
         {
             let entities = back.pending_block_entities.lock().unwrap();
-            let entity = entities.get(&BlockPos::new(17, 1, -110)).expect("entity kept");
+            let entity = entities
+                .get(&BlockPos::new(17, 1, -110))
+                .expect("entity kept");
             assert_eq!(entity.get_string("id"), Some("minecraft:chest"));
         }
         {
@@ -1802,5 +1983,19 @@ mod tests {
 
         let end_level = Level::from_root_folder(&config, root.clone(), 0, Dimension::THE_END);
         assert_eq!(end_level.level_folder.dim_folder, root.join("DIM1"));
+    }
+
+    #[test]
+    fn overlapping_lobby_chunk_needs_survive_one_departure() {
+        let needs = ClusterLobbyNeedCounts::new();
+        let shared = Vector2::new(3, -4);
+        let only_first = Vector2::new(4, -4);
+        needs.acquire(&[shared, only_first]);
+        needs.acquire(&[shared]);
+        needs.release(&[shared, only_first]);
+        assert!(needs.contains(&shared));
+        assert!(!needs.contains(&only_first));
+        needs.release(&[shared]);
+        assert!(!needs.contains(&shared));
     }
 }

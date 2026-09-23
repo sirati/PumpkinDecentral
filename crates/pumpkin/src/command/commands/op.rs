@@ -7,6 +7,7 @@ use crate::command::node::{CommandExecutor, CommandExecutorResult};
 use crate::command::suggestion::provider::{SuggestionProvider, SuggestionProviderResult};
 use crate::command::suggestion::suggestions::SuggestionsBuilder;
 use crate::data::SaveJSONConfiguration;
+use pumpkin_cluster::admin_sync::{AdminMutation, OpGrant};
 use pumpkin_config::op::Op;
 use pumpkin_data::translation;
 use pumpkin_util::PermissionLvl;
@@ -28,9 +29,57 @@ impl CommandExecutor for OpCommandExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let server = context.server();
         let profiles = GameProfileArgumentType::get(context, ARG_TARGETS)?;
+        if server.advanced_config.cluster.enabled {
+            let snapshot = server.cluster_admin_view.load_full();
+            let level = server.basic_config.op_permission_level;
+            let mut changed = 0;
+            let mut busy = false;
+            for profile in profiles {
+                let existing = snapshot
+                    .operators
+                    .iter()
+                    .find(|entry| entry.uuid == *profile.id.as_bytes());
+                if existing.is_some_and(|entry| entry.level == level as u8) {
+                    continue;
+                }
+                let mutation = AdminMutation::GrantOp(OpGrant::new(
+                    *profile.id.as_bytes(),
+                    profile.name.clone(),
+                    level as u8,
+                    existing.is_some_and(|entry| entry.bypasses_player_limit),
+                ));
+                let Some(prepared) = crate::server::cluster_admin_apply::prepare_admin_mutation(
+                    server,
+                    mutation,
+                    &context.source.name,
+                ) else {
+                    busy = true;
+                    continue;
+                };
+                crate::server::cluster_admin_apply::commit_admin_mutation(server, prepared);
+                context.source.send_feedback(
+                    TextComponent::text(format!(
+                        "Queued /op for {}; pending primary durability.",
+                        profile.name
+                    )),
+                    false,
+                );
+                changed += 1;
+            }
+            if changed == 0 {
+                return if busy {
+                    Err(crate::server::cluster_admin_apply::admin_busy_error())
+                } else {
+                    Err(ALREADY_OP_ERROR_TYPE.create_without_context())
+                };
+            }
+            return Ok(changed);
+        }
 
         let new_level = server.basic_config.op_permission_level;
-        let mut granted: Vec<(uuid::Uuid, String, pumpkin_util::PermissionLvl, bool)> = Vec::new();
+        let mut granted: Vec<(uuid::Uuid, String, pumpkin_util::PermissionLvl)> = Vec::new();
+        let mut prepared = Vec::new();
+        let mut queue_full = false;
 
         {
             let mut config = server
@@ -47,50 +96,108 @@ impl CommandExecutor for OpCommandExecutor {
                         continue;
                     }
 
-                    op.level = new_level;
-                    op.name.clone_from(&profile.name);
+                    let mutation = AdminMutation::GrantOp(OpGrant::new(
+                        *profile.id.as_bytes(),
+                        profile.name.clone(),
+                        new_level as u8,
+                        op.bypasses_player_limit,
+                    ));
+                    let Some(reservation) =
+                        crate::server::cluster_admin_apply::prepare_admin_mutation(
+                            server,
+                            mutation,
+                            &context.source.name,
+                        )
+                    else {
+                        queue_full = true;
+                        continue;
+                    };
+                    prepared.push(reservation);
+
+                    if !crate::server::cluster_admin_apply::defer_local_admin_apply(server) {
+                        op.level = new_level;
+                        op.name.clone_from(&profile.name);
+                    }
                 } else {
+                    let mutation = AdminMutation::GrantOp(OpGrant::new(
+                        *profile.id.as_bytes(),
+                        profile.name.clone(),
+                        new_level as u8,
+                        false,
+                    ));
+                    let Some(reservation) =
+                        crate::server::cluster_admin_apply::prepare_admin_mutation(
+                            server,
+                            mutation,
+                            &context.source.name,
+                        )
+                    else {
+                        queue_full = true;
+                        continue;
+                    };
+                    prepared.push(reservation);
                     let op_entry = Op::new(profile.id, profile.name.clone(), new_level, false);
-                    config.ops.push(op_entry);
+                    if !crate::server::cluster_admin_apply::defer_local_admin_apply(server) {
+                        config.ops.push(op_entry);
+                    }
                 }
 
-                granted.push((profile.id, profile.name.clone(), new_level, false));
+                granted.push((profile.id, profile.name.clone(), new_level));
             }
 
-            if !granted.is_empty() {
+            if !granted.is_empty()
+                && crate::server::cluster_admin_apply::stores_authoritative_files(server)
+                && !crate::server::cluster_admin_apply::defer_local_admin_apply(server)
+            {
                 config.save();
             }
         }
 
-        for (id, name, level, bypass) in &granted {
-            crate::server::cluster_admin_apply::publish_op_grant(
-                server,
-                *id,
-                name,
-                *level,
-                *bypass,
-                &context.source.name,
-            );
+        for reservation in prepared {
+            crate::server::cluster_admin_apply::commit_admin_mutation(server, reservation);
         }
 
         if granted.is_empty() {
+            if queue_full {
+                return Err(crate::server::cluster_admin_apply::admin_busy_error());
+            }
             return Err(ALREADY_OP_ERROR_TYPE.create_without_context());
         }
 
-        for (id, name, level, _bypass) in &granted {
-            if let Some(player) = server.get_player_by_uuid(*id) {
+        if queue_full {
+            context.source.send_feedback(
+                TextComponent::text(
+                    "Some cluster admin targets could not be queued; they were not changed.",
+                ),
+                false,
+            );
+        }
+
+        for (id, name, level) in &granted {
+            if !crate::server::cluster_admin_apply::defer_local_admin_apply(server)
+                && let Some(player) = server.get_player_by_uuid(*id)
+            {
                 let command_dispatcher = server.command_dispatcher.load();
                 player.set_permission_lvl(server, *level, &command_dispatcher);
             }
 
-            context.source.send_feedback(
-                TextComponent::translate_cross(
-                    translation::java::COMMANDS_OP_SUCCESS,
-                    translation::bedrock::COMMANDS_OP_SUCCESS,
-                    [TextComponent::text(name.clone())],
-                ),
-                true,
-            );
+            if crate::server::cluster_admin_apply::mutation_pending_primary(server) {
+                context.source.send_feedback(
+                    TextComponent::text(format!(
+                        "Queued /op for {name}; pending primary durability."
+                    )),
+                    false,
+                );
+            } else {
+                context.source.send_feedback(
+                    TextComponent::translate_cross(
+                        translation::java::COMMANDS_OP_SUCCESS,
+                        translation::bedrock::COMMANDS_OP_SUCCESS,
+                        [TextComponent::text(name.clone())],
+                    ),
+                    true,
+                );
+            }
         }
 
         Ok(granted.len() as i32)
@@ -99,76 +206,18 @@ impl CommandExecutor for OpCommandExecutor {
 
 struct OpSuggestionProvider;
 
-fn online_completion_names(
-    local_names: impl IntoIterator<Item = String>,
-    remote_names: impl IntoIterator<Item = String>,
-) -> Vec<String> {
-    let mut names: Vec<String> = local_names.into_iter().collect();
-    for name in remote_names {
-        if name.is_empty() || names.iter().any(|existing| existing.eq_ignore_ascii_case(&name)) {
-            continue;
-        }
-        names.push(name);
-    }
-    names
-}
-
 impl SuggestionProvider for OpSuggestionProvider {
     fn suggest(
         &self,
         context: &CommandContext,
         mut builder: SuggestionsBuilder,
     ) -> SuggestionProviderResult {
-        // `/op` is an online-player command.  In particular, do not hide an
-        // already-opped player here: doing so makes a player who is the only
-        // one online disappear from completion altogether, and the executor
-        // remains the authority for returning the normal "already op" error.
-        let names = online_completion_names(
-            context
-                .source
-                .server()
-                .get_all_players()
-                .into_iter()
-                .map(|player| player.gameprofile.name.clone()),
-            crate::server::cluster_presence::remote_presence_entries()
-                .into_iter()
-                .map(|(_, entry)| entry.name),
-        );
-        for name in names {
-            // Keep the server suggestion result consistent with all other
-            // player-name providers: completions honour the typed prefix.
+        for name in
+            crate::server::cluster_chat_pm::completion_names_for_viewer(context.server(), "")
+        {
             builder = builder.filter_and_suggest_one(name);
         }
         builder.build()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::online_completion_names;
-
-    #[test]
-    fn online_completion_keeps_already_opped_local_player_candidates() {
-        // Operator status is intentionally not an input to this function:
-        // `/op` must offer every online player, including existing operators.
-        assert_eq!(
-            online_completion_names(
-                [String::from("LocalOperator")],
-                [String::from("RemotePlayer")]
-            ),
-            vec![String::from("LocalOperator"), String::from("RemotePlayer")]
-        );
-    }
-
-    #[test]
-    fn online_completion_deduplicates_remote_presence_case_insensitively() {
-        assert_eq!(
-            online_completion_names(
-                [String::from("LocalPlayer")],
-                [String::from("localplayer"), String::new(), String::from("RemotePlayer")]
-            ),
-            vec![String::from("LocalPlayer"), String::from("RemotePlayer")]
-        );
     }
 }
 

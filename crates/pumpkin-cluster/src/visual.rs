@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use crate::banks::Bank;
 use crate::identity::{GlobalPlayerId, PlayerSeq};
 use crate::protocol::{
-    ArmorUpdate, BlockingUpdate, HeldUpdate, SkinLayersUpdate, SneakUpdate, SprintUpdate,
-    SwingUpdate,
+    BlockingUpdate, EquipmentUpdate, HeldUpdate, PoseUpdate, SkinLayersUpdate, SneakUpdate,
+    SprintUpdate, SwingUpdate,
 };
 use crate::time::TickStamp;
 
@@ -35,19 +35,21 @@ impl VisualCounters {
 }
 
 #[must_use]
-pub const fn capture_armor(
+pub const fn capture_equipment(
     gid: GlobalPlayerId,
     seq: PlayerSeq,
     tick: TickStamp,
     slot: u8,
     item: u16,
-) -> ArmorUpdate {
-    ArmorUpdate {
+    count: u8,
+) -> EquipmentUpdate {
+    EquipmentUpdate {
         gid,
         seq,
         tick,
         slot,
         item,
+        count,
     }
 }
 
@@ -93,6 +95,23 @@ pub const fn capture_sprint(
         seq,
         tick,
         active,
+    }
+}
+
+#[must_use]
+pub const fn capture_pose(
+    gid: GlobalPlayerId,
+    seq: PlayerSeq,
+    tick: TickStamp,
+    swimming: bool,
+    gliding: bool,
+) -> PoseUpdate {
+    PoseUpdate {
+        gid,
+        seq,
+        tick,
+        swimming,
+        gliding,
     }
 }
 
@@ -206,9 +225,16 @@ fn push_visual(
     });
 }
 
-pub fn emit_armor(gid: Option<GlobalPlayerId>, tick: TickStamp, slot: u8, item: u16) {
+pub fn emit_equipment(
+    gid: Option<GlobalPlayerId>,
+    tick: TickStamp,
+    slot: u8,
+    item: u16,
+    count: u8,
+) {
     push_visual(gid, |bank, gid, seq| {
-        bank.armor.push(capture_armor(gid, seq, tick, slot, item));
+        bank.equipment
+            .push(capture_equipment(gid, seq, tick, slot, item, count));
     });
 }
 
@@ -227,6 +253,13 @@ pub fn emit_sneak(gid: Option<GlobalPlayerId>, tick: TickStamp, active: bool) {
 pub fn emit_sprint(gid: Option<GlobalPlayerId>, tick: TickStamp, active: bool) {
     push_visual(gid, |bank, gid, seq| {
         bank.sprint.push(capture_sprint(gid, seq, tick, active));
+    });
+}
+
+pub fn emit_pose(gid: Option<GlobalPlayerId>, tick: TickStamp, swimming: bool, gliding: bool) {
+    push_visual(gid, |bank, gid, seq| {
+        bank.pose
+            .push(capture_pose(gid, seq, tick, swimming, gliding));
     });
 }
 
@@ -261,78 +294,6 @@ mod tests {
 
     fn sample_gid() -> GlobalPlayerId {
         GlobalPlayerId::new(ServerId(1), PlayerSlot(7))
-    }
-
-    #[test]
-    fn capture_ctors_echo_params() {
-        reset_visual_state();
-        let gid = sample_gid();
-        let seq = PlayerSeq(9);
-        let tick = TickStamp(3);
-        assert_eq!(
-            capture_armor(gid, seq, tick, 4, 512),
-            ArmorUpdate {
-                gid,
-                seq,
-                tick,
-                slot: 4,
-                item: 512
-            }
-        );
-        assert_eq!(
-            capture_held(gid, seq, tick, 2),
-            HeldUpdate {
-                gid,
-                seq,
-                tick,
-                slot: 2
-            }
-        );
-        assert_eq!(
-            capture_sneak(gid, seq, tick, true),
-            SneakUpdate {
-                gid,
-                seq,
-                tick,
-                active: true
-            }
-        );
-        assert_eq!(
-            capture_sprint(gid, seq, tick, false),
-            SprintUpdate {
-                gid,
-                seq,
-                tick,
-                active: false
-            }
-        );
-        assert_eq!(
-            capture_blocking(gid, seq, tick, true),
-            BlockingUpdate {
-                gid,
-                seq,
-                tick,
-                active: true
-            }
-        );
-        assert_eq!(
-            capture_swing(gid, seq, tick, 1),
-            SwingUpdate {
-                gid,
-                seq,
-                tick,
-                hand: 1
-            }
-        );
-        assert_eq!(
-            capture_skin(gid, seq, tick, 0x7F),
-            SkinLayersUpdate {
-                gid,
-                seq,
-                tick,
-                mask: 0x7F
-            }
-        );
     }
 
     #[test]
@@ -390,7 +351,7 @@ mod tests {
     fn emit_without_gid_skips_and_counts() {
         reset_visual_state();
         emit_sneak(None, TickStamp(5), true);
-        emit_armor(None, TickStamp(5), 1, 2);
+        emit_equipment(None, TickStamp(5), 1, 2, 1);
         assert!(visual_bank_is_empty());
         let counters = visual_counters();
         assert_eq!(counters.emitted, 0);

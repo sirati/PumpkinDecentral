@@ -1,14 +1,21 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
-use crate::server::cluster_lobby::LOBBY_TELEPORT_ID;
 
 impl JavaClient {
     pub fn handle_confirm_teleport(&self, player: &Player, confirm_teleport: &SConfirmTeleport) {
-        if confirm_teleport.teleport_id == VarInt(LOBBY_TELEPORT_ID)
-            && player
-                .lobby_teleport_pending
-                .swap(false, std::sync::atomic::Ordering::Relaxed)
+        if let Some(server) = player.world().server.upgrade()
+            && server.advanced_config.cluster.enabled
         {
+            if player.cluster_gid().is_none() {
+                return;
+            }
+            crate::server::cluster_controller::submit_patch(
+                &server,
+                player,
+                crate::server::cluster_controller::ControllerPatch::TeleportConfirm(
+                    confirm_teleport.teleport_id,
+                ),
+            );
             return;
         }
         enum TeleportResult {
@@ -38,7 +45,15 @@ impl JavaClient {
         };
 
         match result {
-            TeleportResult::Success => {}
+            TeleportResult::Success => {
+                if let Some(gid) = player.cluster_gid()
+                    && let Some(server) = player.world().server.upgrade()
+                {
+                    if !server.cluster_controller.note_teleport(gid, None) {
+                        self.try_kick(&TextComponent::text("Controller teleport queue saturated"));
+                    }
+                }
+            }
             TeleportResult::WrongId => {
                 self.try_kick(&TextComponent::text("Wrong teleport id"));
             }

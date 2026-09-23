@@ -3,9 +3,8 @@
 //!
 //! - Routing key is the entity's current [`ChunkAddr`]: updates flow to the
 //!   chunk's holders, never as a mesh-wide broadcast.
-//! - Owner gating applies on top: a peer may only speak for entities whose
-//!   [`EntityRef::owner`] matches the sending peer, and never for entities
-//!   owned by the local peer (loopback is a bug, not a fast path).
+//! - Owner gating applies on top through the current ownership table; origin
+//!   identity remains unchanged across graceful ownership transfer.
 //! - One shared stream per update family ([`ENTITY_STREAM_KINDS`]): pos,
 //!   visual, transient, and combat each ride exactly one [`StreamKind`].
 //!   There are no per-player entity streams.
@@ -21,7 +20,7 @@ use crate::identity::ServerId;
 use crate::time::TickStamp;
 
 pub use crate::protocol::{
-    ChunkAddr, EntityRef, FireProjectileUpdate, HitEntityUpdate, StreamKind,
+    ChunkAddr, ChunkKey, EntityRef, FireProjectileUpdate, HitEntityUpdate, StreamKind,
 };
 
 /// Exactly one shared stream per entity update family.
@@ -73,10 +72,11 @@ impl EntityCombatUpdate {
 pub struct EntitySpawn {
     pub entity: EntityRef,
     pub tick: TickStamp,
-    pub kind: u8,
+    pub kind: u16,
     pub pos: [f64; 3],
     pub yaw: f32,
     pub pitch: f32,
+    pub visual: EntityVisualState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,8 +99,18 @@ pub struct EntityPosUpdate {
 pub struct EntityVisualUpdate {
     pub entity: EntityRef,
     pub tick: TickStamp,
-    pub slot: u8,
+    pub visual: EntityVisualState,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityEquipmentState {
     pub item: u16,
+    pub count: u8,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityVisualState {
+    pub equipment: [EntityEquipmentState; 8],
     pub flags: u8,
 }
 
@@ -109,6 +119,7 @@ pub struct EntityTransientUpdate {
     pub entity: EntityRef,
     pub tick: TickStamp,
     pub action: u8,
+    pub bedrock_action: Option<u8>,
     pub value: u16,
 }
 
@@ -122,12 +133,12 @@ pub struct EntityCombatUpdate {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GhostState {
-    pub chunk: ChunkAddr,
+    pub chunk: ChunkKey,
     pub last_tick: TickStamp,
     pub pos: [f64; 3],
     pub yaw: f32,
     pub pitch: f32,
-    pub kind: u8,
+    pub kind: u16,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -157,18 +168,18 @@ impl EntityGhosts {
     }
 
     #[must_use]
-    pub fn get_owned(&self, owner: ServerId, local_id: i32) -> Option<&GhostState> {
-        let key = self.locate_key(owner, local_id)?;
+    pub fn get_owned(&self, origin: ServerId, local_id: i32) -> Option<&GhostState> {
+        let key = self.locate_any_generation(origin, local_id)?;
         self.by_ref.get(&key)
     }
 
     #[must_use]
-    pub fn contains(&self, owner: ServerId, local_id: i32) -> bool {
-        self.locate_key(owner, local_id).is_some()
+    pub fn contains(&self, origin: ServerId, local_id: i32) -> bool {
+        self.locate_any_generation(origin, local_id).is_some()
     }
 
     pub fn spawn(&mut self, update: &EntitySpawn) -> bool {
-        let previous = self.locate_key(update.entity.owner, update.entity.local_id);
+        let previous = self.locate_any_generation(update.entity.origin, update.entity.local_id);
         if let Some(stale) = previous {
             let _evicted: Option<GhostState> = self.by_ref.remove(&stale);
         }
@@ -210,7 +221,11 @@ impl EntityGhosts {
     }
 
     pub fn despawn(&mut self, update: &EntityDespawn) -> bool {
-        let previous = self.locate_key(update.entity.owner, update.entity.local_id);
+        let previous = self.locate_key(
+            update.entity.origin,
+            update.entity.local_id,
+            update.entity.generation,
+        );
         let Some(stale) = previous else {
             return false;
         };
@@ -218,15 +233,24 @@ impl EntityGhosts {
         true
     }
 
-    fn locate_key(&self, owner: ServerId, local_id: i32) -> Option<EntityRef> {
+    fn locate_any_generation(&self, origin: ServerId, local_id: i32) -> Option<EntityRef> {
         self.by_ref
             .keys()
-            .find(|key| key.owner == owner && key.local_id == local_id)
+            .find(|key| key.origin == origin && key.local_id == local_id)
+            .copied()
+    }
+
+    fn locate_key(&self, origin: ServerId, local_id: i32, generation: u32) -> Option<EntityRef> {
+        self.by_ref
+            .keys()
+            .find(|key| {
+                key.origin == origin && key.local_id == local_id && key.generation == generation
+            })
             .copied()
     }
 
     fn state_for(&mut self, entity: &EntityRef, tick: TickStamp) -> Option<&mut GhostState> {
-        let key = self.locate_key(entity.owner, entity.local_id)?;
+        let key = self.locate_key(entity.origin, entity.local_id, entity.generation)?;
         let previous = self.by_ref.remove(&key)?;
         let mut state = previous;
         state.chunk = entity.chunk;
@@ -238,7 +262,7 @@ impl EntityGhosts {
 #[derive(Debug, Clone, PartialEq)]
 pub struct OwnerTable {
     pub local_peer: ServerId,
-    pub entries: HashMap<(ServerId, i32), ChunkAddr>,
+    pub entries: HashMap<(ServerId, i32), ChunkKey>,
 }
 
 impl OwnerTable {
@@ -260,16 +284,16 @@ impl OwnerTable {
         self.entries.len()
     }
 
-    pub fn insert(&mut self, local_id: i32, chunk: ChunkAddr) {
+    pub fn insert(&mut self, local_id: i32, chunk: ChunkKey) {
         self.entries.insert((self.local_peer, local_id), chunk);
     }
 
     #[must_use]
-    pub fn chunk_of(&self, local_id: i32) -> Option<ChunkAddr> {
+    pub fn chunk_of(&self, local_id: i32) -> Option<ChunkKey> {
         self.entries.get(&(self.local_peer, local_id)).copied()
     }
 
-    pub fn note_moved(&mut self, local_id: i32, chunk: ChunkAddr) -> bool {
+    pub fn note_moved(&mut self, local_id: i32, chunk: ChunkKey) -> bool {
         let Some(entry) = self.entries.get_mut(&(self.local_peer, local_id)) else {
             return false;
         };
@@ -277,7 +301,7 @@ impl OwnerTable {
         true
     }
 
-    pub fn remove(&mut self, local_id: i32) -> Option<ChunkAddr> {
+    pub fn remove(&mut self, local_id: i32) -> Option<ChunkKey> {
         self.entries.remove(&(self.local_peer, local_id))
     }
 
@@ -286,10 +310,7 @@ impl OwnerTable {
     /// Entities without another holder are omitted: with no holder there is
     /// nobody to hand to, and handoff must not fall back to broadcast.
     #[must_use]
-    pub fn plan_handoff(
-        &self,
-        holders: &dyn Fn(ChunkAddr) -> Vec<u16>,
-    ) -> Vec<EntityHandoff> {
+    pub fn plan_handoff(&self, holders: &dyn Fn(ChunkKey) -> Vec<u16>) -> Vec<EntityHandoff> {
         let mut out = Vec::new();
         for ((owner, local_id), chunk) in &self.entries {
             let mut candidates: Vec<u16> = holders(*chunk)
@@ -301,8 +322,9 @@ impl OwnerTable {
             if let Some(&target_peer) = candidates.first() {
                 out.push(EntityHandoff {
                     entity_ref: EntityRef {
-                        owner: *owner,
+                        origin: *owner,
                         local_id: *local_id,
+                        generation: 0,
                         chunk: *chunk,
                     },
                     target_peer,
@@ -310,8 +332,8 @@ impl OwnerTable {
             }
         }
         out.sort_by(|left, right| {
-            (left.entity_ref.owner, left.entity_ref.local_id)
-                .cmp(&(right.entity_ref.owner, right.entity_ref.local_id))
+            (left.entity_ref.origin, left.entity_ref.local_id)
+                .cmp(&(right.entity_ref.origin, right.entity_ref.local_id))
         });
         out
     }
@@ -342,9 +364,9 @@ pub fn is_owner_sender(peer: ServerId, owner: ServerId, local: ServerId) -> bool
 /// definition of "holder".
 #[must_use]
 pub fn is_holder(
-    chunk: ChunkAddr,
+    chunk: ChunkKey,
     local: ServerId,
-    directory: &dyn Fn(ChunkAddr) -> Vec<u16>,
+    directory: &dyn Fn(ChunkKey) -> Vec<u16>,
 ) -> bool {
     route_to_holders(chunk, directory).contains(&local.0)
 }
@@ -358,9 +380,10 @@ pub fn should_accept(
     peer: ServerId,
     local: ServerId,
     entity: &EntityRef,
-    directory: &dyn Fn(ChunkAddr) -> Vec<u16>,
+    current_owner: ServerId,
+    directory: &dyn Fn(ChunkKey) -> Vec<u16>,
 ) -> bool {
-    if !is_owner_sender(peer, entity.owner, local) {
+    if !is_owner_sender(peer, current_owner, local) {
         return false;
     }
     is_holder(entity.chunk, local, directory)
@@ -371,10 +394,7 @@ pub fn should_accept(
 /// This is the only routing query outbound fanout may use. An empty holder
 /// set means "drop", never "send to everyone".
 #[must_use]
-pub fn route_to_holders(
-    chunk: ChunkAddr,
-    directory: &dyn Fn(ChunkAddr) -> Vec<u16>,
-) -> Vec<u16> {
+pub fn route_to_holders(chunk: ChunkKey, directory: &dyn Fn(ChunkKey) -> Vec<u16>) -> Vec<u16> {
     let mut holders = directory(chunk);
     holders.sort_unstable();
     holders.dedup();
@@ -387,8 +407,8 @@ pub fn route_to_holders(
 /// a peer never echoes an update back to itself; non-holders are never added.
 #[must_use]
 pub fn fanout_to_holders(
-    chunk: ChunkAddr,
-    directory: &dyn Fn(ChunkAddr) -> Vec<u16>,
+    chunk: ChunkKey,
+    directory: &dyn Fn(ChunkKey) -> Vec<u16>,
     exclude: ServerId,
 ) -> Vec<u16> {
     route_to_holders(chunk, directory)
@@ -397,36 +417,50 @@ pub fn fanout_to_holders(
         .collect()
 }
 
+#[must_use]
+pub fn holder_transition(old: &[u16], new: &[u16]) -> (Vec<u16>, Vec<u16>) {
+    let old: std::collections::BTreeSet<_> = old.iter().copied().collect();
+    let new: std::collections::BTreeSet<_> = new.iter().copied().collect();
+    (
+        old.difference(&new).copied().collect(),
+        new.difference(&old).copied().collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn chunk(x: i32, z: i32) -> ChunkAddr {
-        ChunkAddr { x, z }
+    const WORLD: crate::protocol::WorldId = crate::protocol::WorldId::new(0, 7);
+
+    fn chunk(x: i32, z: i32) -> ChunkKey {
+        ChunkKey::new(WORLD, x, z)
     }
 
-    fn entity_ref(owner: u16, local_id: i32, x: i32, z: i32) -> EntityRef {
+    fn entity_ref(origin: u16, local_id: i32, x: i32, z: i32) -> EntityRef {
         EntityRef {
-            owner: ServerId(owner),
+            origin: ServerId(origin),
             local_id,
+            generation: 0,
             chunk: chunk(x, z),
         }
     }
 
-    fn spawn_update(owner: u16, local_id: i32, x: i32, z: i32) -> EntitySpawn {
+    fn spawn_update(origin: u16, local_id: i32, x: i32, z: i32) -> EntitySpawn {
         EntitySpawn {
-            entity: entity_ref(owner, local_id, x, z),
+            entity: entity_ref(origin, local_id, x, z),
             tick: TickStamp(10),
             kind: 3,
             pos: [1.0, 2.0, 3.0],
             yaw: 90.0,
             pitch: 0.0,
+            visual: EntityVisualState::default(),
         }
     }
 
-    fn pos_update(owner: u16, local_id: i32, x: i32, z: i32) -> EntityPosUpdate {
+    fn pos_update(origin: u16, local_id: i32, x: i32, z: i32) -> EntityPosUpdate {
         EntityPosUpdate {
-            entity: entity_ref(owner, local_id, x, z),
+            entity: entity_ref(origin, local_id, x, z),
             tick: TickStamp(11),
             pos: [4.0, 5.0, 6.0],
             vel: [0.1, 0.0, 0.0],
@@ -460,20 +494,41 @@ mod tests {
     }
 
     #[test]
+    fn delayed_update_cannot_mutate_reused_entity_id() {
+        let mut ghosts = EntityGhosts::new();
+        let first = spawn_update(2, 7, 0, 0);
+        assert!(ghosts.spawn(&first));
+
+        let mut replacement = spawn_update(2, 7, 0, 0);
+        replacement.entity.generation = 1;
+        replacement.pos = [20.0, 70.0, 20.0];
+        assert!(!ghosts.spawn(&replacement));
+
+        let delayed = pos_update(2, 7, 1, 1);
+        assert!(!ghosts.apply_pos(&delayed));
+        assert_eq!(
+            ghosts.get(&replacement.entity).map(|state| state.pos),
+            Some(replacement.pos)
+        );
+    }
+
+    #[test]
     fn all_four_streams_refresh_liveness() {
         let mut ghosts = EntityGhosts::new();
         assert!(ghosts.spawn(&spawn_update(2, 7, 0, 0)));
         let visual = EntityVisualUpdate {
             entity: entity_ref(2, 7, 0, 0),
             tick: TickStamp(12),
-            slot: 1,
-            item: 42,
-            flags: 0,
+            visual: EntityVisualState {
+                equipment: [EntityEquipmentState::default(); 8],
+                flags: 1,
+            },
         };
         let transient = EntityTransientUpdate {
             entity: entity_ref(2, 7, 0, 0),
             tick: TickStamp(13),
             action: 2,
+            bedrock_action: Some(2),
             value: 9,
         };
         let combat = EntityCombatUpdate {
@@ -501,14 +556,13 @@ mod tests {
         assert!(!ghosts.apply_visual(&EntityVisualUpdate {
             entity: entity_ref(2, 7, 0, 0),
             tick: TickStamp(12),
-            slot: 0,
-            item: 0,
-            flags: 0,
+            visual: EntityVisualState::default(),
         }));
         assert!(!ghosts.apply_transient(&EntityTransientUpdate {
             entity: entity_ref(2, 7, 0, 0),
             tick: TickStamp(13),
             action: 0,
+            bedrock_action: None,
             value: 0,
         }));
         assert!(!ghosts.apply_combat(&EntityCombatUpdate {
@@ -540,7 +594,7 @@ mod tests {
 
     #[test]
     fn fanout_reaches_only_holders() {
-        let directory = |addr: ChunkAddr| {
+        let directory = |addr: ChunkKey| {
             if addr == chunk(0, 0) {
                 vec![3_u16, 2, 3]
             } else {
@@ -558,7 +612,7 @@ mod tests {
         owners.insert(8, chunk(0, 0));
         owners.insert(9, chunk(5, 5));
         owners.insert(10, chunk(9, 9));
-        let holders = |addr: ChunkAddr| {
+        let holders = |addr: ChunkKey| {
             if addr == chunk(0, 0) {
                 vec![3_u16, 1, 2]
             } else if addr == chunk(5, 5) {
@@ -579,18 +633,12 @@ mod tests {
     fn single_stream_per_update_family() {
         assert_eq!(ENTITY_STREAM_KINDS.len(), 4);
         assert_eq!(EntityPosUpdate::stream_kind(), StreamKind::EntityPos);
-        assert_eq!(
-            EntityVisualUpdate::stream_kind(),
-            StreamKind::EntityVisual
-        );
+        assert_eq!(EntityVisualUpdate::stream_kind(), StreamKind::EntityVisual);
         assert_eq!(
             EntityTransientUpdate::stream_kind(),
             StreamKind::EntityTransient
         );
-        assert_eq!(
-            EntityCombatUpdate::stream_kind(),
-            StreamKind::EntityCombat
-        );
+        assert_eq!(EntityCombatUpdate::stream_kind(), StreamKind::EntityCombat);
         let mut kinds = ENTITY_STREAM_KINDS.to_vec();
         kinds.sort_by_key(|kind| *kind as u8);
         kinds.dedup();
@@ -603,13 +651,19 @@ mod tests {
         assert!(is_owner_sender(ServerId(2), ServerId(2), local));
         assert!(!is_owner_sender(ServerId(3), ServerId(2), local));
         assert!(!is_owner_sender(ServerId(1), ServerId(1), local));
-        assert!(!should_accept(ServerId(1), local, &entity_ref(1, 7, 0, 0), &|_| vec![1_u16]));
+        assert!(!should_accept(
+            ServerId(1),
+            local,
+            &entity_ref(1, 7, 0, 0),
+            ServerId(1),
+            &|_| vec![1_u16]
+        ));
     }
 
     #[test]
     fn inbound_gate_needs_owner_and_holder() {
         let local = ServerId(1);
-        let directory = |addr: ChunkAddr| {
+        let directory = |addr: ChunkKey| {
             if addr == chunk(0, 0) {
                 vec![1_u16, 2]
             } else {
@@ -617,17 +671,41 @@ mod tests {
             }
         };
         let held = entity_ref(2, 7, 0, 0);
-        assert!(should_accept(ServerId(2), local, &held, &directory));
-        assert!(!should_accept(ServerId(3), local, &held, &directory));
+        assert!(should_accept(
+            ServerId(2),
+            local,
+            &held,
+            ServerId(2),
+            &directory
+        ));
+        assert!(!should_accept(
+            ServerId(3),
+            local,
+            &held,
+            ServerId(2),
+            &directory
+        ));
         let elsewhere = entity_ref(2, 7, 9, 9);
-        assert!(!should_accept(ServerId(2), local, &elsewhere, &directory));
+        assert!(!should_accept(
+            ServerId(2),
+            local,
+            &elsewhere,
+            ServerId(2),
+            &directory
+        ));
         let loopback = entity_ref(1, 7, 0, 0);
-        assert!(!should_accept(local, local, &loopback, &directory));
+        assert!(!should_accept(
+            local,
+            local,
+            &loopback,
+            local,
+            &directory
+        ));
     }
 
     #[test]
     fn fanout_sends_only_to_holders_minus_sender() {
-        let directory = |addr: ChunkAddr| {
+        let directory = |addr: ChunkKey| {
             if addr == chunk(0, 0) {
                 vec![3_u16, 1, 2, 2]
             } else {
@@ -639,6 +717,13 @@ mod tests {
             vec![2, 3]
         );
         assert!(fanout_to_holders(chunk(9, 9), &directory, ServerId(1)).is_empty());
+    }
+
+    #[test]
+    fn boundary_keeps_shared_holders_and_targets_only_changed_peers() {
+        let (leave, enter) = holder_transition(&[1, 2, 4], &[2, 3, 4]);
+        assert_eq!(leave, vec![1]);
+        assert_eq!(enter, vec![3]);
     }
 
     #[test]

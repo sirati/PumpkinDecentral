@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::identity::GlobalPlayerId;
 use crate::protocol::StreamKind;
 
+const HIDE_MAGIC: [u8; 4] = *b"HIDE";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HideError {
     pub message: String,
@@ -49,13 +51,22 @@ pub fn is_valid_hide_name(name: &str) -> bool {
 }
 
 pub fn encode_hide(update: &HideUpdate) -> Result<Vec<u8>, HideError> {
-    postcard::to_allocvec(update).map_err(|error| HideError {
+    let encoded = postcard::to_allocvec(update).map_err(|error| HideError {
         message: format!("encode hide update: {error}"),
-    })
+    })?;
+    let mut bytes = Vec::with_capacity(HIDE_MAGIC.len() + encoded.len());
+    bytes.extend_from_slice(&HIDE_MAGIC);
+    bytes.extend_from_slice(&encoded);
+    Ok(bytes)
 }
 
 pub fn decode_hide(bytes: &[u8]) -> Result<HideUpdate, HideError> {
-    postcard::from_bytes(bytes).map_err(|error| HideError {
+    let Some(encoded) = bytes.strip_prefix(&HIDE_MAGIC) else {
+        return Err(HideError {
+            message: String::from("decode hide update: wrong discriminator"),
+        });
+    };
+    postcard::from_bytes(encoded).map_err(|error| HideError {
         message: format!("decode hide update: {error}"),
     })
 }
@@ -100,7 +111,12 @@ mod tests {
     }
 
     fn update(server: u16, player: u16, hidden: bool) -> HideUpdate {
-        HideUpdate::new(gid(server, player), [player as u8; 16], String::from("Steve"), hidden)
+        HideUpdate::new(
+            gid(server, player),
+            [player as u8; 16],
+            String::from("Steve"),
+            hidden,
+        )
     }
 
     #[test]
@@ -125,14 +141,30 @@ mod tests {
     fn sets_apply_and_clear() {
         let mut gids = HashSet::new();
         let mut uuids = HashSet::new();
-        assert!(apply_hide_to_sets(&mut gids, &mut uuids, &update(2, 7, true)));
+        assert!(apply_hide_to_sets(
+            &mut gids,
+            &mut uuids,
+            &update(2, 7, true)
+        ));
         assert!(hide_set_contains_gid(&gids, &gid(2, 7)));
         assert!(hide_set_contains_uuid(&uuids, &[7_u8; 16]));
-        assert!(!apply_hide_to_sets(&mut gids, &mut uuids, &update(2, 7, true)));
-        assert!(apply_hide_to_sets(&mut gids, &mut uuids, &update(2, 7, false)));
+        assert!(!apply_hide_to_sets(
+            &mut gids,
+            &mut uuids,
+            &update(2, 7, true)
+        ));
+        assert!(apply_hide_to_sets(
+            &mut gids,
+            &mut uuids,
+            &update(2, 7, false)
+        ));
         assert!(!hide_set_contains_gid(&gids, &gid(2, 7)));
         assert!(!hide_set_contains_uuid(&uuids, &[7_u8; 16]));
-        assert!(!apply_hide_to_sets(&mut gids, &mut uuids, &update(2, 7, false)));
+        assert!(!apply_hide_to_sets(
+            &mut gids,
+            &mut uuids,
+            &update(2, 7, false)
+        ));
     }
 
     #[test]

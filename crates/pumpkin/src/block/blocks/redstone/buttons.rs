@@ -53,11 +53,8 @@ fn click_button(world: &Arc<World>, block_pos: &BlockPos) -> bool {
 
     button_props.powered = true;
     let new_button_state = button_props.to_state_id(block);
-    let replaced_button_state = world.set_block_state(
-        block_pos,
-        new_button_state,
-        BlockFlags::NOTIFY_ALL,
-    );
+    let replaced_button_state =
+        world.set_block_state(block_pos, new_button_state, BlockFlags::NOTIFY_ALL);
     crate::server::cluster_world_delta::emit_redstone_write(
         world,
         block_pos,

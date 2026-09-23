@@ -1283,7 +1283,12 @@ impl VillagerEntity {
 
     pub fn open_trading_screen(&self, player: &Arc<Player>) {
         // Open the merchant screen and then send the current offers packet
-        if let Some(sync_id) = player.open_handled_screen(self, None) {
+        let Some(source) =
+            crate::entity::player::InventoryScreenSource::entity(player, self.get_entity())
+        else {
+            return;
+        };
+        if let Some(sync_id) = player.open_handled_screen(self, source) {
             let offers = self
                 .offers
                 .lock()

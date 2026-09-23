@@ -6,7 +6,10 @@ use pumpkin_data::tracked_data;
 use pumpkin_inventory::build_equipment_slots;
 use pumpkin_inventory::player::player_inventory::PlayerInventory;
 use pumpkin_inventory::screen_handler::InventoryPlayer;
-use pumpkin_protocol::bedrock::client::take_item_actor::CTakeItemActor;
+use pumpkin_protocol::bedrock::client::{
+    AttributeData as BedrockAttribute, CUpdateAttributes as CBedrockAttributes,
+    take_item_actor::CTakeItemActor,
+};
 use pumpkin_protocol::bedrock::server::actor_event::{ActorEventID, SActorEvent};
 use pumpkin_protocol::codec::var_ulong::VarULong;
 use pumpkin_util::Difficulty;
@@ -33,6 +36,7 @@ use crate::entity::attributes::ModifierOperation;
 use crate::entity::combat::{CombatRules, CombatTracker, FallLocation, knockback_after_resistance};
 use crate::entity::mob::equipment::DEFAULT_EQUIPMENT_DROP_CHANCE;
 use crate::entity::player::statistics::{CustomStatistic, StatisticCategory};
+use crate::net::ClientPlatform;
 use crate::server::Server;
 use crate::world::loot::LootContextParameters;
 use crossbeam::atomic::AtomicCell;
@@ -57,7 +61,8 @@ use pumpkin_nbt::compound::NbtCompound;
 use pumpkin_nbt::tag::NbtTag;
 use pumpkin_protocol::codec::var_int::VarInt;
 use pumpkin_protocol::java::client::play::{
-    CHurtAnimation, CSetPlayerInventory, CTakeItemEntity, CUpdateMobEffect,
+    CHurtAnimation, CSetEntityMetadata, CSetPlayerInventory, CTakeItemEntity, CUpdateMobEffect,
+    Metadata,
 };
 use pumpkin_protocol::{
     codec::item_stack_seralizer::ItemStackSerializer,
@@ -69,6 +74,38 @@ use pumpkin_util::math::vector3::Vector3;
 use pumpkin_util::text::TextComponent;
 use rand::RngExt;
 use std::sync::RwLock;
+
+fn for_each_published<T>(published: &arc_swap::ArcSwap<Vec<T>>, mut apply: impl FnMut(&T)) {
+    let snapshot = published.load();
+    for value in snapshot.iter() {
+        apply(value);
+    }
+}
+
+fn serialized_java_health_metadata(
+    health: f32,
+    version: &pumpkin_util::version::JavaMinecraftVersion,
+) -> Option<Box<[u8]>> {
+    let mut metadata = Vec::new();
+    Metadata::new(tracked_data::living_entity::DATA_HEALTH_ID, health)
+        .write(&mut metadata, version)
+        .ok()?;
+    metadata.push(255);
+    Some(metadata.into_boxed_slice())
+}
+
+fn bedrock_health_attribute(health: f32, max_health: f32) -> BedrockAttribute {
+    BedrockAttribute {
+        min_value: 0.0,
+        max_value: max_health,
+        current_value: health,
+        default_min_value: 0.0,
+        default_max_value: max_health,
+        default_value: max_health,
+        name: "minecraft:health".to_string(),
+        modifiers: Vec::new(),
+    }
+}
 
 /// Represents a living entity within the game world.
 ///
@@ -778,9 +815,89 @@ impl LivingEntity {
         let max_health = self.get_max_health();
         let clamped = health.max(0.0).min(max_health);
         self.health.store(clamped);
-        // tell everyone entities health changed
-        self.entity
-            .set_synced_data(tracked_data::living_entity::DATA_HEALTH_ID, clamped);
+        self.entity.set_synced_data(
+            tracked_data::living_entity::DATA_HEALTH_ID,
+            self.client_visible_health(clamped),
+        );
+        self.send_actual_health_to_riders(clamped);
+    }
+
+    fn client_visible_health(&self, actual: f32) -> f32 {
+        let Some(server) = self.entity.world.load().server.upgrade() else {
+            return actual;
+        };
+        if !server.advanced_config.cluster.enabled {
+            return actual;
+        }
+        let player = self.entity.entity_type == &EntityType::PLAYER;
+        let health_driven_visual = self.entity.entity_type == &EntityType::WOLF
+            || self.entity.entity_type == &EntityType::IRON_GOLEM;
+        let mode = match server.cluster_health_mask() {
+            pumpkin_config::HealthMaskMode::Off => {
+                pumpkin_cluster::health_policy::HealthMaskMode::Off
+            }
+            pumpkin_config::HealthMaskMode::Players => {
+                pumpkin_cluster::health_policy::HealthMaskMode::Players
+            }
+            pumpkin_config::HealthMaskMode::All => {
+                pumpkin_cluster::health_policy::HealthMaskMode::All
+            }
+        };
+        pumpkin_cluster::health_policy::required_health(
+            mode,
+            player,
+            health_driven_visual,
+            false,
+            actual,
+        )
+    }
+
+    pub fn refresh_client_visible_health(&self) {
+        let actual = self.health.load();
+        self.entity.set_synced_data(
+            tracked_data::living_entity::DATA_HEALTH_ID,
+            self.client_visible_health(actual),
+        );
+        self.send_actual_health_to_riders(actual);
+    }
+
+    fn send_actual_health_to_riders(&self, actual: f32) {
+        for_each_published(&self.entity.passenger_snapshot, |passenger| {
+            let Some(player) = passenger.get_player() else {
+                return;
+            };
+            self.send_actual_health_to_player(player, actual);
+        });
+    }
+
+    pub(crate) fn send_actual_health_to_player(
+        &self,
+        player: &crate::entity::player::Player,
+        actual: f32,
+    ) {
+        let max_health = self.get_max_health();
+        match player.client.as_ref() {
+            ClientPlatform::Java(client) => {
+                let version = client.version.load();
+                let Some(metadata) = serialized_java_health_metadata(actual, &version) else {
+                    return;
+                };
+                let packet = CSetEntityMetadata::new(self.entity.entity_id.into(), metadata);
+                if let Ok(bytes) = client.serialize_packet(&packet) {
+                    client.try_enqueue_packet(bytes);
+                }
+            }
+            ClientPlatform::Bedrock(client) => {
+                let packet = CBedrockAttributes {
+                    target_runtime_id: VarULong(self.entity.entity_id as u64),
+                    attribute_list: vec![bedrock_health_attribute(actual, max_health)],
+                    tick: VarULong(0),
+                };
+                if let Ok(bytes) = client.serialize_packet(&packet) {
+                    client.try_enqueue_packet(bytes);
+                }
+            }
+        }
     }
 
     /// Returns the current maximum health for this entity
@@ -2563,8 +2680,10 @@ impl LivingEntity {
         // Clear any absorption
         self.absorption.store(0.0);
         // Send health metadata
-        self.entity
-            .set_synced_data(tracked_data::living_entity::DATA_HEALTH_ID, max_health);
+        self.entity.set_synced_data(
+            tracked_data::living_entity::DATA_HEALTH_ID,
+            self.client_visible_health(max_health),
+        );
 
         self.reset_effects_and_attributes();
 
@@ -3436,7 +3555,9 @@ impl EntityBase for LivingEntity {
 
         self.tick_effects();
 
-        if let Some(player) = caller.get_player() {
+        if !server.advanced_config.cluster.enabled
+            && let Some(player) = caller.get_player()
+        {
             let remaining_use_ticks = self.item_use_time.load(Ordering::Relaxed);
             if remaining_use_ticks > 0 {
                 let item_in_use = self
@@ -3453,7 +3574,8 @@ impl EntityBase for LivingEntity {
         }
 
         // Current active item
-        if self.item_use_time.load(Ordering::Relaxed) > 0
+        if !server.advanced_config.cluster.enabled
+            && self.item_use_time.load(Ordering::Relaxed) > 0
             && self.item_use_time.fetch_sub(1, Ordering::Relaxed) <= 1
         {
             let item_in_use = self
@@ -4066,5 +4188,93 @@ mod tests {
             .unwrap();
 
         assert_eq!(bytes, [10, 17, 1, 28, 0xff, 0xcd, 0x5c, 0xab]);
+    }
+
+    fn serialized_java_health_value(health: f32) -> f32 {
+        use pumpkin_protocol::ClientPacket;
+
+        let metadata = serialized_java_health_metadata(
+            health,
+            &pumpkin_util::version::JavaMinecraftVersion::V_26_2,
+        )
+        .unwrap();
+        let packet = CSetEntityMetadata::new(VarInt(27), metadata);
+        let mut bytes = Vec::new();
+        packet
+            .write_packet_data(
+                &mut bytes,
+                &pumpkin_util::version::JavaMinecraftVersion::V_26_2,
+            )
+            .unwrap();
+        f32::from_be_bytes(bytes[bytes.len() - 5..bytes.len() - 1].try_into().unwrap())
+    }
+
+    fn serialized_bedrock_health_value(health: f32) -> f32 {
+        use pumpkin_protocol::serial::PacketWrite;
+
+        let packet = CBedrockAttributes {
+            target_runtime_id: VarULong(27),
+            attribute_list: vec![bedrock_health_attribute(health, 20.0)],
+            tick: VarULong(91),
+        };
+        let mut bytes = Vec::new();
+        packet.write(&mut bytes).unwrap();
+        assert!(
+            bytes
+                .windows(health.to_le_bytes().len())
+                .any(|value| value == health.to_le_bytes())
+        );
+        packet.attribute_list[0].current_value
+    }
+
+    #[test]
+    fn serialized_other_actor_health_obeys_mask_and_visual_exception() {
+        use pumpkin_cluster::health_policy::{HealthMaskMode, required_health};
+
+        let player = required_health(HealthMaskMode::Players, true, false, false, 7.5);
+        let mob = required_health(HealthMaskMode::All, false, false, false, 6.0);
+        let wolf = required_health(HealthMaskMode::All, false, true, false, 5.0);
+
+        assert_eq!(serialized_java_health_value(player), 20.0);
+        assert_eq!(serialized_java_health_value(mob), 20.0);
+        assert_eq!(serialized_java_health_value(wolf), 5.0);
+        assert_eq!(serialized_bedrock_health_value(player), 20.0);
+        assert_eq!(serialized_bedrock_health_value(mob), 20.0);
+        assert_eq!(serialized_bedrock_health_value(wolf), 5.0);
+    }
+
+    #[test]
+    fn serialized_self_and_rider_health_remains_actual() {
+        use pumpkin_cluster::health_policy::{HealthMaskMode, required_health};
+        use pumpkin_protocol::ClientPacket;
+        use pumpkin_protocol::ServerPacket;
+        use pumpkin_protocol::java::client::play::CSetHealth;
+
+        let actual = required_health(HealthMaskMode::All, true, false, true, 3.5);
+        let packet = CSetHealth::new(actual, VarInt(20), 5.0);
+        let version = pumpkin_util::version::JavaMinecraftVersion::V_26_2;
+        let mut bytes = Vec::new();
+        packet.write_packet_data(&mut bytes, &version).unwrap();
+        let decoded = CSetHealth::read(&mut bytes.as_slice(), &version).unwrap();
+
+        assert_eq!(decoded.health, 3.5);
+        assert_eq!(serialized_java_health_value(actual), 3.5);
+        assert_eq!(serialized_bedrock_health_value(actual), 3.5);
+    }
+
+    #[test]
+    fn published_rider_receives_current_health_while_mutable_collection_is_locked() {
+        let mutable = std::sync::Mutex::new(vec![41_u64]);
+        let published = arc_swap::ArcSwap::from_pointee(vec![41_u64]);
+        let _guard = mutable.lock().unwrap();
+        assert!(mutable.try_lock().is_err());
+        let current_health = 2.25_f32;
+        let mut deliveries = Vec::new();
+
+        for_each_published(&published, |rider| {
+            deliveries.push((*rider, current_health));
+        });
+
+        assert_eq!(deliveries, [(41, 2.25)]);
     }
 }

@@ -2,13 +2,28 @@
 use super::*;
 
 impl JavaClient {
-    pub fn handle_rotation(&self, player: &Player, rotation: &SPlayerRotation) {
+    pub fn handle_rotation(&self, player: &Player, rotation: &SPlayerRotation, server: &Server) {
         if !player.has_client_loaded() {
             return;
         }
         // A movement packet was received this tick — tracked for SClientTickEnd zeroing.
         self.received_movement_this_tick
             .store(true, Ordering::Relaxed);
+        if server.advanced_config.cluster.enabled {
+            if player.cluster_gid().is_none() {
+                return;
+            }
+            crate::server::cluster_controller::submit_patch(
+                server,
+                player,
+                crate::server::cluster_controller::ControllerPatch::Rotation {
+                    yaw: rotation.yaw,
+                    pitch: rotation.pitch,
+                    on_ground: rotation.ground,
+                },
+            );
+            return;
+        }
         if !rotation.yaw.is_finite() || !rotation.pitch.is_finite() {
             self.try_kick(&TextComponent::translate_cross(
                 translation::java::MULTIPLAYER_DISCONNECT_INVALID_PLAYER_MOVEMENT,

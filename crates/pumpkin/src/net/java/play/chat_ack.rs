@@ -4,6 +4,16 @@ use pumpkin_protocol::java::server::play::SChatAck;
 
 impl JavaClient {
     pub fn handle_chat_ack(&self, player: &Arc<Player>, packet: &SChatAck) {
+        if player.cluster_gid().is_some() {
+            let _ = crate::server::cluster_session_ingress::stage(
+                player,
+                crate::server::cluster_session_ingress::StagedSessionInput::SecureAck {
+                    offset: packet.offset.0,
+                    received_at: std::time::Instant::now(),
+                },
+            );
+            return;
+        }
         let offset = packet.offset.0;
         if offset < 0 {
             warn!(

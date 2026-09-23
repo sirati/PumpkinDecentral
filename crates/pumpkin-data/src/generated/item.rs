@@ -3984,7 +3984,7 @@ impl Item {
             ),
             (TooltipDisplay, &TooltipDisplayImpl),
             (UseEffects, &UseEffectsImpl),
-            (UseRemainder, &UseRemainderImpl),
+            (UseRemainder, &UseRemainderImpl { id: Cow::Borrowed("minecraft:bowl"), count: 1, raw: None }),
         ],
     };
     pub const BELL: Self = Self {
@@ -34021,7 +34021,7 @@ impl Item {
             ),
             (TooltipDisplay, &TooltipDisplayImpl),
             (UseEffects, &UseEffectsImpl),
-            (UseRemainder, &UseRemainderImpl),
+            (UseRemainder, &UseRemainderImpl { id: Cow::Borrowed("minecraft:glass_bottle"), count: 1, raw: None }),
         ],
     };
     pub const HONEYCOMB: Self = Self {
@@ -43947,7 +43947,7 @@ impl Item {
             ),
             (TooltipDisplay, &TooltipDisplayImpl),
             (UseEffects, &UseEffectsImpl),
-            (UseRemainder, &UseRemainderImpl),
+            (UseRemainder, &UseRemainderImpl { id: Cow::Borrowed("minecraft:bucket"), count: 1, raw: None }),
         ],
     };
     pub const MINECART: Self = Self {
@@ -45145,7 +45145,7 @@ impl Item {
             ),
             (TooltipDisplay, &TooltipDisplayImpl),
             (UseEffects, &UseEffectsImpl),
-            (UseRemainder, &UseRemainderImpl),
+            (UseRemainder, &UseRemainderImpl { id: Cow::Borrowed("minecraft:bowl"), count: 1, raw: None }),
         ],
     };
     pub const MUSIC_DISC_11: Self = Self {
@@ -57072,7 +57072,7 @@ impl Item {
             ),
             (TooltipDisplay, &TooltipDisplayImpl),
             (UseEffects, &UseEffectsImpl),
-            (UseRemainder, &UseRemainderImpl),
+            (UseRemainder, &UseRemainderImpl { id: Cow::Borrowed("minecraft:glass_bottle"), count: 1, raw: None }),
         ],
     };
     pub const POWDER_SNOW_BUCKET: Self = Self {
@@ -59576,7 +59576,7 @@ impl Item {
             ),
             (TooltipDisplay, &TooltipDisplayImpl),
             (UseEffects, &UseEffectsImpl),
-            (UseRemainder, &UseRemainderImpl),
+            (UseRemainder, &UseRemainderImpl { id: Cow::Borrowed("minecraft:bowl"), count: 1, raw: None }),
         ],
     };
     pub const RAIL: Self = Self {
@@ -70918,7 +70918,7 @@ impl Item {
             ),
             (TooltipDisplay, &TooltipDisplayImpl),
             (UseEffects, &UseEffectsImpl),
-            (UseRemainder, &UseRemainderImpl),
+            (UseRemainder, &UseRemainderImpl { id: Cow::Borrowed("minecraft:bowl"), count: 1, raw: None }),
         ],
     };
     pub const SWEET_BERRIES: Self = Self {

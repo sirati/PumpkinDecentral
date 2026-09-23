@@ -55,6 +55,20 @@ impl JavaClient {
         // A movement packet was received this tick — tracked for SClientTickEnd zeroing.
         self.received_movement_this_tick
             .store(true, Ordering::Relaxed);
+        if server.advanced_config.cluster.enabled {
+            if player.cluster_gid().is_none() {
+                return;
+            }
+            crate::server::cluster_controller::submit_patch(
+                server,
+                player,
+                crate::server::cluster_controller::ControllerPatch::Position {
+                    position: [packet.position.x, packet.position.y, packet.position.z],
+                    on_ground: packet.collision & FLAG_ON_GROUND != 0,
+                },
+            );
+            return;
+        }
         if player.get_entity().has_vehicle() {
             return;
         }
@@ -196,6 +210,22 @@ impl JavaClient {
         // A movement packet was received this tick — tracked for SClientTickEnd zeroing.
         self.received_movement_this_tick
             .store(true, Ordering::Relaxed);
+        if server.advanced_config.cluster.enabled {
+            if player.cluster_gid().is_none() {
+                return;
+            }
+            crate::server::cluster_controller::submit_patch(
+                server,
+                player,
+                crate::server::cluster_controller::ControllerPatch::PositionRotation {
+                    position: [packet.position.x, packet.position.y, packet.position.z],
+                    yaw: packet.yaw,
+                    pitch: packet.pitch,
+                    on_ground: packet.collision & FLAG_ON_GROUND != 0,
+                },
+            );
+            return;
+        }
         if player.get_entity().has_vehicle() {
             return;
         }

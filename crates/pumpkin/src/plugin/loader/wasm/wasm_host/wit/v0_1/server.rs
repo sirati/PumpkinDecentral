@@ -42,6 +42,17 @@ impl PluginHostState {
     }
 }
 
+fn cluster_wit_permission_level(level: u8) -> pumpkin::plugin::permission::PermissionLevel {
+    let level = match level {
+        1 => pumpkin_util::PermissionLvl::One,
+        2 => pumpkin_util::PermissionLvl::Two,
+        3 => pumpkin_util::PermissionLvl::Three,
+        4 => pumpkin_util::PermissionLvl::Four,
+        _ => pumpkin_util::PermissionLvl::Zero,
+    };
+    to_wit_permission_level(level)
+}
+
 impl pumpkin::plugin::server::Host for PluginHostState {}
 
 impl pumpkin::plugin::server::HostServer for PluginHostState {
@@ -690,6 +701,14 @@ impl pumpkin::plugin::server::HostServerWithStore<PluginHostState> for HasSelf<P
         let message = TextComponent::text(message);
         let sender = TextComponent::text("Server");
 
+        if server.advanced_config.cluster.enabled {
+            return crate::server::cluster_chat_presentation::try_enqueue(
+                &server, message, sender, 0,
+            )
+            .then_some(())
+            .ok_or_else(|| wasmtime::Error::msg("Cluster chat queue is full"));
+        }
+
         plugin
             .store
             .pump_blocking(&mut host, move || {
@@ -744,6 +763,14 @@ impl pumpkin::plugin::server::HostOpManager for PluginHostState {
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("Server not available"))?;
         let uuid = WitUuid::from_wit(&id);
+        if server.advanced_config.cluster.enabled {
+            return Ok(server
+                .cluster_admin_view
+                .load()
+                .operators
+                .iter()
+                .any(|entry| entry.uuid == *uuid.as_bytes()));
+        }
         let ops = server
             .data
             .operator_config
@@ -762,6 +789,20 @@ impl pumpkin::plugin::server::HostOpManager for PluginHostState {
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("Server not available"))?;
         let uuid = WitUuid::from_wit(&id);
+        if server.advanced_config.cluster.enabled {
+            return Ok(server
+                .cluster_admin_view
+                .load()
+                .operators
+                .iter()
+                .find(|entry| entry.uuid == *uuid.as_bytes())
+                .map(|entry| OpEntry {
+                    uuid: WitUuid::to_wit(&uuid),
+                    name: entry.name.clone(),
+                    level: cluster_wit_permission_level(entry.level),
+                    bypasses_player_limit: entry.bypasses_player_limit,
+                }));
+        }
         let ops = server
             .data
             .operator_config
@@ -785,6 +826,16 @@ impl pumpkin::plugin::server::HostOpManager for PluginHostState {
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("Server not available"))?;
         let uuid = WitUuid::from_wit(&id);
+        if server.advanced_config.cluster.enabled {
+            let level = server
+                .cluster_admin_view
+                .load()
+                .operators
+                .iter()
+                .find(|entry| entry.uuid == *uuid.as_bytes())
+                .map_or(0, |entry| entry.level);
+            return Ok(cluster_wit_permission_level(level));
+        }
         let ops = server
             .data
             .operator_config
@@ -801,6 +852,20 @@ impl pumpkin::plugin::server::HostOpManager for PluginHostState {
             .server
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("Server not available"))?;
+        if server.advanced_config.cluster.enabled {
+            return Ok(server
+                .cluster_admin_view
+                .load()
+                .operators
+                .iter()
+                .map(|entry| OpEntry {
+                    uuid: WitUuid::to_wit(&uuid::Uuid::from_bytes(entry.uuid)),
+                    name: entry.name.clone(),
+                    level: cluster_wit_permission_level(entry.level),
+                    bypasses_player_limit: entry.bypasses_player_limit,
+                })
+                .collect());
+        }
         let config = server
             .data
             .operator_config
@@ -852,6 +917,23 @@ impl pumpkin::plugin::server::HostOpManagerWithStore<PluginHostState> for HasSel
         };
         let uuid = WitUuid::from_wit(&id);
         let internal_level = from_wit_permission_level(level);
+
+        if server.advanced_config.cluster.enabled {
+            let mutation = pumpkin_cluster::admin_sync::AdminMutation::GrantOp(
+                pumpkin_cluster::admin_sync::OpGrant::new(
+                    *uuid.as_bytes(),
+                    name,
+                    internal_level as u8,
+                    bypasses_player_limit,
+                ),
+            );
+            let prepared = crate::server::cluster_admin_apply::prepare_admin_mutation(
+                &server, mutation, "Plugin",
+            )
+            .ok_or_else(|| wasmtime::Error::msg("Cluster admin queue full"))?;
+            crate::server::cluster_admin_apply::commit_admin_mutation(&server, prepared);
+            return Ok(());
+        }
 
         plugin
             .store
@@ -905,6 +987,26 @@ impl pumpkin::plugin::server::HostOpManagerWithStore<PluginHostState> for HasSel
         };
         let uuid = WitUuid::from_wit(&id);
 
+        if server.advanced_config.cluster.enabled {
+            let snapshot = server.cluster_admin_view.load();
+            let Some(entry) = snapshot
+                .operators
+                .iter()
+                .find(|entry| entry.uuid == *uuid.as_bytes())
+            else {
+                return Ok(false);
+            };
+            let mutation = pumpkin_cluster::admin_sync::AdminMutation::RevokeOp(
+                pumpkin_cluster::admin_sync::OpRevoke::new(*uuid.as_bytes(), entry.name.clone()),
+            );
+            let prepared = crate::server::cluster_admin_apply::prepare_admin_mutation(
+                &server, mutation, "Plugin",
+            )
+            .ok_or_else(|| wasmtime::Error::msg("Cluster admin queue full"))?;
+            crate::server::cluster_admin_apply::commit_admin_mutation(&server, prepared);
+            return Ok(true);
+        }
+
         plugin
             .store
             .pump_blocking(&mut host, move || {
@@ -952,6 +1054,19 @@ impl pumpkin::plugin::server::HostBanManager for PluginHostState {
             .ok_or_else(|| wasmtime::Error::msg("Server not available"))?;
         let uuid = WitUuid::from_wit(&id);
         let now = time::OffsetDateTime::now_utc();
+        if server.advanced_config.cluster.enabled {
+            return Ok(server
+                .cluster_admin_view
+                .load()
+                .banned_players
+                .iter()
+                .any(|entry| {
+                    entry.uuid == *uuid.as_bytes()
+                        && entry
+                            .expires_epoch_secs
+                            .is_none_or(|expiry| expiry > now.unix_timestamp())
+                }));
+        }
         let mut list = server.data.banned_player_list.write().unwrap();
         list.banned_players
             .retain(|entry| entry.expires.is_none_or(|expires| expires > now));
@@ -970,6 +1085,39 @@ impl pumpkin::plugin::server::HostBanManager for PluginHostState {
             .ok_or_else(|| wasmtime::Error::msg("Server not available"))?;
         let uuid = WitUuid::from_wit(&id);
         let now = time::OffsetDateTime::now_utc();
+        if server.advanced_config.cluster.enabled {
+            return Ok(server
+                .cluster_admin_view
+                .load()
+                .banned_players
+                .iter()
+                .find(|entry| {
+                    entry.uuid == *uuid.as_bytes()
+                        && entry
+                            .expires_epoch_secs
+                            .is_none_or(|expiry| expiry > now.unix_timestamp())
+                })
+                .map(|entry| BannedPlayerEntry {
+                    uuid: WitUuid::to_wit(&uuid),
+                    name: entry.name.clone(),
+                    created: time::OffsetDateTime::from_unix_timestamp(entry.created_epoch_secs)
+                        .ok()
+                        .and_then(|date| {
+                            date.format(&time::format_description::well_known::Rfc3339)
+                                .ok()
+                        })
+                        .unwrap_or_default(),
+                    source: entry.source.clone(),
+                    expires: entry
+                        .expires_epoch_secs
+                        .and_then(|expiry| time::OffsetDateTime::from_unix_timestamp(expiry).ok())
+                        .and_then(|date| {
+                            date.format(&time::format_description::well_known::Rfc3339)
+                                .ok()
+                        }),
+                    reason: entry.reason.clone(),
+                }));
+        }
         let mut list = server.data.banned_player_list.write().unwrap();
         list.banned_players
             .retain(|entry| entry.expires.is_none_or(|expires| expires > now));
@@ -1004,6 +1152,25 @@ impl pumpkin::plugin::server::HostBanManager for PluginHostState {
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("Server not available"))?;
         let uuid = WitUuid::from_wit(&id);
+        if server.advanced_config.cluster.enabled {
+            let snapshot = server.cluster_admin_view.load();
+            let Some(entry) = snapshot
+                .banned_players
+                .iter()
+                .find(|entry| entry.uuid == *uuid.as_bytes())
+            else {
+                return Ok(false);
+            };
+            let mutation = pumpkin_cluster::admin_sync::AdminMutation::RemoveBan(
+                pumpkin_cluster::admin_sync::BanRevoke::new(*uuid.as_bytes(), entry.name.clone()),
+            );
+            let prepared = crate::server::cluster_admin_apply::prepare_admin_mutation(
+                server, mutation, "Plugin",
+            )
+            .ok_or_else(|| wasmtime::Error::msg("Cluster admin queue full"))?;
+            crate::server::cluster_admin_apply::commit_admin_mutation(server, prepared);
+            return Ok(true);
+        }
         let mut list = server.data.banned_player_list.write().unwrap();
         Ok(list
             .banned_players
@@ -1025,6 +1192,39 @@ impl pumpkin::plugin::server::HostBanManager for PluginHostState {
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("Server not available"))?;
         let now = time::OffsetDateTime::now_utc();
+        if server.advanced_config.cluster.enabled {
+            return Ok(server
+                .cluster_admin_view
+                .load()
+                .banned_players
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .expires_epoch_secs
+                        .is_none_or(|expiry| expiry > now.unix_timestamp())
+                })
+                .map(|entry| BannedPlayerEntry {
+                    uuid: WitUuid::to_wit(&uuid::Uuid::from_bytes(entry.uuid)),
+                    name: entry.name.clone(),
+                    created: time::OffsetDateTime::from_unix_timestamp(entry.created_epoch_secs)
+                        .ok()
+                        .and_then(|date| {
+                            date.format(&time::format_description::well_known::Rfc3339)
+                                .ok()
+                        })
+                        .unwrap_or_default(),
+                    source: entry.source.clone(),
+                    expires: entry
+                        .expires_epoch_secs
+                        .and_then(|expiry| time::OffsetDateTime::from_unix_timestamp(expiry).ok())
+                        .and_then(|date| {
+                            date.format(&time::format_description::well_known::Rfc3339)
+                                .ok()
+                        }),
+                    reason: entry.reason.clone(),
+                })
+                .collect());
+        }
         let mut list = server.data.banned_player_list.write().unwrap();
         list.banned_players
             .retain(|entry| entry.expires.is_none_or(|expires| expires > now));
@@ -1061,6 +1261,13 @@ impl pumpkin::plugin::server::HostBanManager for PluginHostState {
         let ip_addr: std::net::IpAddr = ip
             .parse()
             .map_err(|_| wasmtime::Error::msg("Invalid IP address"))?;
+        if server.advanced_config.cluster.enabled {
+            return Ok(server
+                .cluster_access_policy
+                .snapshot()
+                .active_ip_ban(ip_addr)
+                .is_some());
+        }
         let now = time::OffsetDateTime::now_utc();
         let mut list = server.data.banned_ip_list.write().unwrap();
         list.banned_ips
@@ -1081,6 +1288,25 @@ impl pumpkin::plugin::server::HostBanManager for PluginHostState {
         let ip_addr: std::net::IpAddr = ip
             .parse()
             .map_err(|_| wasmtime::Error::msg("Invalid IP address"))?;
+        if server.advanced_config.cluster.enabled {
+            return Ok(server
+                .cluster_access_policy
+                .snapshot()
+                .active_ip_ban(ip_addr)
+                .map(|entry| BannedIpEntry {
+                    ip: entry.ip.to_string(),
+                    created: entry
+                        .created
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap_or_default(),
+                    source: entry.source.clone(),
+                    expires: entry.expires.and_then(|date| {
+                        date.format(&time::format_description::well_known::Rfc3339)
+                            .ok()
+                    }),
+                    reason: entry.reason.clone(),
+                }));
+        }
         let now = time::OffsetDateTime::now_utc();
         let mut list = server.data.banned_ip_list.write().unwrap();
         list.banned_ips
@@ -1117,6 +1343,19 @@ impl pumpkin::plugin::server::HostBanManager for PluginHostState {
         let ip_addr: std::net::IpAddr = ip
             .parse()
             .map_err(|_| wasmtime::Error::msg("Invalid IP address"))?;
+        if server.advanced_config.cluster.enabled {
+            if server
+                .cluster_access_policy
+                .snapshot()
+                .active_ip_ban(ip_addr)
+                .is_none()
+            {
+                return Ok(false);
+            }
+            return Ok(server.cluster_access_policy.try_submit(
+                crate::server::cluster_access_policy::AccessPolicyCommand::PardonIp(ip_addr),
+            ));
+        }
         let mut list = server.data.banned_ip_list.write().unwrap();
         Ok(list
             .banned_ips
@@ -1138,6 +1377,28 @@ impl pumpkin::plugin::server::HostBanManager for PluginHostState {
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("Server not available"))?;
         let now = time::OffsetDateTime::now_utc();
+        if server.advanced_config.cluster.enabled {
+            return Ok(server
+                .cluster_access_policy
+                .snapshot()
+                .banned_ips
+                .iter()
+                .filter(|entry| entry.expires.is_none_or(|expiry| expiry > now))
+                .map(|entry| BannedIpEntry {
+                    ip: entry.ip.to_string(),
+                    created: entry
+                        .created
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .unwrap_or_default(),
+                    source: entry.source.clone(),
+                    expires: entry.expires.and_then(|date| {
+                        date.format(&time::format_description::well_known::Rfc3339)
+                            .ok()
+                    }),
+                    reason: entry.reason.clone(),
+                })
+                .collect());
+        }
         let mut list = server.data.banned_ip_list.write().unwrap();
         list.banned_ips
             .retain(|entry| entry.expires.is_none_or(|expires| expires > now));
@@ -1207,6 +1468,34 @@ impl pumpkin::plugin::server::HostBanManagerWithStore<PluginHostState>
         let expires = parse_ban_expiry(options.expires_at_utc, options.duration_seconds);
         let kick_if_online = options.kick_if_online;
         let log_to_console = options.log_to_console;
+
+        if server.advanced_config.cluster.enabled {
+            let mutation = pumpkin_cluster::admin_sync::AdminMutation::AddBan(
+                pumpkin_cluster::admin_sync::BanEntry::new(
+                    *uuid.as_bytes(),
+                    name.clone(),
+                    source_name,
+                    reason_text.clone(),
+                    time::OffsetDateTime::now_utc().unix_timestamp(),
+                    expires.map(|date| date.unix_timestamp()),
+                ),
+            );
+            let prepared = crate::server::cluster_admin_apply::prepare_admin_mutation(
+                &server, mutation, "Plugin",
+            )
+            .ok_or_else(|| wasmtime::Error::msg("Cluster admin queue full"))?;
+            crate::server::cluster_admin_apply::commit_admin_mutation(&server, prepared);
+            if kick_if_online && let Some(player) = server.get_player_by_uuid(uuid) {
+                player.kick(
+                    crate::net::DisconnectReason::Kicked,
+                    &pumpkin_util::text::TextComponent::text(reason_text.clone()),
+                );
+            }
+            if log_to_console {
+                tracing::info!("Queued player ban {} ({})", name, uuid);
+            }
+            return Ok(());
+        }
 
         plugin
             .store
@@ -1283,6 +1572,36 @@ impl pumpkin::plugin::server::HostBanManagerWithStore<PluginHostState>
         let kick_matching_players = options.kick_matching_players;
         let log_to_console = options.log_to_console;
 
+        if server.advanced_config.cluster.enabled {
+            if !server.cluster_access_policy.try_submit(
+                crate::server::cluster_access_policy::AccessPolicyCommand::BanIp(
+                    crate::server::cluster_access_policy::IpBanRecord {
+                        ip: ip_addr,
+                        created: time::OffsetDateTime::now_utc(),
+                        source: source_name,
+                        expires,
+                        reason: reason_text.clone(),
+                    },
+                ),
+            ) {
+                return Err(wasmtime::Error::msg("Cluster access-policy queue full"));
+            }
+            if kick_matching_players {
+                for player in server.get_all_players() {
+                    if player.client.address().ip() == ip_addr {
+                        player.kick(
+                            crate::net::DisconnectReason::Kicked,
+                            &pumpkin_util::text::TextComponent::text(reason_text.clone()),
+                        );
+                    }
+                }
+            }
+            if log_to_console {
+                tracing::info!("Queued IP ban {}", ip_addr);
+            }
+            return Ok(());
+        }
+
         plugin
             .store
             .pump_blocking(&mut host, move || {
@@ -1342,6 +1661,9 @@ impl pumpkin::plugin::server::HostWhitelistManager for PluginHostState {
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("Server not available"))?;
         let uuid = WitUuid::from_wit(&id);
+        if server.advanced_config.cluster.enabled {
+            return Ok(server.cluster_access_policy.snapshot().is_whitelisted(uuid));
+        }
         let whitelist = server.data.whitelist_config.read().unwrap();
         Ok(whitelist.whitelist.iter().any(|e| e.uuid == uuid))
     }
@@ -1357,6 +1679,16 @@ impl pumpkin::plugin::server::HostWhitelistManager for PluginHostState {
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("Server not available"))?;
         let uuid = WitUuid::from_wit(&id);
+        if server.advanced_config.cluster.enabled {
+            if server.cluster_access_policy.snapshot().is_whitelisted(uuid) {
+                return Ok(false);
+            }
+            return Ok(server.cluster_access_policy.try_submit(
+                crate::server::cluster_access_policy::AccessPolicyCommand::AddWhitelist(
+                    crate::server::cluster_access_policy::WhitelistRecord { uuid, name },
+                ),
+            ));
+        }
         let mut config = server.data.whitelist_config.write().unwrap();
         if config.whitelist.iter().any(|e| e.uuid == uuid) {
             Ok(false)
@@ -1379,6 +1711,14 @@ impl pumpkin::plugin::server::HostWhitelistManager for PluginHostState {
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("Server not available"))?;
         let uuid = WitUuid::from_wit(&id);
+        if server.advanced_config.cluster.enabled {
+            if !server.cluster_access_policy.snapshot().is_whitelisted(uuid) {
+                return Ok(false);
+            }
+            return Ok(server.cluster_access_policy.try_submit(
+                crate::server::cluster_access_policy::AccessPolicyCommand::RemoveWhitelist(uuid),
+            ));
+        }
         let mut config = server.data.whitelist_config.write().unwrap();
         Ok(config
             .whitelist
@@ -1399,6 +1739,18 @@ impl pumpkin::plugin::server::HostWhitelistManager for PluginHostState {
             .server
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("Server not available"))?;
+        if server.advanced_config.cluster.enabled {
+            return Ok(server
+                .cluster_access_policy
+                .snapshot()
+                .whitelist
+                .iter()
+                .map(|entry| WitWhitelistEntry {
+                    uuid: WitUuid::to_wit(&entry.uuid),
+                    name: entry.name.clone(),
+                })
+                .collect());
+        }
         let config = server.data.whitelist_config.read().unwrap();
         Ok(config
             .whitelist
@@ -1441,6 +1793,19 @@ impl pumpkin::plugin::server::HostWhitelistManagerWithStore<PluginHostState>
                 .ok_or_else(|| wasmtime::Error::msg("Plugin instance not available"))?;
             (server, plugin)
         };
+
+        if server.advanced_config.cluster.enabled {
+            server
+                .white_list
+                .store(enabled, std::sync::atomic::Ordering::Relaxed);
+            if enabled {
+                crate::server::cluster_access_policy::kick_non_whitelisted(
+                    &server,
+                    &server.cluster_access_policy.snapshot(),
+                );
+            }
+            return Ok(());
+        }
 
         plugin
             .store

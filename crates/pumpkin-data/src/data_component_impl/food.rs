@@ -393,14 +393,61 @@ impl DataComponentImpl for UseEffectsImpl {
     default_impl!(UseEffects);
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub struct UseRemainderImpl;
+#[derive(Clone, Debug, PartialEq)]
+pub struct UseRemainderImpl {
+    pub id: Cow<'static, str>,
+    pub count: u8,
+    pub raw: Option<NbtTag>,
+}
 impl UseRemainderImpl {
-    pub const fn read_data(_data: &NbtTag) -> Option<Self> {
-        Some(Self)
+    pub fn read_data(data: &NbtTag) -> Option<Self> {
+        let compound = data.extract_compound()?;
+        let id = compound.get_string("id")?;
+        let count = u8::try_from(compound.get_int("count").unwrap_or(1)).ok()?;
+        if count == 0 {
+            return None;
+        }
+        let value = Self {
+            id: Cow::Owned(id.to_owned()),
+            count,
+            raw: Some(data.clone()),
+        };
+        value.remainder_stack()?;
+        Some(value)
+    }
+
+    pub fn remainder_stack(&self) -> Option<crate::item_stack::ItemStack> {
+        let mut compound = self
+            .raw
+            .as_ref()
+            .and_then(NbtTag::extract_compound)
+            .cloned()
+            .unwrap_or_default();
+        compound.put_string("id", self.id.to_string());
+        compound.put_int("count", i32::from(self.count));
+        crate::item_stack::ItemStack::read_item_stack(&compound)
     }
 }
 impl DataComponentImpl for UseRemainderImpl {
+    fn write_data(&self) -> NbtTag {
+        if let Some(raw) = &self.raw {
+            return raw.clone();
+        }
+        let mut compound = NbtCompound::new();
+        compound.put_string("id", self.id.to_string());
+        if self.count != 1 {
+            compound.put_int("count", i32::from(self.count));
+        }
+        NbtTag::Compound(compound)
+    }
+
+    fn get_hash(&self) -> i32 {
+        let mut digest = Digest::new(Crc32Iscsi);
+        digest.update(&get_str_hash(self.id.as_ref()).to_le_bytes());
+        digest.update(&get_i32_hash(i32::from(self.count)).to_le_bytes());
+        digest.finalize() as i32
+    }
+
     default_impl!(UseRemainder);
 }
 

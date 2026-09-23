@@ -65,22 +65,37 @@ impl CommandExecutor for WasmCommandExecutor {
         let function = match self.plugin.plugin_instance.as_ref() {
             PluginInstance::V0_1(plugin) => plugin.func_handle_command(),
         };
+        let plugin = self.plugin.clone();
 
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                self.plugin
-                    .store
-                    .call_guest(move |mut guest| {
-                        Box::pin(async move {
-                            let (sender_resource, server_resource, args_resource, reps) = guest
-                                .with(|mut store| {
-                                    let sender_resource =
-                                        store.data_mut().add_command_sender(sender)?;
-                                    let sender_rep = sender_resource.rep();
-                                    let server_resource = match store.data_mut().add_server(server)
-                                    {
+        let execution = async move {
+            plugin
+                .store
+                .call_guest(move |mut guest| {
+                    Box::pin(async move {
+                        let (sender_resource, server_resource, args_resource, reps) =
+                            guest.with(|mut store| {
+                                let sender_resource =
+                                    store.data_mut().add_command_sender(sender)?;
+                                let sender_rep = sender_resource.rep();
+                                let server_resource = match store.data_mut().add_server(server) {
+                                    Ok(resource) => resource,
+                                    Err(error) => {
+                                        remove_resource::<CommandSenderResource>(
+                                            store.data_mut(),
+                                            sender_rep,
+                                        );
+                                        return Err(error);
+                                    }
+                                };
+                                let server_rep = server_resource.rep();
+                                let args_resource =
+                                    match store.data_mut().add_consumed_args(consumed_args) {
                                         Ok(resource) => resource,
                                         Err(error) => {
+                                            remove_resource::<ServerResource>(
+                                                store.data_mut(),
+                                                server_rep,
+                                            );
                                             remove_resource::<CommandSenderResource>(
                                                 store.data_mut(),
                                                 sender_rep,
@@ -88,59 +103,59 @@ impl CommandExecutor for WasmCommandExecutor {
                                             return Err(error);
                                         }
                                     };
-                                    let server_rep = server_resource.rep();
-                                    let args_resource =
-                                        match store.data_mut().add_consumed_args(consumed_args) {
-                                            Ok(resource) => resource,
-                                            Err(error) => {
-                                                remove_resource::<ServerResource>(
-                                                    store.data_mut(),
-                                                    server_rep,
-                                                );
-                                                remove_resource::<CommandSenderResource>(
-                                                    store.data_mut(),
-                                                    sender_rep,
-                                                );
-                                                return Err(error);
-                                            }
-                                        };
-                                    let reps = (sender_rep, server_rep, args_resource.rep());
-                                    Ok::<_, wasmtime::Error>((
-                                        sender_resource,
-                                        server_resource,
-                                        args_resource,
-                                        reps,
-                                    ))
-                                })?;
+                                let reps = (sender_rep, server_rep, args_resource.rep());
+                                Ok::<_, wasmtime::Error>((
+                                    sender_resource,
+                                    server_resource,
+                                    args_resource,
+                                    reps,
+                                ))
+                            })?;
 
-                            let result = guest
-                                .call(
-                                    function,
-                                    (handler_id, sender_resource, server_resource, args_resource),
-                                )
-                                .await;
+                        let result = guest
+                            .call(
+                                function,
+                                (handler_id, sender_resource, server_resource, args_resource),
+                            )
+                            .await;
 
-                            guest.with(|mut store| {
-                                let result = result
-                                    .map(|(result,)| map_command_result(store.data_mut(), result));
-                                remove_resource::<CommandSenderResource>(store.data_mut(), reps.0);
-                                remove_resource::<ServerResource>(store.data_mut(), reps.1);
-                                remove_resource::<ConsumedArgsResource>(store.data_mut(), reps.2);
-                                result
-                            })
+                        guest.with(|mut store| {
+                            let result = result
+                                .map(|(result,)| map_command_result(store.data_mut(), result));
+                            remove_resource::<CommandSenderResource>(store.data_mut(), reps.0);
+                            remove_resource::<ServerResource>(store.data_mut(), reps.1);
+                            remove_resource::<ConsumedArgsResource>(store.data_mut(), reps.2);
+                            result
                         })
                     })
-                    .await
-                    .map_err(|error| {
-                        DISPATCHER_PARSE_EXCEPTION.create_without_context(
-                            TextComponent::text(format!(
-                                "Wasm command failed with following error: {error}"
-                            ))
-                            .color(Color::Named(NamedColor::Red)),
-                        )
-                    })?
-            })
-        })
+                })
+                .await
+                .map_err(|error| {
+                    DISPATCHER_PARSE_EXCEPTION.create_without_context(
+                        TextComponent::text(format!(
+                            "Wasm command failed with following error: {error}"
+                        ))
+                        .color(Color::Named(NamedColor::Red)),
+                    )
+                })?
+        };
+        if self.server.advanced_config.cluster.enabled {
+            let source = context.source.clone();
+            if !crate::server::cluster_session_ingress::register_command_task(
+                &self.server,
+                async move {
+                    if let Err(error) = execution.await {
+                        source.send_error(error.message);
+                    }
+                },
+            ) {
+                return Err(DISPATCHER_PARSE_EXCEPTION
+                    .create_without_context(TextComponent::text("Cluster command queue is full")));
+            }
+            Ok(1)
+        } else {
+            tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(execution))
+        }
     }
 }
 
@@ -165,73 +180,76 @@ impl SuggestionProvider for WasmCommandSuggestionProvider {
         let function = match self.plugin.plugin_instance.as_ref() {
             PluginInstance::V0_1(plugin) => plugin.func_handle_command_suggestion(),
         };
+        let plugin = self.plugin.clone();
 
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                match self
-                    .plugin
-                    .store
-                    .call_guest(move |mut guest| {
-                        Box::pin(async move {
-                            let (sender_resource, server_resource, reps) =
-                                guest.with(|mut store| {
-                                    let sender_resource =
-                                        store.data_mut().add_command_sender(sender)?;
-                                    let sender_rep = sender_resource.rep();
-                                    let server_resource = match store.data_mut().add_server(server)
-                                    {
-                                        Ok(resource) => resource,
-                                        Err(error) => {
-                                            remove_resource::<CommandSenderResource>(
-                                                store.data_mut(),
-                                                sender_rep,
-                                            );
-                                            return Err(error);
-                                        }
-                                    };
-                                    let reps = (sender_rep, server_resource.rep());
-                                    Ok::<_, wasmtime::Error>((
-                                        sender_resource,
-                                        server_resource,
-                                        reps,
-                                    ))
-                                })?;
-                            let response = guest
-                                .call(
-                                    function,
-                                    (handler_id, sender_resource, server_resource, request),
-                                )
-                                .await
-                                .map(|(response,)| response);
+        let execution = async move {
+            match plugin
+                .store
+                .call_guest(move |mut guest| {
+                    Box::pin(async move {
+                        let (sender_resource, server_resource, reps) =
                             guest.with(|mut store| {
-                                let suggestions = response.map(|response| {
-                                    let mut builder = builder;
-                                    for suggestion in response.values {
-                                        if let Some(tooltip) = suggestion.tooltip {
-                                            let text = tooltip.consume(store.data_mut()).provider;
-                                            builder = builder
-                                                .suggest_with_tooltip(suggestion.value, text);
-                                        } else {
-                                            builder = builder.suggest(suggestion.value);
-                                        }
+                                let sender_resource =
+                                    store.data_mut().add_command_sender(sender)?;
+                                let sender_rep = sender_resource.rep();
+                                let server_resource = match store.data_mut().add_server(server) {
+                                    Ok(resource) => resource,
+                                    Err(error) => {
+                                        remove_resource::<CommandSenderResource>(
+                                            store.data_mut(),
+                                            sender_rep,
+                                        );
+                                        return Err(error);
                                     }
-                                    builder.build()
-                                });
-                                remove_resource::<CommandSenderResource>(store.data_mut(), reps.0);
-                                remove_resource::<ServerResource>(store.data_mut(), reps.1);
-                                suggestions
-                            })
+                                };
+                                let reps = (sender_rep, server_resource.rep());
+                                Ok::<_, wasmtime::Error>((sender_resource, server_resource, reps))
+                            })?;
+                        let response = guest
+                            .call(
+                                function,
+                                (handler_id, sender_resource, server_resource, request),
+                            )
+                            .await
+                            .map(|(response,)| response);
+                        guest.with(|mut store| {
+                            let suggestions = response.map(|response| {
+                                let mut builder = builder;
+                                for suggestion in response.values {
+                                    if let Some(tooltip) = suggestion.tooltip {
+                                        let text = tooltip.consume(store.data_mut()).provider;
+                                        builder =
+                                            builder.suggest_with_tooltip(suggestion.value, text);
+                                    } else {
+                                        builder = builder.suggest(suggestion.value);
+                                    }
+                                }
+                                builder.build()
+                            });
+                            remove_resource::<CommandSenderResource>(store.data_mut(), reps.0);
+                            remove_resource::<ServerResource>(store.data_mut(), reps.1);
+                            suggestions
                         })
                     })
-                    .await
-                {
-                    Ok(suggestions) => suggestions,
-                    Err(error) => {
-                        tracing::error!("Wasm command suggestion failed: {error}");
-                        Suggestions::empty()
-                    }
+                })
+                .await
+            {
+                Ok(suggestions) => suggestions,
+                Err(error) => {
+                    tracing::error!("Wasm command suggestion failed: {error}");
+                    Suggestions::empty()
                 }
-            })
-        })
+            }
+        };
+        if self.server.advanced_config.cluster.enabled {
+            if crate::server::cluster_command_suggestions::register(&self.server, execution) {
+                Suggestions::empty()
+            } else {
+                tracing::warn!("cluster plugin suggestion queue is full");
+                Suggestions::empty()
+            }
+        } else {
+            tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(execution))
+        }
     }
 }

@@ -761,7 +761,7 @@ impl EntityBase for MinecartEntity {
         match &self.kind {
             MinecartKind::Chest(minecart) => {
                 let custom_name = self.vehicle.entity.custom_name.load().as_ref().clone();
-                minecart.interact(custom_name, player);
+                minecart.interact(custom_name, &self.vehicle.entity, player);
                 true
             }
             MinecartKind::Furnace(minecart) => {
@@ -769,7 +769,7 @@ impl EntityBase for MinecartEntity {
             }
             MinecartKind::Hopper(minecart) => {
                 let custom_name = self.vehicle.entity.custom_name.load().as_ref().clone();
-                minecart.interact(custom_name, player);
+                minecart.interact(custom_name, &self.vehicle.entity, player);
                 true
             }
             MinecartKind::Rideable(_) => RideableMinecart::interact(&self.vehicle.entity, player),

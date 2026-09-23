@@ -10,6 +10,82 @@ impl BedrockClient {
         packet: SPlayerAuthInput,
         server: &Arc<Server>,
     ) {
+        if server.advanced_config.cluster.enabled {
+            if player.cluster_gid().is_none() {
+                return;
+            }
+            let mut flags = 0_u64;
+            for bit in 0_usize..64 {
+                if packet.input_data.get(bit) {
+                    flags |= 1_u64 << bit;
+                }
+            }
+            let transition = |start, stop| {
+                if packet.input_data.get(start) {
+                    Some(true)
+                } else if packet.input_data.get(stop) {
+                    Some(false)
+                } else {
+                    None
+                }
+            };
+            let eye_height = player.get_entity().entity_type.eye_height;
+            crate::server::cluster_controller::submit_patch(
+                server,
+                player,
+                crate::server::cluster_controller::ControllerPatch::Bedrock {
+                    position: [
+                        packet.position.x as f64,
+                        packet.position.y as f64 - f64::from(eye_height),
+                        packet.position.z as f64,
+                    ],
+                    velocity: [
+                        packet.delta.x as f64,
+                        packet.delta.y as f64,
+                        packet.delta.z as f64,
+                    ],
+                    yaw: packet.yaw,
+                    pitch: packet.pitch,
+                    on_ground: packet.input_data.get(InputData::VerticalCollision as usize)
+                        && packet.delta.y < 0.0,
+                    flags,
+                    sneaking: transition(
+                        InputData::StartSneaking as usize,
+                        InputData::StopSneaking as usize,
+                    ),
+                    sprinting: transition(
+                        InputData::StartSprinting as usize,
+                        InputData::StopSprinting as usize,
+                    ),
+                    flying: transition(
+                        InputData::StartFlying as usize,
+                        InputData::StopFlying as usize,
+                    ),
+                    crawling: transition(
+                        InputData::StartCrawling as usize,
+                        InputData::StopCrawling as usize,
+                    ),
+                },
+            );
+            if let Some(request) = packet.item_stack_request {
+                crate::server::cluster_inventory_protocol::stage_bedrock_stack_requests(
+                    player,
+                    vec![request],
+                );
+            }
+            if let Some(interaction) = packet.item_interaction {
+                crate::server::cluster_inventory_protocol::stage_bedrock_auth_interaction(
+                    player,
+                    interaction,
+                );
+            }
+            if let Some(actions) = packet.block_actions {
+                crate::server::cluster_inventory_protocol::stage_bedrock_block_actions(
+                    player, actions,
+                );
+            }
+            return;
+        }
         if !player.has_client_loaded() {
             return;
         }

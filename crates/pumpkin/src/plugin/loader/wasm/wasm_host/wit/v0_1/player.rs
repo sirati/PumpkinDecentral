@@ -1161,6 +1161,11 @@ impl pumpkin::plugin::player::HostPlayer for PluginHostState {
         stack: Option<Resource<WitHostItemStack>>,
     ) -> wasmtime::Result<()> {
         let player = player_from_resource(self, &player)?;
+        if player.cluster_gid().is_some() {
+            return Err(wasmtime::Error::msg(
+                "Cluster inventory mutation requires the semantic inventory service",
+            ));
+        }
         let stack = if let Some(stack_res) = stack {
             self.get_item_stack(&stack_res)?.lock().await.clone()
         } else {
@@ -1190,6 +1195,11 @@ impl pumpkin::plugin::player::HostPlayer for PluginHostState {
         stack: Option<Resource<WitHostItemStack>>,
     ) -> wasmtime::Result<()> {
         let player = player_from_resource(self, &player)?;
+        if player.cluster_gid().is_some() {
+            return Err(wasmtime::Error::msg(
+                "Cluster inventory mutation requires the semantic inventory service",
+            ));
+        }
         let stack = if let Some(stack_res) = stack {
             self.get_item_stack(&stack_res)?.lock().await.clone()
         } else {
@@ -1274,6 +1284,11 @@ impl pumpkin::plugin::player::HostPlayer for PluginHostState {
         stack: Option<Resource<WitHostItemStack>>,
     ) -> wasmtime::Result<()> {
         let player = player_from_resource(self, &player)?;
+        if player.cluster_gid().is_some() {
+            return Err(wasmtime::Error::msg(
+                "Cluster inventory mutation requires the semantic inventory service",
+            ));
+        }
         let stack = if let Some(stack_res) = stack {
             self.get_item_stack(&stack_res)?.lock().await.clone()
         } else {
@@ -1314,6 +1329,11 @@ impl pumpkin::plugin::player::HostPlayer for PluginHostState {
 
     async fn clear_ender_chest(&mut self, player: Resource<Player>) -> wasmtime::Result<()> {
         let player = player_from_resource(self, &player)?;
+        if player.cluster_gid().is_some() {
+            return Err(wasmtime::Error::msg(
+                "Cluster inventory mutation requires the semantic inventory service",
+            ));
+        }
         let ec = player.ender_chest_inventory();
         ec.clear();
 
@@ -2443,7 +2463,17 @@ impl pumpkin::plugin::player::HostPlayer for PluginHostState {
         let header = text_component_from_resource(self, &header);
         let footer = text_component_from_resource(self, &footer);
         let player = player_from_resource(self, &player)?;
-        player.set_tab_list_header_footer(&header, &footer);
+        if self
+            .server
+            .as_ref()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            player.try_send_client_packet(&pumpkin_protocol::java::client::play::CTabList::new(
+                &header, &footer,
+            ));
+        } else {
+            player.set_tab_list_header_footer(&header, &footer);
+        }
         Ok(())
     }
 
@@ -3023,6 +3053,12 @@ impl pumpkin::plugin::player::HostPlayerWithStore<PluginHostState> for HasSelf<P
             )
         };
 
+        if player.cluster_gid().is_some() {
+            return Err(wasmtime::Error::msg(
+                "Cluster screen opening requires the inventory owner",
+            ));
+        }
+
         plugin
             .store
             .pump_blocking(&mut host, move || {
@@ -3280,6 +3316,12 @@ impl pumpkin::plugin::player::HostPlayerWithStore<PluginHostState> for HasSelf<P
                 plugin_from_state(state)?,
             )
         };
+
+        if player.cluster_gid().is_some() {
+            return Err(wasmtime::Error::msg(
+                "Cluster screen opening requires the inventory owner",
+            ));
+        }
 
         let (window_type, inventory, allow_grab_items, allow_put_items, title) = plugin
             .store

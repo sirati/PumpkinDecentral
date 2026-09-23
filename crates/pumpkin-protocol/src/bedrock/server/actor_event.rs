@@ -85,9 +85,11 @@ pub enum ActorEventID {
     HurtWithoutReceivingDamage,
 }
 
-impl PacketRead for ActorEventID {
-    fn read<R: Read>(reader: &mut R) -> Result<Self, Error> {
-        Ok(match u8::read(reader)? {
+impl TryFrom<u8> for ActorEventID {
+    type Error = Error;
+
+    fn try_from(event: u8) -> Result<Self, Self::Error> {
+        Ok(match event {
             0 => Self::None,
             1 => Self::Jump,
             2 => Self::Hurt,
@@ -149,8 +151,14 @@ impl PacketRead for ActorEventID {
             79 => Self::ShakeWetnessStop,
             80 => Self::KineticDamageDealt,
             81 => Self::HurtWithoutReceivingDamage,
-            event => return Err(Error::other(format!("Invalid actor event ID: {event}"))),
+            _ => return Err(Error::other(format!("Invalid actor event ID: {event}"))),
         })
+    }
+}
+
+impl PacketRead for ActorEventID {
+    fn read<R: Read>(reader: &mut R) -> Result<Self, Error> {
+        Self::try_from(u8::read(reader)?)
     }
 }
 

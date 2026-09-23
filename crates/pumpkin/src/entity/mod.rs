@@ -84,6 +84,7 @@ pub mod area_effect_cloud;
 pub mod attributes;
 pub mod boss;
 pub mod breath;
+pub mod cluster_entity_replica;
 pub mod cluster_player_ghost;
 pub mod custom_sound;
 pub mod decoration;
@@ -921,6 +922,7 @@ pub struct Entity {
     pub removal_reason: AtomicCell<Option<RemovalReason>>,
     // The passengers that entity has
     pub passengers: std::sync::Mutex<Vec<Arc<dyn EntityBase>>>,
+    pub passenger_snapshot: ArcSwap<Vec<Arc<dyn EntityBase>>>,
     /// The vehicle that entity is in
     pub vehicle: std::sync::Mutex<Option<Arc<dyn EntityBase>>>,
     /// The entity this entity is attached/leashed to (if any)
@@ -985,6 +987,12 @@ impl Entity {
 
     pub fn reserve_ids(count: i32) -> i32 {
         CURRENT_ID.fetch_add(count, Relaxed)
+    }
+
+    #[must_use]
+    pub fn cluster_generation(&self) -> u32 {
+        let bytes = self.entity_uuid.as_bytes();
+        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
     }
 
     pub fn from_uuid(
@@ -1076,6 +1084,7 @@ impl Entity {
             was_in_powder_snow: AtomicBool::new(false),
             removal_reason: AtomicCell::new(None),
             passengers: std::sync::Mutex::new(Vec::new()),
+            passenger_snapshot: ArcSwap::from_pointee(Vec::new()),
             vehicle: std::sync::Mutex::new(None),
             leashed_to: std::sync::Mutex::new(None),
 
@@ -3723,13 +3732,20 @@ impl Entity {
         *passenger_entity
             .vehicle
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(vehicle);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(vehicle.clone());
 
         let mut passengers = self
             .passengers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         passengers.push(passenger);
+        self.passenger_snapshot.store(Arc::new(passengers.clone()));
+
+        if let Some(living) = vehicle.get_living_entity()
+            && let Some(player) = passengers.last().and_then(|entry| entry.get_player())
+        {
+            living.send_actual_health_to_player(player, living.health.load());
+        }
 
         let passenger_ids: Vec<VarInt> = passengers
             .iter()
@@ -3760,6 +3776,7 @@ impl Entity {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         }
+        self.passenger_snapshot.store(Arc::new(passengers.clone()));
 
         let passenger_ids: Vec<VarInt> = passengers
             .iter()
@@ -3831,6 +3848,7 @@ impl Entity {
                 .iter()
                 .map(|p| VarInt(p.get_entity().entity_id))
                 .collect();
+            self.passenger_snapshot.store(Arc::new(passengers.clone()));
             (removed_passenger, passenger_ids)
         };
 

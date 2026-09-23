@@ -71,6 +71,14 @@ impl JavaClient {
                     server.plugin_manager.fire_blocking(server, &mut event);
                     if !event.cancelled {
                         entity.set_fall_flying(event.is_gliding);
+                        pumpkin_cluster::visual::emit_pose(
+                            player.cluster_gid(),
+                            pumpkin_cluster::visual::tick_from_counter(
+                                player.tick_counter.load(Ordering::Relaxed),
+                            ),
+                            entity.is_swimming(),
+                            event.is_gliding,
+                        );
                     }
                 }
             }

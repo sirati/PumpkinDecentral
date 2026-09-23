@@ -1,25 +1,19 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pumpkin_cluster::buckets::BucketTable;
-use pumpkin_cluster::codec::decode_batch;
 use pumpkin_cluster::identity::ServerId;
 use pumpkin_cluster::order::order_players;
 use pumpkin_cluster::protocol::{
-    BlockPos as ClusterBlockPos, BreakBlockUpdate, ChunkAddr, PlaceBlockUpdate, StreamKind,
-    TickBatch,
+    BlockPos as ClusterBlockPos, BreakBlockUpdate, ChunkKey, PlaceBlockUpdate, TickBatch, WorldId,
 };
 use pumpkin_cluster::reconcile::ReconcilePlan;
-use pumpkin_cluster::streams::InboundParcel;
 use pumpkin_cluster::time::TickStamp;
 use pumpkin_cluster::world_delta::{
     BlockDelta, FallibleClaim, FallibleDecision, RandomTickDecision, RandomTickDelta, WorldDelta,
     WorldDeltaAcceptance, apply_fallible_edit, apply_random_tick_edit, chunk_of_block,
-    decode_frame, elect_fallible_claim, is_world_delta_frame, make_delta_undo,
+    elect_fallible_claim, make_delta_undo,
 };
-use tokio::sync::mpsc;
-use tracing::{debug, warn};
 
 use super::Server;
 
@@ -94,11 +88,7 @@ fn read_delta_state(world: &crate::world::World, pos: ClusterBlockPos) -> Option
     }
 }
 
-fn write_delta_state(
-    world: &Arc<crate::world::World>,
-    pos: ClusterBlockPos,
-    state: u16,
-) -> bool {
+fn write_delta_state(world: &Arc<crate::world::World>, pos: ClusterBlockPos, state: u16) -> bool {
     let Some(new_id) = pumpkin_data::BlockStateId::new(state) else {
         return false;
     };
@@ -133,10 +123,7 @@ pub fn revert_delta_plan(world: &Arc<crate::world::World>, plan: &ReconcilePlan)
     reverted
 }
 
-pub fn apply_random_tick_delta(
-    world: &Arc<crate::world::World>,
-    update: &RandomTickDelta,
-) {
+pub fn apply_random_tick_delta(world: &Arc<crate::world::World>, update: &RandomTickDelta) {
     for edit in &update.edits {
         let Some(current) = read_delta_state(world, edit.pos) else {
             continue;
@@ -154,7 +141,7 @@ pub fn apply_fallible_delta(
     state: &mut WorldDeltaState,
     peer: ServerId,
     holder: ServerId,
-    chunk: ChunkAddr,
+    chunk: ChunkKey,
     tick: TickStamp,
     trigger: ClusterBlockPos,
     edits: &[BlockDelta],
@@ -223,26 +210,24 @@ pub fn apply_fallible_delta(
 
 #[must_use]
 pub fn group_winners_by_chunk(
+    world: WorldId,
     winners: &[(ClusterBlockPos, u16)],
-) -> HashMap<ChunkAddr, Vec<(ClusterBlockPos, u16)>> {
-    let mut by_chunk: HashMap<ChunkAddr, Vec<(ClusterBlockPos, u16)>> = HashMap::new();
+) -> HashMap<ChunkKey, Vec<(ClusterBlockPos, u16)>> {
+    let mut by_chunk: HashMap<ChunkKey, Vec<(ClusterBlockPos, u16)>> = HashMap::new();
     for (pos, new_state) in winners {
         by_chunk
-            .entry(chunk_of_block(pos.x, pos.z))
+            .entry(chunk_of_block(world, pos.x, pos.z))
             .or_default()
             .push((*pos, *new_state));
     }
     by_chunk
 }
 
-fn promote_chunk_winners(
-    world: &crate::world::World,
-    winners: &[(ClusterBlockPos, u16)],
-) {
-    use pumpkin_world::level::ClusterBlockEdit;
+fn promote_chunk_winners(world: &crate::world::World, winners: &[(ClusterBlockPos, u16)]) {
     use pumpkin_util::math::vector2::Vector2;
-    let grouped = group_winners_by_chunk(winners);
-    let mut by_chunk: HashMap<ChunkAddr, Vec<ClusterBlockEdit>> = HashMap::new();
+    use pumpkin_world::level::ClusterBlockEdit;
+    let grouped = group_winners_by_chunk(super::cluster_world_delta::world_id(world), winners);
+    let mut by_chunk: HashMap<ChunkKey, Vec<ClusterBlockEdit>> = HashMap::new();
     for (chunk, entries) in &grouped {
         let mut accepted: Vec<ClusterBlockEdit> = Vec::with_capacity(entries.len());
         for (pos, new_state) in entries {
@@ -261,15 +246,12 @@ fn promote_chunk_winners(
         by_chunk.insert(*chunk, accepted);
     }
     for (chunk, accepted) in &by_chunk {
-        let coordinate = Vector2::new(chunk.x, chunk.z);
+        let coordinate = Vector2::new(chunk.x(), chunk.z());
         world.level.cluster_promote_tick(&coordinate, accepted, &[]);
     }
 }
 
-pub fn drain_complete_fallible_ticks(
-    world: &crate::world::World,
-    state: &mut WorldDeltaState,
-) {
+pub fn drain_complete_fallible_ticks(world: &crate::world::World, state: &mut WorldDeltaState) {
     while let Some(tick) = state.promote_queue.iter().next().copied() {
         if !state.acceptance.is_complete(tick) {
             break;
@@ -299,12 +281,12 @@ pub fn apply_world_delta_frame(
 ) {
     match frame {
         WorldDelta::RandomTick(update) => {
-            if let Some(world) = default_world(server) {
+            if let Some(world) = world_by_id(server, update.chunk.world) {
                 apply_random_tick_delta(&world, update);
             }
         }
         WorldDelta::Redstone(update) => {
-            if let Some(world) = default_world(server) {
+            if let Some(world) = world_by_id(server, update.chunk.world) {
                 apply_fallible_delta(
                     &world,
                     state,
@@ -318,7 +300,7 @@ pub fn apply_world_delta_frame(
             }
         }
         WorldDelta::Explosion(update) => {
-            if let Some(world) = default_world(server) {
+            if let Some(world) = world_by_id(server, update.chunk.world) {
                 apply_fallible_delta(
                     &world,
                     state,
@@ -331,6 +313,7 @@ pub fn apply_world_delta_frame(
                 );
             }
         }
+        WorldDelta::Administrative(_) => {}
     }
 }
 
@@ -436,7 +419,18 @@ fn default_world(server: &Server) -> Option<Arc<crate::world::World>> {
     server.worlds.load().first().cloned()
 }
 
-fn cluster_pos(update_pos: pumpkin_cluster::protocol::BlockPos) -> pumpkin_util::math::position::BlockPos {
+fn world_by_id(server: &Server, id: WorldId) -> Option<Arc<crate::world::World>> {
+    server
+        .worlds
+        .load()
+        .iter()
+        .find(|world| super::cluster_world_delta::world_id(world) == id)
+        .cloned()
+}
+
+fn cluster_pos(
+    update_pos: pumpkin_cluster::protocol::BlockPos,
+) -> pumpkin_util::math::position::BlockPos {
     pumpkin_util::math::position::BlockPos::new(update_pos.x, update_pos.y, update_pos.z)
 }
 
@@ -452,10 +446,7 @@ fn mirror_to_dual(
 }
 
 #[must_use]
-pub fn apply_break_atomic(
-    server: &Arc<Server>,
-    update: &BreakBlockUpdate,
-) -> BreakApplyOutcome {
+pub fn apply_break_atomic(server: &Arc<Server>, update: &BreakBlockUpdate) -> BreakApplyOutcome {
     let Some(world) = default_world(server) else {
         BREAK_REJECTED.fetch_add(1, Ordering::Relaxed);
         return BreakApplyOutcome {
@@ -639,216 +630,12 @@ pub fn sort_places_for_tick(tick: TickStamp, updates: &mut [PlaceBlockUpdate]) {
 pub fn sort_batch_for_apply(batch: &mut TickBatch) {
     sort_breaks_for_tick(batch.tick, &mut batch.break_block);
     sort_places_for_tick(batch.tick, &mut batch.place_block);
-    pumpkin_cluster::inventory::sort_inv_ops_for_tick(batch.tick, &mut batch.inv_ops);
+    pumpkin_cluster::inventory::sort_inv_ops_for_tick_with_seed(
+        CLUSTER_SEED,
+        batch.tick,
+        &mut batch.inv_ops,
+    );
 }
 
-#[derive(Debug, Default)]
-pub struct WorldTickBuckets {
-    pending: BTreeMap<TickStamp, Vec<TickBatch>>,
-    buckets: BucketTable,
-}
-
-impl WorldTickBuckets {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn push_batch(&mut self, batch: TickBatch) {
-        let tick = batch.tick;
-        self.buckets.require(
-            tick,
-            pumpkin_cluster::protocol::ChunkAddr { x: 0, z: 0 },
-            &[],
-        );
-        self.pending.entry(tick).or_default().push(batch);
-    }
-
-    pub fn pop_ready(&mut self) -> Option<(TickStamp, Vec<TickBatch>)> {
-        let smallest = self.pending.keys().next().copied()?;
-        if self.buckets.is_tick_complete(smallest) {
-            let batches = self.pending.remove(&smallest)?;
-            self.buckets.remove_tick(smallest);
-            Some((smallest, batches))
-        } else {
-            None
-        }
-    }
-
-    #[must_use]
-    pub fn pending_ticks(&self) -> usize {
-        self.pending.len()
-    }
-}
-
-pub fn apply_batch_to_server(
-    server: &Arc<Server>,
-    ledger: &mut pumpkin_cluster::inventory::InvLedger,
-    batch: &TickBatch,
-) {
-    let mut ordered = batch.clone();
-    sort_batch_for_apply(&mut ordered);
-    for op in &ordered.inv_ops {
-        let _ = ledger.apply_op(op);
-    }
-    for update in &ordered.break_block {
-        let _ = apply_break_atomic(server, update);
-    }
-    for update in &ordered.place_block {
-        let _ = apply_place_atomic(server, ledger, update);
-    }
-}
-
-pub fn apply_batch_bytes(
-    server: &Arc<Server>,
-    buckets: &mut WorldTickBuckets,
-    delta: &mut WorldDeltaState,
-    ledger: &mut pumpkin_cluster::inventory::InvLedger,
-    parcel_peer: ServerId,
-    bytes: &[u8],
-) {
-    if is_world_delta_frame(bytes) {
-        match decode_frame(bytes) {
-            Ok(frame) => apply_world_delta_frame(server, delta, parcel_peer, &frame),
-            Err(error) => {
-                warn!(%error, "cluster world delta decode failed");
-                WORLD_DELTA_DECODE_ERRORS.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        return;
-    }
-    let batch = match decode_batch(bytes) {
-        Ok(batch) => batch,
-        Err(error) => {
-            warn!(%error, "cluster world batch decode failed");
-            WORLD_DECODE_ERRORS.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-    };
-    WORLD_BATCHES.fetch_add(1, Ordering::Relaxed);
-    buckets.push_batch(batch);
-    let world = default_world(server);
-    while let Some((tick, batches)) = buckets.pop_ready() {
-        if let Some(world) = world.as_ref() {
-            world.level.cluster_note_ground_tick(tick.0);
-        }
-        for ready in &batches {
-            apply_batch_to_server(server, ledger, ready);
-        }
-        if let Some(world) = world.as_ref() {
-            world.level.cluster_note_applied_tick(tick.0);
-        }
-    }
-}
-
-pub fn spawn_world_apply(server: &Arc<Server>, mut world_rx: mpsc::Receiver<InboundParcel>) {
-    let task_server = Arc::clone(server);
-    server.spawn_task(async move {
-        let mut buckets = WorldTickBuckets::new();
-        let mut delta = WorldDeltaState::new();
-        let mut ledger = pumpkin_cluster::inventory::InvLedger::new();
-        let mut first = true;
-        while let Some(parcel) = world_rx.recv().await {
-            if parcel.header.kind != StreamKind::PlayerWorld {
-                continue;
-            }
-            if first {
-                first = false;
-                debug!(from = parcel.peer.0, "cluster world stream started");
-            }
-            let parcel_peer = parcel.peer;
-            apply_batch_bytes(
-                &task_server,
-                &mut buckets,
-                &mut delta,
-                &mut ledger,
-                parcel_peer,
-                &parcel.bytes,
-            );
-        }
-        debug!("cluster world stream closed");
-    });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use pumpkin_cluster::identity::{PlayerSlot, ServerId};
-    use pumpkin_cluster::identity::GlobalPlayerId;
-
-    fn gid(server: u16, player: u16) -> GlobalPlayerId {
-        GlobalPlayerId::new(ServerId(server), PlayerSlot(player))
-    }
-
-    #[test]
-    fn dirt_wood_conflict_flags_mismatch() {
-        assert!(!dirt_vs_wood_conflict(7, 7));
-        assert!(dirt_vs_wood_conflict(dirt_state_id(), wood_state_ids()[0]));
-        assert!(dirt_vs_wood_conflict(wood_state_ids()[1], dirt_state_id()));
-        assert!(dirt_vs_wood_conflict(3, 4));
-    }
-
-    #[test]
-    fn place_conflict_flags_duplicate() {
-        assert!(place_conflict(9, 9));
-        assert!(!place_conflict(9, 10));
-    }
-
-    #[test]
-    fn tick_ordering_is_deterministic_across_arrivals() {
-        let tick = TickStamp(41);
-        let first = gid(1, 1);
-        let second = gid(2, 1);
-        let mut arrival_a = [second, first];
-        let mut arrival_b = [first, second];
-        for arrival in [&mut arrival_a, &mut arrival_b] {
-            arrival.sort_by(|left, right| order_players(CLUSTER_SEED, tick, *left, *right));
-        }
-        assert_eq!(arrival_a, arrival_b);
-    }
-
-    #[test]
-    fn buckets_drain_in_tick_order() {
-        let mut buckets = WorldTickBuckets::new();
-        let late = TickBatch::new(TickStamp(9));
-        let early = TickBatch::new(TickStamp(3));
-        buckets.push_batch(late);
-        buckets.push_batch(early);
-        let (first_tick, _) = buckets.pop_ready().unwrap_or((TickStamp(0), Vec::new()));
-        assert_eq!(first_tick, TickStamp(3));
-    }
-
-    #[test]
-    fn winners_group_by_chunk_for_promotion() {
-        let winners = [
-            (
-                pumpkin_cluster::protocol::BlockPos { x: 1, y: 64, z: 1 },
-                8_u16,
-            ),
-            (
-                pumpkin_cluster::protocol::BlockPos { x: 2, y: 64, z: 3 },
-                10_u16,
-            ),
-            (
-                pumpkin_cluster::protocol::BlockPos { x: 20, y: 65, z: 21 },
-                0_u16,
-            ),
-        ];
-        let grouped = group_winners_by_chunk(&winners);
-        assert_eq!(grouped.len(), 2);
-        let home = pumpkin_cluster::protocol::ChunkAddr { x: 0, z: 0 };
-        let away = pumpkin_cluster::protocol::ChunkAddr { x: 1, z: 1 };
-        assert_eq!(grouped[&home].len(), 2);
-        assert_eq!(grouped[&away].len(), 1);
-    }
-
-    #[test]
-    fn inventory_delta_consumes_one() {
-        let delta = InventoryStackDelta {
-            slot: 0,
-            count_before: 64,
-            count_after: 63,
-        };
-        assert_eq!(delta.count_before.saturating_sub(1), delta.count_after);
-    }
-}
+pub use super::cluster_world_actions::WorldTickBuckets;
+pub use super::cluster_world_owner::spawn_world_apply;

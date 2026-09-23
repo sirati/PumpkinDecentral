@@ -29,8 +29,12 @@ impl BlockBehaviour for SmithingTableBlock {
                 pumpkin_data::statistic::CustomStatistic::InteractWithSmithingTable as i32,
                 1,
             );
-            args.player
-                .open_handled_screen(factory.as_ref(), Some(*args.position));
+            args.player.open_handled_screen(
+                factory.as_ref(),
+                crate::entity::player::InventoryScreenSource::virtual_window(
+                    pumpkin_data::screen::WindowType::Smithing,
+                ),
+            );
         }
 
         BlockActionResult::Success

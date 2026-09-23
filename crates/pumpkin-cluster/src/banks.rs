@@ -7,12 +7,10 @@
 //! Rules the code below encodes, so callers do not have to look elsewhere:
 //! - [`WorkerEnds::end_tick`] never blocks and never locks: it only uses
 //!   `try_recv`/`try_send`, then `mem::swap`s the active [`Box<Bank>`].
-//! - Steady state allocates nothing: the empty channel recycles the cleared
-//!   box, and a fresh box is only allocated when the fuse has not returned
-//!   one yet (`empty_missed`) or when the fuse is full (`fuse_backpressure`).
-//! - Slow fuse is lossy on purpose, never blocking: when `full` is still
-//!   occupied the just-filled bank is kept locally as the next write bank,
-//!   so the newest tick wins and the worker thread never stalls.
+//! - Both banks are allocated by [`bank_pipes`]. The empty channel recycles
+//!   the cleared box; no later rotation allocates another bank.
+//! - When the fuse has not returned a bank, the worker keeps accumulating
+//!   records in its current bank. Every record retains its own tick identity.
 //! - Slow-fuse noise is throttled: worker backpressure and fuse tick backlog
 //!   each log at most once per minute via `tracing::warn!`.
 
@@ -20,10 +18,10 @@ use tokio::sync::mpsc;
 
 use crate::inventory::InventoryOp;
 use crate::protocol::{
-    ArmorUpdate, BreakAnimUpdate, BreakBlockUpdate, EatAbortUpdate, EatStartUpdate,
-    FireProjectileUpdate, HeldUpdate, HitEntityUpdate, HitPlayerUpdate, PlaceBlockUpdate,
-    PosUpdate, SkinLayersUpdate, SneakUpdate, SprintUpdate, SwingUpdate, BlockingUpdate,
-    TickBatch,
+    BlockingUpdate, BreakAnimUpdate, BreakBlockUpdate, EatAbortUpdate, EatStartUpdate,
+    EquipmentUpdate, FireProjectileUpdate, HeldUpdate, HitEntityUpdate, HitPlayerUpdate,
+    PlaceBlockUpdate, PosUpdate, PoseUpdate, SkinLayersUpdate, SneakUpdate, SprintUpdate,
+    SwingUpdate, TickBatch,
 };
 use crate::time::TickStamp;
 
@@ -38,10 +36,11 @@ const SLOW_WARN_COOLDOWN: core::time::Duration = core::time::Duration::from_secs
 #[derive(Debug, Default)]
 pub struct Bank {
     pub pos: Vec<PosUpdate>,
-    pub armor: Vec<ArmorUpdate>,
+    pub equipment: Vec<EquipmentUpdate>,
     pub held: Vec<HeldUpdate>,
     pub sneak: Vec<SneakUpdate>,
     pub sprint: Vec<SprintUpdate>,
+    pub pose: Vec<PoseUpdate>,
     pub blocking: Vec<BlockingUpdate>,
     pub swing: Vec<SwingUpdate>,
     pub skin: Vec<SkinLayersUpdate>,
@@ -65,10 +64,11 @@ impl Bank {
     /// Keeps allocations, drops rows; what the fuse returns to `empty`.
     pub fn clear(&mut self) {
         self.pos.clear();
-        self.armor.clear();
+        self.equipment.clear();
         self.held.clear();
         self.sneak.clear();
         self.sprint.clear();
+        self.pose.clear();
         self.blocking.clear();
         self.swing.clear();
         self.skin.clear();
@@ -86,10 +86,11 @@ impl Bank {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.pos.is_empty()
-            && self.armor.is_empty()
+            && self.equipment.is_empty()
             && self.held.is_empty()
             && self.sneak.is_empty()
             && self.sprint.is_empty()
+            && self.pose.is_empty()
             && self.blocking.is_empty()
             && self.swing.is_empty()
             && self.skin.is_empty()
@@ -108,10 +109,8 @@ impl Bank {
 /// Lossy-handoff counters; both only grow when the fuse is slower than tick.
 #[derive(Debug, Default)]
 pub struct HandoffCounters {
-    /// `full` was occupied, so the filled bank stayed local as next `bank`.
-    pub fuse_backpressure: u64,
-    /// No recycled box was parked, so a fresh box was allocated.
-    pub empty_missed: u64,
+    pub delayed_rotations: u64,
+    pub failed_handoffs: u64,
 }
 
 /// Worker side: the active write [`Bank`] plus the two fixed-1 pipe ends.
@@ -123,6 +122,7 @@ pub struct WorkerEnds {
     pub full_tx: mpsc::Sender<Box<Bank>>,
     pub empty_rx: mpsc::Receiver<Box<Bank>>,
     pub bank: Box<Bank>,
+    spare: Option<Box<Bank>>,
     pub counters: HandoffCounters,
     slow_warn_at: Option<tokio::time::Instant>,
 }
@@ -144,6 +144,7 @@ pub fn bank_pipes() -> (WorkerEnds, FuseEnds) {
             full_tx,
             empty_rx,
             bank: Box::new(Bank::new()),
+            spare: Some(Box::new(Bank::new())),
             counters: HandoffCounters::default(),
             slow_warn_at: None,
         },
@@ -154,27 +155,25 @@ pub fn bank_pipes() -> (WorkerEnds, FuseEnds) {
 impl WorkerEnds {
     /// Swaps the write bank into `full` without blocking or locking.
     ///
-    /// Reaps a recycled box when parked, else allocates and counts
-    /// `empty_missed`. When the fuse has not drained the previous tick,
-    /// `try_send` fails, the filled bank is kept as the next write bank so
-    /// no sample blocks, and `fuse_backpressure` plus a 1/min warn records
-    /// that the fuse is slower than tick.
-    pub fn end_tick(&mut self) {
-        let mut next = match self.empty_rx.try_recv() {
-            Ok(bank) => bank,
-            Err(_) => {
-                self.counters.empty_missed =
-                    self.counters.empty_missed.saturating_add(1);
-                Box::new(Bank::new())
+    pub fn end_tick(&mut self) -> bool {
+        let mut next = match self.spare.take().or_else(|| self.empty_rx.try_recv().ok()) {
+            Some(bank) => bank,
+            None => {
+                self.counters.delayed_rotations = self.counters.delayed_rotations.saturating_add(1);
+                self.warn_slow_fuse();
+                return false;
             }
         };
         core::mem::swap(&mut self.bank, &mut next);
         if let Err(error) = self.full_tx.try_send(next) {
-            self.counters.fuse_backpressure =
-                self.counters.fuse_backpressure.saturating_add(1);
-            self.bank = error.into_inner();
+            self.counters.failed_handoffs = self.counters.failed_handoffs.saturating_add(1);
+            let mut filled = error.into_inner();
+            core::mem::swap(&mut self.bank, &mut filled);
+            self.spare = Some(filled);
             self.warn_slow_fuse();
+            return false;
         }
+        true
     }
 
     /// 1/min warn while every tick hits a still-full `full` channel.
@@ -187,8 +186,9 @@ impl WorkerEnds {
         if due {
             self.slow_warn_at = Some(now);
             tracing::warn!(
-                backpressure = self.counters.fuse_backpressure,
-                "cluster fuse slower than tick; keeping newest bank"
+                delayed_rotations = self.counters.delayed_rotations,
+                failed_handoffs = self.counters.failed_handoffs,
+                "cluster fuse slower than tick; retaining tick buckets"
             );
         }
     }
@@ -265,10 +265,7 @@ impl Fuse {
         if due {
             self.last_lag_warn = Some(now);
             self.lag_warnings = self.lag_warnings.saturating_add(1);
-            tracing::warn!(
-                pending_ticks,
-                "cluster fuse behind tick; ticks queuing"
-            );
+            tracing::warn!(pending_ticks, "cluster fuse behind tick; ticks queuing");
         }
     }
 }
@@ -283,47 +280,51 @@ impl Default for Fuse {
 mod tests {
     use super::*;
     use crate::identity::{GlobalPlayerId, PlayerSeq, PlayerSlot, ServerId};
-    use crate::protocol::ArmorUpdate;
+    use crate::protocol::EquipmentUpdate;
 
-    fn sample_armor() -> ArmorUpdate {
-        ArmorUpdate {
+    fn sample_equipment() -> EquipmentUpdate {
+        EquipmentUpdate {
             gid: GlobalPlayerId::new(ServerId(1), PlayerSlot(2)),
             seq: PlayerSeq(3),
             tick: TickStamp(4),
             slot: 1,
             item: 42,
+            count: 1,
         }
     }
 
     #[test]
     fn handoff_recycles_bank() {
         let (mut worker, mut fuse) = bank_pipes();
-        worker.bank.armor.push(sample_armor());
-        worker.end_tick();
-        assert_eq!(worker.counters.empty_missed, 1);
+        worker.bank.equipment.push(sample_equipment());
+        assert!(worker.end_tick());
 
         let mut bank = fuse.full_rx.try_recv().unwrap();
-        assert_eq!(bank.armor.len(), 1);
+        assert_eq!(bank.equipment.len(), 1);
         bank.clear();
         fuse.empty_tx.try_send(bank).unwrap();
 
-        worker.bank.armor.push(sample_armor());
-        worker.end_tick();
-        assert_eq!(worker.counters.empty_missed, 1);
-        assert_eq!(fuse.full_rx.try_recv().unwrap().armor.len(), 1);
+        worker.bank.equipment.push(sample_equipment());
+        assert!(worker.end_tick());
+        assert_eq!(worker.counters.delayed_rotations, 0);
+        assert_eq!(fuse.full_rx.try_recv().unwrap().equipment.len(), 1);
     }
 
     #[test]
     fn backpressure_keeps_data() {
         let (mut worker, mut fuse) = bank_pipes();
-        worker.bank.armor.push(sample_armor());
-        worker.end_tick();
-        worker.bank.armor.push(sample_armor());
-        worker.end_tick();
-        worker.bank.armor.push(sample_armor());
-        worker.end_tick();
-        assert!(worker.counters.fuse_backpressure > 0);
-        let _ = fuse.full_rx.try_recv();
+        worker.bank.equipment.push(sample_equipment());
+        assert!(worker.end_tick());
+        worker.bank.equipment.push(sample_equipment());
+        assert!(!worker.end_tick());
+        worker.bank.equipment.push(sample_equipment());
+        assert!(!worker.end_tick());
+        assert_eq!(worker.counters.delayed_rotations, 2);
+        let mut returned = fuse.full_rx.try_recv().unwrap();
+        returned.clear();
+        fuse.empty_tx.try_send(returned).unwrap();
+        assert!(worker.end_tick());
+        assert_eq!(fuse.full_rx.try_recv().unwrap().equipment.len(), 2);
     }
 
     #[tokio::test]
@@ -334,7 +335,7 @@ mod tests {
         let (out_tx, mut out_rx) = mpsc::channel(4);
         let mut fuse = Fuse::new();
 
-        worker.bank.armor.push(sample_armor());
+        worker.bank.equipment.push(sample_equipment());
         worker.end_tick();
         tick_tx.send(TickStamp(9)).await.unwrap();
         drop(tick_tx);
@@ -343,6 +344,6 @@ mod tests {
         let bytes = out_rx.recv().await.unwrap();
         let batch = crate::codec::decode_batch(&bytes).unwrap();
         assert_eq!(batch.tick, TickStamp(9));
-        assert_eq!(batch.armor.len(), 1);
+        assert_eq!(batch.equipment.len(), 1);
     }
 }

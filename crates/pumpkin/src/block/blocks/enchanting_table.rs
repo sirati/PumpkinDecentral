@@ -34,8 +34,12 @@ impl BlockBehaviour for EnchantingTableBlock {
             position: args.position,
             player: args.player,
         }) {
-            args.player
-                .open_handled_screen(factory.as_ref(), Some(*args.position));
+            args.player.open_handled_screen(
+                factory.as_ref(),
+                crate::entity::player::InventoryScreenSource::virtual_window(
+                    pumpkin_data::screen::WindowType::Enchantment,
+                ),
+            );
         }
         BlockActionResult::Success
     }

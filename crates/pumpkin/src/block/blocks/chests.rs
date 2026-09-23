@@ -242,6 +242,9 @@ fn get_chest_screen_handler_factory(
 }
 
 fn normal_use_chest_impl(args: &NormalUseArgs<'_>) -> BlockActionResult {
+    if args.server.advanced_config.cluster.enabled {
+        return BlockActionResult::Fail;
+    }
     let stat = if args.block.id == Block::TRAPPED_CHEST.id {
         pumpkin_data::statistic::CustomStatistic::TriggerTrappedChest
     } else {
@@ -260,8 +263,10 @@ fn normal_use_chest_impl(args: &NormalUseArgs<'_>) -> BlockActionResult {
         position: args.position,
         player: args.player,
     }) {
-        args.player
-            .open_handled_screen(factory.as_ref(), Some(*args.position));
+        args.player.open_handled_screen(
+            factory.as_ref(),
+            crate::entity::player::InventoryScreenSource::Block(*args.position),
+        );
     }
 
     BlockActionResult::Success

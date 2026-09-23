@@ -196,6 +196,26 @@ impl NbtTag {
         Ok(())
     }
 
+    pub fn serialize_data_canonical<W: NbtWriteHelper>(self, w: &mut W) -> serializer::Result<()> {
+        match self {
+            Self::List(list) => {
+                let len = list.len();
+                if len > i32::MAX as usize {
+                    return Err(Error::LargeLength(len));
+                }
+                let element_id = Self::get_list_element_type_id(&list);
+                w.write_u8(element_id)?;
+                w.write_i32(len as i32)?;
+                for tag in list {
+                    Self::wrap_tag_if_needed(element_id, tag).serialize_data_canonical(w)?;
+                }
+                Ok(())
+            }
+            Self::Compound(compound) => compound.serialize_content_canonical(w),
+            other => other.serialize_data(w),
+        }
+    }
+
     /// Deserializes a type ID and its following payload.
     pub fn deserialize<'a, R: NbtReadHelper<'a>>(reader: &mut R) -> Result<Self, Error> {
         let tag_id = reader.get_u8()?;

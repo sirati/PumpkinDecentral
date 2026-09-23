@@ -200,6 +200,7 @@ impl ScreenHandlerFactory for MinecartScreenFactory {
 
 pub(super) fn open(
     custom_name: Option<TextComponent>,
+    entity: &Entity,
     player: &Arc<Player>,
     inventory: &Arc<MinecartInventory>,
     title: TextComponent,
@@ -219,7 +220,10 @@ pub(super) fn open(
                 title: custom_name.unwrap_or(title),
                 hopper,
             },
-            None,
+            match crate::entity::player::InventoryScreenSource::entity(player, entity) {
+                Some(source) => source,
+                None => return false,
+            },
         )
         .is_some()
 }

@@ -1,6 +1,420 @@
 #[allow(clippy::wildcard_imports)]
 use super::*;
 
+fn result_container(container: pumpkin_protocol::bedrock::network_item::ContainerName) -> bool {
+    use pumpkin_protocol::bedrock::network_item::ContainerName;
+
+    matches!(
+        container,
+        ContainerName::CreatedOutput
+            | ContainerName::CraftingOutputPreview
+            | ContainerName::AnvilResultPreview
+            | ContainerName::GrindstoneResultPreview
+            | ContainerName::LoomResultPreview
+            | ContainerName::TradeResultPreview
+            | ContainerName::Trade2ResultPreview
+    )
+}
+
+fn untyped_result_action(
+    action: &pumpkin_protocol::bedrock::server::item_stack_request::ItemStackRequestAction,
+) -> bool {
+    use pumpkin_protocol::bedrock::server::item_stack_request::ItemStackRequestAction;
+
+    match action {
+        ItemStackRequestAction::Take {
+            source,
+            destination,
+            ..
+        }
+        | ItemStackRequestAction::Place {
+            source,
+            destination,
+            ..
+        } => {
+            result_container(source.container_name.container_name)
+                || result_container(destination.container_name.container_name)
+        }
+        ItemStackRequestAction::Swap { slot1, slot2 } => {
+            result_container(slot1.container_name.container_name)
+                || result_container(slot2.container_name.container_name)
+        }
+        ItemStackRequestAction::Drop { source, .. }
+        | ItemStackRequestAction::Destroy { source, .. }
+        | ItemStackRequestAction::Consume { source, .. } => {
+            result_container(source.container_name.container_name)
+        }
+        _ => false,
+    }
+}
+
+fn semantic_stack_request<'a>(
+    player: &Player,
+    actions: impl IntoIterator<
+        Item = &'a pumpkin_protocol::bedrock::server::item_stack_request::ItemStackRequestAction,
+    >,
+) -> Result<
+    Vec<pumpkin_cluster::inventory::InventoryGesture>,
+    pumpkin_cluster::inventory::InventoryApplyError,
+> {
+    use pumpkin_cluster::inventory::{InventoryGesture, InventoryRemovalKind};
+    use pumpkin_protocol::bedrock::network_item::ContainerName;
+    use pumpkin_protocol::bedrock::server::item_stack_request::ItemStackRequestAction;
+
+    let slot =
+        |info: &pumpkin_protocol::bedrock::server::item_stack_request::ItemStackRequestSlotInfo| {
+            crate::server::cluster_inventory_protocol::bedrock_slot_state(player, info)
+                .map(|(slot, _)| slot)
+        };
+    let mut operations = Vec::new();
+    let mut creative_stack = None;
+    for action in actions {
+        match action {
+            ItemStackRequestAction::CraftCreative {
+                creative_item_id,
+                repetitions,
+            } => {
+                if player.gamemode.load() != GameMode::Creative || *repetitions == 0 {
+                    return Err(pumpkin_cluster::inventory::InventoryApplyError::Rejected);
+                }
+                let entry = pumpkin_data::bedrock_creative::CREATIVE_ENTRIES
+                    .get(creative_item_id.0.saturating_sub(1) as usize)
+                    .ok_or(pumpkin_cluster::inventory::InventoryApplyError::Rejected)?;
+                let mapping = pumpkin_data::item::JavaToBedrockItemMapping::from_bedrock(
+                    entry.item_id,
+                    entry.item_aux_value,
+                )
+                .ok_or(pumpkin_cluster::inventory::InventoryApplyError::Rejected)?;
+                let limit = ItemStack::static_new_java(1, mapping.java_item).get_max_stack_size();
+                let count = u16::from(limit)
+                    .saturating_mul(u16::from(*repetitions))
+                    .min(u16::from(u8::MAX)) as u8;
+                creative_stack = Some(ItemStack::new(count, mapping.java_item));
+            }
+            ItemStackRequestAction::Create { .. } if creative_stack.is_some() => {}
+            ItemStackRequestAction::Take {
+                count,
+                source,
+                destination,
+            } if source.container_name.container_name == ContainerName::CreatedOutput
+                && creative_stack.is_some() =>
+            {
+                let mut stack = creative_stack
+                    .clone()
+                    .ok_or(pumpkin_cluster::inventory::InventoryApplyError::Rejected)?;
+                if *count == 0 || *count > stack.item_count {
+                    return Err(pumpkin_cluster::inventory::InventoryApplyError::Rejected);
+                }
+                stack.item_count = *count;
+                let destination = slot(destination)?;
+                let cell = crate::server::cluster_invsee::inventory_cell_from_item_stack(
+                    destination.loc,
+                    &stack,
+                )?;
+                operations.push(InventoryGesture::CreativeSet {
+                    destination,
+                    stack: cell,
+                    destination_limit: stack.get_max_stack_size(),
+                });
+            }
+            ItemStackRequestAction::Drop { count, source, .. }
+                if source.container_name.container_name == ContainerName::CreatedOutput =>
+            {
+                let mut stack = creative_stack
+                    .clone()
+                    .ok_or(pumpkin_cluster::inventory::InventoryApplyError::Rejected)?;
+                if *count == 0 || *count > stack.item_count {
+                    return Err(pumpkin_cluster::inventory::InventoryApplyError::Rejected);
+                }
+                stack.item_count = *count;
+                let owner = pumpkin_cluster::inventory::InventoryTarget::Player(
+                    player.cluster_gid().ok_or(
+                        pumpkin_cluster::inventory::InventoryApplyError::TargetUnavailable,
+                    )?,
+                );
+                let cell = crate::server::cluster_invsee::inventory_cell_from_item_stack(
+                    pumpkin_cluster::inventory::InvLoc::new(
+                        pumpkin_cluster::inventory::INV_CURSOR,
+                        0,
+                    ),
+                    &stack,
+                )?;
+                operations.push(InventoryGesture::CreativeDrop { owner, stack: cell });
+            }
+            ItemStackRequestAction::Take {
+                count,
+                source,
+                destination,
+            }
+            | ItemStackRequestAction::Place {
+                count,
+                source,
+                destination,
+            } => operations.push(InventoryGesture::Transfer {
+                source: slot(source)?,
+                destination: slot(destination)?,
+                count: *count,
+                destination_limit: 64,
+            }),
+            ItemStackRequestAction::Swap { slot1, slot2 } => {
+                operations.push(InventoryGesture::Swap {
+                    first: slot(slot1)?,
+                    second: slot(slot2)?,
+                    first_limit: 64,
+                    second_limit: 64,
+                });
+            }
+            ItemStackRequestAction::Drop { count, source, .. } => {
+                operations.push(InventoryGesture::Remove {
+                    source: slot(source)?,
+                    count: *count,
+                    kind: InventoryRemovalKind::Drop,
+                });
+            }
+            ItemStackRequestAction::Destroy { count, source } => {
+                operations.push(InventoryGesture::Remove {
+                    source: slot(source)?,
+                    count: *count,
+                    kind: InventoryRemovalKind::Destroy,
+                });
+            }
+            ItemStackRequestAction::Consume { count, source } => {
+                operations.push(InventoryGesture::Remove {
+                    source: slot(source)?,
+                    count: *count,
+                    kind: InventoryRemovalKind::Consume,
+                });
+            }
+            _ => return Err(pumpkin_cluster::inventory::InventoryApplyError::Rejected),
+        }
+    }
+    Ok(operations)
+}
+
+fn submit_semantic_stack_requests(
+    player: &Arc<Player>,
+    packet: &pumpkin_protocol::bedrock::server::item_stack_request::SItemStackRequest,
+    tick: pumpkin_cluster::time::TickStamp,
+    sequence: &mut u16,
+) -> bool {
+    use pumpkin_protocol::bedrock::client::item_stack_response::{
+        CItemStackResponse, ItemStackResponseInfo,
+    };
+    let Some(server) = player.world().server.upgrade() else {
+        return false;
+    };
+    let Some(gid) = player.cluster_gid() else {
+        return false;
+    };
+    let mut rejected = Vec::new();
+    for request in &packet.requests {
+        let input_sequence =
+            Some(crate::server::cluster_inventory_protocol::next_input_sequence(sequence));
+        let origin = Some(
+            crate::server::cluster_inventory_protocol::bedrock_stack_request_origin(
+                request.request_id.0,
+            ),
+        );
+        let result = match semantic_menu_request(player, &request.actions) {
+            Ok(Some((kind, companions))) => {
+                crate::server::cluster_inventory_protocol::submit_menu_kind_with_companions(
+                    player,
+                    tick,
+                    kind,
+                    Some(companions),
+                    origin,
+                    input_sequence,
+                )
+            }
+            Ok(None) if request.actions.iter().any(untyped_result_action) => {
+                Err(pumpkin_cluster::inventory::InventoryApplyError::Rejected)
+            }
+            Ok(None) => semantic_stack_request(player, &request.actions).and_then(|gestures| {
+                let screen_session =
+                    crate::server::cluster_inventory_protocol::current_screen_snapshot(player)
+                        .ok()
+                        .map(|screen| screen.session);
+                let affected = crate::server::cluster_inventory_protocol::inventory_affected_chunks(
+                    player, &gestures,
+                );
+                crate::server::cluster_invsee::submit_inventory_intent_with_sequence(
+                    &server,
+                    pumpkin_cluster::inventory::InventoryMutationIntent {
+                        actor: gid.into(),
+                        tick,
+                        payload: pumpkin_cluster::inventory::InventoryIntentPayload::Gestures(
+                            gestures,
+                        ),
+                        affected,
+                        actor_chunk: crate::server::cluster_inventory_protocol::player_chunk(
+                            player,
+                        ),
+                        screen_session,
+                    },
+                    origin,
+                    input_sequence,
+                )
+            }),
+            Err(error) => Err(error),
+        };
+        if result.is_err() {
+            rejected.push(ItemStackResponseInfo {
+                result: 1,
+                client_request_id: request.request_id,
+                containers: Vec::new(),
+            });
+        }
+    }
+    if !rejected.is_empty()
+        && let Some(client) = player.client.bedrock()
+    {
+        client.try_enqueue_client_packet(&CItemStackResponse {
+            responses: rejected,
+        });
+        crate::server::cluster_inventory_protocol::resync_inventory_screen(player);
+    }
+    true
+}
+
+fn semantic_menu_request(
+    player: &Player,
+    actions: &[pumpkin_protocol::bedrock::server::item_stack_request::ItemStackRequestAction],
+) -> Result<
+    Option<(
+        pumpkin_cluster::inventory::InventoryMenuKind,
+        Vec<pumpkin_cluster::inventory::InventoryGesture>,
+    )>,
+    pumpkin_cluster::inventory::InventoryApplyError,
+> {
+    use pumpkin_cluster::inventory::{InventoryMenuKind, InventoryPatternSelection};
+    use pumpkin_protocol::bedrock::server::item_stack_request::ItemStackRequestAction;
+
+    let window_kind =
+        crate::server::cluster_inventory_protocol::current_screen_snapshot(player)?.window_kind;
+    let has_explicit_menu = actions.iter().any(|action| {
+        matches!(
+            action,
+            ItemStackRequestAction::BeaconPayment { .. }
+                | ItemStackRequestAction::CraftRecipe { .. }
+                | ItemStackRequestAction::CraftRecipeAuto { .. }
+                | ItemStackRequestAction::Grindstone { .. }
+                | ItemStackRequestAction::Loom { .. }
+        )
+    });
+    let has_creative_output = actions
+        .iter()
+        .any(|action| matches!(action, ItemStackRequestAction::CraftCreative { .. }));
+    let mut selected = None;
+    let mut selector_index = None;
+    let mut result_take = false;
+    for (index, action) in actions.iter().enumerate() {
+        let kind = match action {
+            ItemStackRequestAction::BeaconPayment {
+                primary_effect_id,
+                secondary_effect_id,
+            } => Some(InventoryMenuKind::SetBeacon {
+                primary_effect: u16::try_from(primary_effect_id.0)
+                    .map_err(|_| pumpkin_cluster::inventory::InventoryApplyError::Rejected)?,
+                secondary_effect: (secondary_effect_id.0 > 0)
+                    .then(|| u16::try_from(secondary_effect_id.0))
+                    .transpose()
+                    .map_err(|_| pumpkin_cluster::inventory::InventoryApplyError::Rejected)?,
+            }),
+            ItemStackRequestAction::CraftRecipe {
+                recipe_id,
+                repetitions,
+            }
+            | ItemStackRequestAction::CraftRecipeAuto {
+                recipe_id,
+                repetitions,
+            } if *repetitions != 0 => {
+                if window_kind == pumpkin_data::screen::WindowType::Merchant as u16 {
+                    Some(InventoryMenuKind::ExecuteTrade {
+                        offer: recipe_id.0.checked_sub(1).ok_or(
+                            pumpkin_cluster::inventory::InventoryApplyError::Rejected,
+                        )?,
+                        repetitions: u16::from(*repetitions),
+                    })
+                } else {
+                    Some(InventoryMenuKind::CraftResult {
+                        recipe: recipe_id.0,
+                        repetitions: u16::from(*repetitions),
+                    })
+                }
+            }
+            ItemStackRequestAction::Grindstone { repetitions, .. } if *repetitions != 0 => {
+                Some(InventoryMenuKind::TakeGrindstoneResult)
+            }
+            ItemStackRequestAction::Loom {
+                pattern_id,
+                repetitions,
+            } if *repetitions != 0 => Some(InventoryMenuKind::ApplyLoomPattern {
+                pattern: InventoryPatternSelection::Key(pattern_id.clone()),
+            }),
+            ItemStackRequestAction::Take { source, .. }
+                if !has_explicit_menu && !has_creative_output && matches!(
+                    source.container_name.container_name,
+                    pumpkin_protocol::bedrock::network_item::ContainerName::CreatedOutput
+                        | pumpkin_protocol::bedrock::network_item::ContainerName::CraftingOutputPreview
+                        | pumpkin_protocol::bedrock::network_item::ContainerName::AnvilResultPreview
+                        | pumpkin_protocol::bedrock::network_item::ContainerName::GrindstoneResultPreview
+                        | pumpkin_protocol::bedrock::network_item::ContainerName::LoomResultPreview
+                        | pumpkin_protocol::bedrock::network_item::ContainerName::TradeResultPreview
+                        | pumpkin_protocol::bedrock::network_item::ContainerName::Trade2ResultPreview
+                ) => {
+                    result_take = true;
+                    Some(InventoryMenuKind::TakeDisplayedResult { repetitions: 1 })
+                }
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            if selected.replace(kind).is_some() {
+                return Err(pumpkin_cluster::inventory::InventoryApplyError::Rejected);
+            }
+            selector_index = Some(index);
+        }
+    }
+    let Some(kind) = selected else {
+        return Ok(None);
+    };
+    let companions = semantic_stack_request(
+        player,
+        actions.iter().enumerate().filter_map(|(index, action)| {
+            (result_take || Some(index) != selector_index).then_some(action)
+        }),
+    )?;
+    Ok(Some((kind, companions)))
+}
+
+pub(crate) fn process_cluster_stack_requests(
+    player: &Arc<Player>,
+    requests: Vec<pumpkin_protocol::bedrock::server::item_stack_request::ItemStackRequest>,
+    tick: pumpkin_cluster::time::TickStamp,
+    sequence: &mut u16,
+) {
+    use pumpkin_protocol::bedrock::client::item_stack_response::{
+        CItemStackResponse, ItemStackResponseInfo,
+    };
+    let packet =
+        pumpkin_protocol::bedrock::server::item_stack_request::SItemStackRequest { requests };
+    if submit_semantic_stack_requests(player, &packet, tick, sequence) {
+        return;
+    }
+    let responses = packet
+        .requests
+        .iter()
+        .map(|request| ItemStackResponseInfo {
+            result: 1,
+            client_request_id: request.request_id,
+            containers: Vec::new(),
+        })
+        .collect();
+    if let Some(client) = player.client.bedrock() {
+        client.try_enqueue_client_packet(&CItemStackResponse { responses });
+        crate::server::cluster_inventory_protocol::resync_inventory_screen(player);
+    }
+}
+
 impl BedrockClient {
     #[allow(clippy::too_many_lines)]
     pub fn handle_item_stack_request(
@@ -8,6 +422,18 @@ impl BedrockClient {
         player: &Arc<Player>,
         packet: pumpkin_protocol::bedrock::server::item_stack_request::SItemStackRequest,
     ) {
+        let cluster_enabled = player
+            .world()
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled);
+        if cluster_enabled {
+            crate::server::cluster_inventory_protocol::stage_bedrock_stack_requests(
+                player,
+                packet.requests,
+            );
+            return;
+        }
         use pumpkin_protocol::bedrock::client::item_stack_response::{
             CItemStackResponse, ItemStackResponseContainerInfo, ItemStackResponseInfo,
             ItemStackResponseSlotInfo,

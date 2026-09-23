@@ -29,24 +29,46 @@ impl CommandExecutor for BanListCommandExecutor {
         let data = &context.server().data;
 
         if self.players {
-            let lock = data.banned_player_list.read().unwrap();
-            for entry in &lock.banned_players {
-                entries.push(BanListEntry {
-                    name: entry.name.clone(),
-                    source: entry.source.clone(),
-                    reason: entry.reason.clone(),
-                });
+            if context.server().advanced_config.cluster.enabled {
+                let snapshot = context.server().cluster_admin_view.load();
+                for entry in &snapshot.banned_players {
+                    entries.push(BanListEntry {
+                        name: entry.name.clone(),
+                        source: entry.source.clone(),
+                        reason: entry.reason.clone(),
+                    });
+                }
+            } else {
+                let lock = data.banned_player_list.read().unwrap();
+                for entry in &lock.banned_players {
+                    entries.push(BanListEntry {
+                        name: entry.name.clone(),
+                        source: entry.source.clone(),
+                        reason: entry.reason.clone(),
+                    });
+                }
             }
         }
 
         if self.ips {
-            let lock = data.banned_ip_list.read().unwrap();
-            for entry in &lock.banned_ips {
-                entries.push(BanListEntry {
-                    name: entry.ip.to_string(),
-                    source: entry.source.clone(),
-                    reason: entry.reason.clone(),
-                });
+            if context.server().advanced_config.cluster.enabled {
+                let policy = context.server().cluster_access_policy.snapshot();
+                for entry in &policy.banned_ips {
+                    entries.push(BanListEntry {
+                        name: entry.ip.to_string(),
+                        source: entry.source.clone(),
+                        reason: entry.reason.clone(),
+                    });
+                }
+            } else {
+                let lock = data.banned_ip_list.read().unwrap();
+                for entry in &lock.banned_ips {
+                    entries.push(BanListEntry {
+                        name: entry.ip.to_string(),
+                        source: entry.source.clone(),
+                        reason: entry.reason.clone(),
+                    });
+                }
             }
         }
 

@@ -18,6 +18,59 @@ impl JavaClient {
         if !player.has_client_loaded() {
             return;
         }
+        if server.advanced_config.cluster.enabled {
+            match Status::try_from(player_action.status.0) {
+                Ok(Status::DropItem) => {
+                    crate::server::cluster_inventory_protocol::stage_held_drop(player, false);
+                    return;
+                }
+                Ok(Status::DropItemStack) => {
+                    crate::server::cluster_inventory_protocol::stage_held_drop(player, true);
+                    return;
+                }
+                Ok(Status::SwapItem) => {
+                    crate::server::cluster_inventory_protocol::stage_hand_swap(player);
+                    return;
+                }
+                Ok(Status::StartedDigging | Status::CancelledDigging | Status::FinishedDigging) => {
+                    player.client.try_kick(
+                        crate::net::DisconnectReason::Unknown,
+                        &pumpkin_util::text::TextComponent::text(
+                            "Block action could not be verified",
+                        ),
+                    );
+                    return;
+                }
+                Ok(Status::SpearJab) => {
+                    player.client.try_kick(
+                        crate::net::DisconnectReason::Unknown,
+                        &pumpkin_util::text::TextComponent::text(
+                            "Item action could not be verified",
+                        ),
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if server.advanced_config.cluster.enabled
+            && matches!(
+                Status::try_from(player_action.status.0),
+                Ok(Status::ReleaseItemInUse)
+            )
+        {
+            crate::server::cluster_inventory_protocol::stage_item_action(
+                player,
+                0,
+                crate::server::cluster_inventory_protocol::StagedItemActionKind::Release,
+                Some(
+                    crate::server::cluster_inventory_protocol::java_item_action_origin(
+                        player_action.sequence.0,
+                    ),
+                ),
+            );
+            return;
+        }
         player.update_last_action_time();
         match Status::try_from(player_action.status.0) {
             Ok(status) => match status {
@@ -233,12 +286,7 @@ impl JavaClient {
                         },
                     );
                     if new_state.is_some() {
-                        record_cluster_break_snapshot(
-                            player,
-                            server,
-                            location,
-                            state.id.as_u16(),
-                        );
+                        record_cluster_break_snapshot(player, server, location, state.id.as_u16());
                         server
                             .block_registry
                             .broken(&world, block, player, &location, server, state);
@@ -353,7 +401,9 @@ fn record_cluster_break_snapshot(
     let Some(gid) = player.cluster_gid() else {
         return;
     };
-    let chunk = chunk_of_block(position.0.x, position.0.z);
+    let world_id = crate::server::cluster_world_delta::world_id(&player.world());
+    let chunk = chunk_of_block(world_id, position.0.x, position.0.z);
+    let actor = player.get_entity().chunk_pos.load();
     let update = capture_break(
         gid,
         next_break_seq(gid),
@@ -364,6 +414,7 @@ fn record_cluster_break_snapshot(
             z: position.0.z,
         },
         expected_old_state,
+        pumpkin_cluster::protocol::ChunkKey::new(world_id, actor.x, actor.y),
         chunk,
     );
     BREAK_OUTBOX.push(update);
@@ -372,8 +423,8 @@ fn record_cluster_break_snapshot(
         pos_x = position.0.x,
         pos_y = position.0.y,
         pos_z = position.0.z,
-        chunk_x = chunk.x,
-        chunk_z = chunk.z,
+        chunk_x = chunk.x(),
+        chunk_z = chunk.z(),
         "cluster break snapshot"
     );
 }

@@ -7,6 +7,19 @@ use pumpkin_world::level::is_cluster_secondary;
 
 const DATA_FOLDER: &str = "data/";
 
+fn load_secondary_operator_config(path: &Path) -> op::OperatorConfig {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return op::OperatorConfig::default();
+    };
+    match serde_json::from_str(&contents) {
+        Ok(operators) => operators,
+        Err(error) => {
+            error!(%error, path = %path.display(), "secondary operator bootstrap invalid");
+            op::OperatorConfig::default()
+        }
+    }
+}
+
 pub mod op;
 
 pub mod advancement_data;
@@ -30,7 +43,17 @@ impl VanillaData {
     #[must_use]
     pub fn load() -> Self {
         if is_cluster_secondary() {
-            return Self::empty();
+            let mut data = Self::empty();
+            let ops_path = env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .join(DATA_FOLDER)
+                .join(op::OperatorConfig::get_path());
+            *data
+                .operator_config
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                load_secondary_operator_config(&ops_path);
+            return data;
         }
         Self {
             banned_ip_list: RwLock::new(banned_ip::BannedIpList::load()),
@@ -143,5 +166,34 @@ pub trait SaveJSONConfiguration: LoadJSONConfiguration {
                 path.display()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod cluster_operator_bootstrap_tests {
+    use super::*;
+
+    #[test]
+    fn secondary_operator_bootstrap_reads_existing_file_without_creating_missing_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing").join("ops.json");
+        assert!(load_secondary_operator_config(&missing).ops.is_empty());
+        assert!(!missing.parent().unwrap().exists());
+
+        let existing = directory.path().join("ops.json");
+        let operator = pumpkin_config::op::Op::new(
+            uuid::Uuid::new_v4(),
+            String::from("Operator"),
+            pumpkin_util::PermissionLvl::Four,
+            false,
+        );
+        let encoded = serde_json::to_vec(&op::OperatorConfig {
+            ops: vec![operator],
+        })
+        .unwrap();
+        fs::write(&existing, encoded).unwrap();
+        let loaded = load_secondary_operator_config(&existing);
+        assert_eq!(loaded.ops.len(), 1);
+        assert_eq!(loaded.ops[0].name, "Operator");
     }
 }

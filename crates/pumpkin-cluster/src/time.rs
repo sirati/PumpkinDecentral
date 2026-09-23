@@ -52,6 +52,12 @@ impl TickStamp {
     }
 
     #[must_use]
+    pub const fn is_after(self, older: Self) -> bool {
+        let distance = self.distance_since(older);
+        distance != 0 && distance < 32_768
+    }
+
+    #[must_use]
     pub fn now() -> Self {
         let millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -107,10 +113,7 @@ impl NtpDiscipline {
                 } else if offset > self.max_offset_millis {
                     return None;
                 }
-                Some(TickStamp::from_disciplined_millis(
-                    unix_millis,
-                    offset,
-                ))
+                Some(TickStamp::from_disciplined_millis(unix_millis, offset))
             }
         }
     }
@@ -122,23 +125,21 @@ mod tests {
 
     #[test]
     fn maps_millis_to_ticks() {
-        assert_eq!(
-            TickStamp::from_disciplined_millis(50, 0),
-            TickStamp(1)
-        );
-        assert_eq!(
-            TickStamp::from_disciplined_millis(0, 50),
-            TickStamp(1)
-        );
+        assert_eq!(TickStamp::from_disciplined_millis(50, 0), TickStamp(1));
+        assert_eq!(TickStamp::from_disciplined_millis(0, 50), TickStamp(1));
     }
 
     #[test]
     fn wraps_around() {
         let full = TICKS_PER_WRAP * MILLIS_PER_TICK;
-        assert_eq!(
-            TickStamp::from_disciplined_millis(full, 0),
-            TickStamp(0)
-        );
+        assert_eq!(TickStamp::from_disciplined_millis(full, 0), TickStamp(0));
+    }
+
+    #[test]
+    fn wrapping_order_includes_the_last_unambiguous_distance() {
+        assert!(TickStamp(32_767).is_after(TickStamp(0)));
+        assert!(!TickStamp(32_768).is_after(TickStamp(0)));
+        assert!(TickStamp(0).is_after(TickStamp(u16::MAX)));
     }
 
     #[test]

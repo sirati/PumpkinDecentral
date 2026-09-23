@@ -3,6 +3,36 @@ use super::*;
 
 impl BedrockClient {
     pub fn handle_container_close(&self, player: &Arc<Player>, packet: &SContainerClose) {
+        if player
+            .world()
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            let session = player
+                .cluster_current_inventory_session
+                .load(Ordering::Acquire);
+            let sync_id = player.screen_handler_sync_id.load(Ordering::Acquire);
+            if (session == 0 && packet.container_id != 0 && packet.container_id != 0xff)
+                || (session != 0 && packet.container_id != sync_id)
+            {
+                crate::server::cluster_inventory_protocol::resync_inventory_screen(player);
+                return;
+            }
+            if player.try_on_handled_screen_closed().is_err() {
+                crate::server::cluster_inventory_protocol::resync_inventory_screen(player);
+                return;
+            }
+            if packet.container_id == 0 || packet.container_id == 0xff {
+                self.inventory_opened.store(false, Ordering::Relaxed);
+            }
+            self.try_enqueue_client_packet(&SContainerClose {
+                container_id: packet.container_id,
+                container_type: packet.container_type,
+                server_initiated_close: false,
+            });
+            return;
+        }
         if packet.container_id == 0 || packet.container_id == 0xff {
             self.inventory_opened.store(false, Ordering::Relaxed);
         }

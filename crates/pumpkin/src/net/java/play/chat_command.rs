@@ -9,6 +9,21 @@ impl JavaClient {
         command: &SChatCommand<'_>,
     ) {
         player.update_last_action_time();
+        if server.advanced_config.cluster.enabled {
+            let command_str = command.command.strip_prefix('/').unwrap_or(command.command);
+            if crate::server::cluster_session_ingress::stage(
+                player,
+                crate::server::cluster_session_ingress::StagedSessionInput::Command {
+                    command: command_str.to_string(),
+                    received_at: std::time::Instant::now(),
+                },
+            )
+            .is_err()
+            {
+                player.send_system_message(&TextComponent::text("Cluster command queue is full"));
+            }
+            return;
+        }
         if player.check_chat_spam(server, crate::entity::player::SpamType::Command) {
             return;
         }

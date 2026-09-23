@@ -166,6 +166,17 @@ impl ServerPlayerData {
         }
     }
 
+    pub fn save_cluster_data(
+        &self,
+        uuid: &uuid::Uuid,
+        data: NbtCompound,
+    ) -> Result<(), PlayerDataError> {
+        if pumpkin_world::level::is_cluster_secondary() {
+            return Ok(());
+        }
+        self.storage.save_player_data(uuid, data)
+    }
+
     /// Extracts and saves data from a player.
     ///
     /// This function extracts NBT data from a player and saves it to disk.

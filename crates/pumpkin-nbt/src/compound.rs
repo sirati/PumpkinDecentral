@@ -130,6 +130,18 @@ impl NbtCompound {
         Ok(())
     }
 
+    pub fn serialize_content_canonical<W: NbtWriteHelper>(self, w: &mut W) -> Result<(), Error> {
+        let mut entries: Vec<_> = self.child_tags.into_iter().collect();
+        entries.sort_unstable_by(|first, second| first.0.cmp(&second.0));
+        for (name, tag) in entries {
+            w.write_u8(tag.get_type_id())?;
+            w.write_string(&name)?;
+            tag.serialize_data_canonical(w)?;
+        }
+        w.write_u8(END_ID)?;
+        Ok(())
+    }
+
     /// Returns `true` when the compound contains no child tags.
     #[must_use]
     pub fn is_empty(&self) -> bool {

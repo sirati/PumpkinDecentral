@@ -13,6 +13,7 @@ use crate::command::node::{
     tree::ROOT_NODE_ID,
 };
 use crate::entity::player::Player;
+use crate::net::java::JavaClient;
 use crate::server::Server;
 use pumpkin_protocol::bedrock::client::available_commands::{
     CAvailableCommands, CommandData, EnumData, OverloadData, ParamData, arg_flags, arg_types,
@@ -25,8 +26,20 @@ pub fn send_c_commands_packet(
     server: &Arc<Server>,
     dispatcher: &CommandDispatcher,
 ) {
+    send_java_commands_packet(
+        player.client.java().unwrap_or_else(|| unreachable!()),
+        &player.get_command_source(server),
+        dispatcher,
+    );
+}
+
+#[allow(clippy::too_many_lines)]
+pub fn send_java_commands_packet(
+    client: &JavaClient,
+    source: &crate::command::CommandSource,
+    dispatcher: &CommandDispatcher,
+) {
     let mut proto_nodes: Vec<ProtoNode> = Vec::with_capacity(dispatcher.tree.len());
-    let source = &super::CommandSender::Player(player.clone()).into_source(server);
     for node in &dispatcher.tree {
         let children: Box<[VarInt]> = match node {
             AttachedNode::Root(_) => {
@@ -143,7 +156,7 @@ pub fn send_c_commands_packet(
 
     let root_node_index = ROOT_NODE_ID.0.get() - 1;
     let packet = CCommands::new(proto_nodes.into(), VarInt(root_node_index as i32));
-    player.try_send_client_packet(&packet);
+    client.try_send_packet(&packet);
 }
 
 struct BuilderContext<'a> {

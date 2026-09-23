@@ -79,12 +79,7 @@ pub struct TeamChatBroadcast {
 
 impl TeamChatBroadcast {
     #[must_use]
-    pub fn new(
-        sender: GlobalPlayerId,
-        sender_name: String,
-        team: String,
-        body: String,
-    ) -> Self {
+    pub fn new(sender: GlobalPlayerId, sender_name: String, team: String, body: String) -> Self {
         Self {
             sender,
             sender_name,
@@ -139,6 +134,30 @@ pub enum ChatControlMessage {
     Say(SayChatBroadcast),
 }
 
+#[must_use]
+pub fn chat_origin(message: &ChatControlMessage) -> ServerId {
+    match message {
+        ChatControlMessage::Public(value) => value.sender.server,
+        ChatControlMessage::Private(value) => value.from.server,
+        ChatControlMessage::Team(value) => value.sender.server,
+        ChatControlMessage::Emote(value) => value.sender.server,
+        ChatControlMessage::Say(value) => value.sender.server,
+    }
+}
+
+#[must_use]
+pub fn authorized_chat_message(
+    local: ServerId,
+    source: ServerId,
+    parcel_generation: u64,
+    current_generation: Option<u64>,
+    message: &ChatControlMessage,
+) -> bool {
+    source != local
+        && current_generation == Some(parcel_generation)
+        && chat_origin(message) == source
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatParcel {
     pub peer: u16,
@@ -173,9 +192,7 @@ pub fn canonical_chat_key(name: &str) -> String {
     name.to_lowercase()
 }
 
-pub fn encode_control_message(
-    message: &ChatControlMessage,
-) -> Result<Vec<u8>, ChatSyncError> {
+pub fn encode_control_message(message: &ChatControlMessage) -> Result<Vec<u8>, ChatSyncError> {
     postcard::to_allocvec(message).map_err(|error| ChatSyncError {
         message: format!("encode chat control: {error}"),
     })
@@ -227,9 +244,7 @@ pub fn say_parcels_for_peers(
     control_parcels_for_peers(&ChatControlMessage::Say(broadcast.clone()), peers)
 }
 
-pub fn private_parcel_for_host(
-    request: &PrivateChatRequest,
-) -> Result<ChatParcel, ChatSyncError> {
+pub fn private_parcel_for_host(request: &PrivateChatRequest) -> Result<ChatParcel, ChatSyncError> {
     let bytes = encode_control_message(&ChatControlMessage::Private(request.clone()))?;
     Ok(ChatParcel::new(
         request.to.server.0,
@@ -427,9 +442,7 @@ pub fn handle_chat_bytes(
 ) -> Result<ChatInboundEffect, ChatSyncError> {
     let message = decode_control_message(bytes)?;
     Ok(match message {
-        ChatControlMessage::Public(broadcast) => {
-            ChatInboundEffect::PublicDelivery(broadcast)
-        }
+        ChatControlMessage::Public(broadcast) => ChatInboundEffect::PublicDelivery(broadcast),
         ChatControlMessage::Private(request) => {
             if should_deliver_private_locally(&request, local) {
                 ChatInboundEffect::PrivateDelivery(request)
@@ -525,11 +538,7 @@ mod tests {
     }
 
     fn emote() -> EmoteChatBroadcast {
-        EmoteChatBroadcast::new(
-            gid(1, 1),
-            String::from("Alice"),
-            String::from("waves"),
-        )
+        EmoteChatBroadcast::new(gid(1, 1), String::from("Alice"), String::from("waves"))
     }
 
     #[test]
@@ -541,10 +550,14 @@ mod tests {
     fn body_and_name_validation() {
         assert!(is_valid_chat_body("hi"));
         assert!(!is_valid_chat_body(""));
-        assert!(!is_valid_chat_body(str::repeat("x", MAX_CHAT_BODY_LEN + 1).as_str()));
+        assert!(!is_valid_chat_body(
+            str::repeat("x", MAX_CHAT_BODY_LEN + 1).as_str()
+        ));
         assert!(is_valid_chat_name("Alice"));
         assert!(!is_valid_chat_name(""));
-        assert!(!is_valid_chat_name(str::repeat("y", MAX_CHAT_NAME_LEN + 1).as_str()));
+        assert!(!is_valid_chat_name(
+            str::repeat("y", MAX_CHAT_NAME_LEN + 1).as_str()
+        ));
     }
 
     #[test]
@@ -589,37 +602,73 @@ mod tests {
     #[test]
     fn private_routes_by_global_id() {
         let snapshot = directory();
-        let local =
-            resolve_private_by_name(&snapshot, gid(2, 7), String::from("Bob"), "alice", String::from("hi"))
-                .unwrap();
+        let local = resolve_private_by_name(
+            &snapshot,
+            gid(2, 7),
+            String::from("Bob"),
+            "alice",
+            String::from("hi"),
+        )
+        .unwrap();
         assert!(local.local);
         assert_eq!(local.target, gid(1, 1));
-        let remote =
-            resolve_private_by_name(&snapshot, gid(1, 1), String::from("Alice"), "BOB", String::from("hi"))
-                .unwrap();
+        let remote = resolve_private_by_name(
+            &snapshot,
+            gid(1, 1),
+            String::from("Alice"),
+            "BOB",
+            String::from("hi"),
+        )
+        .unwrap();
         assert!(!remote.local);
         assert_eq!(remote.target, gid(2, 7));
         assert_eq!(remote.request.to_name, String::from("Bob"));
         assert!(
-            resolve_private_by_name(&snapshot, gid(1, 1), String::from("Alice"), "Nobody", String::from("hi"))
-                .is_none()
+            resolve_private_by_name(
+                &snapshot,
+                gid(1, 1),
+                String::from("Alice"),
+                "Nobody",
+                String::from("hi")
+            )
+            .is_none()
         );
         assert!(
-            resolve_private_by_name(&snapshot, gid(1, 1), String::from("Alice"), "alice", String::from("hi"))
-                .is_none()
+            resolve_private_by_name(
+                &snapshot,
+                gid(1, 1),
+                String::from("Alice"),
+                "alice",
+                String::from("hi")
+            )
+            .is_none()
         );
-        let by_id =
-            resolve_private_by_id(&snapshot, gid(1, 1), String::from("Alice"), gid(2, 7), String::from("hi"))
-                .unwrap();
+        let by_id = resolve_private_by_id(
+            &snapshot,
+            gid(1, 1),
+            String::from("Alice"),
+            gid(2, 7),
+            String::from("hi"),
+        )
+        .unwrap();
         assert_eq!(by_id.request, remote.request);
         assert!(
-            resolve_private_by_id(&snapshot, gid(1, 1), String::from("Alice"), gid(9, 9), String::from("hi"))
-                .is_none()
+            resolve_private_by_id(
+                &snapshot,
+                gid(1, 1),
+                String::from("Alice"),
+                gid(9, 9),
+                String::from("hi")
+            )
+            .is_none()
         );
         let parcel = private_parcel_for_host(&remote.request).unwrap();
         assert_eq!(parcel.peer, 2);
         assert!(should_deliver_private_locally(&remote.request, ServerId(2)));
-        assert!(!should_deliver_private_locally(&remote.request, ServerId(1)));
+        assert!(!should_deliver_private_locally(
+            &remote.request,
+            ServerId(1)
+        ));
     }
 
     #[test]
@@ -643,8 +692,14 @@ mod tests {
             snapshot.completion_names("b"),
             vec![String::from("Bob"), String::from("Bobby")]
         );
-        assert_eq!(snapshot.completion_names("BO"), vec![String::from("Bob"), String::from("Bobby")]);
-        assert_eq!(snapshot.completion_names("ali"), vec![String::from("Alice")]);
+        assert_eq!(
+            snapshot.completion_names("BO"),
+            vec![String::from("Bob"), String::from("Bobby")]
+        );
+        assert_eq!(
+            snapshot.completion_names("ali"),
+            vec![String::from("Alice")]
+        );
         assert!(snapshot.completion_names("zzz").is_empty());
         assert_eq!(snapshot.all_names().len(), 3);
     }
@@ -668,6 +723,32 @@ mod tests {
         let bytes = encode_control_message(&ChatControlMessage::Say(say())).unwrap();
         let effect = handle_chat_bytes(ServerId(2), &bytes).unwrap();
         assert!(matches!(effect, ChatInboundEffect::SayDelivery(_)));
+    }
+
+    #[test]
+    fn inbound_chat_requires_its_live_origin_connection() {
+        let message = ChatControlMessage::Public(public());
+        assert!(authorized_chat_message(
+            ServerId(2),
+            ServerId(1),
+            12,
+            Some(12),
+            &message,
+        ));
+        assert!(!authorized_chat_message(
+            ServerId(2),
+            ServerId(3),
+            12,
+            Some(12),
+            &message,
+        ));
+        assert!(!authorized_chat_message(
+            ServerId(2),
+            ServerId(1),
+            11,
+            Some(12),
+            &message,
+        ));
     }
 
     #[tokio::test]
@@ -699,7 +780,9 @@ mod tests {
             };
             answer_completion_query(&snapshot, query);
         });
-        let names = query_completion_names(&tx, String::from("b")).await.unwrap();
+        let names = query_completion_names(&tx, String::from("b"))
+            .await
+            .unwrap();
         assert_eq!(names, vec![String::from("Bob"), String::from("Bobby")]);
         task.await.unwrap();
     }

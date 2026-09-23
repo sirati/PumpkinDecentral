@@ -172,7 +172,9 @@ fn send_world_time(context: &CommandContext) {
         ),
         None => "World time unavailable".to_owned(),
     };
-    context.source.send_feedback(TextComponent::text(line), false);
+    context
+        .source
+        .send_feedback(TextComponent::text(line), false);
 }
 
 fn send_ntp_time(context: &CommandContext) {
@@ -245,10 +247,7 @@ impl CommandExecutor for SyncstatsChunkAtExecutor {
     }
 }
 
-fn execute_single_chunk(
-    context: &CommandContext,
-    position: Vector2<i32>,
-) -> CommandExecutorResult {
+fn execute_single_chunk(context: &CommandContext, position: Vector2<i32>) -> CommandExecutorResult {
     let level = &context.source.world().level;
     let item = pending_for_chunk(level, position);
     let totals = collect_pending_totals(level);
@@ -272,15 +271,10 @@ pub fn register(dispatcher: &mut CommandDispatcher, registry: &PermissionRegistr
             .requires(PERMISSION)
             .executes(SyncstatsAllExecutor)
             .then(literal("all").executes(SyncstatsAllExecutor))
-            .then(
-                literal("chunk")
-                    .executes(SyncstatsChunkSelfExecutor)
-                    .then(
-                        argument(ARG_X, IntegerArgumentType::any()).then(
-                            argument(ARG_Z, IntegerArgumentType::any())
-                                .executes(SyncstatsChunkAtExecutor),
-                        ),
-                    ),
-            ),
+            .then(literal("chunk").executes(SyncstatsChunkSelfExecutor).then(
+                argument(ARG_X, IntegerArgumentType::any()).then(
+                    argument(ARG_Z, IntegerArgumentType::any()).executes(SyncstatsChunkAtExecutor),
+                ),
+            )),
     );
 }

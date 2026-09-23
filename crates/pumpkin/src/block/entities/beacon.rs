@@ -1,3 +1,4 @@
+use arc_swap::ArcSwap;
 use pumpkin_data::data_component_impl::IDSetContent;
 use pumpkin_data::tag::Taggable;
 use std::any::Any;
@@ -20,7 +21,7 @@ pub struct BeaconBlockEntity {
     pub secondary_effect: AtomicI32,
     pub levels: AtomicI32,
     pub dirty: AtomicBool,
-    pub payment: Arc<Mutex<ItemStack>>,
+    pub payment: ArcSwap<ItemStack>,
 
     // Vanilla Parity Fields
     pub custom_name: Mutex<Option<String>>,
@@ -45,7 +46,7 @@ impl BeaconBlockEntity {
             secondary_effect: AtomicI32::new(-1),
             levels: AtomicI32::new(0),
             dirty: AtomicBool::new(false),
-            payment: Arc::new(Mutex::new(ItemStack::EMPTY.clone())),
+            payment: ArcSwap::from_pointee(ItemStack::EMPTY.clone()),
             custom_name: Mutex::new(None),
             lock_key: Mutex::new(None),
             last_check_y: AtomicI32::new(position.0.y - 1),
@@ -269,7 +270,7 @@ impl BlockEntity for BeaconBlockEntity {
             secondary_effect: AtomicI32::new(secondary),
             levels: AtomicI32::new(levels),
             dirty: AtomicBool::new(false),
-            payment: Arc::new(Mutex::new(ItemStack::EMPTY.clone())),
+            payment: ArcSwap::from_pointee(ItemStack::EMPTY.clone()),
             custom_name: Mutex::new(custom_name),
             lock_key: Mutex::new(lock_key),
             last_check_y: AtomicI32::new(position.0.y - 1),
@@ -366,18 +367,12 @@ impl Inventory for BeaconBlockEntity {
     }
 
     fn is_empty(&self) -> bool {
-        self.payment
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty()
+        self.payment.load().is_empty()
     }
 
     fn get_stack(&self, slot: usize) -> ItemStack {
         if slot == 0 {
-            self.payment
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
+            self.payment.load_full().as_ref().clone()
         } else {
             ItemStack::EMPTY.clone()
         }
@@ -385,14 +380,9 @@ impl Inventory for BeaconBlockEntity {
 
     fn remove_stack(&self, slot: usize) -> ItemStack {
         if slot == 0 {
-            let mut removed = ItemStack::EMPTY.clone();
-            let mut guard = self
-                .payment
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            std::mem::swap(&mut removed, &mut *guard);
+            let removed = self.payment.swap(Arc::new(ItemStack::EMPTY.clone()));
             self.mark_dirty();
-            removed
+            removed.as_ref().clone()
         } else {
             ItemStack::EMPTY.clone()
         }
@@ -400,16 +390,18 @@ impl Inventory for BeaconBlockEntity {
 
     fn remove_stack_specific(&self, slot: usize, amount: u8) -> ItemStack {
         if slot == 0 {
-            let mut stack = self
-                .payment
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if stack.is_empty() {
-                return ItemStack::EMPTY.clone();
-            }
-            let res = stack.split(amount);
+            let mut removed = ItemStack::EMPTY.clone();
+            self.payment.rcu(|current| {
+                let mut next = current.as_ref().clone();
+                removed = if next.is_empty() {
+                    ItemStack::EMPTY.clone()
+                } else {
+                    next.split(amount)
+                };
+                Arc::new(next)
+            });
             self.mark_dirty();
-            res
+            removed
         } else {
             ItemStack::EMPTY.clone()
         }
@@ -417,10 +409,7 @@ impl Inventory for BeaconBlockEntity {
 
     fn set_stack(&self, slot: usize, stack: ItemStack) {
         if slot == 0 {
-            *self
-                .payment
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = stack;
+            self.payment.store(Arc::new(stack));
             self.mark_dirty();
         }
     }
@@ -436,8 +425,52 @@ impl Inventory for BeaconBlockEntity {
 
 impl Clearable for BeaconBlockEntity {
     fn clear(&self) {
-        if let Ok(mut payment) = self.payment.try_lock() {
-            *payment = ItemStack::EMPTY.clone();
-        }
+        self.payment.store(Arc::new(ItemStack::EMPTY.clone()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pumpkin_data::item::Item;
+
+    #[test]
+    fn payment_split_and_removal_conserve_items() {
+        let beacon = BeaconBlockEntity::new(BlockPos::new(0, 80, 0));
+        beacon.set_stack(0, ItemStack::new(5, &Item::DIAMOND));
+        let taken = beacon.remove_stack_specific(0, 2);
+        assert_eq!(taken.item_count, 2);
+        assert_eq!(beacon.get_stack(0).item_count, 3);
+        let remaining = beacon.remove_stack(0);
+        assert_eq!(remaining.item_count, 3);
+        assert!(beacon.get_stack(0).is_empty());
+        beacon.set_stack(0, ItemStack::new(1, &Item::DIAMOND));
+        beacon.clear();
+        assert!(beacon.get_stack(0).is_empty());
+    }
+
+    #[test]
+    fn concurrent_payment_splits_return_only_committed_items() {
+        let beacon = BeaconBlockEntity::new(BlockPos::new(0, 80, 0));
+        beacon.set_stack(0, ItemStack::new(5, &Item::DIAMOND));
+        let barrier = std::sync::Barrier::new(3);
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                barrier.wait();
+                beacon.remove_stack_specific(0, 4)
+            });
+            let second = scope.spawn(|| {
+                barrier.wait();
+                beacon.remove_stack_specific(0, 4)
+            });
+            barrier.wait();
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        let total = u16::from(first.item_count)
+            + u16::from(second.item_count)
+            + u16::from(beacon.get_stack(0).item_count);
+        assert_eq!(total, 5);
+        assert!(beacon.get_stack(0).is_empty());
+        assert_ne!(first.item_count, second.item_count);
     }
 }

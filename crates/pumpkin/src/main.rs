@@ -75,11 +75,7 @@ async fn main() {
             && matches!(config.advanced.cluster.role, ClusterRole::Secondary),
     );
 
-    let vanilla_data = if pumpkin_world::level::is_cluster_secondary() {
-        VanillaData::empty()
-    } else {
-        VanillaData::load()
-    };
+    let vanilla_data = VanillaData::load();
 
     pumpkin::init_logger(&config.advanced);
 

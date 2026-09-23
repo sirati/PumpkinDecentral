@@ -1,4 +1,6 @@
+use arc_swap::ArcSwap;
 use rustc_hash::FxHashMap;
+use std::sync::Arc;
 
 use pumpkin_data::scoreboard::ScoreboardDisplaySlot;
 use pumpkin_protocol::{
@@ -118,12 +120,26 @@ pub struct Scoreboard {
     display_slots: FxHashMap<ScoreboardDisplaySlot, String>,
     scores: FxHashMap<String, FxHashMap<String, ScoreboardScore>>,
     teams: FxHashMap<String, Team>,
+    team_snapshot: Option<Arc<ArcSwap<FxHashMap<String, Team>>>>,
 }
 
 impl Scoreboard {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_team_snapshot(snapshot: Arc<ArcSwap<FxHashMap<String, Team>>>) -> Self {
+        Self {
+            team_snapshot: Some(snapshot),
+            ..Self::default()
+        }
+    }
+
+    fn publish_teams(&self) {
+        if let Some(snapshot) = self.team_snapshot.as_ref() {
+            snapshot.store(Arc::new(self.teams.clone()));
+        }
     }
 
     #[must_use]
@@ -502,6 +518,7 @@ impl Scoreboard {
         });
 
         self.teams.insert(team.name.clone(), team);
+        self.publish_teams();
     }
 
     pub fn create_team(&mut self, target: &impl ScoreboardTarget, team: Team) {
@@ -532,6 +549,7 @@ impl Scoreboard {
         });
 
         self.teams.insert(team.name.clone(), team);
+        self.publish_teams();
     }
 
     pub fn remove_team(&mut self, target: &impl ScoreboardTarget, name: &str) {
@@ -548,6 +566,7 @@ impl Scoreboard {
         });
 
         self.teams.remove(name);
+        self.publish_teams();
     }
 
     pub fn add_player_to_team(
@@ -576,6 +595,7 @@ impl Scoreboard {
         });
 
         team.players.push(player);
+        self.publish_teams();
     }
 
     pub fn remove_player_from_team(
@@ -604,6 +624,7 @@ impl Scoreboard {
         });
 
         team.players.retain(|p| p != player);
+        self.publish_teams();
     }
 
     pub fn clear_team_players(&mut self, target: &impl ScoreboardTarget, team_name: &str) {
@@ -628,6 +649,7 @@ impl Scoreboard {
         });
 
         team.players.clear();
+        self.publish_teams();
     }
 
     pub fn send_to_player(&self, player: &Player) {
@@ -824,6 +846,40 @@ pub struct Team {
     pub player_prefix: TextComponent,
     pub player_suffix: TextComponent,
     pub players: Vec<String>,
+}
+
+#[cfg(test)]
+mod cluster_team_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn team_membership_publication_preserves_prior_reader_snapshot() {
+        let published = Arc::new(ArcSwap::from_pointee(FxHashMap::default()));
+        let mut board = Scoreboard::with_team_snapshot(Arc::clone(&published));
+        board.add_team(
+            &NoTarget,
+            Team {
+                name: String::from("red"),
+                display_name: TextComponent::text("Red"),
+                options: 0,
+                nametag_visibility: NameTagVisibility::Always,
+                collision_rule: CollisionRule::Always,
+                color: NamedColor::Red,
+                player_prefix: TextComponent::empty(),
+                player_suffix: TextComponent::empty(),
+                players: Vec::new(),
+            },
+        );
+        let before = published.load_full();
+        board.add_player_to_team(&NoTarget, "red", String::from("Alice"));
+        assert!(before.get("red").unwrap().players.is_empty());
+        assert_eq!(
+            published.load().get("red").unwrap().players,
+            vec![String::from("Alice")]
+        );
+        board.remove_team(&NoTarget, "red");
+        assert!(published.load().get("red").is_none());
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

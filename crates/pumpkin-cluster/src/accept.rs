@@ -22,22 +22,21 @@
 //! and gates application.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::buckets::BucketTable;
 use crate::identity::GlobalPlayerId;
-use crate::protocol::{BlockPos, ChunkAddr, EntityRef};
+use crate::protocol::{BlockPos, ChunkKey, EntityRef};
 use crate::time::TickStamp;
 
 /// Stable identity of one contested outcome inside a tick.
 ///
 /// Tags keep block, entity, and player conflicts in disjoint key spaces so a
 /// single winner map can resolve every conflict deterministically.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ConflictKey {
     pub tag: u8,
     pub payload: [u8; 12],
@@ -57,8 +56,7 @@ impl ConflictKey {
         Self {
             tag: Self::BLOCK_TAG,
             payload: [
-                x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3], z[0], z[1],
-                z[2], z[3],
+                x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3], z[0], z[1], z[2], z[3],
             ],
         }
     }
@@ -66,12 +64,23 @@ impl ConflictKey {
     /// Encodes an entity reference into the entity key space.
     #[must_use]
     pub const fn for_entity(target: EntityRef) -> Self {
-        let owner = target.owner.0.to_le_bytes();
+        let owner = target.origin.0.to_le_bytes();
         let id = target.local_id.to_le_bytes();
+        let generation = target.generation.to_le_bytes();
         Self {
             tag: Self::ENTITY_TAG,
             payload: [
-                owner[0], owner[1], id[0], id[1], id[2], id[3], 0, 0, 0, 0, 0,
+                owner[0],
+                owner[1],
+                id[0],
+                id[1],
+                id[2],
+                id[3],
+                generation[0],
+                generation[1],
+                generation[2],
+                generation[3],
+                0,
                 0,
             ],
         }
@@ -85,8 +94,7 @@ impl ConflictKey {
         Self {
             tag: Self::PLAYER_TAG,
             payload: [
-                server[0], server[1], player[0], player[1], 0, 0, 0, 0, 0, 0,
-                0, 0,
+                server[0], server[1], player[0], player[1], 0, 0, 0, 0, 0, 0, 0, 0,
             ],
         }
     }
@@ -99,7 +107,7 @@ impl ConflictKey {
 /// advertises holder peers the voter discovered after the tick started.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkDecision {
-    pub chunk: ChunkAddr,
+    pub chunk: ChunkKey,
     pub accepted_gids: Vec<GlobalPlayerId>,
     pub winners: Vec<(ConflictKey, GlobalPlayerId)>,
     pub new_holders: Vec<u16>,
@@ -153,7 +161,8 @@ impl AcceptBatch {
         for decision in &mut self.decisions {
             decision.normalize();
         }
-        self.decisions.sort_by(|left, right| left.chunk.cmp(&right.chunk));
+        self.decisions
+            .sort_by(|left, right| left.chunk.cmp(&right.chunk));
     }
 }
 
@@ -163,7 +172,7 @@ impl AcceptBatch {
 /// value explicitly; [`build_accept`] converts and normalizes outcomes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalChunkOutcome {
-    pub chunk: ChunkAddr,
+    pub chunk: ChunkKey,
     pub accepted_gids: Vec<GlobalPlayerId>,
     pub winners: Vec<(ConflictKey, GlobalPlayerId)>,
     pub new_holders: Vec<u16>,
@@ -172,7 +181,7 @@ pub struct LocalChunkOutcome {
 /// Builds a canonical vote: normalized payloads sorted by chunk.
 ///
 /// Every decision is sorted and deduped first, then decisions are ordered by
-/// [`ChunkAddr`], so all peers produce byte-identical votes for identical
+/// [`ChunkKey`], so all peers produce byte-identical votes for identical
 /// outcomes and duplicate deliveries stay `==`-comparable downstream.
 #[must_use]
 pub fn build_accept(tick: TickStamp, local_outcomes: Vec<LocalChunkOutcome>) -> AcceptBatch {
@@ -230,8 +239,88 @@ pub fn decode_accept(bytes: &[u8]) -> Result<AcceptBatch, AcceptCodecError> {
 #[derive(Debug, Default)]
 pub struct Acceptor {
     table: BucketTable,
-    seen: HashSet<(TickStamp, ChunkAddr, u16)>,
+    seen: HashSet<(TickStamp, ChunkKey, u16)>,
     buffered: HashMap<TickStamp, Vec<AcceptBatch>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptanceDelayLevel {
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcceptanceDelayDiagnostic {
+    pub tick: TickStamp,
+    pub delayed_seconds: u64,
+    pub level: AcceptanceDelayLevel,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AcceptanceDelayEmission {
+    threshold_seconds: u64,
+    level: AcceptanceDelayLevel,
+    emitted_at: Duration,
+}
+
+#[derive(Debug, Default)]
+pub struct AcceptanceDelayTracker {
+    first_seen: HashMap<TickStamp, Duration>,
+    emissions: HashMap<TickStamp, AcceptanceDelayEmission>,
+}
+
+impl AcceptanceDelayTracker {
+    #[must_use]
+    pub fn observe(
+        &mut self,
+        now: Duration,
+        pending_ticks: &[TickStamp],
+    ) -> Vec<AcceptanceDelayDiagnostic> {
+        let pending: HashSet<_> = pending_ticks.iter().copied().collect();
+        self.first_seen.retain(|tick, _| pending.contains(tick));
+        self.emissions.retain(|tick, emission| {
+            pending.contains(tick)
+                || now.saturating_sub(emission.emitted_at) < Duration::from_secs(300)
+        });
+
+        let mut diagnostics = Vec::new();
+        for tick in pending_ticks {
+            let first_seen = *self.first_seen.entry(*tick).or_insert(now);
+            let elapsed = now.saturating_sub(first_seen);
+            if elapsed <= Duration::from_secs(10) {
+                continue;
+            }
+            let threshold_seconds = (elapsed.as_secs() / 10) * 10;
+            let level = if elapsed > Duration::from_secs(60) {
+                AcceptanceDelayLevel::Error
+            } else {
+                AcceptanceDelayLevel::Warning
+            };
+            let should_emit = self.emissions.get(tick).is_none_or(|emission| {
+                threshold_seconds > emission.threshold_seconds
+                    || (level == AcceptanceDelayLevel::Error
+                        && emission.level == AcceptanceDelayLevel::Warning)
+                    || now.saturating_sub(emission.emitted_at) >= Duration::from_secs(300)
+            });
+            if !should_emit {
+                continue;
+            }
+            self.emissions.insert(
+                *tick,
+                AcceptanceDelayEmission {
+                    threshold_seconds,
+                    level,
+                    emitted_at: now,
+                },
+            );
+            diagnostics.push(AcceptanceDelayDiagnostic {
+                tick: *tick,
+                delayed_seconds: threshold_seconds,
+                level,
+            });
+        }
+        diagnostics
+    }
 }
 
 impl Acceptor {
@@ -248,7 +337,7 @@ impl Acceptor {
     }
 
     /// Declares which holder peers must accept `chunk` at `tick`.
-    pub fn require(&mut self, tick: TickStamp, chunk: ChunkAddr, holders: &[u16]) {
+    pub fn require(&mut self, tick: TickStamp, chunk: ChunkKey, holders: &[u16]) {
         self.table.require(tick, chunk, holders);
     }
 
@@ -266,16 +355,13 @@ impl Acceptor {
             let mut fresh: Vec<u16> = Vec::new();
             for gid in &decision.accepted_gids {
                 let peer = gid.server.0;
-                if self.seen.insert((batch.tick, decision.chunk, peer))
-                    && !fresh.contains(&peer)
-                {
+                if self.seen.insert((batch.tick, decision.chunk, peer)) && !fresh.contains(&peer) {
                     fresh.push(peer);
                 }
             }
             if !fresh.is_empty() {
                 fresh.sort_unstable();
-                self.table
-                    .accept_peers(batch.tick, decision.chunk, &fresh);
+                self.table.accept_peers(batch.tick, decision.chunk, &fresh);
             }
         }
         let slot = self.buffered.entry(batch.tick).or_default();
@@ -300,7 +386,7 @@ impl Acceptor {
 
     /// Lists required holders of `chunk` that have not accepted `tick`, sorted.
     #[must_use]
-    pub fn missing_holders(&self, tick: TickStamp, chunk: ChunkAddr) -> Vec<u16> {
+    pub fn missing_holders(&self, tick: TickStamp, chunk: ChunkKey) -> Vec<u16> {
         self.table.missing(tick, chunk)
     }
 
@@ -308,6 +394,11 @@ impl Acceptor {
     #[must_use]
     pub fn pending_ticks(&self) -> usize {
         self.table.pending_ticks()
+    }
+
+    #[must_use]
+    pub fn pending_tick_stamps(&self) -> Vec<TickStamp> {
+        self.table.pending_tick_stamps()
     }
 
     /// Counts ticks with at least one buffered vote.
@@ -336,39 +427,19 @@ impl Acceptor {
         from_table || from_buffer
     }
 
-    pub fn drain_all_without_waiting(&mut self) -> usize {
-        let dropped = self.table.drain_all_without_waiting();
-        self.seen.clear();
-        let buffered = self.buffered.len();
-        self.buffered.clear();
-        dropped.max(buffered)
-    }
-
     pub fn evict_holder(&mut self, peer: u16) -> usize {
         self.seen.retain(|key| key.2 != peer);
         for batches in self.buffered.values_mut() {
             batches.retain(|batch| {
                 !batch.decisions.iter().all(|decision| {
-                    decision.accepted_gids.iter().all(|gid| gid.server.0 == peer)
+                    decision
+                        .accepted_gids
+                        .iter()
+                        .all(|gid| gid.server.0 == peer)
                 })
             });
         }
         self.table.evict_holder(peer)
-    }
-
-    pub fn expire_stale(&mut self, max_ticks: usize) -> usize {
-        let dropped = self.table.expire_stale(max_ticks);
-        if self.buffered.len() > max_ticks {
-            let mut ticks: Vec<TickStamp> = self.buffered.keys().copied().collect();
-            ticks.sort();
-            let drop_count = ticks.len() - max_ticks;
-            for tick in ticks.into_iter().take(drop_count) {
-                self.buffered.remove(&tick);
-                self.seen.retain(|key| key.0 != tick);
-            }
-            return dropped.max(drop_count);
-        }
-        dropped
     }
 }
 
@@ -429,15 +500,11 @@ mod tests {
         GlobalPlayerId::new(ServerId(server), PlayerSlot(player))
     }
 
-    fn chunk(x: i32, z: i32) -> ChunkAddr {
-        ChunkAddr { x, z }
+    fn chunk(x: i32, z: i32) -> ChunkKey {
+        ChunkKey::new(crate::protocol::WorldId::new(0, 7), x, z)
     }
 
-    fn outcome(
-        addr: ChunkAddr,
-        gids: &[GlobalPlayerId],
-        new_holders: &[u16],
-    ) -> LocalChunkOutcome {
+    fn outcome(addr: ChunkKey, gids: &[GlobalPlayerId], new_holders: &[u16]) -> LocalChunkOutcome {
         LocalChunkOutcome {
             chunk: addr,
             accepted_gids: gids.to_vec(),
@@ -468,10 +535,7 @@ mod tests {
         let tick = TickStamp(3);
         let addr = chunk(1, 2);
         acceptor.require(tick, addr, &[1, 2]);
-        let batch = build_accept(
-            tick,
-            vec![outcome(addr, &[gid(1, 0), gid(2, 5)], &[])],
-        );
+        let batch = build_accept(tick, vec![outcome(addr, &[gid(1, 0), gid(2, 5)], &[])]);
         acceptor.apply_accept(batch.clone());
         assert!(acceptor.is_globally_accepted(tick));
         assert_eq!(acceptor.buffered_batches(tick), 1);
@@ -513,8 +577,9 @@ mod tests {
                     (ConflictKey::for_block(block), gid(1, 2)),
                     (
                         ConflictKey::for_entity(EntityRef {
-                            owner: ServerId(1),
+                            origin: ServerId(1),
                             local_id: 77,
+                            generation: 0,
                             chunk: addr,
                         }),
                         gid(2, 0),
@@ -530,11 +595,34 @@ mod tests {
     }
 
     #[test]
+    fn reused_entity_id_has_a_distinct_conflict_key() {
+        let addr = chunk(2, -4);
+        let first = EntityRef {
+            origin: ServerId(3),
+            local_id: 77,
+            generation: 8,
+            chunk: addr,
+        };
+        let replacement = EntityRef {
+            generation: 9,
+            ..first
+        };
+
+        assert_ne!(
+            ConflictKey::for_entity(first),
+            ConflictKey::for_entity(replacement)
+        );
+    }
+
+    #[test]
     fn build_sorts_decisions_by_chunk() {
         let tick = TickStamp(5);
         let batch = build_accept(
             tick,
-            vec![outcome(chunk(9, 0), &[], &[]), outcome(chunk(1, 0), &[], &[])],
+            vec![
+                outcome(chunk(9, 0), &[], &[]),
+                outcome(chunk(1, 0), &[], &[]),
+            ],
         );
         assert_eq!(batch.decisions[0].chunk, chunk(1, 0));
         assert_eq!(batch.decisions[1].chunk, chunk(9, 0));
@@ -557,10 +645,7 @@ mod tests {
                 new_holders: vec![3, 1, 3],
             }],
         );
-        assert_eq!(
-            batch.decisions[0].accepted_gids,
-            vec![gid(1, 0), gid(2, 0)]
-        );
+        assert_eq!(batch.decisions[0].accepted_gids, vec![gid(1, 0), gid(2, 0)]);
         assert_eq!(
             batch.decisions[0].winners,
             vec![
@@ -579,15 +664,64 @@ mod tests {
         acceptor.require(tick, addr, &[1]);
         let items = vec![10_u32, 20_u32];
         let mut applied: Vec<u32> = Vec::new();
-        let ran =
-            apply_if_globally_accepted(&acceptor, tick, &items, |item| applied.push(*item));
+        let ran = apply_if_globally_accepted(&acceptor, tick, &items, |item| applied.push(*item));
         assert_eq!(ran, 0);
         assert!(applied.is_empty());
         acceptor.apply_accept(build_accept(tick, vec![outcome(addr, &[gid(1, 0)], &[])]));
-        let ran =
-            apply_if_globally_accepted(&acceptor, tick, &items, |item| applied.push(*item));
+        let ran = apply_if_globally_accepted(&acceptor, tick, &items, |item| applied.push(*item));
         assert_eq!(ran, 2);
         assert_eq!(applied, items);
+    }
+
+    #[test]
+    fn delayed_acceptance_escalates_and_suppresses_reused_tick() {
+        let tick = TickStamp(7);
+        let mut tracker = AcceptanceDelayTracker::default();
+        assert!(tracker.observe(Duration::ZERO, &[tick]).is_empty());
+        assert!(tracker.observe(Duration::from_secs(10), &[tick]).is_empty());
+
+        let first = tracker.observe(Duration::from_secs(11), &[tick]);
+        assert_eq!(
+            first,
+            vec![AcceptanceDelayDiagnostic {
+                tick,
+                delayed_seconds: 10,
+                level: AcceptanceDelayLevel::Warning,
+            }]
+        );
+        assert!(tracker.observe(Duration::from_secs(19), &[tick]).is_empty());
+        assert_eq!(
+            tracker.observe(Duration::from_secs(21), &[tick])[0].delayed_seconds,
+            20
+        );
+        let sixty = tracker.observe(Duration::from_secs(60), &[tick]);
+        assert_eq!(sixty[0].level, AcceptanceDelayLevel::Warning);
+        assert_eq!(
+            tracker.observe(Duration::from_secs(61), &[tick])[0].level,
+            AcceptanceDelayLevel::Error
+        );
+
+        assert!(tracker.observe(Duration::from_secs(62), &[]).is_empty());
+        assert!(
+            tracker
+                .observe(Duration::from_secs(100), &[tick])
+                .is_empty()
+        );
+        assert!(
+            tracker
+                .observe(Duration::from_secs(111), &[tick])
+                .is_empty()
+        );
+        assert!(tracker.observe(Duration::from_secs(112), &[]).is_empty());
+        assert!(
+            tracker
+                .observe(Duration::from_secs(400), &[tick])
+                .is_empty()
+        );
+        assert_eq!(
+            tracker.observe(Duration::from_secs(411), &[tick])[0].delayed_seconds,
+            10
+        );
     }
 
     #[tokio::test]

@@ -58,8 +58,10 @@ impl BlockBehaviour for BeaconBlock {
             );
 
             // Open the screen using the factory
-            args.player
-                .open_handled_screen(factory.as_ref(), Some(*args.position));
+            args.player.open_handled_screen(
+                factory.as_ref(),
+                crate::entity::player::InventoryScreenSource::Block(*args.position),
+            );
 
             BlockActionResult::Success
         })

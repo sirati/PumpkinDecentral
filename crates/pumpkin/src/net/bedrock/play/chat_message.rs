@@ -9,6 +9,22 @@ impl BedrockClient {
         packet: SText<'_>,
     ) {
         player.update_last_action_time();
+        if server.advanced_config.cluster.enabled && !server.basic_config.allow_chat_reports {
+            if crate::server::cluster_session_ingress::stage(
+                player,
+                crate::server::cluster_session_ingress::StagedSessionInput::Bedrock {
+                    body: packet.message.into_owned(),
+                    xuid: packet.xuid.into_owned(),
+                    filtered: packet.filtered_message.map(std::borrow::Cow::into_owned),
+                    received_at: std::time::Instant::now(),
+                },
+            )
+            .is_err()
+            {
+                player.send_system_message(&TextComponent::text("Cluster chat queue is full"));
+            }
+            return;
+        }
         if player.check_chat_spam(server, crate::entity::player::SpamType::Chat) {
             return;
         }
@@ -28,9 +44,13 @@ impl BedrockClient {
                     None => event.message.clone(),
                 };
 
-                crate::server::cluster_chat_out::broadcast_public_chat_from_player(
+                let accepted = crate::server::cluster_chat_out::broadcast_public_chat_from_player(
                     server, player, &message,
                 );
+
+                if !accepted {
+                    player.send_system_message(&TextComponent::text("Cluster chat queue is full"));
+                } else {
 
                 let decorated_message = TextComponent::chat_decorated(
                     &config.chat.format,
@@ -56,6 +76,7 @@ impl BedrockClient {
                     );
 
                     entity.world.load().broadcast_editioned(&je_packet, &be_packet);
+                }
                 }
             }
         }}

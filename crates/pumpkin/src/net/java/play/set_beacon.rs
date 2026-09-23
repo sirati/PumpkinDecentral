@@ -37,12 +37,7 @@ impl JavaClient {
             };
 
             // Check if payment slot has an item
-            if beacon_entity
-                .payment
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty()
-            {
+            if beacon_entity.payment.load().is_empty() {
                 return;
             }
 

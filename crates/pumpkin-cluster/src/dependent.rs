@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::buckets::BucketTable;
 use crate::identity::{GlobalPlayerId, PlayerSeq, ServerId};
-use crate::protocol::{BlockPos, BlockUndo, ChunkAddr, StreamKind};
+use crate::protocol::{BlockPos, BlockUndo, ChunkKey, StreamKind, WorldId};
 use crate::reconcile::ReconcilePlan;
 use crate::time::TickStamp;
 
@@ -24,12 +24,7 @@ pub struct DependentCause {
 
 impl DependentCause {
     #[must_use]
-    pub const fn new(
-        gid: GlobalPlayerId,
-        seq: PlayerSeq,
-        tick: TickStamp,
-        pos: BlockPos,
-    ) -> Self {
+    pub const fn new(gid: GlobalPlayerId, seq: PlayerSeq, tick: TickStamp, pos: BlockPos) -> Self {
         Self {
             gid,
             seq,
@@ -42,7 +37,7 @@ impl DependentCause {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComparatorDependentUpdate {
     pub holder: ServerId,
-    pub chunk: ChunkAddr,
+    pub chunk: ChunkKey,
     pub tick: TickStamp,
     pub target: BlockPos,
     pub cause: DependentCause,
@@ -59,7 +54,7 @@ impl ComparatorDependentUpdate {
     }
 
     #[must_use]
-    pub const fn chunk(&self) -> ChunkAddr {
+    pub const fn chunk(&self) -> ChunkKey {
         self.chunk
     }
 
@@ -77,7 +72,7 @@ impl ComparatorDependentUpdate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObserverDependentUpdate {
     pub holder: ServerId,
-    pub chunk: ChunkAddr,
+    pub chunk: ChunkKey,
     pub tick: TickStamp,
     pub target: BlockPos,
     pub cause: DependentCause,
@@ -94,7 +89,7 @@ impl ObserverDependentUpdate {
     }
 
     #[must_use]
-    pub const fn chunk(&self) -> ChunkAddr {
+    pub const fn chunk(&self) -> ChunkKey {
         self.chunk
     }
 
@@ -122,7 +117,7 @@ impl DependentUpdate {
     }
 
     #[must_use]
-    pub fn chunk(&self) -> ChunkAddr {
+    pub fn chunk(&self) -> ChunkKey {
         match *self {
             Self::Comparator(update) => update.chunk,
             Self::Observer(update) => update.chunk,
@@ -413,11 +408,8 @@ fn dependent_codec_error(context: &str, error: postcard::Error) -> DependentCode
 }
 
 #[must_use]
-pub const fn chunk_of_block(x: i32, z: i32) -> ChunkAddr {
-    ChunkAddr {
-        x: x.div_euclid(16),
-        z: z.div_euclid(16),
-    }
+pub const fn chunk_of_block(world: WorldId, x: i32, z: i32) -> ChunkKey {
+    ChunkKey::new(world, x.div_euclid(16), z.div_euclid(16))
 }
 
 #[must_use]
@@ -433,7 +425,7 @@ pub fn is_dependent_due(fire_tick: TickStamp, now: TickStamp) -> bool {
 #[must_use]
 pub fn capture_comparator(
     holder: ServerId,
-    chunk: ChunkAddr,
+    chunk: ChunkKey,
     tick: TickStamp,
     target: BlockPos,
     cause: DependentCause,
@@ -461,7 +453,7 @@ pub fn capture_comparator(
 #[must_use]
 pub fn capture_observer(
     holder: ServerId,
-    chunk: ChunkAddr,
+    chunk: ChunkKey,
     tick: TickStamp,
     target: BlockPos,
     cause: DependentCause,
@@ -603,8 +595,7 @@ pub fn encode_observer_to_slice<'out>(
     update: &ObserverDependentUpdate,
     out: &'out mut [u8],
 ) -> Result<&'out mut [u8], DependentCodecError> {
-    postcard::to_slice(update, out)
-        .map_err(|error| dependent_codec_error("encode observer", error))
+    postcard::to_slice(update, out).map_err(|error| dependent_codec_error("encode observer", error))
 }
 
 pub fn encoded_observer_len(
@@ -661,8 +652,7 @@ pub fn decode_dependent_batch(bytes: &[u8]) -> Result<DependentBatch, DependentC
 pub fn decode_dependent_batch_prefix(
     bytes: &[u8],
 ) -> Result<(DependentBatch, &[u8]), DependentCodecError> {
-    postcard::take_from_bytes(bytes)
-        .map_err(|error| dependent_codec_error("decode batch", error))
+    postcard::take_from_bytes(bytes).map_err(|error| dependent_codec_error("decode batch", error))
 }
 
 pub fn encode_dependent_batch_into(
@@ -686,9 +676,17 @@ pub fn encoded_dependent_batch_len(batch: &DependentBatch) -> Result<usize, Depe
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DependentDecision {
-    Apply { undo: BlockUndo },
-    Wait { fire_tick: TickStamp, now: TickStamp },
-    Conflict { expected: u16, current: u16 },
+    Apply {
+        undo: BlockUndo,
+    },
+    Wait {
+        fire_tick: TickStamp,
+        now: TickStamp,
+    },
+    Conflict {
+        expected: u16,
+        current: u16,
+    },
 }
 
 #[must_use]
@@ -870,11 +868,11 @@ impl DependentAcceptance {
         &self.table
     }
 
-    pub fn require(&mut self, tick: TickStamp, chunk: ChunkAddr, holders: &[u16]) {
+    pub fn require(&mut self, tick: TickStamp, chunk: ChunkKey, holders: &[u16]) {
         self.table.require(tick, chunk, holders);
     }
 
-    pub fn accept(&mut self, tick: TickStamp, chunk: ChunkAddr, peer: u16, new_holders: &[u16]) {
+    pub fn accept(&mut self, tick: TickStamp, chunk: ChunkKey, peer: u16, new_holders: &[u16]) {
         self.table.accept(tick, chunk, peer, new_holders);
     }
 
@@ -884,7 +882,7 @@ impl DependentAcceptance {
     }
 
     #[must_use]
-    pub fn missing(&self, tick: TickStamp, chunk: ChunkAddr) -> Vec<u16> {
+    pub fn missing(&self, tick: TickStamp, chunk: ChunkKey) -> Vec<u16> {
         self.table.missing(tick, chunk)
     }
 
@@ -911,8 +909,10 @@ mod tests {
         BlockPos { x, y, z }
     }
 
-    fn chunk(x: i32, z: i32) -> ChunkAddr {
-        ChunkAddr { x, z }
+    const WORLD: WorldId = WorldId::new(0, 7);
+
+    fn chunk(x: i32, z: i32) -> ChunkKey {
+        ChunkKey::new(WORLD, x, z)
     }
 
     fn cause() -> DependentCause {
@@ -999,7 +999,9 @@ mod tests {
         assert_eq!(encode_comparator_into(&update, Vec::new()).unwrap(), bytes);
         assert_eq!(encoded_comparator_len(&update).unwrap(), bytes.len());
         let mut slice = vec![0_u8; bytes.len()];
-        let used = encode_comparator_to_slice(&update, &mut slice).unwrap().len();
+        let used = encode_comparator_to_slice(&update, &mut slice)
+            .unwrap()
+            .len();
         assert_eq!(&slice[..used], bytes);
         let (back, rest) = decode_comparator_prefix(&bytes).unwrap();
         assert_eq!(back, update);
@@ -1035,7 +1037,9 @@ mod tests {
         assert_eq!(encode_dependent_into(&update, Vec::new()).unwrap(), bytes);
         assert_eq!(encoded_dependent_len(&update).unwrap(), bytes.len());
         let mut slice = vec![0_u8; bytes.len()];
-        let used = encode_dependent_to_slice(&update, &mut slice).unwrap().len();
+        let used = encode_dependent_to_slice(&update, &mut slice)
+            .unwrap()
+            .len();
         assert_eq!(&slice[..used], bytes);
         let (back, rest) = decode_dependent_prefix(&bytes).unwrap();
         assert_eq!(back, update);
@@ -1051,10 +1055,15 @@ mod tests {
         assert_eq!(DependentBatch::stream_kind(), StreamKind::PlayerWorld);
         let bytes = encode_dependent_batch(&batch).unwrap();
         assert_eq!(decode_dependent_batch(&bytes).unwrap(), batch);
-        assert_eq!(encode_dependent_batch_into(&batch, Vec::new()).unwrap(), bytes);
+        assert_eq!(
+            encode_dependent_batch_into(&batch, Vec::new()).unwrap(),
+            bytes
+        );
         assert_eq!(encoded_dependent_batch_len(&batch).unwrap(), bytes.len());
         let mut slice = vec![0_u8; bytes.len()];
-        let used = encode_dependent_batch_to_slice(&batch, &mut slice).unwrap().len();
+        let used = encode_dependent_batch_to_slice(&batch, &mut slice)
+            .unwrap()
+            .len();
         assert_eq!(&slice[..used], bytes);
         let (back, rest) = decode_dependent_batch_prefix(&bytes).unwrap();
         assert_eq!(back, batch);
@@ -1123,10 +1132,7 @@ mod tests {
         assert_eq!(conflicts[0].1, 100);
         assert_eq!(conflicts[0].2, 999);
         assert_eq!(metrics.waiting(), 1);
-        revert_dependent_undos_to_map(
-            &mut states,
-            &[(pos(2, 64, 0), make_dependent_undo(200))],
-        );
+        revert_dependent_undos_to_map(&mut states, &[(pos(2, 64, 0), make_dependent_undo(200))]);
         assert_eq!(states[&pos(2, 64, 0)], 200);
     }
 
@@ -1175,8 +1181,7 @@ mod tests {
             update: DependentUpdate::Observer(observer()),
             undo: make_dependent_undo(200),
         }];
-        let unknown =
-            DependentCause::new(gid(8, 8), PlayerSeq(8), TickStamp(8), pos(8, 64, 8));
+        let unknown = DependentCause::new(gid(8, 8), PlayerSeq(8), TickStamp(8), pos(8, 64, 8));
         let revocation = revoke_cause_for(&mut pending, &mut applied, &unknown);
         assert!(revocation.is_empty());
         assert_eq!(pending.len(), 1);
@@ -1234,9 +1239,9 @@ mod tests {
 
     #[test]
     fn chunk_of_block_handles_negatives() {
-        assert_eq!(chunk_of_block(0, 0), chunk(0, 0));
-        assert_eq!(chunk_of_block(15, 15), chunk(0, 0));
-        assert_eq!(chunk_of_block(16, -1), chunk(1, -1));
-        assert_eq!(chunk_of_block(-17, -17), chunk(-2, -2));
+        assert_eq!(chunk_of_block(WORLD, 0, 0), chunk(0, 0));
+        assert_eq!(chunk_of_block(WORLD, 15, 15), chunk(0, 0));
+        assert_eq!(chunk_of_block(WORLD, 16, -1), chunk(1, -1));
+        assert_eq!(chunk_of_block(WORLD, -17, -17), chunk(-2, -2));
     }
 }

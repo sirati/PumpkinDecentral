@@ -53,26 +53,64 @@ impl PresenceSurfaces {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuditIssue {
-    CountMismatch { expected: usize, advertised: usize },
-    OnlineGhost { gid: GlobalPlayerId },
-    OnlineMissing { gid: GlobalPlayerId },
+    CountMismatch {
+        expected: usize,
+        advertised: usize,
+    },
+    OnlineGhost {
+        gid: GlobalPlayerId,
+    },
+    OnlineMissing {
+        gid: GlobalPlayerId,
+    },
     OnlineOrder,
-    TabGhost { gid: GlobalPlayerId },
-    TabMissing { gid: GlobalPlayerId },
+    TabGhost {
+        gid: GlobalPlayerId,
+    },
+    TabMissing {
+        gid: GlobalPlayerId,
+    },
     TabOrder,
-    MotdGhost { gid: GlobalPlayerId },
-    MotdMissing { gid: GlobalPlayerId },
+    MotdGhost {
+        gid: GlobalPlayerId,
+    },
+    MotdMissing {
+        gid: GlobalPlayerId,
+    },
     MotdOrder,
-    MotdOverLimit { len: usize, limit: usize },
-    HiddenLeaked { gid: GlobalPlayerId, surface: SurfaceKind },
-    DuplicateAdvertised { gid: GlobalPlayerId, surface: SurfaceKind },
-    GhostEntry { gid: GlobalPlayerId },
-    MissingEntry { gid: GlobalPlayerId },
-    UuidMismatch { gid: GlobalPlayerId },
-    NameMismatch { gid: GlobalPlayerId },
-    InvalidName { gid: GlobalPlayerId },
-    DuplicateUuid { uuid: [u8; 16] },
-    DuplicateName { name: String },
+    MotdOverLimit {
+        len: usize,
+        limit: usize,
+    },
+    HiddenLeaked {
+        gid: GlobalPlayerId,
+        surface: SurfaceKind,
+    },
+    DuplicateAdvertised {
+        gid: GlobalPlayerId,
+        surface: SurfaceKind,
+    },
+    GhostEntry {
+        gid: GlobalPlayerId,
+    },
+    MissingEntry {
+        gid: GlobalPlayerId,
+    },
+    UuidMismatch {
+        gid: GlobalPlayerId,
+    },
+    NameMismatch {
+        gid: GlobalPlayerId,
+    },
+    InvalidName {
+        gid: GlobalPlayerId,
+    },
+    DuplicateUuid {
+        uuid: [u8; 16],
+    },
+    DuplicateName {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -173,13 +211,7 @@ pub const fn logout_for_hidden(gid: GlobalPlayerId) -> PresenceLogout {
 
 #[must_use]
 pub fn login_for_unhidden(entry: &VisiblePlayer) -> PresenceLogin {
-    PresenceLogin::new(
-        entry.gid,
-        entry.uuid,
-        entry.name.clone(),
-        Vec::new(),
-        false,
-    )
+    PresenceLogin::new(entry.gid, entry.uuid, entry.name.clone(), Vec::new(), false)
 }
 
 fn ordered_gids(view: &[VisiblePlayer]) -> Vec<GlobalPlayerId> {
@@ -224,10 +256,7 @@ fn audit_surface_list(
     let mut seen: HashSet<GlobalPlayerId> = HashSet::new();
     for gid in advertised_gids.iter() {
         if !seen.insert(*gid) {
-            report.push(AuditIssue::DuplicateAdvertised {
-                gid: *gid,
-                surface,
-            });
+            report.push(AuditIssue::DuplicateAdvertised { gid: *gid, surface });
         }
     }
     if ordered_gids(advertised) != advertised_gids {
@@ -269,7 +298,13 @@ pub fn audit_surfaces(
         SurfaceKind::Online,
         None,
     );
-    audit_surface_list(&mut report, expected, &advertised.tab, SurfaceKind::Tab, None);
+    audit_surface_list(
+        &mut report,
+        expected,
+        &advertised.tab,
+        SurfaceKind::Tab,
+        None,
+    );
     let expected_motd = motd_capped(expected, motd_limit);
     audit_surface_list(
         &mut report,
@@ -398,7 +433,11 @@ pub fn audit_hide_transition(
         report.push(AuditIssue::MissingEntry { gid: *gid });
     }
     for entry in after {
-        if entry.gid != *gid && !before.iter().any(|before_entry| before_entry.gid == entry.gid) {
+        if entry.gid != *gid
+            && !before
+                .iter()
+                .any(|before_entry| before_entry.gid == entry.gid)
+        {
             report.push(AuditIssue::GhostEntry { gid: entry.gid });
         }
     }
@@ -476,9 +515,24 @@ mod tests {
         assert_eq!(surfaces.count, 1);
         let report = audit_surfaces(&roster, &surfaces, &hidden_gids, &hidden_uuids, MOTD_LIMIT);
         assert!(report.is_consistent());
-        assert!(is_hidden(&gid(1, 7), &[7_u8; 16], &hidden_gids, &hidden_uuids));
-        assert!(is_hidden(&gid(2, 9), &[9_u8; 16], &hidden_gids, &hidden_uuids));
-        assert!(!is_hidden(&gid(1, 3), &[3_u8; 16], &hidden_gids, &hidden_uuids));
+        assert!(is_hidden(
+            &gid(1, 7),
+            &[7_u8; 16],
+            &hidden_gids,
+            &hidden_uuids
+        ));
+        assert!(is_hidden(
+            &gid(2, 9),
+            &[9_u8; 16],
+            &hidden_gids,
+            &hidden_uuids
+        ));
+        assert!(!is_hidden(
+            &gid(1, 3),
+            &[3_u8; 16],
+            &hidden_gids,
+            &hidden_uuids
+        ));
     }
 
     #[test]
@@ -494,7 +548,11 @@ mod tests {
             expected: 2,
             advertised: 5
         }));
-        assert!(report.issues.contains(&AuditIssue::TabMissing { gid: gid(1, 7) }));
+        assert!(
+            report
+                .issues
+                .contains(&AuditIssue::TabMissing { gid: gid(1, 7) })
+        );
     }
 
     #[test]
@@ -507,9 +565,23 @@ mod tests {
             vec![entry(1, 3, "Amy")],
             vec![entry(1, 3, "Amy"), entry(9, 9, "Ghost")],
         );
-        let report = audit_surfaces(&roster, &advertised, &hidden_gids, &hidden_uuids, MOTD_LIMIT);
-        assert!(report.issues.contains(&AuditIssue::OnlineGhost { gid: gid(9, 9) }));
-        assert!(report.issues.contains(&AuditIssue::MotdGhost { gid: gid(9, 9) }));
+        let report = audit_surfaces(
+            &roster,
+            &advertised,
+            &hidden_gids,
+            &hidden_uuids,
+            MOTD_LIMIT,
+        );
+        assert!(
+            report
+                .issues
+                .contains(&AuditIssue::OnlineGhost { gid: gid(9, 9) })
+        );
+        assert!(
+            report
+                .issues
+                .contains(&AuditIssue::MotdGhost { gid: gid(9, 9) })
+        );
         assert!(!report.has_hidden_leak());
     }
 
@@ -525,7 +597,13 @@ mod tests {
             vec![entry(1, 3, "Amy"), entry(1, 7, "Bo")],
             vec![entry(1, 3, "Amy"), entry(1, 7, "Bo")],
         );
-        let report = audit_surfaces(&roster, &advertised, &hidden_gids, &hidden_uuids, MOTD_LIMIT);
+        let report = audit_surfaces(
+            &roster,
+            &advertised,
+            &hidden_gids,
+            &hidden_uuids,
+            MOTD_LIMIT,
+        );
         assert!(report.issues.iter().any(|issue| matches!(
             issue,
             AuditIssue::HiddenLeaked { gid: leaked, .. } if *leaked == gid(1, 7)
@@ -543,7 +621,13 @@ mod tests {
             vec![entry(1, 3, "Amy"), entry(1, 3, "Amy")],
             motd_capped(&roster, MOTD_LIMIT),
         );
-        let report = audit_surfaces(&roster, &advertised, &hidden_gids, &hidden_uuids, MOTD_LIMIT);
+        let report = audit_surfaces(
+            &roster,
+            &advertised,
+            &hidden_gids,
+            &hidden_uuids,
+            MOTD_LIMIT,
+        );
         assert!(report.issues.contains(&AuditIssue::OnlineOrder));
         assert!(report.issues.iter().any(|issue| matches!(
             issue,
@@ -570,10 +654,12 @@ mod tests {
         let mut overfull = surfaces;
         overfull.motd_sample = roster.clone();
         let report = audit_surfaces(&roster, &overfull, &hidden_gids, &hidden_uuids, MOTD_LIMIT);
-        assert!(report.issues.iter().any(|issue| matches!(
-            issue,
-            AuditIssue::MotdOverLimit { .. }
-        )));
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| matches!(issue, AuditIssue::MotdOverLimit { .. }))
+        );
     }
 
     #[test]
@@ -583,13 +669,29 @@ mod tests {
         peer[0].name = String::from("AmyX");
         let (hidden_gids, hidden_uuids) = empty_hide();
         let report = audit_peer_rosters(&local, &peer, &hidden_gids, &hidden_uuids);
-        assert!(report.issues.contains(&AuditIssue::MissingEntry { gid: gid(1, 7) }));
-        assert!(report.issues.contains(&AuditIssue::GhostEntry { gid: gid(2, 1) }));
-        assert!(report.issues.contains(&AuditIssue::NameMismatch { gid: gid(1, 3) }));
+        assert!(
+            report
+                .issues
+                .contains(&AuditIssue::MissingEntry { gid: gid(1, 7) })
+        );
+        assert!(
+            report
+                .issues
+                .contains(&AuditIssue::GhostEntry { gid: gid(2, 1) })
+        );
+        assert!(
+            report
+                .issues
+                .contains(&AuditIssue::NameMismatch { gid: gid(1, 3) })
+        );
         let mut peer_uuid = entry(1, 3, "Amy");
         peer_uuid.uuid = [99_u8; 16];
         let report = audit_peer_rosters(&local, &[peer_uuid], &hidden_gids, &hidden_uuids);
-        assert!(report.issues.contains(&AuditIssue::UuidMismatch { gid: gid(1, 3) }));
+        assert!(
+            report
+                .issues
+                .contains(&AuditIssue::UuidMismatch { gid: gid(1, 3) })
+        );
         let clean = audit_peer_rosters(&local, &local, &hidden_gids, &hidden_uuids);
         assert!(clean.is_consistent());
     }
@@ -598,20 +700,28 @@ mod tests {
     fn roster_integrity_catches_collisions() {
         let roster = vec![entry(1, 3, "Amy"), entry(1, 7, "amy")];
         let report = audit_roster_integrity(&roster);
-        assert!(report.issues.iter().any(|issue| matches!(
-            issue,
-            AuditIssue::DuplicateName { .. }
-        )));
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| matches!(issue, AuditIssue::DuplicateName { .. }))
+        );
         let mut dup_uuid = entry(2, 5, "Zed");
         dup_uuid.uuid = [3_u8; 16];
         let report = audit_roster_integrity(&[entry(1, 3, "Amy"), dup_uuid]);
-        assert!(report.issues.iter().any(|issue| matches!(
-            issue,
-            AuditIssue::DuplicateUuid { .. }
-        )));
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| matches!(issue, AuditIssue::DuplicateUuid { .. }))
+        );
         let bad = vec![VisiblePlayer::new(gid(1, 3), [3_u8; 16], String::new())];
         let report = audit_roster_integrity(&bad);
-        assert!(report.issues.contains(&AuditIssue::InvalidName { gid: gid(1, 3) }));
+        assert!(
+            report
+                .issues
+                .contains(&AuditIssue::InvalidName { gid: gid(1, 3) })
+        );
         let unordered = vec![entry(1, 7, "Bo"), entry(1, 3, "Amy")];
         let report = audit_roster_integrity(&unordered);
         assert!(report.issues.contains(&AuditIssue::OnlineOrder));
@@ -630,13 +740,19 @@ mod tests {
         assert_eq!(login.uuid, [7_u8; 16]);
         assert_eq!(login.name, String::from("Bo"));
         let leaked = audit_hide_transition(&before, &before, &gid(1, 7), true);
-        assert!(leaked.issues.iter().any(|issue| matches!(
-            issue,
-            AuditIssue::HiddenLeaked { .. }
-        )));
+        assert!(
+            leaked
+                .issues
+                .iter()
+                .any(|issue| matches!(issue, AuditIssue::HiddenLeaked { .. }))
+        );
         let restored = audit_hide_transition(&after, &before, &gid(1, 7), false);
         assert!(restored.is_consistent());
         let still_gone = audit_hide_transition(&before, &after, &gid(1, 7), false);
-        assert!(still_gone.issues.contains(&AuditIssue::MissingEntry { gid: gid(1, 7) }));
+        assert!(
+            still_gone
+                .issues
+                .contains(&AuditIssue::MissingEntry { gid: gid(1, 7) })
+        );
     }
 }

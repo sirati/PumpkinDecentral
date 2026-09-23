@@ -197,9 +197,11 @@ pub fn submit_world_time_control(
     control: &WorldTimeControl,
 ) -> Result<(), WorldTimeError> {
     let payload = encode_control(control)?;
-    handle.try_submit(tick, payload).map_err(|_| WorldTimeError {
-        message: String::from("primary world time queue full"),
-    })
+    handle
+        .try_submit(tick, payload)
+        .map_err(|_| WorldTimeError {
+            message: String::from("primary world time queue full"),
+        })
 }
 
 pub fn try_submit_world_time_control(
@@ -226,7 +228,14 @@ mod tests {
     }
 
     fn weather_update() -> WeatherUpdate {
-        WeatherUpdate::new(String::from("minecraft:overworld"), 12_000, 0, 0, false, false)
+        WeatherUpdate::new(
+            String::from("minecraft:overworld"),
+            12_000,
+            0,
+            0,
+            false,
+            false,
+        )
     }
 
     #[test]
@@ -280,7 +289,11 @@ mod tests {
         assert_eq!(parcels.len(), 2);
         assert_eq!(parcels[0].peer, 2);
         assert_eq!(parcels[1].peer, 3);
-        assert!(parcels.iter().all(|parcel| parcel.kind == StreamKind::Control));
+        assert!(
+            parcels
+                .iter()
+                .all(|parcel| parcel.kind == StreamKind::Control)
+        );
         for parcel in &parcels {
             assert_eq!(
                 decode_control(&parcel.bytes).unwrap(),

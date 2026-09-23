@@ -17,19 +17,24 @@ use crate::{
     command::node::dispatcher::CommandDispatcher, entity::player::Player, world::World,
     world::map::MapManager,
 };
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use connection_cache::{CachedBranding, CachedStatus};
 use key_store::KeyStore;
+use pumpkin_cluster::health_policy::{
+    HealthMaskMode as ClusterHealthMaskMode, HealthPolicySnapshot,
+};
 use pumpkin_cluster::primary::{
     DEFAULT_PRIMARY_SAVE_QUEUE_CAPACITY, PrimarySaveHandle, primary_save_channel,
 };
-use pumpkin_config::{AdvancedConfiguration, BasicConfiguration, ClusterRole, TelemetryConfig};
+use pumpkin_config::{
+    AdvancedConfiguration, BasicConfiguration, ClusterRole, HealthMaskMode, TelemetryConfig,
+};
 use pumpkin_data::dimension::Dimension;
 use pumpkin_util::permission::PermissionManager;
 use pumpkin_util::text::color::NamedColor;
 use pumpkin_world::dimension::into_level;
-use pumpkin_world::level::set_cluster_secondary;
 use pumpkin_world::generation::generator::GeneratorInit;
+use pumpkin_world::level::set_cluster_secondary;
 use pumpkin_world::world::WorldPortalExt;
 use tracing::{debug, error, info, warn};
 
@@ -47,38 +52,67 @@ use rayon::prelude::*;
 use rsa::RsaPublicKey;
 use std::fs;
 use std::net::IpAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU16, AtomicU32, AtomicU64};
+use std::sync::{Arc, OnceLock};
 use std::{future::Future, sync::atomic::Ordering, time::Duration};
 use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
 use tokio_util::task::TaskTracker;
 
 pub mod cluster;
+pub mod cluster_access_policy;
+pub mod cluster_actor_statistics;
+pub mod cluster_actor_import;
 pub mod cluster_admin_apply;
+pub mod cluster_admin_journal;
+pub mod cluster_block_action;
 pub mod cluster_chat_in;
 pub mod cluster_chat_out;
 pub mod cluster_chat_pm;
+pub mod cluster_chat_presentation;
+pub mod cluster_chunk_state;
 pub mod cluster_combat_apply;
+pub mod cluster_command_suggestions;
+pub mod cluster_controller;
 pub mod cluster_datagram;
 pub mod cluster_entity_apply;
 pub mod cluster_entity_emit;
 pub mod cluster_ghost;
+pub mod cluster_global_outbound;
+pub mod cluster_ground;
+pub mod cluster_handoff;
+pub mod cluster_health_policy;
+pub mod cluster_hide;
+pub mod cluster_inventory_protocol;
 /// Cluster-wide invsee snapshot and edit routing.
 pub mod cluster_invsee;
+pub mod cluster_item_action;
 pub mod cluster_lobby;
-pub mod cluster_world_apply;
-pub mod cluster_world_delta;
-pub mod cluster_world_time;
-pub mod cluster_transient;
-pub mod cluster_visual;
-pub mod cluster_moderation;
 pub mod cluster_movement_sample;
-pub mod cluster_hide;
+pub mod cluster_player_admin;
 pub mod cluster_presence;
 pub mod cluster_regions;
+pub mod cluster_secure_chat;
+pub mod cluster_session_ingress;
 pub mod cluster_status;
+#[cfg(feature = "cluster-e2e")]
+pub mod cluster_test;
 pub mod cluster_tick_pump;
+pub mod cluster_transient;
+pub mod cluster_visual;
+pub mod cluster_world_actions;
+pub mod cluster_world_actor;
+pub mod cluster_world_administration;
+pub mod cluster_world_apply;
+pub mod cluster_world_block_actions;
+pub mod cluster_world_delta;
+pub mod cluster_world_inventory;
+pub mod cluster_world_item_actions;
+pub mod cluster_world_owner;
+pub mod cluster_world_settlement;
+pub mod cluster_world_time;
+pub mod cluster_world_view;
+pub mod cluster_world_visibility;
 mod connection_cache;
 pub(crate) mod debug_profiler;
 pub mod enchantment;
@@ -144,10 +178,142 @@ pub struct Server {
     /// Manages all maps on the server
     pub map_manager: MapManager,
     /// The default gamemode when a player joins the server (reset every restart)
-    pub defaultgamemode: std::sync::Mutex<DefaultGamemode>,
+    pub defaultgamemode: ArcSwap<DefaultGamemode>,
     /// Manages player data storage
     pub player_data_storage: ServerPlayerData,
     pub primary_save: Option<PrimarySaveHandle>,
+    pub(crate) cluster_global_outbound: cluster_global_outbound::GlobalOutboundRuntime,
+    pub(crate) cluster_admin_local_route:
+        ArcSwapOption<tokio::sync::mpsc::Sender<cluster_admin_apply::LocalAdminMutation>>,
+    pub(crate) cluster_admin_seed_route:
+        ArcSwapOption<tokio::sync::mpsc::Sender<pumpkin_cluster::identity::ServerId>>,
+    pub(crate) cluster_admin_view: ArcSwap<pumpkin_cluster::admin_sync::AdminSnapshot>,
+    pub(crate) cluster_chat_presentation_tx:
+        tokio::sync::mpsc::Sender<cluster_chat_presentation::ChatPresentation>,
+    pub(crate) cluster_session_ingress_tx:
+        tokio::sync::mpsc::Sender<cluster_session_ingress::SessionInput>,
+    pub(crate) cluster_lobby_command_tx:
+        tokio::sync::mpsc::Sender<cluster_session_ingress::LobbyCommandInput>,
+    pub(crate) cluster_command_suggestions_tx:
+        tokio::sync::mpsc::Sender<cluster_command_suggestions::SuggestionRequest>,
+    pub(crate) cluster_secure_chat: cluster_secure_chat::SecureChatRuntime,
+    pub(crate) cluster_access_policy: cluster_access_policy::AccessPolicyRuntime,
+    pub(crate) cluster_health_policy: ArcSwap<HealthPolicySnapshot>,
+    pub(crate) cluster_health_policy_tx:
+        OnceLock<tokio::sync::mpsc::Sender<cluster_health_policy::HealthPolicyCommand>>,
+    pub(crate) cluster_invsee_tx: tokio::sync::mpsc::Sender<cluster_invsee::InvseeCommand>,
+    pub(crate) cluster_inventory_action_route_tx:
+        tokio::sync::watch::Sender<cluster_invsee::InventoryActionRoute>,
+    pub(crate) cluster_inventory_screen_route_tx:
+        tokio::sync::watch::Sender<cluster_invsee::InventoryScreenRoute>,
+    pub(crate) cluster_inventory_menu_route_tx:
+        tokio::sync::watch::Sender<cluster_inventory_protocol::InventoryMenuRoute>,
+    pub(crate) cluster_item_action_route_tx:
+        tokio::sync::watch::Sender<cluster_item_action::ItemActionRoute>,
+    pub(crate) cluster_block_action_route_tx:
+        tokio::sync::watch::Sender<cluster_block_action::BlockActionRoute>,
+    pub(crate) cluster_inventory_snapshot_route_tx:
+        tokio::sync::watch::Sender<cluster_invsee::InventorySnapshotRoute>,
+    pub(crate) cluster_inventory_install_route_tx:
+        tokio::sync::watch::Sender<cluster_invsee::InventoryInstallRoute>,
+    pub(crate) cluster_inventory_publication_tx:
+        tokio::sync::broadcast::Sender<cluster_invsee::InventoryPublication>,
+    pub(crate) cluster_inventory_snapshots: ArcSwap<
+        std::collections::HashMap<
+            pumpkin_cluster::inventory::InventoryTarget,
+            pumpkin_cluster::inventory::InventoryStateSnapshot,
+        >,
+    >,
+    pub(crate) cluster_inventory_screens: ArcSwap<
+        std::collections::HashMap<
+            pumpkin_cluster::inventory::InventoryScreenSession,
+            pumpkin_cluster::inventory::InventoryScreenSnapshot,
+        >,
+    >,
+    pub(crate) cluster_inventory_close_status: ArcSwap<
+        std::collections::HashMap<
+            (pumpkin_cluster::identity::GlobalPlayerId, u64),
+            cluster_world_inventory::InventoryCloseStatus,
+        >,
+    >,
+    pub(crate) cluster_inventory_handoff_installed: ArcSwap<
+        std::collections::HashMap<
+            pumpkin_cluster::identity::GlobalPlayerId,
+            cluster_world_inventory::InventoryHandoffInstallStatus,
+        >,
+    >,
+    pub(crate) cluster_inventory_cancel_requests:
+        ArcSwap<std::collections::HashSet<(pumpkin_cluster::identity::GlobalPlayerId, u64)>>,
+    pub(crate) cluster_inventory_close_token: AtomicU64,
+    pub(crate) cluster_beacon_states: ArcSwap<
+        std::collections::HashMap<
+            pumpkin_cluster::inventory::InventoryTarget,
+            pumpkin_cluster::inventory::BeaconMenuState,
+        >,
+    >,
+    pub(crate) cluster_player_admin: cluster_player_admin::PlayerAdministrativeRuntime,
+    pub(crate) cluster_administrative_action_route_tx:
+        tokio::sync::watch::Sender<cluster_world_delta::AdministrativeIntentRoute>,
+    pub(crate) cluster_administrative_publication_tx:
+        tokio::sync::broadcast::Sender<cluster_world_delta::AdministrativePublication>,
+    pub(crate) cluster_handoff: ArcSwap<cluster_handoff::HandoffSnapshot>,
+    pub(crate) cluster_handoff_tx:
+        OnceLock<tokio::sync::mpsc::Sender<cluster_handoff::HandoffCommand>>,
+    pub(crate) cluster_handoff_commits:
+        ArcSwap<std::collections::HashMap<uuid::Uuid, Arc<cluster_handoff::HandoffCommit>>>,
+    pub(crate) cluster_handoff_commit_wake: tokio::sync::watch::Sender<u64>,
+    pub(crate) cluster_lobby_chat_tx:
+        tokio::sync::broadcast::Sender<(Option<String>, TextComponent)>,
+    pub(crate) cluster_lobby_directory: cluster_lobby::LobbyDirectory,
+    pub(crate) cluster_presence: cluster_presence::PresenceRuntime,
+    pub(crate) cluster_presence_slot: AtomicU16,
+    pub(crate) cluster_lobby_session_generation: AtomicU64,
+    pub(crate) cluster_connected_peers:
+        ArcSwap<std::collections::HashSet<pumpkin_cluster::identity::ServerId>>,
+    pub(crate) cluster_peer_generations:
+        ArcSwap<std::collections::HashMap<pumpkin_cluster::identity::ServerId, u64>>,
+    pub(crate) cluster_primary_peers:
+        ArcSwap<std::collections::HashSet<pumpkin_cluster::identity::ServerId>>,
+    pub(crate) cluster_entity_owners: ArcSwap<
+        std::collections::HashMap<
+            pumpkin_cluster::protocol::GlobalEntityId,
+            pumpkin_cluster::identity::ServerId,
+        >,
+    >,
+    pub(crate) cluster_ground_snapshots: ArcSwap<
+        std::collections::HashMap<
+            pumpkin_cluster::protocol::ChunkKey,
+            cluster_ground::GroundChunkSnapshot,
+        >,
+    >,
+    pub(crate) cluster_owned_chunk_blocks: ArcSwap<
+        std::collections::HashMap<
+            pumpkin_cluster::protocol::ChunkKey,
+            std::sync::Arc<cluster_chunk_state::OwnedChunkBlocks>,
+        >,
+    >,
+    pub(crate) cluster_controller: cluster_controller::ControllerRuntime,
+    pub(crate) cluster_actor_statistics: cluster_actor_statistics::StatisticsPublication,
+    pub(crate) cluster_actor_living: ArcSwap<
+        std::collections::HashMap<
+            pumpkin_cluster::actor::ActorId,
+            cluster_world_actor::ActorLivingState,
+        >,
+    >,
+    pub(crate) cluster_actor_statistics_import_route:
+        ArcSwapOption<tokio::sync::mpsc::Sender<cluster_actor_statistics::ActorStatisticsImport>>,
+    pub(crate) cluster_actor_statistics_retire_route:
+        ArcSwapOption<tokio::sync::mpsc::Sender<cluster_actor_statistics::ActorStatisticsRetire>>,
+    pub(crate) cluster_actor_living_import_route:
+        ArcSwapOption<tokio::sync::mpsc::Sender<cluster_world_actor::ActorLivingImport>>,
+    pub(crate) cluster_actor_admission_import_route:
+        ArcSwapOption<tokio::sync::mpsc::Sender<cluster_world_actor::ActorAdmissionImport>>,
+    pub(crate) cluster_action_route:
+        ArcSwapOption<tokio::sync::mpsc::Sender<pumpkin_cluster::canonical_action::CanonicalAction>>,
+    pub(crate) cluster_actor_drain_route:
+        ArcSwapOption<tokio::sync::mpsc::Sender<cluster_world_owner::ActorDrainRequest>>,
+    #[cfg(feature = "cluster-e2e")]
+    pub(crate) cluster_test: cluster_test::TestRuntime,
     /// Command storage for `/data` command
     pub command_storage:
         std::sync::Mutex<std::collections::HashMap<String, pumpkin_nbt::compound::NbtCompound>>,
@@ -185,6 +351,16 @@ pub struct Server {
     world_info_writer: Arc<dyn WorldInfoWriter>,
 }
 
+pub(crate) struct PreparedPlayerJoin {
+    player: Arc<Player>,
+    world: Arc<World>,
+    config: Option<PlayerConfig>,
+    gid: Option<pumpkin_cluster::identity::GlobalPlayerId>,
+    inventory_install_token: Option<u64>,
+    statistics_import: Option<cluster_actor_statistics::ActorStatisticsImport>,
+    living_import: Option<cluster_world_actor::ActorLivingImport>,
+}
+
 impl Server {
     #[expect(clippy::too_many_lines)]
     #[must_use]
@@ -218,7 +394,7 @@ impl Server {
         let level_info = match AnvilLevelInfo.read_world_info(&world_path) {
             Ok(level_info) => {
                 let dat_path = world_path.join(LEVEL_DAT_FILE_NAME);
-                if dat_path.exists() {
+                if !cluster_secondary_early && dat_path.exists() {
                     let backup_path = world_path.join(LEVEL_DAT_BACKUP_FILE_NAME);
                     if let Err(err) = fs::copy(&dat_path, &backup_path) {
                         warn!("Failed to create backup {LEVEL_DAT_BACKUP_FILE_NAME}: {err}");
@@ -254,8 +430,7 @@ impl Server {
                     LevelData::from_world_generator(basic_config.seed, &overworld_gen);
                 if cluster_secondary_early {
                     info!("Cluster secondary: keeping fresh level info in memory only");
-                } else if let Err(err) =
-                    AnvilLevelInfo.write_world_info(&default_data, &world_path)
+                } else if let Err(err) = AnvilLevelInfo.write_world_info(&default_data, &world_path)
                 {
                     error!("Failed to save level.dat: {err}");
                 }
@@ -289,7 +464,7 @@ impl Server {
             &advanced_config.networking.java.motd,
             advanced_config.networking.java.max_players,
         ));
-        let defaultgamemode = std::sync::Mutex::new(DefaultGamemode {
+        let defaultgamemode = ArcSwap::from_pointee(DefaultGamemode {
             gamemode: basic_config.default_gamemode,
         });
         let players_dir = world_path.join("players");
@@ -341,7 +516,41 @@ impl Server {
         } else {
             (None, None)
         };
+        let cluster_health_mask = match advanced_config.cluster.health_mask {
+            HealthMaskMode::Off => ClusterHealthMaskMode::Off,
+            HealthMaskMode::Players => ClusterHealthMaskMode::Players,
+            HealthMaskMode::All => ClusterHealthMaskMode::All,
+        };
+        let (cluster_invsee_tx, cluster_invsee_rx) = tokio::sync::mpsc::channel(256);
+        let (cluster_inventory_action_route_tx, _) = tokio::sync::watch::channel(None);
+        let (cluster_inventory_screen_route_tx, _) = tokio::sync::watch::channel(None);
+        let (cluster_inventory_menu_route_tx, _) = tokio::sync::watch::channel(None);
+        let (cluster_item_action_route_tx, _) = tokio::sync::watch::channel(None);
+        let (cluster_block_action_route_tx, _) = tokio::sync::watch::channel(None);
+        let (cluster_inventory_snapshot_route_tx, _) = tokio::sync::watch::channel(None);
+        let (cluster_inventory_install_route_tx, _) = tokio::sync::watch::channel(None);
+        let (cluster_inventory_publication_tx, _) = tokio::sync::broadcast::channel(256);
+        let (cluster_administrative_action_route_tx, _) = tokio::sync::watch::channel(None);
+        let (cluster_administrative_publication_tx, _) = tokio::sync::broadcast::channel(256);
+        let (cluster_lobby_chat_tx, _) = tokio::sync::broadcast::channel(256);
+        let (cluster_lobby_directory, cluster_lobby_directory_rx) =
+            cluster_lobby::LobbyDirectory::new(4096);
+        let (cluster_presence, cluster_presence_rx) = cluster_presence::PresenceRuntime::new(4096);
+        let (cluster_chat_presentation_tx, cluster_chat_presentation_rx) =
+            tokio::sync::mpsc::channel(1024);
+        let (cluster_session_ingress_tx, cluster_session_ingress_rx) =
+            tokio::sync::mpsc::channel(1024);
+        let (cluster_lobby_command_tx, cluster_lobby_command_rx) = tokio::sync::mpsc::channel(256);
+        let (cluster_command_suggestions_tx, cluster_command_suggestions_rx) =
+            tokio::sync::mpsc::channel(256);
+        let (cluster_secure_chat, cluster_secure_chat_rx) =
+            cluster_secure_chat::SecureChatRuntime::new();
+        let (cluster_access_policy, cluster_access_policy_rx) =
+            cluster_access_policy::AccessPolicyRuntime::new(&vanilla_data);
+        let (cluster_handoff_commit_wake, _) = tokio::sync::watch::channel(0_u64);
 
+        let (cluster_global_outbound, cluster_global_outbound_rx, cluster_global_outbound_ack_rx) =
+            cluster_global_outbound::GlobalOutboundRuntime::new();
         let server = Self {
             basic_config,
             advanced_config,
@@ -369,6 +578,74 @@ impl Server {
             defaultgamemode,
             player_data_storage,
             primary_save,
+            cluster_global_outbound,
+            cluster_admin_local_route: ArcSwapOption::empty(),
+            cluster_admin_seed_route: ArcSwapOption::empty(),
+            cluster_admin_view: ArcSwap::from_pointee(
+                pumpkin_cluster::admin_sync::AdminSnapshot::default(),
+            ),
+            cluster_chat_presentation_tx,
+            cluster_session_ingress_tx,
+            cluster_lobby_command_tx,
+            cluster_command_suggestions_tx,
+            cluster_secure_chat,
+            cluster_access_policy,
+            cluster_health_policy: ArcSwap::from_pointee(HealthPolicySnapshot::new(
+                0,
+                cluster_health_mask,
+            )),
+            cluster_health_policy_tx: OnceLock::new(),
+            cluster_invsee_tx,
+            cluster_inventory_action_route_tx,
+            cluster_inventory_screen_route_tx,
+            cluster_inventory_menu_route_tx,
+            cluster_item_action_route_tx,
+            cluster_block_action_route_tx,
+            cluster_inventory_snapshot_route_tx,
+            cluster_inventory_install_route_tx,
+            cluster_inventory_publication_tx,
+            cluster_inventory_snapshots: ArcSwap::from_pointee(std::collections::HashMap::new()),
+            cluster_inventory_screens: ArcSwap::from_pointee(std::collections::HashMap::new()),
+            cluster_inventory_close_status: ArcSwap::from_pointee(std::collections::HashMap::new()),
+            cluster_inventory_handoff_installed: ArcSwap::from_pointee(
+                std::collections::HashMap::new(),
+            ),
+            cluster_inventory_cancel_requests: ArcSwap::from_pointee(
+                std::collections::HashSet::new(),
+            ),
+            cluster_inventory_close_token: AtomicU64::new(1),
+            cluster_beacon_states: ArcSwap::from_pointee(std::collections::HashMap::new()),
+            cluster_player_admin: cluster_player_admin::PlayerAdministrativeRuntime::new(256),
+            cluster_administrative_action_route_tx,
+            cluster_administrative_publication_tx,
+            cluster_handoff: ArcSwap::from_pointee(cluster_handoff::HandoffSnapshot::default()),
+            cluster_handoff_tx: OnceLock::new(),
+            cluster_handoff_commits: ArcSwap::from_pointee(std::collections::HashMap::new()),
+            cluster_handoff_commit_wake,
+            cluster_lobby_chat_tx,
+            cluster_lobby_directory,
+            cluster_presence,
+            cluster_presence_slot: AtomicU16::new(1),
+            cluster_lobby_session_generation: AtomicU64::new(1),
+            cluster_connected_peers: ArcSwap::from_pointee(std::collections::HashSet::new()),
+            cluster_peer_generations: ArcSwap::from_pointee(std::collections::HashMap::new()),
+            cluster_primary_peers: ArcSwap::from_pointee(std::collections::HashSet::new()),
+            cluster_entity_owners: ArcSwap::from_pointee(std::collections::HashMap::new()),
+            cluster_ground_snapshots: ArcSwap::from_pointee(std::collections::HashMap::new()),
+            cluster_owned_chunk_blocks: ArcSwap::from_pointee(std::collections::HashMap::new()),
+            cluster_controller: cluster_controller::ControllerRuntime::new(4096),
+            cluster_actor_statistics: Arc::new(ArcSwap::from_pointee(
+                std::collections::HashMap::new(),
+            )),
+            cluster_actor_living: ArcSwap::from_pointee(std::collections::HashMap::new()),
+            cluster_actor_statistics_import_route: ArcSwapOption::empty(),
+            cluster_actor_statistics_retire_route: ArcSwapOption::empty(),
+            cluster_actor_living_import_route: ArcSwapOption::empty(),
+            cluster_actor_admission_import_route: ArcSwapOption::empty(),
+            cluster_action_route: ArcSwapOption::empty(),
+            cluster_actor_drain_route: ArcSwapOption::empty(),
+            #[cfg(feature = "cluster-e2e")]
+            cluster_test: cluster_test::TestRuntime::new(),
             command_storage: std::sync::Mutex::new(std::collections::HashMap::new()),
             stopwatches: std::sync::Mutex::new(crate::world::stopwatches::Stopwatches::new()),
             random_sequences: std::sync::Mutex::new(
@@ -392,6 +669,35 @@ impl Server {
             level_info,
         };
         let server = Arc::new(server);
+        server
+            .cluster_admin_view
+            .store(Arc::new(cluster_admin_apply::snapshot_from_stores(
+                &server, 0,
+            )));
+        cluster_global_outbound::spawn(
+            &server,
+            cluster_global_outbound_rx,
+            cluster_global_outbound_ack_rx,
+        );
+        cluster_lobby::spawn_lobby_directory(&server, cluster_lobby_directory_rx);
+        cluster_presence::spawn_presence_owner(&server, cluster_presence_rx);
+        cluster_chat_presentation::spawn(&server, cluster_chat_presentation_rx);
+        cluster_session_ingress::spawn(&server, cluster_session_ingress_rx);
+        cluster_session_ingress::spawn_lobby_commands(&server, cluster_lobby_command_rx);
+        cluster_command_suggestions::spawn(&server, cluster_command_suggestions_rx);
+        cluster_secure_chat::spawn(&server, cluster_secure_chat_rx);
+        cluster_access_policy::spawn(&server, cluster_access_policy_rx);
+        {
+            let operators = server
+                .data
+                .operator_config
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for operator in &operators.ops {
+                cluster_presence::publish_permission(&server, operator.uuid, Some(operator.level));
+            }
+        }
+        cluster_invsee::spawn_invsee_owner(&server, cluster_invsee_rx);
         {
             let favicon = server
                 .listing
@@ -770,6 +1076,72 @@ impl Server {
         profile: GameProfile,
         config: Option<PlayerConfig>,
     ) -> Option<(Arc<Player>, Arc<World>)> {
+        let prepared = self.prepare_player_with_data(
+            client, profile, config, None, None, None, None, None, None,
+        )?;
+        let mut event = PlayerLoginEvent::new(
+            prepared.player.clone(),
+            TextComponent::text("You have been kicked from the server"),
+        );
+        self.plugin_manager.fire_blocking(self, &mut event);
+        if event.cancelled {
+            prepared
+                .player
+                .kick(DisconnectReason::Kicked, &event.kick_message);
+            return None;
+        }
+        self.finish_prepared_player(prepared)
+    }
+
+    pub(crate) async fn prepare_player_from_handoff(
+        self: &Arc<Self>,
+        client: Arc<ClientPlatform>,
+        profile: GameProfile,
+        config: PlayerConfig,
+        entity_id: i32,
+        gid: pumpkin_cluster::identity::GlobalPlayerId,
+        inventory_install_token: u64,
+        data: Option<pumpkin_nbt::compound::NbtCompound>,
+        chunk_sender: crate::net::ChunkSender,
+        world: Arc<World>,
+    ) -> Option<PreparedPlayerJoin> {
+        let prepared = self.prepare_player_with_data(
+            client,
+            profile,
+            Some(config),
+            Some(entity_id),
+            Some(gid),
+            Some(inventory_install_token),
+            Some(data),
+            Some(chunk_sender),
+            Some(world),
+        )?;
+        let mut event = PlayerLoginEvent::new(
+            prepared.player.clone(),
+            TextComponent::text("You have been kicked from the server"),
+        );
+        self.plugin_manager.fire(self, &mut event).await;
+        if event.cancelled {
+            prepared
+                .player
+                .kick(DisconnectReason::Kicked, &event.kick_message);
+            return None;
+        }
+        Some(prepared)
+    }
+
+    fn prepare_player_with_data(
+        self: &Arc<Self>,
+        client: Arc<ClientPlatform>,
+        profile: GameProfile,
+        config: Option<PlayerConfig>,
+        entity_id: Option<i32>,
+        gid: Option<pumpkin_cluster::identity::GlobalPlayerId>,
+        handoff_inventory_token: Option<u64>,
+        handoff_data: Option<Option<pumpkin_nbt::compound::NbtCompound>>,
+        chunk_sender: Option<crate::net::ChunkSender>,
+        handoff_world: Option<Arc<World>>,
+    ) -> Option<PreparedPlayerJoin> {
         if self.is_cluster_primary() {
             client.try_kick(
                 DisconnectReason::Kicked,
@@ -778,15 +1150,22 @@ impl Server {
             return None;
         }
 
-        let gamemode = self
-            .defaultgamemode
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .gamemode;
+        let gamemode = self.defaultgamemode.load().gamemode;
 
         let first_world = self.worlds.load().first().cloned()?;
 
-        let (world, nbt) = if pumpkin_world::level::is_cluster_secondary() {
+        let (world, nbt) = if let Some(data) = handoff_data {
+            let world = handoff_world.unwrap_or_else(|| {
+                data.as_ref()
+                    .and_then(|data| data.get_string("Dimension"))
+                    .and_then(Dimension::from_name)
+                    .map_or_else(
+                        || first_world.clone(),
+                        |dimension| self.get_world_from_dimension(dimension),
+                    )
+            });
+            (world, data)
+        } else if pumpkin_world::level::is_cluster_secondary() {
             (first_world, None)
         } else if let Ok(Some(data)) = self.player_data_storage.load_data(&profile.id) {
             if let Some(dimension_key) = data.get_string("Dimension") {
@@ -806,25 +1185,154 @@ impl Server {
             (first_world, None)
         };
 
-        let mut player = Player::new(
+        let statistics_import = gid
+            .filter(|_| self.advanced_config.cluster.enabled)
+            .map(|actor| {
+                cluster_actor_statistics::ActorStatisticsImport::from_nbt(actor, nbt.as_ref())
+            });
+        let living_import = if let Some(actor) = gid.filter(|_| self.advanced_config.cluster.enabled) {
+            match cluster_actor_import::from_player_nbt(actor, nbt.as_ref()) {
+                Ok(import) => Some(import),
+                Err(error) => {
+                    tracing::error!(?actor, ?error, "cluster living handoff decode failed");
+                    client.try_kick(
+                        DisconnectReason::Kicked,
+                        &TextComponent::text("Living state handoff unavailable"),
+                    );
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+
+        let inventory_snapshot = if let Some(gid) = gid {
+            match cluster_invsee::player_inventory_snapshot_from_nbt(gid, nbt.as_ref()) {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    tracing::error!(?gid, ?error, "cluster inventory handoff decode failed");
+                    client.try_kick(
+                        DisconnectReason::Kicked,
+                        &TextComponent::text("Inventory handoff unavailable"),
+                    );
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+        let ender_snapshot = if let Some(gid) = gid {
+            match cluster_invsee::ender_chest_snapshot_from_nbt(gid, nbt.as_ref()) {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    tracing::error!(
+                        ?gid,
+                        ?error,
+                        "cluster ender inventory handoff decode failed"
+                    );
+                    client.try_kick(
+                        DisconnectReason::Kicked,
+                        &TextComponent::text("Inventory handoff unavailable"),
+                    );
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+        if let (Some(gid), Some(token), Some(snapshot)) =
+            (gid, handoff_inventory_token, inventory_snapshot.as_ref())
+        {
+            let installed = self.cluster_inventory_handoff_installed.load();
+            if !installed.get(&gid).is_some_and(|status| {
+                status.token == token && status.revision == Ok(snapshot.revision)
+            }) {
+                client.try_kick(
+                    DisconnectReason::Kicked,
+                    &TextComponent::text("Inventory handoff unavailable"),
+                );
+                return None;
+            }
+        }
+
+        let mut player = Player::new_with_entity_id(
             client,
             profile,
             config.clone().unwrap_or_default(),
             &world,
             gamemode,
+            entity_id,
+            chunk_sender,
         );
 
+        if handoff_inventory_token.is_some() {
+            if let Some(snapshot) = inventory_snapshot.as_ref() {
+                let Ok(projection) =
+                    cluster_invsee::cluster_player_inventory_snapshot_from_state(snapshot)
+                else {
+                    player.client.try_kick(
+                        DisconnectReason::Kicked,
+                        &TextComponent::text("Inventory handoff unavailable"),
+                    );
+                    return None;
+                };
+                if !player.inventory.publish_cluster_snapshot(projection) {
+                    player.client.try_kick(
+                        DisconnectReason::Kicked,
+                        &TextComponent::text("Inventory handoff unavailable"),
+                    );
+                    return None;
+                }
+            }
+            player.ender_chest_inventory = Arc::new(
+                pumpkin_inventory::player::ender_chest_inventory::EnderChestInventory::from_stacks(
+                    cluster_invsee::ender_chest_stacks_from_nbt(nbt.as_ref()),
+                ),
+            );
+        }
+
         if let Some(mut nbt_data) = nbt {
-            player.read_nbt(&mut nbt_data);
+            if handoff_inventory_token.is_some() {
+                player.read_cluster_handoff_nbt(&mut nbt_data);
+            } else {
+                player.read_nbt(&mut nbt_data);
+            }
             // The data file itself proves this is a returning player. Older Bedrock
             // sessions could persist HasPlayedBefore as false and mask a valid Pos.
             player.has_played_before.store(true, Ordering::Relaxed);
         }
 
-        // Wrap in Arc after data is loaded
-        let player = Arc::new(player);
-        let _ = cluster_presence::assign_login_gid(self, &player);
+        if handoff_inventory_token.is_none()
+            && let Some(gid) = gid
+            && let Some(snapshot) = inventory_snapshot
+            && let Some(ender) = ender_snapshot
+            && let Err(error) =
+                cluster_invsee::install_player_inventory(self, gid, &player, snapshot, ender)
         {
+            tracing::error!(?gid, ?error, "cluster inventory handoff install failed");
+            player.client.try_kick(
+                DisconnectReason::Kicked,
+                &TextComponent::text("Inventory handoff unavailable"),
+            );
+            return None;
+        }
+
+        // Wrap in Arc after data is loaded
+        let player = if self.advanced_config.cluster.enabled {
+            Arc::new_cyclic(|weak| {
+                Arc::get_mut(&mut player.advancements)
+                    .expect("new player owns its advancement state")
+                    .get_mut()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .player = weak.clone();
+                player
+            })
+        } else {
+            Arc::new(player)
+        };
+        player.set_cluster_gid(gid);
+        let _ = cluster_presence::assign_login_gid(self, &player);
+        if !self.advanced_config.cluster.enabled {
             let mut advancements = player
                 .advancements
                 .lock()
@@ -835,59 +1343,118 @@ impl Server {
             advancements.player = Arc::downgrade(&player);
         };
 
-        let joined = send_cancellable_blocking! {{
-            self;
-            &mut PlayerLoginEvent::new(player.clone(), TextComponent::text("You have been kicked from the server"));
-            'after: {
-                player.screen_handler_sync_handler.store_player(player.clone());
-                world.add_player(&player).is_ok().then(|| {
-                    {
-                        let mut user_cache = self
-                            .data
-                            .user_cache
-                            .write()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        user_cache.upsert(player.gameprofile.id, player.gameprofile.name.clone());
-                    };
+        Some(PreparedPlayerJoin {
+            player,
+            world,
+            config,
+            gid,
+            inventory_install_token: handoff_inventory_token,
+            statistics_import,
+            living_import,
+        })
+    }
 
-                    // TODO: Config if we want increase online
-                    if let Some(config) = config {
-                        // TODO: Config so we can also just ignore this hehe
-                        if config.server_listing {
-                            self.listing
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .add_player(&player);
-                        }
-                    }
-
-                    (player, world)
+    pub(crate) fn finish_prepared_player(
+        self: &Arc<Self>,
+        prepared: PreparedPlayerJoin,
+    ) -> Option<(Arc<Player>, Arc<World>)> {
+        let PreparedPlayerJoin {
+            player,
+            world,
+            config,
+            gid,
+            inventory_install_token,
+            statistics_import,
+            living_import,
+        } = prepared;
+        let admission = match (gid, statistics_import, living_import) {
+            (Some(actor), Some(statistics), Some(living)) => {
+                Some(cluster_world_actor::ActorAdmissionImport {
+                    actor,
+                    statistics,
+                    living: living.state,
                 })
             }
-
-            'cancelled: {
-                player.kick(DisconnectReason::Kicked, &event.kick_message);
-                None
+            (None, None, None) => None,
+            _ => {
+                player.kick(
+                    DisconnectReason::Kicked,
+                    &TextComponent::text("Actor handoff unavailable"),
+                );
+                return None;
             }
-        }};
-        if let Some((joined_player, _)) = joined.as_ref() {
-            cluster_presence::publish_login(self, joined_player);
+        };
+        let admission_route = if admission.is_some() {
+            let Some(route) = self.cluster_actor_admission_import_route.load_full() else {
+                player.kick(
+                    DisconnectReason::Kicked,
+                    &TextComponent::text("Cluster actor owner unavailable"),
+                );
+                return None;
+            };
+            Some(route)
+        } else {
+            None
+        };
+        let admission_permit = if let Some(route) = admission_route.as_deref() {
+            let Ok(permit) = route.try_reserve() else {
+                player.kick(
+                    DisconnectReason::Kicked,
+                    &TextComponent::text("Cluster actor queue saturated"),
+                );
+                return None;
+            };
+            Some(permit)
+        } else {
+            None
+        };
+        player
+            .screen_handler_sync_handler
+            .store_player(player.clone());
+        if world.add_player(&player).is_err() {
+            return None;
         }
-        joined
+        if let (Some(permit), Some(admission)) = (admission_permit, admission) {
+            permit.send(admission);
+        }
+        if !self.advanced_config.cluster.enabled {
+            let mut user_cache = self
+                .data
+                .user_cache
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            user_cache.upsert(player.gameprofile.id, player.gameprofile.name.clone());
+            if config.as_ref().is_some_and(|config| config.server_listing) {
+                self.listing
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .add_player(&player);
+            }
+        }
+        cluster_presence::publish_login(self, &player);
+        if let (Some(gid), Some(token)) = (gid, inventory_install_token) {
+            cluster_invsee::retire_handoff_inventory_install(self, gid, token);
+        }
+        Some((player, world))
     }
 
     pub fn remove_player(&self, player: &Player) {
         cluster_presence::publish_logout(self, player);
+        if self.advanced_config.cluster.enabled {
+            let _ = self.cluster_secure_chat.remove(player);
+        }
         player.increment_stat(
             pumpkin_data::statistic::StatisticCategory::Custom,
             pumpkin_data::statistic::CustomStatistic::LeaveGame as i32,
             1,
         );
         // TODO: Config if we want decrease online
-        self.listing
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove_player(player);
+        if !self.advanced_config.cluster.enabled {
+            self.listing
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove_player(player);
+        }
     }
 
     pub async fn shutdown(&self) {
@@ -941,6 +1508,12 @@ impl Server {
 
     pub fn broadcast_tab_list_header_footer(&self, header: &TextComponent, footer: &TextComponent) {
         let packet = CTabList::new(header, footer);
+        if self.advanced_config.cluster.enabled {
+            for world in self.worlds.load().iter() {
+                world.broadcast_packet_all(&packet);
+            }
+            return;
+        }
         for world in self.worlds.load().iter() {
             for player in world.players.load().iter() {
                 *player
@@ -1093,7 +1666,7 @@ impl Server {
             world.players.load().iter().any(|player| {
                 player.is_in_cluster_lobby() && player.gameprofile.name.eq_ignore_ascii_case(name)
             })
-        }) || cluster_presence::remote_player_in_lobby(name)
+        }) || cluster_presence::remote_player_in_lobby(self, name)
     }
 
     pub fn get_players_by_ip(&self, ip: IpAddr) -> Vec<Arc<Player>> {
@@ -1272,19 +1845,26 @@ impl Server {
     /// Main server tick method. This now handles both player/network ticking (which always runs)
     /// and world/game logic ticking (which is affected by freeze state).
     pub fn tick(self: &Arc<Self>) {
-        if pumpkin_world::level::is_cluster_secondary()
-            && self
-                .worlds
-                .load()
-                .iter()
-                .all(|world| world.players.load().is_empty())
-        {
-            return;
+        if pumpkin_world::level::is_cluster_secondary() {
+            for player in self.get_all_players() {
+                if !player
+                    .cluster_departing
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    player.process_inbound_packets();
+                }
+            }
         }
-
-        let _ = cluster_movement_sample::sample_server_tick(self);
-        let _ = cluster_entity_emit::sample_entities_tick(self);
+        let cluster_tick = cluster::disciplined_tick_stamp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|age| age.as_millis() as i64)
+                .unwrap_or(0),
+        );
+        self.cluster_controller.advance(self, cluster_tick);
         let _ = cluster_tick_pump::pump_staged_tick(self);
+        let _ = cluster_movement_sample::sample_server_tick(self, cluster_tick);
+        let _ = cluster_entity_emit::sample_entities_tick(self);
         if self.tick_rate_manager.runs_normally() || self.tick_rate_manager.is_sprinting() {
             self.tick_worlds();
             // Always run player and network ticking, even when game is frozen
@@ -1404,6 +1984,90 @@ impl Server {
             return 0;
         }
         self.aggregated_tick_times_nanos.load(Ordering::Relaxed) / sample_size as i64
+    }
+
+    pub fn cluster_health_mask(&self) -> HealthMaskMode {
+        match self.cluster_health_policy.load().mode {
+            ClusterHealthMaskMode::Off => HealthMaskMode::Off,
+            ClusterHealthMaskMode::Players => HealthMaskMode::Players,
+            ClusterHealthMaskMode::All => HealthMaskMode::All,
+        }
+    }
+
+    pub fn set_cluster_health_mask(&self, mode: HealthMaskMode) -> bool {
+        let mode = match mode {
+            HealthMaskMode::Off => ClusterHealthMaskMode::Off,
+            HealthMaskMode::Players => ClusterHealthMaskMode::Players,
+            HealthMaskMode::All => ClusterHealthMaskMode::All,
+        };
+        if !self.advanced_config.cluster.enabled {
+            let Some(snapshot) = (**self.cluster_health_policy.load()).next(mode) else {
+                return false;
+            };
+            self.cluster_health_policy.store(Arc::new(snapshot));
+            self.refresh_client_health_metadata();
+            return true;
+        }
+        self.cluster_health_policy_tx.get().is_some_and(|tx| {
+            tx.try_send(cluster_health_policy::HealthPolicyCommand::Set(mode))
+                .is_ok()
+        })
+    }
+
+    pub(crate) fn publish_cluster_health_policy_to(&self, peer: u16) {
+        if let Some(tx) = self.cluster_health_policy_tx.get() {
+            let _ = tx.try_send(cluster_health_policy::HealthPolicyCommand::PublishTo(peer));
+        }
+    }
+
+    pub(crate) fn note_cluster_health_policy_primary(&self, peer: u16) {
+        if let Some(tx) = self.cluster_health_policy_tx.get() {
+            let _ = tx.try_send(cluster_health_policy::HealthPolicyCommand::PrimaryObserved(
+                peer,
+            ));
+        }
+    }
+
+    pub(crate) fn note_cluster_health_policy_connected(&self, peer: u16) {
+        if let Some(tx) = self.cluster_health_policy_tx.get() {
+            let _ = tx.try_send(cluster_health_policy::HealthPolicyCommand::PeerConnected(
+                peer,
+            ));
+        }
+    }
+
+    pub(crate) fn note_cluster_health_policy_admitted(&self, peer: u16) {
+        if let Some(tx) = self.cluster_health_policy_tx.get() {
+            let _ = tx.try_send(cluster_health_policy::HealthPolicyCommand::PeerAdmitted(
+                peer,
+            ));
+        }
+    }
+
+    pub(crate) fn note_cluster_health_policy_disconnected(&self, peer: u16) {
+        if let Some(tx) = self.cluster_health_policy_tx.get() {
+            let _ = tx.try_send(cluster_health_policy::HealthPolicyCommand::PeerDisconnected(peer));
+        }
+    }
+
+    pub(crate) fn note_cluster_health_policy_local_admitted(&self) {
+        if let Some(tx) = self.cluster_health_policy_tx.get() {
+            let _ = tx.try_send(cluster_health_policy::HealthPolicyCommand::LocalAdmitted);
+        }
+    }
+
+    pub(crate) fn refresh_client_health_metadata(&self) {
+        for world in self.worlds.load().iter() {
+            for entity in world.entities.load().iter() {
+                if let Some(living) = entity.get_living_entity() {
+                    living.refresh_client_visible_health();
+                }
+            }
+            for player in world.players.load().iter() {
+                player.living_entity.refresh_client_visible_health();
+                player.send_health();
+            }
+        }
     }
 
     /// Returns the average Milliseconds Per Tick (MSPT).

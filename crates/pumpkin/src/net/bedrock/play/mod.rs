@@ -77,7 +77,7 @@ use tracing::{debug, info};
 
 const MIN_PREDICTED_BREAK_PROGRESS: f32 = 0.65;
 
-fn descriptor_to_stack(desc: &NetworkItemDescriptor) -> ItemStack {
+pub(crate) fn descriptor_to_stack(desc: &NetworkItemDescriptor) -> ItemStack {
     if desc.id.0 == 0 || desc.stack_size == 0 {
         ItemStack::EMPTY.clone()
     } else {

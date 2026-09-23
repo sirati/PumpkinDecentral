@@ -875,7 +875,7 @@ mod tests {
     use crate::data_component::DataComponent;
     use crate::data_component_impl::{
         CustomDataImpl, CustomNameImpl, DataComponentImpl, EnchantmentsImpl, ItemNameImpl,
-        LoreImpl, UnbreakableImpl,
+        LoreImpl, UnbreakableImpl, UseRemainderImpl,
     };
 
     /// Helper: creates a fresh Iron Sword (max_damage 250, damage 0).
@@ -1098,6 +1098,37 @@ mod tests {
                 .name,
             "filled_map.mansion"
         );
+    }
+
+    #[test]
+    fn use_remainder_preserves_vanilla_and_patched_stack_after_roundtrip() {
+        let default = ItemStack::new(1, &Item::BEETROOT_SOUP);
+        let bowl = default
+            .get_data_component::<UseRemainderImpl>()
+            .unwrap()
+            .remainder_stack()
+            .unwrap();
+        assert_eq!(bowl.item.id, Item::BOWL.id);
+        assert_eq!(bowl.item_count, 1);
+
+        let mut patched = default;
+        let mut value = NbtCompound::new();
+        value.put_string("id", "minecraft:glass_bottle".to_owned());
+        value.put_int("count", 2);
+        patched.patch.push((
+            DataComponent::UseRemainder,
+            Some(UseRemainderImpl::read_data(&NbtTag::Compound(value)).unwrap().to_dyn()),
+        ));
+        let mut encoded = NbtCompound::new();
+        patched.write_item_stack(&mut encoded);
+        let decoded = ItemStack::read_item_stack(&encoded).unwrap();
+        let remainder = decoded
+            .get_data_component::<UseRemainderImpl>()
+            .unwrap()
+            .remainder_stack()
+            .unwrap();
+        assert_eq!(remainder.item.id, Item::GLASS_BOTTLE.id);
+        assert_eq!(remainder.item_count, 2);
     }
 
     // ── damage_item ───────────────────────────────────────────────

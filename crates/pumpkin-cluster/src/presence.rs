@@ -16,6 +16,8 @@ pub const PRESENCE_MAX_PROPERTY_NAME_LEN: usize = 64;
 
 pub const PRESENCE_MAX_PROPERTY_VALUE_LEN: usize = 8192;
 
+const PRESENCE_MAGIC: [u8; 4] = *b"PRES";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PresenceError {
     pub message: String,
@@ -54,6 +56,7 @@ pub struct PresenceLogin {
     pub name: String,
     pub properties: Vec<PresenceProperty>,
     pub in_lobby: bool,
+    pub listed: bool,
 }
 
 impl PresenceLogin {
@@ -71,7 +74,14 @@ impl PresenceLogin {
             name,
             properties: sanitize_presence_properties(properties),
             in_lobby,
+            listed: true,
         }
+    }
+
+    #[must_use]
+    pub fn with_listing(mut self, listed: bool) -> Self {
+        self.listed = listed;
+        self
     }
 }
 
@@ -141,9 +151,7 @@ fn truncate_to(text: &str, max_len: usize) -> String {
 }
 
 #[must_use]
-pub fn sanitize_presence_properties(
-    properties: Vec<PresenceProperty>,
-) -> Vec<PresenceProperty> {
+pub fn sanitize_presence_properties(properties: Vec<PresenceProperty>) -> Vec<PresenceProperty> {
     properties
         .into_iter()
         .filter(|property| !property.name.is_empty() && !property.value.is_empty())
@@ -162,13 +170,22 @@ pub fn sanitize_presence_properties(
 }
 
 pub fn encode_control(message: &PresenceControl) -> Result<Vec<u8>, PresenceError> {
-    postcard::to_allocvec(message).map_err(|error| PresenceError {
+    let encoded = postcard::to_allocvec(message).map_err(|error| PresenceError {
         message: format!("encode presence control: {error}"),
-    })
+    })?;
+    let mut bytes = Vec::with_capacity(PRESENCE_MAGIC.len() + encoded.len());
+    bytes.extend_from_slice(&PRESENCE_MAGIC);
+    bytes.extend_from_slice(&encoded);
+    Ok(bytes)
 }
 
 pub fn decode_control(bytes: &[u8]) -> Result<PresenceControl, PresenceError> {
-    postcard::from_bytes(bytes).map_err(|error| PresenceError {
+    let Some(encoded) = bytes.strip_prefix(&PRESENCE_MAGIC) else {
+        return Err(PresenceError {
+            message: String::from("decode presence control: wrong discriminator"),
+        });
+    };
+    postcard::from_bytes(encoded).map_err(|error| PresenceError {
         message: format!("decode presence control: {error}"),
     })
 }
@@ -229,6 +246,7 @@ pub struct RemotePlayerEntry {
     pub properties: Vec<PresenceProperty>,
     pub joined_at_millis: u64,
     pub in_lobby: bool,
+    pub listed: bool,
 }
 
 impl RemotePlayerEntry {
@@ -240,6 +258,7 @@ impl RemotePlayerEntry {
         properties: Vec<PresenceProperty>,
         joined_at_millis: u64,
         in_lobby: bool,
+        listed: bool,
     ) -> Self {
         Self {
             gid,
@@ -248,6 +267,7 @@ impl RemotePlayerEntry {
             properties: sanitize_presence_properties(properties),
             joined_at_millis,
             in_lobby,
+            listed,
         }
     }
 
@@ -280,6 +300,7 @@ impl PresenceTable {
             entry.name = login.name.clone();
             entry.properties = properties;
             entry.in_lobby = login.in_lobby;
+            entry.listed = login.listed;
             return true;
         }
         if self.entries.len() >= PRESENCE_MAX_ENTRIES {
@@ -296,6 +317,7 @@ impl PresenceTable {
                 properties,
                 now_millis,
                 login.in_lobby,
+                login.listed,
             ),
         );
         true
@@ -428,7 +450,10 @@ mod tests {
         let mut announced = login(2, 7, "Steve");
         announced.properties = textured();
         let bytes = encode_control(&PresenceControl::Login(announced.clone())).unwrap();
-        assert_eq!(decode_control(&bytes).unwrap(), PresenceControl::Login(announced));
+        assert_eq!(
+            decode_control(&bytes).unwrap(),
+            PresenceControl::Login(announced)
+        );
         assert!(is_valid_presence_property(&textured()[0]));
         assert!(!is_valid_presence_property(&PresenceProperty::new(
             String::new(),
@@ -460,8 +485,7 @@ mod tests {
         assert_eq!(parcels.len(), 2);
         assert_eq!(parcels[0].peer, 1);
         assert_eq!(parcels[1].peer, 3);
-        let parcels =
-            logout_parcels_for_peers(&PresenceLogout::new(gid(2, 7)), &[1, 3]).unwrap();
+        let parcels = logout_parcels_for_peers(&PresenceLogout::new(gid(2, 7)), &[1, 3]).unwrap();
         assert_eq!(parcels.len(), 2);
         assert_eq!(parcels[0].kind, StreamKind::Control);
     }
@@ -482,7 +506,11 @@ mod tests {
         let removed = table.apply_logout(&PresenceLogout::new(gid(2, 7)));
         assert_eq!(removed.unwrap().name, String::from("Alex"));
         assert!(table.is_empty());
-        assert!(table.apply_logout(&PresenceLogout::new(gid(9, 9))).is_none());
+        assert!(
+            table
+                .apply_logout(&PresenceLogout::new(gid(9, 9)))
+                .is_none()
+        );
     }
 
     #[test]
@@ -497,13 +525,11 @@ mod tests {
         let mut table = PresenceTable::new();
         let bytes = encode_control(&PresenceControl::Login(login(2, 7, "Steve"))).unwrap();
         let effect = handle_presence_bytes(&mut table, &bytes, 50).unwrap();
-        assert!(matches!(
-            effect,
-            PresenceInboundEffect::LoginApplied(_)
-        ));
+        assert!(matches!(effect, PresenceInboundEffect::LoginApplied(_)));
         assert!(decode_control(&[]).is_err());
         assert!(handle_presence_bytes(&mut table, &[], 50).is_err());
-        let bytes = encode_control(&PresenceControl::Logout(PresenceLogout::new(gid(2, 7)))).unwrap();
+        let bytes =
+            encode_control(&PresenceControl::Logout(PresenceLogout::new(gid(2, 7)))).unwrap();
         let effect = handle_presence_bytes(&mut table, &bytes, 60).unwrap();
         match effect {
             PresenceInboundEffect::LogoutApplied { logout, removed } => {
@@ -517,6 +543,20 @@ mod tests {
         let bytes = encode_control(&PresenceControl::Login(login(2, 8, ""))).unwrap();
         let effect = handle_presence_bytes(&mut table, &bytes, 70).unwrap();
         assert_eq!(effect, PresenceInboundEffect::Ignored);
+    }
+
+    #[test]
+    fn control_discriminator_prevents_hide_cross_talk() {
+        let presence = encode_control(&PresenceControl::Login(login(2, 7, "Steve"))).unwrap();
+        assert!(crate::hide::decode_hide(&presence).is_err());
+        let hide = crate::hide::encode_hide(&crate::hide::HideUpdate::new(
+            gid(2, 7),
+            [7; 16],
+            String::from("Steve"),
+            true,
+        ))
+        .unwrap();
+        assert!(decode_control(&hide).is_err());
     }
 
     #[test]

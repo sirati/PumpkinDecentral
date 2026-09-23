@@ -1259,10 +1259,13 @@ fn deserialize_item_stack_template(
     seq: &mut impl NetworkReadExt,
 ) -> Result<pumpkin_data::item_stack::ItemStack, ReadingError> {
     const MAX_COMPONENTS: i32 = 256;
+    const MAX_TEMPLATE_BYTES: usize = 1 << 20;
 
-    let item_id = seq.get_var_int()?.0 as u16;
+    let item_id = u16::try_from(seq.get_var_int()?.0)
+        .map_err(|_| ReadingError::Message("Invalid ItemStackTemplate item id".into()))?;
 
-    let count = seq.get_var_int()?.0 as u8;
+    let count = u8::try_from(seq.get_var_int()?.0)
+        .map_err(|_| ReadingError::Message("Invalid ItemStackTemplate count".into()))?;
 
     let num_to_add = seq.get_var_int()?.0;
     let num_to_remove = seq.get_var_int()?.0;
@@ -1283,14 +1286,27 @@ fn deserialize_item_stack_template(
 
     let mut patch = Vec::with_capacity((num_to_add + num_to_remove) as usize);
 
+    let mut component_bytes = 0_usize;
     for _ in 0..num_to_add {
         let id_val = seq.get_var_int()?.0;
         let id = DataComponent::try_from_id(id_val as u8)
             .ok_or_else(|| ReadingError::Message(format!("Unknown component ID: {id_val}")))?;
 
-        let _byte_len = seq.get_var_int()?;
-
-        let component_impl = deserialize(id, seq)?;
+        let byte_len = usize::try_from(seq.get_var_int()?.0)
+            .map_err(|_| ReadingError::Message("Negative component byte length".into()))?;
+        component_bytes = component_bytes
+            .checked_add(byte_len)
+            .ok_or_else(|| ReadingError::Message("Component byte length overflow".into()))?;
+        if component_bytes > MAX_TEMPLATE_BYTES {
+            return Err(ReadingError::Message("ItemStackTemplate patch too large".into()));
+        }
+        let mut bytes = vec![0_u8; byte_len];
+        seq.read_bytes_to_buf(&mut bytes)?;
+        let mut component = std::io::Cursor::new(bytes);
+        let component_impl = deserialize(id, &mut component)?;
+        if component.position() != byte_len as u64 {
+            return Err(ReadingError::Message("Trailing component bytes".into()));
+        }
         patch.push((id, Some(component_impl)));
     }
 
@@ -1301,11 +1317,9 @@ fn deserialize_item_stack_template(
         patch.push((id, None));
     }
 
-    Ok(pumpkin_data::item_stack::ItemStack::new_with_component(
-        count,
-        pumpkin_data::item::Item::from_id(item_id).unwrap_or(&pumpkin_data::item::Item::AIR),
-        patch,
-    ))
+    let item = pumpkin_data::item::Item::from_id(item_id)
+        .ok_or_else(|| ReadingError::Message("Unknown ItemStackTemplate item".into()))?;
+    Ok(pumpkin_data::item_stack::ItemStack::new_with_component(count, item, patch))
 }
 
 fn serialize_item_stack_template(
@@ -1331,7 +1345,12 @@ fn serialize_item_stack_template(
     for (id, data) in &stack.patch {
         if let Some(data) = data {
             seq.write_var_int(&VarInt::from(id.to_id()))?;
-            serialize(*id, data.as_ref(), seq)?;
+            let mut component = Vec::new();
+            serialize(*id, data.as_ref(), &mut component)?;
+            let byte_len = i32::try_from(component.len())
+                .map_err(|_| WritingError::Message("ItemStackTemplate patch too large".into()))?;
+            seq.write_var_int(&VarInt(byte_len))?;
+            seq.write_slice(&component)?;
         }
     }
 
@@ -1751,15 +1770,18 @@ impl DataComponentCodec<Self> for FoodImpl {
 
 impl DataComponentCodec<Self> for UseRemainderImpl {
     fn serialize(&self, seq: &mut impl NetworkWriteExt) -> Result<(), WritingError> {
-        seq.write_var_int(&VarInt(0))?;
-        seq.write_var_int(&VarInt(0))?;
-        seq.write_var_int(&VarInt(0))?;
-        seq.write_var_int(&VarInt(0))
+        let stack = self
+            .remainder_stack()
+            .ok_or_else(|| WritingError::Message("Invalid use remainder stack".into()))?;
+        serialize_item_stack_template(&stack, seq)
     }
 
     fn deserialize(seq: &mut impl NetworkReadExt) -> Result<Self, ReadingError> {
-        let _ = deserialize_item_stack_template(seq)?;
-        Ok(Self)
+        let stack = deserialize_item_stack_template(seq)?;
+        let mut value = pumpkin_nbt::compound::NbtCompound::new();
+        stack.write_item_stack(&mut value);
+        Self::read_data(&NbtTag::Compound(value))
+            .ok_or_else(|| ReadingError::Message("Invalid use remainder stack".into()))
     }
 }
 
@@ -2807,5 +2829,32 @@ impl DataComponentCodec<Self> for BreakSoundImpl {
     fn deserialize(seq: &mut impl NetworkReadExt) -> Result<Self, ReadingError> {
         let _ = seq.get_var_int()?;
         Ok(Self)
+    }
+}
+
+#[cfg(test)]
+mod use_remainder_tests {
+    use super::*;
+    use pumpkin_data::item::Item;
+    use pumpkin_data::item_stack::ItemStack;
+    use pumpkin_nbt::compound::NbtCompound;
+
+    #[test]
+    fn patched_remainder_stack_survives_network_component_roundtrip() {
+        let mut remainder = ItemStack::new(2, &Item::GLASS_BOTTLE);
+        remainder.patch.push((
+            DataComponent::MaxStackSize,
+            Some(MaxStackSizeImpl { size: 16 }.to_dyn()),
+        ));
+        let mut compound = NbtCompound::new();
+        remainder.write_item_stack(&mut compound);
+        let component = UseRemainderImpl::read_data(&NbtTag::Compound(compound)).unwrap();
+        let mut bytes = Vec::new();
+        component.serialize(&mut bytes).unwrap();
+        let decoded = UseRemainderImpl::deserialize(&mut std::io::Cursor::new(bytes)).unwrap();
+        let result = decoded.remainder_stack().unwrap();
+        assert_eq!(result.item.id, Item::GLASS_BOTTLE.id);
+        assert_eq!(result.item_count, 2);
+        assert_eq!(result.get_data_component::<MaxStackSizeImpl>().unwrap().size, 16);
     }
 }

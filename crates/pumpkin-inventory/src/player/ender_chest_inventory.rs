@@ -11,7 +11,8 @@
 //! manage the viewer count for animation purposes.
 
 use std::any::Any;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
+use arc_swap::ArcSwapOption;
 
 use crate::{
     inventory::{Clearable, Inventory},
@@ -30,7 +31,8 @@ pub struct EnderChestInventory {
     /// Viewer count tracker for lid animation.
     ///
     /// Tracks how many players have the ender chest open to animate the lid.
-    pub tracker: Mutex<Option<Arc<ViewerCountTracker>>>,
+    pub tracker: ArcSwapOption<ViewerCountTracker>,
+    cluster_snapshot: ArcSwapOption<[ItemStack; Self::INVENTORY_SIZE]>,
 }
 
 impl Default for EnderChestInventory {
@@ -48,19 +50,32 @@ impl EnderChestInventory {
     pub fn new() -> Self {
         Self {
             items: RwLock::new(std::array::from_fn(|_| ItemStack::EMPTY.clone())),
-            tracker: Mutex::new(None),
+            tracker: ArcSwapOption::empty(),
+            cluster_snapshot: ArcSwapOption::empty(),
         }
+    }
+
+    pub fn from_stacks(stacks: [ItemStack; Self::INVENTORY_SIZE]) -> Self {
+        Self {
+            items: RwLock::new(stacks.clone()),
+            tracker: ArcSwapOption::empty(),
+            cluster_snapshot: ArcSwapOption::from(Some(Arc::new(stacks))),
+        }
+    }
+
+    pub fn publish_cluster_snapshot(&self, stacks: [ItemStack; Self::INVENTORY_SIZE]) {
+        self.cluster_snapshot.store(Some(Arc::new(stacks)));
+    }
+
+    pub fn cluster_stacks(&self) -> Option<Arc<[ItemStack; Self::INVENTORY_SIZE]>> {
+        self.cluster_snapshot.load_full()
     }
 
     /// Sets the viewer count tracker for this inventory.
     ///
     /// Used to animate the ender chest lid based on viewers.
     pub fn set_tracker(&self, tracker: Arc<ViewerCountTracker>) {
-        let old = self
-            .tracker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .replace(tracker);
+        let old = self.tracker.swap(Some(tracker));
         if let Some(old_tracker) = old {
             old_tracker.close_container();
         }
@@ -68,20 +83,12 @@ impl EnderChestInventory {
 
     /// Checks if this inventory has a tracker set.
     pub fn has_tracker(&self) -> bool {
-        self.tracker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
+        self.tracker.load().is_some()
     }
 
     /// Checks if the given tracker is associated with this inventory.
     pub fn is_tracker(&self, tracker: &Arc<ViewerCountTracker>) -> bool {
-        if let Some(value) = self
-            .tracker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-        {
+        if let Some(value) = self.tracker.load_full().as_ref() {
             return Arc::ptr_eq(value, tracker);
         }
         false
@@ -94,6 +101,9 @@ impl Inventory for EnderChestInventory {
     }
 
     fn is_empty(&self) -> bool {
+        if let Some(snapshot) = self.cluster_snapshot.load_full() {
+            return snapshot.iter().all(ItemStack::is_empty);
+        }
         let items = self
             .items
             .read()
@@ -102,6 +112,9 @@ impl Inventory for EnderChestInventory {
     }
 
     fn get_stack(&self, slot: usize) -> ItemStack {
+        if let Some(snapshot) = self.cluster_snapshot.load_full() {
+            return snapshot.get(slot).cloned().unwrap_or_else(|| ItemStack::EMPTY.clone());
+        }
         let items = self
             .items
             .read()
@@ -147,22 +160,13 @@ impl Inventory for EnderChestInventory {
     }
 
     fn on_open(&self) {
-        if let Some(tracker) = self
-            .tracker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-        {
+        if let Some(tracker) = self.tracker.load_full().as_ref() {
             tracker.open_container();
         }
     }
 
     fn on_close(&self) {
-        let tracker = self
-            .tracker
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
+        let tracker = self.tracker.swap(None);
         if let Some(tracker) = tracker {
             tracker.close_container();
         }

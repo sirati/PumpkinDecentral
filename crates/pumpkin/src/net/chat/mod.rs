@@ -352,81 +352,81 @@ impl OutgoingChatMessage {
                 player.try_enqueue_packet_editioned(&je_packet, &be_packet);
             }
             Self::Player { message } => {
-                let filtered_message = message.filter_by_bool(filtered);
-                if !filtered_message.is_fully_filtered() {
-                    let messages_sent = VarInt(filtered_message.link.index);
-                    let messages_received: i32 = player
-                        .chat_session
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .messages_received;
-
-                    let sender_last_seen = {
-                        let cache = player
-                            .signature_cache
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        cache.last_seen.indexed_for(player)
-                    };
-
-                    let je_packet = CPlayerChatMessage::new(
-                        VarInt(messages_received),
-                        filtered_message.sender(),
-                        messages_sent,
-                        filtered_message.signature.clone(),
-                        filtered_message.signed_content().into(),
-                        filtered_message.timestamp(),
-                        filtered_message.salt(),
-                        sender_last_seen,
-                        filtered_message.unsigned_content.clone(),
-                        filtered_message.filter_mask.to_filter_type(),
-                        chat_type,
-                        sender_name.clone(),
-                        target_name.cloned(),
-                    );
-                    let be_packet = SText::new(
-                        filtered_message.decorated_content().get_text(),
-                        sender_name.clone().get_text(),
-                    );
-
-                    player.try_enqueue_packet_editioned(&je_packet, &be_packet);
-
-                    if let Some(signature) = &filtered_message.signature {
-                        let mut cache = player
-                            .signature_cache
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        cache.add_seen_signature(signature);
-                        cache.last_seen_validator.add_pending(signature);
-                        let tracked_count = cache.last_seen_validator.tracked_messages_count();
-                        drop(cache);
-
-                        if tracked_count > 4096 {
-                            player.kick(
-                                crate::net::DisconnectReason::Kicked,
-                                &TextComponent::translate_cross(
-                                    pumpkin_data::translation::java::MULTIPLAYER_DISCONNECT_TOO_MANY_PENDING_CHATS,
-                                    pumpkin_data::translation::java::MULTIPLAYER_DISCONNECT_TOO_MANY_PENDING_CHATS,
-                                    [],
-                                ),
-                            );
-                        }
-                    }
-
-                    if player.gameprofile.id != filtered_message.sender() {
-                        player
-                            .signature_cache
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .cache_signatures(&filtered_message.signed_body.last_seen);
-                    }
-                    player
-                        .chat_session
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .messages_received += 1;
-                }
+                let mut session = player
+                    .chat_session
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut cache = player
+                    .signature_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                Self::send_signed_to_player_owned(
+                    message,
+                    player,
+                    filtered,
+                    chat_type,
+                    sender_name,
+                    target_name,
+                    &mut session,
+                    &mut cache,
+                );
             }
         }
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn send_signed_to_player_owned(
+        message: &PlayerChatMessage,
+        player: &Arc<Player>,
+        filtered: bool,
+        chat_type: VarInt,
+        sender_name: &TextComponent,
+        target_name: Option<&TextComponent>,
+        session: &mut crate::entity::player::ChatSession,
+        cache: &mut crate::entity::player::MessageCache,
+    ) {
+        let filtered_message = message.filter_by_bool(filtered);
+        if filtered_message.is_fully_filtered() {
+            return;
+        }
+        let previous = cache.last_seen.indexed_for_cache(cache);
+        let je_packet = CPlayerChatMessage::new(
+            VarInt(session.messages_received),
+            filtered_message.sender(),
+            VarInt(filtered_message.link.index),
+            filtered_message.signature.clone(),
+            filtered_message.signed_content().into(),
+            filtered_message.timestamp(),
+            filtered_message.salt(),
+            previous,
+            filtered_message.unsigned_content.clone(),
+            filtered_message.filter_mask.to_filter_type(),
+            chat_type,
+            sender_name.clone(),
+            target_name.cloned(),
+        );
+        let be_packet = SText::new(
+            filtered_message.decorated_content().get_text(),
+            sender_name.clone().get_text(),
+        );
+        player.try_enqueue_packet_editioned(&je_packet, &be_packet);
+        if let Some(signature) = &filtered_message.signature {
+            cache.add_seen_signature(signature);
+            cache.last_seen_validator.add_pending(signature);
+            if cache.last_seen_validator.tracked_messages_count() > 4096 {
+                player.kick(
+                    crate::net::DisconnectReason::Kicked,
+                    &TextComponent::translate_cross(
+                        pumpkin_data::translation::java::MULTIPLAYER_DISCONNECT_TOO_MANY_PENDING_CHATS,
+                        pumpkin_data::translation::java::MULTIPLAYER_DISCONNECT_TOO_MANY_PENDING_CHATS,
+                        [],
+                    ),
+                );
+            }
+        }
+        if player.gameprofile.id != filtered_message.sender() {
+            cache.cache_signatures(&filtered_message.signed_body.last_seen);
+        }
+        session.messages_received += 1;
     }
 }

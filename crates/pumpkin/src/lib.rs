@@ -264,10 +264,10 @@ impl PumpkinServer {
         adjust_file_descriptor_limit();
 
         let cluster_primary = server.advanced_config.cluster.enabled
-            && matches!(
-                server.advanced_config.cluster.role,
-                ClusterRole::Primary
-            );
+            && matches!(server.advanced_config.cluster.role, ClusterRole::Primary);
+        if server.advanced_config.cluster.enabled && !cluster_primary {
+            server::cluster_lobby::initialize_lobby_images(&server);
+        }
         if cluster_primary {
             info!("Cluster primary: game listeners disabled, QUIC mesh only");
         }
@@ -544,7 +544,10 @@ impl PumpkinServer {
             player.kick(DisconnectReason::Shutdown, &kick_message);
         }
 
-        crate::server::cluster::log_cluster_shutdown_progress(&self.server, "shutdown ending player tasks");
+        crate::server::cluster::log_cluster_shutdown_progress(
+            &self.server,
+            "shutdown ending player tasks",
+        );
         crate::server::cluster::begin_cluster_leave_drain(&self.server);
         info!("Ending player tasks");
 
@@ -553,7 +556,10 @@ impl PumpkinServer {
 
         self.unload_plugins().await;
 
-        crate::server::cluster::log_cluster_shutdown_progress(&self.server, "shutdown starting save");
+        crate::server::cluster::log_cluster_shutdown_progress(
+            &self.server,
+            "shutdown starting save",
+        );
         info!("Starting save.");
 
         self.server.shutdown().await;
@@ -611,8 +617,237 @@ impl PumpkinServer {
                                      pending.close();
                                 },
                                 PacketHandlerResult::ReadyToPlay(profile, config) => {
-                                     let mut java_client = JavaClient::from_pending(pending, profile.clone(), config.clone());
-                                     java_client.start_outgoing_packet_task();
+                                     let (mut java_client, mut network_reader, network_writer) = JavaClient::from_pending(pending, profile.clone(), config.clone());
+                                     java_client.start_outgoing_packet_task(network_writer);
+
+                                     if server_clone.persistence_delegated_to_primary() {
+                                         let client = Arc::new(ClientPlatform::Java(java_client));
+                                         let ClientPlatform::Java(java) = client.as_ref() else {
+                                             unreachable!()
+                                         };
+                                         let Some(initial_lobby) = server::cluster_lobby::LobbySession::new(
+                                             client.clone(),
+                                             profile.clone(),
+                                             config,
+                                             &server_clone,
+                                         ).await else {
+                                             java.close();
+                                             java.await_tasks().await;
+                                             return;
+                                         };
+                                         let mut next_lobby = Some(initial_lobby);
+                                         loop {
+                                             let mut lobby = next_lobby.take().unwrap();
+                                             let Some(promotion) = java
+                                                 .progress_lobby_packets(&mut lobby, &server_clone, &mut network_reader)
+                                                 .await
+                                             else {
+                                                 lobby.close(&server_clone);
+                                                 server::cluster_presence::publish_logout_gid(&server_clone, lobby.gid());
+                                                 java.close();
+                                                 java.await_tasks().await;
+                                                 return;
+                                             };
+                                             #[cfg(feature = "cluster-e2e")]
+                                             let promotion_gid = promotion.gid;
+                                             let chunk_need = promotion.chunk_need;
+                                             let reentered = promotion.reentered;
+                                             let prepared = java.progress_lobby_during_login_event(
+                                                 &mut lobby,
+                                                 &server_clone,
+                                                 &mut network_reader,
+                                                 server_clone.prepare_player_from_handoff(
+                                                 client.clone(),
+                                                 profile.clone(),
+                                                 promotion.config,
+                                                 promotion.entity_id,
+                                                 promotion.gid,
+                                                 promotion.inventory_install_token,
+                                                 promotion.data,
+                                                 promotion.chunk_sender,
+                                                 promotion.world.clone(),
+                                                 ),
+                                             ).await.flatten();
+                                             let Some(prepared) = prepared else {
+                                                 lobby.close(&server_clone);
+                                                 server::cluster_invsee::cancel_handoff_inventory_install(
+                                                     &server_clone,
+                                                     promotion.gid,
+                                                     promotion.inventory_install_token,
+                                                 );
+                                                 server::cluster_presence::publish_logout_gid(
+                                                     &server_clone,
+                                                     promotion.gid,
+                                                 );
+                                                 java.close();
+                                                 java.await_tasks().await;
+                                                 return;
+                                             };
+                                             if !lobby.finish_promotion(&server_clone) {
+                                                 tracing::error!(gid = ?promotion.gid, "cluster lobby promotion directory missing");
+                                                 lobby.close(&server_clone);
+                                                 server::cluster_presence::publish_logout_gid(&server_clone, promotion.gid);
+                                                 java.close();
+                                                 java.await_tasks().await;
+                                                 return;
+                                             }
+                                             let Some((player, world)) = server_clone.finish_prepared_player(prepared) else {
+                                                 server::cluster_invsee::cancel_handoff_inventory_install(
+                                                     &server_clone,
+                                                     promotion.gid,
+                                                     promotion.inventory_install_token,
+                                                 );
+                                                 server::cluster_presence::publish_logout_gid(&server_clone, promotion.gid);
+                                                 java.close();
+                                                 java.await_tasks().await;
+                                                 return;
+                                             };
+                                             #[cfg(feature = "cluster-e2e")]
+                                             if reentered {
+                                                 tracing::info!(
+                                                     uuid = %player.gameprofile.id,
+                                                     gid_before = promotion_gid.pack_u32(),
+                                                     gid_lobby = promotion_gid.pack_u32(),
+                                                     gid_after = player.cluster_gid().map_or(u32::MAX, pumpkin_cluster::identity::GlobalPlayerId::pack_u32),
+                                                     "cluster e2e manual lobby gid continuity"
+                                                 );
+                                             }
+                                             player.living_entity.entity.set_pos(pumpkin_util::math::vector3::Vector3::new(
+                                                 promotion.hint.position[0],
+                                                 promotion.hint.position[1],
+                                                 promotion.hint.position[2],
+                                             ));
+                                             player.living_entity.entity.set_rotation(
+                                                 promotion.hint.rotation[0],
+                                                 promotion.hint.rotation[1],
+                                             );
+                                             crate::world::chunker::update_position(&player);
+                                             drop(chunk_need);
+                                             java.set_player(player.clone());
+                                             let announce_join = !reentered;
+                                             world
+                                                 .spawn_java_player(
+                                                     &server_clone.basic_config,
+                                                     &player,
+                                                     &server_clone,
+                                                     true,
+                                                     announce_join,
+                                                 )
+                                                 .await;
+                                             for (channel, data) in promotion.plugin_payloads {
+                                                 java.handle_play_custom_payload(
+                                                     &server_clone,
+                                                     &player,
+                                                     &channel,
+                                                     &data,
+                                                 );
+                                             }
+                                             for (uuid, result) in promotion.resource_pack_results {
+                                                 let packet = pumpkin_protocol::java::server::play::SPlayResourcePack {
+                                                     uuid,
+                                                     result,
+                                                 };
+                                                 let mut event = crate::plugin::api::events::player::player_resource_pack_status::PlayerResourcePackStatusEvent::new(
+                                                     player.clone(),
+                                                     uuid.to_string(),
+                                                     format!("{:?}", packet.response_result()),
+                                                 );
+                                                 server_clone.plugin_manager.fire(
+                                                     &server_clone,
+                                                     &mut event,
+                                                 ).await;
+                                             }
+                                             for (action_id, payload) in promotion.dialog_actions {
+                                                 let mut event = crate::plugin::api::events::dialog::dialog_click_action::DialogClickActionEvent::new(
+                                                     player.clone(),
+                                                     action_id,
+                                                     payload,
+                                                 );
+                                                 server_clone.plugin_manager.fire(
+                                                     &server_clone,
+                                                     &mut event,
+                                                 ).await;
+                                             }
+                                             if let Some(chat_session) = promotion.chat_session {
+                                                 if server_clone.basic_config.allow_chat_reports {
+                                                     let _ = server_clone.cluster_secure_chat.install(
+                                                         player.clone(), chat_session,
+                                                     );
+                                                 }
+                                             }
+                                             let loop_result = java
+                                                 .progress_player_packets(&player, &server_clone, &mut network_reader)
+                                                 .await;
+                                             java.clear_player();
+                                             match loop_result {
+                                                 crate::net::java::PlayerPacketLoopResult::Closed => {
+                                                     let departure = server::cluster_lobby::begin_player_departure(
+                                                         &server_clone, &player, true,
+                                                     );
+                                                     java.close();
+                                                     java.await_tasks().await;
+                                                     if let Some(departure) = departure {
+                                                         let server = server_clone.clone();
+                                                         tokio::spawn(async move {
+                                                             if server::cluster_lobby::await_player_departure(
+                                                                 departure.ready, player.gameprofile.id,
+                                                             ).await {
+                                                                 player.remove().await;
+                                                                 if let Some(retained) = departure.retained.as_ref() {
+                                                                     let _ = server::cluster_presence::commit_retained_departure(
+                                                                         &server, &player, retained, true,
+                                                                     );
+                                                                 }
+                                                             }
+                                                         });
+                                                     }
+                                                     return;
+                                                 }
+                                                 crate::net::java::PlayerPacketLoopResult::EnterLobby { forced } => {
+                                                     let departure = server::cluster_lobby::begin_player_departure(
+                                                         &server_clone, &player, false,
+                                                     );
+                                                     let Some(departure) = departure else {
+                                                         java.close();
+                                                         java.await_tasks().await;
+                                                         return;
+                                                     };
+                                                     let (snapshot_tx, snapshot_rx) = tokio::sync::oneshot::channel();
+                                                     let Some(lobby) = server::cluster_lobby::LobbySession::from_departing_player(
+                                                         &player,
+                                                         &server_clone,
+                                                         forced,
+                                                         snapshot_rx,
+                                                     ).await else {
+                                                         java.close();
+                                                         java.await_tasks().await;
+                                                         return;
+                                                     };
+                                                     let server = server_clone.clone();
+                                                     tokio::spawn(async move {
+                                                         if server::cluster_lobby::await_player_departure(
+                                                             departure.ready, player.gameprofile.id,
+                                                         ).await {
+                                                             player.remove_for_lobby().await;
+                                                             let Some(mut snapshot) = server::cluster_lobby::local_snapshot_from_player(&player, &server) else {
+                                                                 return;
+                                                             };
+                                                             if let Some(retained) = departure.retained.as_ref() {
+                                                                 let Some(commit_token) = server::cluster_presence::commit_retained_departure(
+                                                                     &server, &player, retained, false,
+                                                                 ) else {
+                                                                     return;
+                                                                 };
+                                                                 snapshot.commit_token = Some(commit_token);
+                                                             }
+                                                             let _ = snapshot_tx.send(snapshot);
+                                                         }
+                                                     });
+                                                     next_lobby = Some(lobby);
+                                                 }
+                                             }
+                                         }
+                                     }
 
                                      if let Some((player, world)) = server_clone
                                          .add_player(Arc::new(ClientPlatform::Java(java_client)), profile, Some(config))
@@ -622,11 +857,11 @@ impl PumpkinServer {
                                          client.set_player(player.clone());
                                      }
                                      world
-                                         .spawn_java_player(&server_clone.basic_config, &player, &server_clone)
+                                         .spawn_java_player(&server_clone.basic_config, &player, &server_clone, false, true)
                                          .await;
 
                                      if let ClientPlatform::Java(client) = player.client.as_ref() {
-                                         client.progress_player_packets(&player, &server_clone).await;
+                                         client.progress_player_packets(&player, &server_clone, &mut network_reader).await;
 
                                          // Close when done
                                          client.close();
@@ -739,8 +974,34 @@ impl PumpkinServer {
                     ) {
                         client.set_player(player.clone());
                         client.progress_player_packets(&player).await;
+                        let departure = server
+                            .persistence_delegated_to_primary()
+                            .then(|| {
+                                server::cluster_lobby::begin_player_departure(&server, &player, true)
+                            })
+                            .flatten();
                         client.close().await;
                         client.await_tasks().await;
+                        if let Some(departure) = departure {
+                            let server = server.clone();
+                            tokio::spawn(async move {
+                                if server::cluster_lobby::await_player_departure(
+                                    departure.ready, player.gameprofile.id,
+                                ).await {
+                                    player.remove().await;
+                                    if let Some(retained) = departure.retained.as_ref() {
+                                        let _ = server::cluster_presence::commit_retained_departure(
+                                            &server, &player, retained, true,
+                                        );
+                                    }
+                                }
+                            });
+                            return;
+                        }
+                        if server.persistence_delegated_to_primary() {
+                            tracing::error!(uuid = %player.gameprofile.id, "cluster bedrock player departure ticket failed");
+                            return;
+                        }
                         player.remove().await;
                         server.remove_player(&player);
                         if !server.persistence_delegated_to_primary() {

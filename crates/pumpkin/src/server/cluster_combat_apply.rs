@@ -4,11 +4,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use pumpkin_cluster::codec::decode_batch;
 use pumpkin_cluster::combat::{
-    CombatLimits, HitSnapshot, is_dir_sane, validate_fire, validate_hit_entity, validate_hit_player,
-    FireDecision, HitDecision,
+    CombatLimits, FireDecision, HitDecision, HitSnapshot, chunk_of_pos, is_dir_sane, validate_fire,
+    validate_hit_entity, validate_hit_player,
 };
 use pumpkin_cluster::identity::{GlobalPlayerId, PlayerSeq, ServerId};
-use pumpkin_cluster::protocol::{FireProjectileUpdate, HitEntityUpdate, HitPlayerUpdate, StreamKind};
+use pumpkin_cluster::protocol::{
+    FireProjectileUpdate, HitEntityUpdate, HitPlayerUpdate, StreamKind,
+};
 use pumpkin_cluster::streams::InboundParcel;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -69,7 +71,10 @@ impl CombatApplyState {
     }
 }
 
-fn find_player_by_gid(server: &Arc<Server>, gid: GlobalPlayerId) -> Option<Arc<crate::entity::player::Player>> {
+fn find_player_by_gid(
+    server: &Arc<Server>,
+    gid: GlobalPlayerId,
+) -> Option<Arc<crate::entity::player::Player>> {
     for world in server.worlds.load().iter() {
         for player in world.players.load().iter() {
             if player.cluster_gid() == Some(gid) {
@@ -140,10 +145,15 @@ fn apply_hit_entity(
     batch_tick: pumpkin_cluster::time::TickStamp,
     update: &HitEntityUpdate,
 ) {
+    let local = ServerId(server.advanced_config.cluster.server_id);
     let mut victim: Option<Arc<dyn crate::entity::EntityBase>> = None;
     for world in server.worlds.load().iter() {
-        if let Some(entity) = world.get_entity_by_id(update.target.local_id) {
-            victim = Some(entity);
+        let entities = world.entities.load();
+        if let Some(entity) = entities
+            .iter()
+            .find(|entity| entity_matches_ref(entity.as_ref(), update.target, local))
+        {
+            victim = Some(Arc::clone(entity));
             break;
         }
     }
@@ -192,6 +202,30 @@ fn apply_hit_entity(
     }
 }
 
+fn entity_matches_ref(
+    entity: &dyn EntityBase,
+    target: pumpkin_cluster::protocol::EntityRef,
+    local: ServerId,
+) -> bool {
+    let inner = entity.get_entity();
+    let pos = inner.pos.load();
+    let world = inner.world.load();
+    if chunk_of_pos(super::cluster_world_delta::world_id(&world), pos.x, pos.z) != target.chunk {
+        return false;
+    }
+    if let Some(replica) = entity
+        .cast_any()
+        .downcast_ref::<crate::entity::cluster_entity_replica::RemoteEntityReplica>(
+    ) {
+        return replica.cluster_ref.origin == target.origin
+            && replica.cluster_ref.local_id == target.local_id
+            && replica.cluster_ref.generation == target.generation;
+    }
+    target.origin == local
+        && inner.entity_id == target.local_id
+        && inner.cluster_generation() == target.generation
+}
+
 fn arrow_speed_for_fire(update: &FireProjectileUpdate) -> f32 {
     if update.kind == 1 {
         return crate::item::items::crossbow::CrossbowItem::ARROW_POWER;
@@ -211,7 +245,12 @@ fn apply_fire(
         COMBAT_REJECTED.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    match validate_fire(update, state.last_for(update.gid), batch_tick, &state.limits) {
+    match validate_fire(
+        update,
+        state.last_for(update.gid),
+        batch_tick,
+        &state.limits,
+    ) {
         FireDecision::Reject(_) => {
             COMBAT_REJECTED.fetch_add(1, Ordering::Relaxed);
         }
@@ -227,7 +266,8 @@ fn apply_fire(
                 shooter_entity.pos.load(),
                 &pumpkin_data::entity::EntityType::ARROW,
             );
-            let stack = pumpkin_data::item_stack::ItemStack::new(1, &pumpkin_data::item::Item::ARROW);
+            let stack =
+                pumpkin_data::item_stack::ItemStack::new(1, &pumpkin_data::item::Item::ARROW);
             let arrow = crate::entity::projectile::arrow::ArrowEntity::new_shot(
                 arrow_base,
                 shooter_entity,
@@ -248,11 +288,7 @@ fn apply_fire(
     }
 }
 
-pub fn apply_batch_bytes(
-    server: &Arc<Server>,
-    state: &mut CombatApplyState,
-    bytes: &[u8],
-) {
+pub fn apply_batch_bytes(server: &Arc<Server>, state: &mut CombatApplyState, bytes: &[u8]) {
     let batch = match decode_batch(bytes) {
         Ok(batch) => batch,
         Err(error) => {
@@ -261,6 +297,14 @@ pub fn apply_batch_bytes(
             return;
         }
     };
+    apply_resolved_batch(server, state, &batch);
+}
+
+pub fn apply_resolved_batch(
+    server: &Arc<Server>,
+    state: &mut CombatApplyState,
+    batch: &pumpkin_cluster::protocol::TickBatch,
+) {
     COMBAT_BATCHES.fetch_add(1, Ordering::Relaxed);
     for update in &batch.hit_player {
         apply_hit_player(server, state, batch.tick, update);
@@ -306,6 +350,11 @@ mod tests {
             gid: GlobalPlayerId::new(ServerId(1), pumpkin_cluster::identity::PlayerSlot(1)),
             seq: PlayerSeq(0),
             tick: pumpkin_cluster::time::TickStamp(0),
+            actor_chunk: pumpkin_cluster::protocol::ChunkKey::new(
+                pumpkin_cluster::protocol::WorldId::new(0, 7),
+                0,
+                0,
+            ),
             kind: 0,
             charge_milli: 1000,
             dir: [0.0, 0.0, 1.0],
@@ -317,7 +366,10 @@ mod tests {
         });
         assert!(full > weak);
         let crossbow = arrow_speed_for_fire(&FireProjectileUpdate { kind: 1, ..base });
-        assert!((crossbow - crate::item::items::crossbow::CrossbowItem::ARROW_POWER).abs() < f32::EPSILON);
+        assert!(
+            (crossbow - crate::item::items::crossbow::CrossbowItem::ARROW_POWER).abs()
+                < f32::EPSILON
+        );
     }
 
     #[test]

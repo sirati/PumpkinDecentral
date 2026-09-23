@@ -273,7 +273,9 @@ pub fn run_generation(
     level: &Level,
 ) -> RecvChunk {
     if crate::level::is_cluster_secondary() {
-        error!("Cluster secondary refused local chunk generation at {pos:?} ({stage:?}): secondaries never generate, chunks must arrive from the holding peer");
+        error!(
+            "Cluster secondary refused local chunk generation at {pos:?} ({stage:?}): secondaries never generate, chunks must arrive from the holding peer"
+        );
         return RecvChunk::GenerationFailure {
             pos,
             stage,

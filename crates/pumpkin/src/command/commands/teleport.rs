@@ -1,5 +1,8 @@
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
+use pumpkin_cluster::player_admin::{PlayerAdministrativeIntent, PlayerAdministrativeMutation};
 use pumpkin_data::translation;
 use pumpkin_util::PermissionLvl;
 use pumpkin_util::math::position::BlockPos;
@@ -11,10 +14,10 @@ use crate::command::argument_builder::{ArgumentBuilder, argument, command, liter
 use crate::command::argument_types::coordinates::rotation::RotationArgumentType;
 use crate::command::argument_types::coordinates::vec3::Vec3ArgumentType;
 use crate::command::argument_types::entity::EntityArgumentType;
-use crate::command::argument_types::entity_selector::EntitySelector;
 use crate::command::argument_types::entity_anchor::{
     EntityAnchor, EntityAnchorArgumentType, EntityAnchorExt,
 };
+use crate::command::argument_types::entity_selector::EntitySelector;
 use crate::command::context::command_context::CommandContext;
 use crate::command::errors::error_types::CommandErrorType;
 use crate::command::node::dispatcher::CommandDispatcher;
@@ -65,24 +68,28 @@ struct TeleportDestination {
     display_name: TextComponent,
 }
 
-fn remote_destination(
-    context: &CommandContext,
-    argument: &str,
-) -> Option<TeleportDestination> {
+fn remote_destination(context: &CommandContext, argument: &str) -> Option<TeleportDestination> {
     let selector = context.get_argument::<EntitySelector>(argument).ok()?;
     let name = selector.player_name.as_deref()?;
-    if crate::server::cluster_presence::remote_player_in_lobby(name) {
+    if crate::server::cluster_presence::remote_player_in_lobby(context.server(), name) {
         return None;
     }
-    let (gid, entry) = crate::server::cluster_presence::remote_presence_entries()
+    let (gid, entry) = crate::server::cluster_presence::remote_presence_entries(context.server())
         .into_iter()
         .find(|(_, entry)| entry.name.eq_ignore_ascii_case(name))?;
     let sample = crate::server::cluster_ghost::remote_player_position(gid)?;
+    let world = context
+        .server()
+        .worlds
+        .load()
+        .iter()
+        .find(|world| crate::server::cluster_world_delta::world_id(world) == sample.world)?
+        .clone();
     Some(TeleportDestination {
         pos: Vector3::new(sample.pos[0], sample.pos[1], sample.pos[2]),
         yaw: sample.yaw,
         pitch: sample.pitch,
-        world: context.source.world().clone(),
+        world,
         display_name: TextComponent::text(entry.name),
     })
 }
@@ -93,13 +100,147 @@ fn destination_or_lobby_error(
 ) -> Option<CommandExecutorResult> {
     let selector = context.get_argument::<EntitySelector>(argument).ok()?;
     let name = selector.player_name.as_deref()?;
-    if !crate::server::cluster_presence::remote_player_in_lobby(name) {
+    if !crate::server::cluster_presence::remote_player_in_lobby(context.server(), name) {
         return None;
     }
     context.source.send_error(TextComponent::text(format!(
         "{name} is currently in the lobby, and not in the game world"
     )));
     Some(Ok(0))
+}
+
+fn teleport_named_player(
+    context: &CommandContext,
+    argument: &str,
+    pos: Vector3<f64>,
+    rotation: Option<(f32, f32)>,
+    world: &Arc<World>,
+    destination: Option<TextComponent>,
+) -> Option<CommandExecutorResult> {
+    if !context.server().advanced_config.cluster.enabled {
+        return None;
+    }
+    let selector = context.get_argument::<EntitySelector>(argument).ok()?;
+    let name = selector.player_name.as_deref()?;
+    let target = crate::server::cluster_presence::all_presence_entries(context.server())
+        .into_iter()
+        .find(|(_, entry)| entry.name.eq_ignore_ascii_case(name))
+        .map(|(gid, entry)| (gid, entry.name, entry.in_lobby))
+        .or_else(|| {
+            let player = context.server().get_player_by_name(name)?;
+            Some((
+                player.cluster_gid()?,
+                player.gameprofile.name.clone(),
+                player.is_in_cluster_lobby(),
+            ))
+        })?;
+    let (gid, target_name, in_lobby) = target;
+    if in_lobby {
+        context.source.send_error(TextComponent::text(format!(
+            "{} is currently in the lobby, and not in the game world",
+            target_name
+        )));
+        return Some(Ok(0));
+    }
+    let (yaw, pitch) = rotation.unwrap_or_else(|| {
+        context
+            .server()
+            .get_player_by_name(&target_name)
+            .map(|player| player.rotation())
+            .or_else(|| {
+                crate::server::cluster_ghost::remote_player_position(gid)
+                    .map(|sample| (sample.yaw, sample.pitch))
+            })
+            .unwrap_or((0.0, 0.0))
+    });
+    let origin = (1_u64 << 63)
+        | context
+            .server()
+            .cluster_lobby_session_generation
+            .fetch_add(1, Ordering::Relaxed);
+    let intent = PlayerAdministrativeIntent {
+        target: gid,
+        mutation: PlayerAdministrativeMutation::Teleport {
+            world: crate::server::cluster_world_delta::world_id(world),
+            position: [pos.x, pos.y, pos.z],
+            yaw,
+            pitch,
+        },
+        origin: Some(origin),
+    };
+    let mut publications =
+        crate::server::cluster_player_admin::subscribe_player_administrative(context.server());
+    let mut failures =
+        crate::server::cluster_player_admin::subscribe_player_administrative_failures(
+            context.server(),
+        );
+    let submitted = if let Some(issuer) = context.source.output.as_pre_join() {
+        crate::server::cluster_player_admin::submit_lobby_player_administrative(
+            context.server(),
+            issuer.gid,
+            issuer.profile.id,
+            intent,
+        )
+    } else {
+        crate::server::cluster_player_admin::submit_player_administrative(context.server(), intent)
+    };
+    if submitted.is_err() {
+        context
+            .source
+            .send_error(TextComponent::text("Cluster teleport unavailable"));
+        return Some(Ok(0));
+    }
+    let feedback = if let Some(destination) = destination {
+        TextComponent::translate_cross(
+            translation::java::COMMANDS_TELEPORT_SUCCESS_ENTITY_SINGLE,
+            translation::bedrock::COMMANDS_TP_SUCCESSVICTIM,
+            [TextComponent::text(target_name), destination],
+        )
+    } else {
+        TextComponent::translate_cross(
+            translation::java::COMMANDS_TELEPORT_SUCCESS_LOCATION_SINGLE,
+            translation::bedrock::COMMANDS_TP_SUCCESS_COORDINATES,
+            [
+                TextComponent::text(target_name),
+                TextComponent::text(pos.x.to_string()),
+                TextComponent::text(pos.y.to_string()),
+                TextComponent::text(pos.z.to_string()),
+            ],
+        )
+    };
+    let sender = context.source.output.clone();
+    let server = context.server().clone();
+    server.spawn_task(async move {
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                tokio::select! {
+                    publication = publications.recv() => match publication {
+                        Ok(publication) if publication.target == gid && publication.origin == Some(origin) => {
+                            return publication.accepted;
+                        }
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return false,
+                    },
+                    failure = failures.recv() => match failure {
+                        Ok(failure) if failure.target == gid && failure.origin == Some(origin) => {
+                            return false;
+                        }
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return false,
+                    }
+                }
+            }
+        }).await;
+        match result {
+            Ok(true) => sender.send_message(feedback),
+            Ok(false) => sender.send_message(TextComponent::text("Teleport failed")),
+            Err(_) => {
+                tracing::error!(target = gid.pack_u32(), origin, "cluster teleport did not settle within 30 seconds");
+                sender.send_message(TextComponent::text("Teleport timed out"));
+            }
+        }
+    });
+    Some(Ok(1))
 }
 
 struct SelfToPosExecutor;
@@ -180,10 +321,7 @@ impl CommandExecutor for SelfToEntityExecutor {
             TextComponent::translate_cross(
                 translation::java::COMMANDS_TELEPORT_SUCCESS_ENTITY_SINGLE,
                 translation::bedrock::COMMANDS_TP_SUCCESSVICTIM,
-                [
-                    entity.get_display_name(),
-                    destination.display_name,
-                ],
+                [entity.get_display_name(), destination.display_name],
             ),
             true,
         );
@@ -196,7 +334,6 @@ struct EntitiesToEntityExecutor;
 
 impl CommandExecutor for EntitiesToEntityExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
-        let targets = EntityArgumentType::get_entities(context, "targets")?;
         let destination = match EntityArgumentType::get_entity(context, "destination") {
             Ok(destination) => {
                 let entity = destination.get_entity();
@@ -223,6 +360,19 @@ impl CommandExecutor for EntitiesToEntityExecutor {
         if !World::is_valid(BlockPos(pos.floor_to_i32())) {
             return Err(ERROR_INVALID_POSITION.create_without_context());
         }
+
+        if let Some(result) = teleport_named_player(
+            context,
+            "targets",
+            pos,
+            Some((destination.yaw, destination.pitch)),
+            &destination.world,
+            Some(destination.display_name.clone()),
+        ) {
+            return result;
+        }
+
+        let targets = EntityArgumentType::get_entities(context, "targets")?;
 
         for target in &targets {
             target.teleport(
@@ -255,7 +405,6 @@ struct EntitiesToPosExecutor;
 
 impl CommandExecutor for EntitiesToPosExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
-        let targets = EntityArgumentType::get_entities(context, "targets")?;
         let pos = Vec3ArgumentType::get_coordinates(context, "location")?.resolve(&context.source);
 
         if !World::is_valid(BlockPos(pos.floor_to_i32())) {
@@ -263,6 +412,10 @@ impl CommandExecutor for EntitiesToPosExecutor {
         }
 
         let world = context.source.world();
+        if let Some(result) = teleport_named_player(context, "targets", pos, None, world, None) {
+            return result;
+        }
+        let targets = EntityArgumentType::get_entities(context, "targets")?;
         for target in &targets {
             let yaw = target.get_entity().yaw.load();
             let pitch = target.get_entity().pitch.load();
@@ -296,7 +449,6 @@ struct EntitiesToPosWithRotationExecutor;
 
 impl CommandExecutor for EntitiesToPosWithRotationExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
-        let targets = EntityArgumentType::get_entities(context, "targets")?;
         let pos = Vec3ArgumentType::get_coordinates(context, "location")?.resolve(&context.source);
 
         if !World::is_valid(BlockPos(pos.floor_to_i32())) {
@@ -307,6 +459,13 @@ impl CommandExecutor for EntitiesToPosWithRotationExecutor {
         let yaw = rot.y;
         let pitch = rot.x;
         let world = context.source.world();
+
+        if let Some(result) =
+            teleport_named_player(context, "targets", pos, Some((yaw, pitch)), world, None)
+        {
+            return result;
+        }
+        let targets = EntityArgumentType::get_entities(context, "targets")?;
 
         for target in &targets {
             target.teleport(pos, Some(yaw), Some(pitch), world.clone());
@@ -339,7 +498,6 @@ struct EntitiesToPosFacingPosExecutor;
 
 impl CommandExecutor for EntitiesToPosFacingPosExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
-        let targets = EntityArgumentType::get_entities(context, "targets")?;
         let pos = Vec3ArgumentType::get_coordinates(context, "location")?.resolve(&context.source);
 
         if !World::is_valid(BlockPos(pos.floor_to_i32())) {
@@ -349,6 +507,19 @@ impl CommandExecutor for EntitiesToPosFacingPosExecutor {
         let facing_pos =
             Vec3ArgumentType::get_coordinates(context, "facingLocation")?.resolve(&context.source);
         let world = context.source.world();
+        let (named_yaw, named_pitch) = yaw_pitch_facing_position(&pos, &facing_pos);
+
+        if let Some(result) = teleport_named_player(
+            context,
+            "targets",
+            pos,
+            Some((named_yaw, named_pitch)),
+            world,
+            None,
+        ) {
+            return result;
+        }
+        let targets = EntityArgumentType::get_entities(context, "targets")?;
 
         for target in &targets {
             let eye_offset = match context.source.entity_anchor {
@@ -389,7 +560,6 @@ struct EntitiesToPosFacingEntityExecutor {
 
 impl CommandExecutor for EntitiesToPosFacingEntityExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
-        let targets = EntityArgumentType::get_entities(context, "targets")?;
         let pos = Vec3ArgumentType::get_coordinates(context, "location")?.resolve(&context.source);
 
         if !World::is_valid(BlockPos(pos.floor_to_i32())) {
@@ -405,6 +575,14 @@ impl CommandExecutor for EntitiesToPosFacingEntityExecutor {
 
         let facing_pos = anchor.position_at_entity(facing_entity.get_entity());
         let world = context.source.world();
+
+        let (yaw, pitch) = yaw_pitch_facing_position(&pos, &facing_pos);
+        if let Some(result) =
+            teleport_named_player(context, "targets", pos, Some((yaw, pitch)), world, None)
+        {
+            return result;
+        }
+        let targets = EntityArgumentType::get_entities(context, "targets")?;
 
         for target in &targets {
             let eye_offset = match context.source.entity_anchor {

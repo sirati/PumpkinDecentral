@@ -168,6 +168,38 @@ impl ChunkData {
         chunk_data: &[u8],
         position: Vector2<i32>,
     ) -> Result<Self, ChunkParsingError> {
+        Self::internal_from_bytes_impl(chunk_data, position, false).map(|(chunk, _, _, _)| chunk)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn internal_from_bytes_with_palettes(
+        chunk_data: &[u8],
+        position: Vector2<i32>,
+    ) -> Result<(Self, i32, Box<[BlockPalette]>, Box<[BiomePalette]>), ChunkParsingError> {
+        let (chunk, min_y, blocks, biomes) =
+            Self::internal_from_bytes_impl(chunk_data, position, true)?;
+        Ok((
+            chunk,
+            min_y,
+            blocks.expect("requested block palettes"),
+            biomes.expect("requested biome palettes"),
+        ))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn internal_from_bytes_impl(
+        chunk_data: &[u8],
+        position: Vector2<i32>,
+        capture_block_palettes: bool,
+    ) -> Result<
+        (
+            Self,
+            i32,
+            Option<Box<[BlockPalette]>>,
+            Option<Box<[BiomePalette]>>,
+        ),
+        ChunkParsingError,
+    > {
         let is_named = chunk_data.len() >= 3
             && chunk_data[0] == 0x0a
             && chunk_data[1] == 0x00
@@ -303,6 +335,10 @@ impl ChunkData {
         let min_y = section_coords::section_to_block(min_y_section);
         let (random_tick_sections, randomly_ticking_mask) =
             ChunkSections::build_random_tick_sections_cache(&block_palettes);
+        let owned_block_palettes =
+            capture_block_palettes.then(|| block_palettes.clone().into_boxed_slice());
+        let owned_biome_palettes =
+            capture_block_palettes.then(|| biome_palettes.clone().into_boxed_slice());
         let section = ChunkSections {
             count: block_palettes.len(),
             block_sections: RwLock::new(block_palettes.into_boxed_slice()),
@@ -389,23 +425,30 @@ impl ChunkData {
             .cloned()
             .unwrap_or_default();
 
-        Ok(Self {
-            section,
-            heightmap: std::sync::Mutex::new(heightmaps),
-            x: position.x,
-            z: position.y,
-            // This chunk is read from disk, so it has not been modified
-            dirty: AtomicBool::new(false),
-            block_ticks: ChunkTickScheduler::from_iter(block_ticks),
-            fluid_ticks: ChunkTickScheduler::from_iter(fluid_ticks),
-            pending_block_entities: std::sync::Mutex::new(block_entities),
-            light_engine: std::sync::Mutex::new(light_engine),
-            light_populated: AtomicBool::new(light_correct),
-            status,
-            blending_data: None,
-            inhabited_time: AtomicU64::new(root_tag.get_long("InhabitedTime").unwrap_or(0) as u64),
-            custom_data: std::sync::Mutex::new(custom_data),
-        })
+        Ok((
+            Self {
+                section,
+                heightmap: std::sync::Mutex::new(heightmaps),
+                x: position.x,
+                z: position.y,
+                // This chunk is read from disk, so it has not been modified
+                dirty: AtomicBool::new(false),
+                block_ticks: ChunkTickScheduler::from_iter(block_ticks),
+                fluid_ticks: ChunkTickScheduler::from_iter(fluid_ticks),
+                pending_block_entities: std::sync::Mutex::new(block_entities),
+                light_engine: std::sync::Mutex::new(light_engine),
+                light_populated: AtomicBool::new(light_correct),
+                status,
+                blending_data: None,
+                inhabited_time: AtomicU64::new(
+                    root_tag.get_long("InhabitedTime").unwrap_or(0) as u64
+                ),
+                custom_data: std::sync::Mutex::new(custom_data),
+            },
+            min_y,
+            owned_block_palettes,
+            owned_biome_palettes,
+        ))
     }
 
     #[allow(clippy::too_many_lines)]

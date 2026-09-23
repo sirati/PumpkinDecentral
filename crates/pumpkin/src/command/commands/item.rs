@@ -35,6 +35,11 @@ const ERROR_NO_SUCH_SLOT: CommandErrorType<1> = CommandErrorType::new(
     translation::java::COMMANDS_ITEM_TARGET_NO_SUCH_SLOT,
 );
 
+const ERROR_CLUSTER_INVENTORY_UNAVAILABLE: CommandErrorType<0> = CommandErrorType::new(
+    "commands.inventory.unavailable",
+    "Inventory change unavailable",
+);
+
 struct BlockReplaceExecutor {
     has_count: bool,
 }
@@ -42,6 +47,13 @@ struct BlockReplaceExecutor {
 impl CommandExecutor for BlockReplaceExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let world = context.source.world();
+        if world
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            return Err(ERROR_CLUSTER_INVENTORY_UNAVAILABLE.create_without_context());
+        }
         let pos = BlockPosArgumentType::get_loaded_block_pos(context, "pos")?;
         let slot = SlotArgumentType::get(context, "slot")?;
         let parsed_stack = ItemStackArgumentType::get(context, "item")?;
@@ -108,6 +120,15 @@ struct EntityReplaceExecutor {
 impl CommandExecutor for EntityReplaceExecutor {
     #[expect(clippy::too_many_lines)]
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
+        if context
+            .source
+            .world()
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            return Err(ERROR_CLUSTER_INVENTORY_UNAVAILABLE.create_without_context());
+        }
         let targets = EntityArgumentType::get_entities(context, "targets")?;
         let mojang_slot = SlotArgumentType::get(context, "slot")?;
         let parsed_stack = ItemStackArgumentType::get(context, "item")?;
@@ -124,6 +145,9 @@ impl CommandExecutor for EntityReplaceExecutor {
 
         for target in &targets {
             if let Some(player) = target.get_player() {
+                if player.cluster_gid().is_some() {
+                    return Err(ERROR_CLUSTER_INVENTORY_UNAVAILABLE.create_without_context());
+                }
                 if let Some(player_arc) = player.world().get_player_by_uuid(player.gameprofile.id) {
                     if (200..=226).contains(&mojang_slot) {
                         let ender_slot = mojang_slot - 200;

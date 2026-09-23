@@ -8,16 +8,16 @@
 //! the tick thread and takes no locks.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use pumpkin_cluster::banks::{FuseEnds, WorkerEnds, bank_pipes};
 use pumpkin_cluster::codec::encode_batch;
-use pumpkin_cluster::identity::{GlobalPlayerId, PlayerSeq, PlayerSlot, ServerId};
-use pumpkin_cluster::protocol::{PosUpdate, TickBatch};
+use pumpkin_cluster::identity::{GlobalPlayerId, PlayerSeq};
+use pumpkin_cluster::protocol::{ChunkKey, PosUpdate, TickBatch, WorldId};
 use pumpkin_cluster::time::TickStamp;
 
-use crate::entity::player::Player;
+use crate::entity::{EntityBase, player::Player};
 
 use super::Server;
 
@@ -27,6 +27,9 @@ thread_local! {
     static FUSED: RefCell<Option<FuseEnds>> = const { RefCell::new(None) };
     static SEQS: RefCell<HashMap<GlobalPlayerId, PlayerSeq>> =
         RefCell::new(HashMap::new());
+    static PLAYER_CHUNKS: RefCell<HashMap<GlobalPlayerId, ChunkKey>> =
+        RefCell::new(HashMap::new());
+    static MISSING_GIDS: RefCell<HashSet<i32>> = RefCell::new(HashSet::new());
 }
 
 fn ensure_worker() {
@@ -86,20 +89,52 @@ pub fn take_parked_fuse_ends() -> Option<FuseEnds> {
 pub fn sample_local(
     gid: GlobalPlayerId,
     tick: TickStamp,
+    world: WorldId,
     pos: [f64; 3],
     vel: [f64; 3],
     yaw: f32,
+    head_yaw: f32,
     pitch: f32,
-) {
-    ensure_worker();
-    let update = PosUpdate {
+    on_ground: bool,
+) -> PosUpdate {
+    sample_local_with_seq(
         gid,
-        seq: next_seq(gid),
+        next_seq(gid),
         tick,
+        world,
         pos,
         vel,
         yaw,
+        head_yaw,
         pitch,
+        on_ground,
+    )
+}
+
+fn sample_local_with_seq(
+    gid: GlobalPlayerId,
+    seq: PlayerSeq,
+    tick: TickStamp,
+    world: WorldId,
+    pos: [f64; 3],
+    vel: [f64; 3],
+    yaw: f32,
+    head_yaw: f32,
+    pitch: f32,
+    on_ground: bool,
+) -> PosUpdate {
+    ensure_worker();
+    let update = PosUpdate {
+        gid,
+        seq,
+        tick,
+        world,
+        pos,
+        vel,
+        yaw,
+        head_yaw,
+        pitch,
+        on_ground,
     };
     WORKER
         .try_with(|worker| {
@@ -110,26 +145,53 @@ pub fn sample_local(
             }
         })
         .ok();
+    update
 }
 
 /// Samples one player's position, velocity and facing into the write bank.
-pub fn sample_player(player: &Player, server_id: u16, tick: TickStamp) {
-    let gid = player.cluster_gid().unwrap_or_else(|| {
-        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-        let slot = player.living_entity.entity.entity_id as u16;
-        GlobalPlayerId::new(ServerId(server_id), PlayerSlot(slot))
-    });
+pub fn sample_player(
+    player: &Player,
+    server: &Server,
+    gid: GlobalPlayerId,
+    tick: TickStamp,
+) -> PosUpdate {
     let entity = &player.living_entity.entity;
+    let world = player.world();
+    if let Some(frame) = server.cluster_controller.effective_for_tick(gid, tick) {
+        let effective = frame.effective;
+        return sample_local_with_seq(
+            gid,
+            next_seq(gid),
+            tick,
+            world_id(&world),
+            effective.position,
+            effective.velocity,
+            effective.yaw,
+            entity.head_yaw.load(),
+            effective.pitch,
+            effective.on_ground,
+        );
+    }
     let pos = entity.pos.load();
     let vel = entity.velocity.load();
     sample_local(
         gid,
         tick,
+        world_id(&world),
         [pos.x, pos.y, pos.z],
         [vel.x, vel.y, vel.z],
         entity.yaw.load(),
+        entity.head_yaw.load(),
         entity.pitch.load(),
-    );
+        entity.on_ground.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+fn world_id(world: &crate::world::World) -> WorldId {
+    WorldId::new(
+        world.dimension.id,
+        xxhash_rust::xxh64::xxh64(world.get_world_name().as_bytes(), 0),
+    )
 }
 
 /// Hands the filled write bank to the fuse side as a boxed bank over mpsc.
@@ -231,18 +293,71 @@ pub fn pump_movement_fuse(tick: TickStamp) {
 /// Returns how many players were sampled. Does nothing when the cluster mesh
 /// is disabled.
 #[must_use]
-pub fn sample_server_tick(server: &Arc<Server>) -> usize {
+pub fn sample_server_tick(server: &Arc<Server>, tick: TickStamp) -> usize {
     if !server.advanced_config.cluster.enabled {
         return 0;
     }
     ensure_worker();
-    let tick = TickStamp::now();
-    let server_id = server.advanced_config.cluster.server_id;
     let mut sampled = 0;
+    let mut chunks = HashMap::new();
+    let mut visuals = Vec::new();
     for player in server.get_all_players() {
-        sample_player(&player, server_id, tick);
+        if player.is_in_cluster_lobby()
+            || player
+                .cluster_departing
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            continue;
+        }
+        let Some(gid) = player.cluster_gid() else {
+            let entity_id = player.living_entity.entity.entity_id;
+            MISSING_GIDS.with_borrow_mut(|seen| {
+                if seen.len() < 1024 && seen.insert(entity_id) {
+                    tracing::error!(entity_id, "cluster joined player missing global identity");
+                }
+            });
+            continue;
+        };
+        let movement = sample_player(&player, server, gid, tick);
+        let chunk = ChunkKey::new(
+            movement.world,
+            (movement.pos[0].floor() as i32).div_euclid(16),
+            (movement.pos[2].floor() as i32).div_euclid(16),
+        );
+        PLAYER_CHUNKS.with_borrow_mut(|known| {
+            if let Some(from) = known.insert(gid, chunk)
+                && from != chunk
+            {
+                super::cluster_tick_pump::stage_player_chunk_transition(
+                    pumpkin_cluster::protocol::PlayerChunkTransition {
+                        gid,
+                        seq: movement.seq,
+                        tick,
+                        from,
+                        to: chunk,
+                        snapshot: pumpkin_cluster::protocol::PlayerReplicaSnapshot {
+                            movement,
+                            visual: super::cluster_tick_pump::player_visual_snapshot(gid),
+                        },
+                    },
+                );
+            }
+        });
+        chunks.insert(gid, chunk);
+        visuals.push(super::cluster_tick_pump::PlayerVisualBase {
+            gid,
+            sneaking: player.get_entity().is_sneaking(),
+            sprinting: player.get_entity().is_sprinting(),
+            swimming: player.get_entity().is_swimming(),
+            gliding: player.get_entity().is_fall_flying(),
+            skin_layers: player.config.load().skin_parts,
+            game_mode: player.gamemode.load() as u8,
+        });
         sampled += 1;
     }
+    PLAYER_CHUNKS.with_borrow_mut(|known| known.retain(|gid, _| chunks.contains_key(gid)));
+    super::cluster_datagram::publish_local_player_chunks(chunks);
+    super::cluster_tick_pump::publish_player_visual_bases(visuals);
     end_tick();
     pump_movement_fuse(tick);
     sampled
@@ -250,6 +365,8 @@ pub fn sample_server_tick(server: &Arc<Server>) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use pumpkin_cluster::identity::{PlayerSlot, ServerId};
+
     use super::*;
 
     #[test]
@@ -259,10 +376,13 @@ mod tests {
         sample_local(
             gid,
             TickStamp(7),
+            WorldId::new(0, 7),
             [1.0, 2.0, 3.0],
             [0.0; 3],
             90.0,
+            90.0,
             0.0,
+            true,
         );
         assert_eq!(pending_len(), 1);
         end_tick();

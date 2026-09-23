@@ -88,8 +88,10 @@ impl BlockBehaviour for SmokerBlock {
                 pumpkin_data::statistic::CustomStatistic::InteractWithSmoker as i32,
                 1,
             );
-            args.player
-                .open_handled_screen(factory.as_ref(), Some(*args.position));
+            args.player.open_handled_screen(
+                factory.as_ref(),
+                crate::entity::player::InventoryScreenSource::Block(*args.position),
+            );
         }
         crate::block::registry::BlockActionResult::Consume
     }

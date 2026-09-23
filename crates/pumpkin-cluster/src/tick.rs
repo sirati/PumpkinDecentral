@@ -3,19 +3,20 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 
-use tokio::sync::{mpsc, oneshot};
 use tokio::sync::oneshot::error::TryRecvError;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::accept::{AcceptBatch, Acceptor};
 use crate::banks::{Bank, Fuse, FuseEnds, WorkerEnds, bank_pipes};
-use crate::protocol::{ChunkAddr, TickBatch};
+use crate::protocol::{ChunkKey, TickBatch};
 use crate::time::TickStamp;
 
 const OUTBOX_CAPACITY: usize = 8;
+const WORKER_REGISTRATION_CAPACITY: usize = 1024;
 
 static CLUSTER_ENABLED: AtomicBool = AtomicBool::new(false);
 static PUBLISHED_TICK: AtomicU16 = AtomicU16::new(0);
-static PENDING_WORKER_SENDER: OnceLock<mpsc::UnboundedSender<FuseEnds>> = OnceLock::new();
+static PENDING_WORKER_SENDER: OnceLock<mpsc::Sender<FuseEnds>> = OnceLock::new();
 
 thread_local! {
     static CURRENT: RefCell<Option<WorkerEnds>> = RefCell::new(None);
@@ -114,9 +115,9 @@ fn ensure_tick_owner() {
 
 fn publish_fuse_ends(fuse_ends: FuseEnds) {
     match PENDING_WORKER_SENDER.get() {
-        Some(sender) => match sender.send(fuse_ends) {
+        Some(sender) => match sender.try_send(fuse_ends) {
             Ok(()) => {}
-            Err(send_error) => stash_unclaimed_fuse_ends(send_error.0),
+            Err(send_error) => stash_unclaimed_fuse_ends(send_error.into_inner()),
         },
         None => stash_unclaimed_fuse_ends(fuse_ends),
     }
@@ -280,8 +281,8 @@ pub struct ClusterTick {
     worker_ends: Vec<FuseEnds>,
     buckets: TickBuckets,
     acceptor: Acceptor,
-    pending_worker_receiver: mpsc::UnboundedReceiver<FuseEnds>,
-    pending_worker_sender: mpsc::UnboundedSender<FuseEnds>,
+    pending_worker_receiver: mpsc::Receiver<FuseEnds>,
+    pending_worker_sender: mpsc::Sender<FuseEnds>,
     fused_sender: mpsc::Sender<Vec<u8>>,
     fused_receiver: Option<mpsc::Receiver<Vec<u8>>>,
     pending_stamp: Option<TickStamp>,
@@ -296,7 +297,8 @@ struct FuseResult {
 impl ClusterTick {
     #[must_use]
     pub fn new() -> Self {
-        let (pending_worker_sender, pending_worker_receiver) = mpsc::unbounded_channel();
+        let (pending_worker_sender, pending_worker_receiver) =
+            mpsc::channel(WORKER_REGISTRATION_CAPACITY);
         let (fused_sender, fused_receiver) = mpsc::channel(OUTBOX_CAPACITY);
         Self {
             fuse: Some(Fuse::new()),
@@ -416,7 +418,7 @@ impl ClusterTick {
         drain_accept_channel(receiver, &mut self.acceptor)
     }
 
-    pub fn require_holder(&mut self, tick: TickStamp, chunk: ChunkAddr, holders: &[u16]) {
+    pub fn require_holder(&mut self, tick: TickStamp, chunk: ChunkKey, holders: &[u16]) {
         self.acceptor.require(tick, chunk, holders);
     }
 
@@ -429,11 +431,7 @@ impl ClusterTick {
         self.acceptor.is_globally_accepted(tick)
     }
 
-    pub fn apply_accepted_tick(
-        &mut self,
-        tick: TickStamp,
-        apply: impl FnMut(&TickBatch),
-    ) -> usize {
+    pub fn apply_accepted_tick(&mut self, tick: TickStamp, apply: impl FnMut(&TickBatch)) -> usize {
         apply_accepted_ground_truth(&mut self.buckets, &self.acceptor, tick, apply)
     }
 
@@ -465,8 +463,7 @@ async fn run_fuse(
     fused_sender: mpsc::Sender<Vec<u8>>,
     result_sender: oneshot::Sender<FuseResult>,
 ) {
-    fuse
-        .run(&mut tick_receiver, &mut worker_ends, &fused_sender)
+    fuse.run(&mut tick_receiver, &mut worker_ends, &fused_sender)
         .await;
     match result_sender.send(FuseResult { fuse, worker_ends }) {
         Ok(()) => {}
@@ -479,15 +476,16 @@ mod tests {
     use super::*;
     use crate::codec::decode_batch;
     use crate::identity::{GlobalPlayerId, PlayerSeq, PlayerSlot, ServerId};
-    use crate::protocol::ArmorUpdate;
+    use crate::protocol::EquipmentUpdate;
 
-    fn sample_armor() -> ArmorUpdate {
-        ArmorUpdate {
+    fn sample_equipment() -> EquipmentUpdate {
+        EquipmentUpdate {
             gid: GlobalPlayerId::new(ServerId(1), PlayerSlot(2)),
             seq: PlayerSeq(3),
             tick: TickStamp(4),
             slot: 1,
             item: 42,
+            count: 1,
         }
     }
 
@@ -502,7 +500,7 @@ mod tests {
     fn fuse_round_trip_single_worker() {
         let mut owner = ClusterTick::new();
         let (mut worker, fuse_ends) = bank_pipes();
-        worker.bank.armor.push(sample_armor());
+        worker.bank.equipment.push(sample_equipment());
         worker.end_tick();
         owner.worker_ends.push(fuse_ends);
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -520,7 +518,7 @@ mod tests {
             let bytes = fused_receiver.recv().await.unwrap();
             let batch = decode_batch(&bytes).unwrap();
             assert_eq!(batch.tick, TickStamp(9));
-            assert_eq!(batch.armor.len(), 1);
+            assert_eq!(batch.equipment.len(), 1);
         });
     }
 
@@ -531,14 +529,13 @@ mod tests {
         CLUSTER_ENABLED.store(true, Ordering::Relaxed);
         PUBLISHED_TICK.store(41, Ordering::Relaxed);
         with_bank(|bank| {
-            bank.armor.push(sample_armor());
+            bank.equipment.push(sample_equipment());
         });
         PUBLISHED_TICK.store(42, Ordering::Relaxed);
         with_bank(|bank| {
             assert!(bank.is_empty());
         });
-        let unclaimed = match UNCLAIMED_FUSE_ENDS.try_with(|slot| match slot.try_borrow_mut()
-        {
+        let unclaimed = match UNCLAIMED_FUSE_ENDS.try_with(|slot| match slot.try_borrow_mut() {
             Ok(mut guard) => guard.take(),
             Err(_) => None,
         }) {
@@ -547,7 +544,7 @@ mod tests {
         };
         let mut fuse_ends = unclaimed.unwrap();
         let handed_off = fuse_ends.full_rx.try_recv().unwrap();
-        assert_eq!(handed_off.armor.len(), 1);
+        assert_eq!(handed_off.equipment.len(), 1);
         end_tick_all(TickStamp(43));
         assert!(is_cluster_enabled());
         assert!(take_fused_outbox().is_some());

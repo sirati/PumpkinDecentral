@@ -347,18 +347,42 @@ pub async fn can_not_join(
         "[year]-[month]-[day] at [hour]:[minute]:[second] [offset_hour sign:mandatory]:[offset_minute]"
     );
 
-    let mut banned_players = server
-        .data
-        .banned_player_list
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(entry) = banned_players.get_entry(profile) {
+    let banned_player = if server.advanced_config.cluster.enabled {
+        server
+            .cluster_admin_view
+            .load()
+            .banned_players
+            .iter()
+            .find(|entry| {
+                entry.uuid == *profile.id.as_bytes()
+                    && entry.expires_epoch_secs.is_none_or(|expires| {
+                        expires >= time::OffsetDateTime::now_utc().unix_timestamp()
+                    })
+            })
+            .map(|entry| {
+                (
+                    entry.reason.clone(),
+                    entry.expires_epoch_secs.and_then(|expires| {
+                        time::OffsetDateTime::from_unix_timestamp(expires).ok()
+                    }),
+                )
+            })
+    } else {
+        server
+            .data
+            .banned_player_list
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_entry(profile)
+            .map(|entry| (entry.reason.clone(), entry.expires))
+    };
+    if let Some((reason, expires)) = banned_player {
         let text = TextComponent::translate_cross(
             translation::java::MULTIPLAYER_DISCONNECT_BANNED_REASON,
             translation::java::MULTIPLAYER_DISCONNECT_BANNED_REASON,
-            [TextComponent::text(entry.reason.clone())],
+            [TextComponent::text(reason)],
         );
-        return Some(match entry.expires {
+        return Some(match expires {
             Some(expires) => text.add_child(TextComponent::translate_cross(
                 translation::java::MULTIPLAYER_DISCONNECT_BANNED_EXPIRATION,
                 translation::java::MULTIPLAYER_DISCONNECT_BANNED_EXPIRATION,
@@ -369,21 +393,38 @@ pub async fn can_not_join(
             None => text,
         });
     }
-    drop(banned_players);
-
     if server.white_list.load(Ordering::Relaxed) {
-        let ops = server
-            .data
-            .operator_config
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let whitelist = server
-            .data
-            .whitelist_config
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let is_op = if server.advanced_config.cluster.enabled {
+            server
+                .cluster_admin_view
+                .load()
+                .operators
+                .iter()
+                .any(|op| op.uuid == *profile.id.as_bytes())
+        } else {
+            server
+                .data
+                .operator_config
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_entry(&profile.id)
+                .is_some()
+        };
+        let is_whitelisted = if server.advanced_config.cluster.enabled {
+            server
+                .cluster_access_policy
+                .snapshot()
+                .is_whitelisted(profile.id)
+        } else {
+            server
+                .data
+                .whitelist_config
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_whitelisted(profile)
+        };
 
-        if ops.get_entry(&profile.id).is_none() && !whitelist.is_whitelisted(profile) {
+        if !is_op && !is_whitelisted {
             return Some(TextComponent::translate_cross(
                 translation::java::MULTIPLAYER_DISCONNECT_NOT_WHITELISTED,
                 translation::java::MULTIPLAYER_DISCONNECT_NOT_WHITELISTED,
@@ -392,19 +433,28 @@ pub async fn can_not_join(
         }
     }
 
-    if let Some(entry) = server
-        .data
-        .banned_ip_list
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get_entry(&address.ip())
-    {
+    let banned_ip = if server.advanced_config.cluster.enabled {
+        server
+            .cluster_access_policy
+            .snapshot()
+            .active_ip_ban(address.ip())
+            .map(|entry| (entry.reason.clone(), entry.expires))
+    } else {
+        server
+            .data
+            .banned_ip_list
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_entry(&address.ip())
+            .map(|entry| (entry.reason.clone(), entry.expires))
+    };
+    if let Some((reason, expires)) = banned_ip {
         let text = TextComponent::translate_cross(
             translation::java::MULTIPLAYER_DISCONNECT_BANNED_IP_REASON,
             translation::java::MULTIPLAYER_DISCONNECT_BANNED_IP_REASON,
-            [TextComponent::text(entry.reason.clone())],
+            [TextComponent::text(reason)],
         );
-        return Some(match entry.expires {
+        return Some(match expires {
             Some(expires) => text.add_child(TextComponent::translate_cross(
                 translation::java::MULTIPLAYER_DISCONNECT_BANNED_IP_EXPIRATION,
                 translation::java::MULTIPLAYER_DISCONNECT_BANNED_IP_EXPIRATION,

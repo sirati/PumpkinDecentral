@@ -1,21 +1,57 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use pumpkin_cluster::entities::{
     ENTITY_STREAM_KINDS, EntityCombatUpdate, EntityDespawn, EntityGhosts, EntityPosUpdate,
-    EntitySpawn, EntityTransientUpdate, EntityVisualUpdate, GhostState, route_to_holders,
+    EntityRef, EntitySpawn, EntityTransientUpdate, EntityVisualState, EntityVisualUpdate,
+    route_to_holders,
 };
 use pumpkin_cluster::identity::ServerId;
-use pumpkin_cluster::protocol::{ChunkAddr, StreamKind};
+use pumpkin_cluster::protocol::{ChunkKey, GlobalEntityId, StreamKind};
 use pumpkin_cluster::streams::{InboundParcel, OutboundParcel, StreamHeader};
+use pumpkin_data::data_component_impl::EquipmentSlot;
+use pumpkin_data::item::Item;
+use pumpkin_data::item_stack::ItemStack;
 use pumpkin_util::math::vector2::Vector2;
+use pumpkin_util::math::vector3::Vector3;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use super::Server;
 use super::cluster_entity_emit::{ENTITY_POS_MAGIC, EntityPosDatagram};
+use crate::entity::EntityBase;
+use crate::entity::cluster_entity_replica::RemoteEntityReplica;
+
+type EntityReplicaKey = (ServerId, i32, u32);
+type EntityReplicas = HashMap<EntityReplicaKey, Arc<RemoteEntityReplica>>;
+
+fn replica_key(entity: EntityRef) -> EntityReplicaKey {
+    (entity.origin, entity.local_id, entity.generation)
+}
+
+#[must_use]
+pub fn current_entity_owner(server: &Server, entity: GlobalEntityId) -> Option<ServerId> {
+    server.cluster_entity_owners.load().get(&entity).copied()
+}
+
+pub fn publish_entity_owner(server: &Server, entity: GlobalEntityId, owner: ServerId) {
+    server.cluster_entity_owners.rcu(|owners| {
+        let mut next = (**owners).clone();
+        next.insert(entity, owner);
+        next
+    });
+}
+
+pub fn remove_entity_owner(server: &Server, entity: GlobalEntityId) {
+    server.cluster_entity_owners.rcu(|owners| {
+        let mut next = (**owners).clone();
+        next.remove(&entity);
+        next
+    });
+}
 
 static ENTITY_APPLIED: AtomicU64 = AtomicU64::new(0);
 static ENTITY_DROPPED: AtomicU64 = AtomicU64::new(0);
@@ -92,7 +128,7 @@ pub fn entity_stream_kinds() -> [StreamKind; 4] {
     ENTITY_STREAM_KINDS
 }
 
-fn try_emit_entity(kind: StreamKind, bytes: &[u8]) -> u64 {
+fn try_emit_entity(kind: StreamKind, chunk: ChunkKey, bytes: &[u8]) -> u64 {
     let Some(outbox) = ENTITY_OUTBOX.get() else {
         return 0;
     };
@@ -100,9 +136,9 @@ fn try_emit_entity(kind: StreamKind, bytes: &[u8]) -> u64 {
         return 0;
     }
     let mut sent = 0_u64;
-    for peer in &outbox.peers {
+    for peer in super::cluster_datagram::holders_for_chunk(chunk) {
         let parcel = OutboundParcel {
-            peer: ServerId(*peer),
+            peer: ServerId(peer),
             header: StreamHeader::new(kind, None),
             bytes: bytes.to_vec(),
         };
@@ -118,7 +154,7 @@ fn try_emit_entity(kind: StreamKind, bytes: &[u8]) -> u64 {
     sent
 }
 
-pub fn emit_entity_parcel(owner: ServerId, kind: StreamKind, bytes: &[u8]) -> u64 {
+pub fn emit_entity_parcel(owner: ServerId, kind: StreamKind, chunk: ChunkKey, bytes: &[u8]) -> u64 {
     let Some(outbox) = ENTITY_OUTBOX.get() else {
         return 0;
     };
@@ -126,7 +162,39 @@ pub fn emit_entity_parcel(owner: ServerId, kind: StreamKind, bytes: &[u8]) -> u6
         note_dropped("owner");
         return 0;
     }
-    try_emit_entity(kind, bytes)
+    try_emit_entity(kind, chunk, bytes)
+}
+
+pub fn emit_entity_parcel_to(
+    owner: ServerId,
+    kind: StreamKind,
+    peers: &[u16],
+    bytes: &[u8],
+) -> u64 {
+    let Some(outbox) = ENTITY_OUTBOX.get() else {
+        return 0;
+    };
+    if owner != outbox.local {
+        note_dropped("owner");
+        return 0;
+    }
+    let mut sent = 0_u64;
+    for peer in peers {
+        let parcel = OutboundParcel {
+            peer: ServerId(*peer),
+            header: StreamHeader::new(kind, None),
+            bytes: bytes.to_vec(),
+        };
+        if outbox.outbound.try_send(parcel).is_ok() {
+            sent = sent.saturating_add(1);
+        } else {
+            note_dropped("full");
+        }
+    }
+    if sent > 0 {
+        ENTITY_EMITTED.fetch_add(1, Ordering::Relaxed);
+    }
+    sent
 }
 
 pub fn forward_entity_pos_datagram(peer: ServerId, updates: Vec<EntityPosUpdate>) -> bool {
@@ -170,25 +238,23 @@ pub fn entity_malformed() -> u64 {
     ENTITY_MALFORMED.load(Ordering::Relaxed)
 }
 
-fn chunk_holders(server: &Server, local: ServerId, chunk: ChunkAddr) -> Vec<u16> {
-    let pos = Vector2::new(chunk.x, chunk.z);
-    let loaded = server
-        .worlds
-        .load()
-        .iter()
-        .any(|world| world.level.is_chunk_loaded(&pos));
-    if loaded {
-        vec![local.0]
-    } else {
-        Vec::new()
-    }
+fn chunk_holders(server: &Server, local: ServerId, chunk: ChunkKey) -> Vec<u16> {
+    let pos = Vector2::new(chunk.x(), chunk.z());
+    let loaded = server.worlds.load().iter().any(|world| {
+        super::cluster_world_delta::world_id(world) == chunk.world
+            && world.level.is_chunk_loaded(&pos)
+    });
+    if loaded { vec![local.0] } else { Vec::new() }
 }
 
-fn holds_chunk(server: &Server, local: ServerId, chunk: ChunkAddr) -> bool {
+fn holds_chunk(server: &Server, local: ServerId, chunk: ChunkKey) -> bool {
     route_to_holders(chunk, &|addr| chunk_holders(server, local, addr)).contains(&local.0)
 }
 
-fn owned_by_sender(peer: ServerId, owner: ServerId, local: ServerId) -> bool {
+fn owned_by_sender(peer: ServerId, current_owner: Option<ServerId>, local: ServerId) -> bool {
+    let Some(owner) = current_owner else {
+        return false;
+    };
     if owner == local {
         return false;
     }
@@ -226,11 +292,16 @@ fn note_malformed_pos_frame(peer: ServerId, bytes: &[u8], error: &impl std::fmt:
 pub fn apply_pos_update(
     server: &Server,
     ghosts: &mut EntityGhosts,
+    replicas: &EntityReplicas,
     local: ServerId,
     peer: ServerId,
     update: &EntityPosUpdate,
 ) -> bool {
-    if !owned_by_sender(peer, update.entity.owner, local) {
+    if !owned_by_sender(
+        peer,
+        current_entity_owner(server, update.entity.id()),
+        local,
+    ) {
         note_dropped("owner");
         return false;
     }
@@ -239,27 +310,33 @@ pub fn apply_pos_update(
         return false;
     }
     if ghosts.apply_pos(update) {
+        if let Some(replica) = replicas.get(&replica_key(update.entity)) {
+            let entity = replica.get_entity();
+            let position = Vector3::new(update.pos[0], update.pos[1], update.pos[2]);
+            entity.set_pos(position);
+            entity
+                .velocity
+                .store(Vector3::new(update.vel[0], update.vel[1], update.vel[2]));
+            entity.yaw.store(update.yaw);
+            entity.body_yaw.store(update.yaw);
+            entity.head_yaw.store(update.yaw);
+            entity.pitch.store(update.pitch);
+            let world = entity.world.load();
+            world
+                .entity_tracker
+                .update_entity_position(replica.as_ref(), &world);
+        }
         note_applied();
         return true;
     }
-    ghosts.by_ref.insert(
-        update.entity,
-        GhostState {
-            chunk: update.entity.chunk,
-            last_tick: update.tick,
-            pos: update.pos,
-            yaw: update.yaw,
-            pitch: update.pitch,
-            kind: 0,
-        },
-    );
-    note_applied();
-    true
+    note_dropped("unknown");
+    false
 }
 
 pub fn apply_pos_bytes(
     server: &Server,
     ghosts: &mut EntityGhosts,
+    replicas: &EntityReplicas,
     local: ServerId,
     peer: ServerId,
     bytes: &[u8],
@@ -271,7 +348,7 @@ pub fn apply_pos_bytes(
             return false;
         }
     };
-    apply_pos_update(server, ghosts, local, peer, &update)
+    apply_pos_update(server, ghosts, replicas, local, peer, &update)
 }
 
 fn insert_spawn(
@@ -281,7 +358,9 @@ fn insert_spawn(
     peer: ServerId,
     update: &EntitySpawn,
 ) -> bool {
-    if !owned_by_sender(peer, update.entity.owner, local) {
+    let id = update.entity.id();
+    let current_owner = current_entity_owner(server, id);
+    if current_owner.is_some() && !owned_by_sender(peer, current_owner, local) {
         note_dropped("owner");
         return false;
     }
@@ -290,21 +369,28 @@ fn insert_spawn(
         return false;
     }
     ghosts.spawn(update);
+    publish_entity_owner(server, id, peer);
     note_applied();
     true
 }
 
 fn remove_despawn(
+    server: &Server,
     ghosts: &mut EntityGhosts,
     local: ServerId,
     peer: ServerId,
     update: &EntityDespawn,
 ) -> bool {
-    if !owned_by_sender(peer, update.entity.owner, local) {
+    if !owned_by_sender(
+        peer,
+        current_entity_owner(server, update.entity.id()),
+        local,
+    ) {
         note_dropped("owner");
         return false;
     }
     if ghosts.despawn(update) {
+        remove_entity_owner(server, update.entity.id());
         note_applied();
         return true;
     }
@@ -315,6 +401,7 @@ fn remove_despawn(
 pub fn apply_spawn_bytes(
     server: &Server,
     ghosts: &mut EntityGhosts,
+    replicas: &mut EntityReplicas,
     local: ServerId,
     peer: ServerId,
     bytes: &[u8],
@@ -331,11 +418,94 @@ pub fn apply_spawn_bytes(
         note_dropped("magic");
         return false;
     }
-    insert_spawn(server, ghosts, local, peer, &tagged.update)
+    if !insert_spawn(server, ghosts, local, peer, &tagged.update) {
+        return false;
+    }
+    let Some(entity_type) = pumpkin_data::entity::EntityType::from_raw(tagged.update.kind) else {
+        let _ = ghosts.despawn(&EntityDespawn {
+            entity: tagged.update.entity,
+            tick: tagged.update.tick,
+        });
+        note_dropped("entity-type");
+        return false;
+    };
+    let Some(world) = server
+        .worlds
+        .load()
+        .iter()
+        .find(|world| {
+            world.dimension.id == tagged.update.entity.chunk.world.dimension
+                && xxhash_rust::xxh64::xxh64(world.get_world_name().as_bytes(), 0)
+                    == tagged.update.entity.chunk.world.key
+        })
+        .cloned()
+    else {
+        note_dropped("world");
+        return false;
+    };
+    let key = replica_key(tagged.update.entity);
+    if let Some(replica) = replicas.get(&key) {
+        if !Arc::ptr_eq(&replica.get_entity().world.load(), &world) {
+            note_dropped("world-change");
+            return false;
+        }
+        let entity = replica.get_entity();
+        entity.set_pos(Vector3::new(
+            tagged.update.pos[0],
+            tagged.update.pos[1],
+            tagged.update.pos[2],
+        ));
+        entity.yaw.store(tagged.update.yaw);
+        entity.body_yaw.store(tagged.update.yaw);
+        entity.head_yaw.store(tagged.update.yaw);
+        entity.pitch.store(tagged.update.pitch);
+        apply_visual_state(replica.as_ref(), tagged.update.visual, true);
+        world
+            .entity_tracker
+            .update_entity_position(replica.as_ref(), &world);
+        return true;
+    }
+    let stale: Vec<_> = replicas
+        .keys()
+        .filter(|(owner, local_id, _)| {
+            *owner == tagged.update.entity.origin && *local_id == tagged.update.entity.local_id
+        })
+        .copied()
+        .collect();
+    for stale_key in stale {
+        let Some(previous) = replicas.remove(&stale_key) else {
+            continue;
+        };
+        previous
+            .get_entity()
+            .world
+            .load()
+            .remove_cluster_replica(previous.as_ref());
+    }
+    let replica = RemoteEntityReplica::new(
+        Arc::clone(&world),
+        tagged.update.entity,
+        entity_type,
+        Vector3::new(
+            tagged.update.pos[0],
+            tagged.update.pos[1],
+            tagged.update.pos[2],
+        ),
+    );
+    replica.get_entity().yaw.store(tagged.update.yaw);
+    replica.get_entity().body_yaw.store(tagged.update.yaw);
+    replica.get_entity().head_yaw.store(tagged.update.yaw);
+    replica.get_entity().pitch.store(tagged.update.pitch);
+    apply_visual_state(replica.as_ref(), tagged.update.visual, false);
+    world.add_cluster_replica(Arc::clone(&replica) as Arc<dyn EntityBase>);
+    replicas.insert(key, replica);
+    true
 }
 
 pub fn apply_despawn_bytes(
+    server: &Server,
     ghosts: &mut EntityGhosts,
+    replicas: &mut EntityReplicas,
     local: ServerId,
     peer: ServerId,
     bytes: &[u8],
@@ -352,7 +522,17 @@ pub fn apply_despawn_bytes(
         note_dropped("magic");
         return false;
     }
-    remove_despawn(ghosts, local, peer, &tagged.update)
+    if !remove_despawn(server, ghosts, local, peer, &tagged.update) {
+        return false;
+    }
+    if let Some(replica) = replicas.remove(&replica_key(tagged.update.entity)) {
+        replica
+            .get_entity()
+            .world
+            .load()
+            .remove_cluster_replica(replica.as_ref());
+    }
+    true
 }
 
 /// Applies the reliable `EntityPos` stream's explicitly tagged payloads.
@@ -367,6 +547,7 @@ pub fn apply_despawn_bytes(
 fn apply_pos_stream_bytes(
     server: &Server,
     ghosts: &mut EntityGhosts,
+    replicas: &mut EntityReplicas,
     local: ServerId,
     peer: ServerId,
     bytes: &[u8],
@@ -379,8 +560,12 @@ fn apply_pos_stream_bytes(
         }
     };
     match frame {
-        EntityPosStreamFrame::Spawn => apply_spawn_bytes(server, ghosts, local, peer, bytes),
-        EntityPosStreamFrame::Despawn => apply_despawn_bytes(ghosts, local, peer, bytes),
+        EntityPosStreamFrame::Spawn => {
+            apply_spawn_bytes(server, ghosts, replicas, local, peer, bytes)
+        }
+        EntityPosStreamFrame::Despawn => {
+            apply_despawn_bytes(server, ghosts, replicas, local, peer, bytes)
+        }
         EntityPosStreamFrame::Datagram => {
             let datagram = match postcard::from_bytes::<EntityPosDatagram>(bytes) {
                 Ok(datagram) => datagram,
@@ -399,7 +584,7 @@ fn apply_pos_stream_bytes(
         // Retain it only as a fully decoded compatibility path; arbitrary
         // data is never accepted merely because it shares this stream kind.
         EntityPosStreamFrame::LegacyBarePos => {
-            apply_pos_bytes(server, ghosts, local, peer, bytes)
+            apply_pos_bytes(server, ghosts, replicas, local, peer, bytes)
         }
     }
 }
@@ -407,6 +592,7 @@ fn apply_pos_stream_bytes(
 pub fn apply_visual_bytes(
     server: &Server,
     ghosts: &mut EntityGhosts,
+    replicas: &EntityReplicas,
     local: ServerId,
     peer: ServerId,
     bytes: &[u8],
@@ -419,7 +605,11 @@ pub fn apply_visual_bytes(
             return false;
         }
     };
-    if !owned_by_sender(peer, update.entity.owner, local) {
+    if !owned_by_sender(
+        peer,
+        current_entity_owner(server, update.entity.id()),
+        local,
+    ) {
         note_dropped("owner");
         return false;
     }
@@ -427,18 +617,79 @@ pub fn apply_visual_bytes(
         note_dropped("chunk");
         return false;
     }
-    if ghosts.apply_visual(&update) {
-        note_applied();
-        true
-    } else {
+    if !ghosts.apply_visual(&update) {
         note_dropped("unknown");
-        false
+        return false;
+    }
+    let Some(replica) = replicas.get(&replica_key(update.entity)) else {
+        note_dropped("replica");
+        return false;
+    };
+    apply_visual_state(replica.as_ref(), update.visual, true);
+    note_applied();
+    true
+}
+
+fn apply_visual_state(replica: &RemoteEntityReplica, visual: EntityVisualState, broadcast: bool) {
+    let entity = replica.get_entity();
+    entity.set_sneaking(visual.flags & 1 != 0);
+    entity.set_sprinting(visual.flags & 2 != 0);
+    entity.set_swimming(visual.flags & 4 != 0);
+    entity.set_invisible(visual.flags & 8 != 0);
+    entity.set_glowing(visual.flags & 16 != 0);
+    let fall_flying = visual.flags & 32 != 0;
+    if entity.is_fall_flying() != fall_flying {
+        entity.set_fall_flying(fall_flying);
+    }
+    let Some(living) = replica.get_living_entity() else {
+        return;
+    };
+    let mut changes = Vec::with_capacity(visual.equipment.len());
+    for (index, equipment) in visual.equipment.into_iter().enumerate() {
+        let Some(slot) = equipment_slot(u8::try_from(index).unwrap_or(u8::MAX)) else {
+            continue;
+        };
+        let stack = if equipment.count == 0 || equipment.item == 0 {
+            ItemStack::EMPTY.clone()
+        } else if let Some(item) = Item::from_id(equipment.item) {
+            ItemStack::new(equipment.count, item)
+        } else {
+            note_dropped("item");
+            continue;
+        };
+        changes.push((slot.clone(), stack));
+    }
+    if let Ok(mut current) = living.entity_equipment.try_lock() {
+        for (slot, stack) in &changes {
+            current.put(slot, stack.clone());
+        }
+    } else {
+        note_dropped("equipment-busy");
+        return;
+    }
+    if broadcast {
+        living.send_equipment_changes(&changes);
+    }
+}
+
+fn equipment_slot(slot: u8) -> Option<&'static EquipmentSlot> {
+    match slot {
+        0 => Some(&EquipmentSlot::MAIN_HAND),
+        1 => Some(&EquipmentSlot::OFF_HAND),
+        2 => Some(&EquipmentSlot::FEET),
+        3 => Some(&EquipmentSlot::LEGS),
+        4 => Some(&EquipmentSlot::CHEST),
+        5 => Some(&EquipmentSlot::HEAD),
+        6 => Some(&EquipmentSlot::BODY),
+        7 => Some(&EquipmentSlot::SADDLE),
+        _ => None,
     }
 }
 
 pub fn apply_transient_bytes(
     server: &Server,
     ghosts: &mut EntityGhosts,
+    replicas: &EntityReplicas,
     local: ServerId,
     peer: ServerId,
     bytes: &[u8],
@@ -451,7 +702,11 @@ pub fn apply_transient_bytes(
             return false;
         }
     };
-    if !owned_by_sender(peer, update.entity.owner, local) {
+    if !owned_by_sender(
+        peer,
+        current_entity_owner(server, update.entity.id()),
+        local,
+    ) {
         note_dropped("owner");
         return false;
     }
@@ -459,18 +714,30 @@ pub fn apply_transient_bytes(
         note_dropped("chunk");
         return false;
     }
-    if ghosts.apply_transient(&update) {
-        note_applied();
-        true
-    } else {
+    if !ghosts.apply_transient(&update) {
         note_dropped("unknown");
-        false
+        return false;
     }
+    let Some(replica) = replicas.get(&replica_key(update.entity)) else {
+        note_dropped("replica");
+        return false;
+    };
+    let bedrock = update.bedrock_action.and_then(|action| {
+        pumpkin_protocol::bedrock::server::actor_event::ActorEventID::try_from(action).ok()
+    });
+    replica
+        .get_entity()
+        .world
+        .load()
+        .broadcast_cluster_entity_event(replica.get_entity(), update.action as i8, bedrock);
+    note_applied();
+    true
 }
 
 pub fn apply_combat_bytes(
     server: &Server,
     ghosts: &mut EntityGhosts,
+    replicas: &EntityReplicas,
     local: ServerId,
     peer: ServerId,
     bytes: &[u8],
@@ -483,7 +750,11 @@ pub fn apply_combat_bytes(
             return false;
         }
     };
-    if !owned_by_sender(peer, update.entity.owner, local) {
+    if !owned_by_sender(
+        peer,
+        current_entity_owner(server, update.entity.id()),
+        local,
+    ) {
         note_dropped("owner");
         return false;
     }
@@ -491,33 +762,44 @@ pub fn apply_combat_bytes(
         note_dropped("chunk");
         return false;
     }
-    if ghosts.apply_combat(&update) {
-        note_applied();
-        true
-    } else {
+    if !ghosts.apply_combat(&update) {
         note_dropped("unknown");
-        false
+        return false;
     }
+    let Some(replica) = replicas.get(&replica_key(update.entity)) else {
+        note_dropped("replica");
+        return false;
+    };
+    replica.get_entity().world.load().broadcast_damage_event(
+        replica.get_entity(),
+        i32::from(update.kind),
+        None,
+        None,
+        None,
+    );
+    note_applied();
+    true
 }
 
 fn apply_parcel(
     server: &Server,
     ghosts: &mut EntityGhosts,
+    replicas: &mut EntityReplicas,
     local: ServerId,
     parcel: &InboundParcel,
 ) {
     match parcel.header.kind {
         StreamKind::EntityPos => {
-            apply_pos_stream_bytes(server, ghosts, local, parcel.peer, &parcel.bytes);
+            apply_pos_stream_bytes(server, ghosts, replicas, local, parcel.peer, &parcel.bytes);
         }
         StreamKind::EntityVisual => {
-            apply_visual_bytes(server, ghosts, local, parcel.peer, &parcel.bytes);
+            apply_visual_bytes(server, ghosts, replicas, local, parcel.peer, &parcel.bytes);
         }
         StreamKind::EntityTransient => {
-            apply_transient_bytes(server, ghosts, local, parcel.peer, &parcel.bytes);
+            apply_transient_bytes(server, ghosts, replicas, local, parcel.peer, &parcel.bytes);
         }
         StreamKind::EntityCombat => {
-            apply_combat_bytes(server, ghosts, local, parcel.peer, &parcel.bytes);
+            apply_combat_bytes(server, ghosts, replicas, local, parcel.peer, &parcel.bytes);
         }
         _ => {
             note_dropped("kind");
@@ -535,6 +817,7 @@ pub fn spawn_entity_apply(
         let (pos_tx, mut pos_rx) = mpsc::channel(64);
         install_entity_pos_bridge(pos_tx);
         let mut ghosts = EntityGhosts::new();
+        let mut replicas = EntityReplicas::new();
         let mut first = true;
         loop {
             tokio::select! {
@@ -545,13 +828,20 @@ pub fn spawn_entity_apply(
                         first = false;
                         debug!(from = parcel.peer.0, kind = ?parcel.header.kind, "cluster entity stream started");
                     }
-                    apply_parcel(&task_server, &mut ghosts, local, &parcel);
+                    apply_parcel(&task_server, &mut ghosts, &mut replicas, local, &parcel);
                 }
                 batch = pos_rx.recv() => {
                     let Some((peer, updates)) = batch else { break };
                     ENTITY_DATAGRAMS.fetch_add(1, Ordering::Relaxed);
                     for update in &updates {
-                        apply_pos_update(&task_server, &mut ghosts, local, peer, update);
+                        apply_pos_update(
+                            &task_server,
+                            &mut ghosts,
+                            &replicas,
+                            local,
+                            peer,
+                            update,
+                        );
                     }
                 }
             }
@@ -568,9 +858,10 @@ mod tests {
 
     fn test_ref(owner: u16, local_id: i32) -> EntityRef {
         EntityRef {
-            owner: ServerId(owner),
+            origin: ServerId(owner),
             local_id,
-            chunk: ChunkAddr { x: 0, z: 0 },
+            generation: 0,
+            chunk: ChunkKey::new(pumpkin_cluster::protocol::WorldId::new(0, 7), 0, 0),
         }
     }
 
@@ -582,6 +873,7 @@ mod tests {
             pos: [1.0, 2.0, 3.0],
             yaw: 90.0,
             pitch: 0.0,
+            visual: EntityVisualState::default(),
         }
     }
 
@@ -672,9 +964,11 @@ mod tests {
             classify_entity_pos_stream(&bytes),
             Ok(EntityPosStreamFrame::Datagram)
         );
-        assert!(postcard::from_bytes::<EntityPosDatagram>(&bytes)
-            .expect("tagged envelope decodes")
-            .is_consistent());
+        assert!(
+            postcard::from_bytes::<EntityPosDatagram>(&bytes)
+                .expect("tagged envelope decodes")
+                .is_consistent()
+        );
     }
 
     #[test]
@@ -702,7 +996,12 @@ mod tests {
     #[test]
     fn emit_without_outbox_is_noop() {
         assert_eq!(
-            emit_entity_parcel(ServerId(1), StreamKind::EntityPos, &[0x00]),
+            emit_entity_parcel(
+                ServerId(1),
+                StreamKind::EntityPos,
+                ChunkKey::new(pumpkin_cluster::protocol::WorldId::new(0, 7), 0, 0),
+                &[0x00],
+            ),
             0
         );
     }

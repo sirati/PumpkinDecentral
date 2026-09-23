@@ -19,6 +19,38 @@ impl BedrockClient {
         }
         player.update_last_action_time();
 
+        if server.advanced_config.cluster.enabled && matches!(packet.action, PlayerAction::DropItem)
+        {
+            crate::server::cluster_inventory_protocol::stage_held_drop(player, false);
+            return;
+        }
+        if server.advanced_config.cluster.enabled
+            && matches!(
+                packet.action,
+                PlayerAction::StartDestroyBlock
+                    | PlayerAction::CreativeDestroyBlock
+                    | PlayerAction::ContinueDestroyBlock
+                    | PlayerAction::PredictDestroyBlock
+                    | PlayerAction::StopDestroyBlock
+                    | PlayerAction::CrackBlock
+                    | PlayerAction::AbortDestroyBlock
+            )
+        {
+            player.client.try_kick(
+                crate::net::DisconnectReason::Unknown,
+                &pumpkin_util::text::TextComponent::text("Block action could not be verified"),
+            );
+            return;
+        }
+        if server.advanced_config.cluster.enabled && matches!(packet.action, PlayerAction::Respawn)
+        {
+            player.client.try_kick(
+                crate::net::DisconnectReason::Unknown,
+                &pumpkin_util::text::TextComponent::text("Respawn could not be verified"),
+            );
+            return;
+        }
+
         match packet.action {
             PlayerAction::StartDestroyBlock
             | PlayerAction::CreativeDestroyBlock

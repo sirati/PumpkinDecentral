@@ -59,12 +59,7 @@ pub const fn eat_inv_precondition_met(
     actual_item: u16,
     actual_count: u8,
 ) -> bool {
-    crate::inventory::inv_precondition_met(
-        actual_item,
-        actual_count,
-        update.item,
-        update.count,
-    )
+    crate::inventory::inv_precondition_met(actual_item, actual_count, update.item, update.count)
 }
 
 #[must_use]
@@ -175,7 +170,8 @@ pub fn emit_eat_start(
     count: u8,
 ) {
     push_transient(gid, |bank, gid, seq| {
-        bank.eat_start.push(capture_eat_start(gid, seq, tick, slot, item, count));
+        bank.eat_start
+            .push(capture_eat_start(gid, seq, tick, slot, item, count));
     });
 }
 
@@ -185,24 +181,14 @@ pub fn emit_eat_abort(gid: Option<GlobalPlayerId>, tick: TickStamp) {
     });
 }
 
-pub fn emit_break_anim(
-    gid: Option<GlobalPlayerId>,
-    tick: TickStamp,
-    pos: BlockPos,
-    stage: u8,
-) {
+pub fn emit_break_anim(gid: Option<GlobalPlayerId>, tick: TickStamp, pos: BlockPos, stage: u8) {
     push_transient(gid, |bank, gid, seq| {
-        bank
-            .break_anim
+        bank.break_anim
             .push(capture_break_anim(gid, seq, tick, pos, stage));
     });
 }
 
-pub fn emit_break_anim_stop(
-    gid: Option<GlobalPlayerId>,
-    tick: TickStamp,
-    pos: BlockPos,
-) {
+pub fn emit_break_anim_stop(gid: Option<GlobalPlayerId>, tick: TickStamp, pos: BlockPos) {
     emit_break_anim(gid, tick, pos, BREAK_ANIM_STOP_STAGE);
 }
 
@@ -259,23 +245,14 @@ impl RemoteEating {
 }
 
 #[must_use]
-pub const fn eat_finished(
-    start: TickStamp,
-    now: TickStamp,
-    use_duration_ticks: u16,
-) -> bool {
+pub const fn eat_finished(start: TickStamp, now: TickStamp, use_duration_ticks: u16) -> bool {
     now.distance_since(start) >= use_duration_ticks
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BreakAnimAction {
-    Stage {
-        pos: BlockPos,
-        stage: u8,
-    },
-    Stop {
-        pos: BlockPos,
-    },
+    Stage { pos: BlockPos, stage: u8 },
+    Stop { pos: BlockPos },
 }
 
 #[derive(Debug, Default)]
@@ -303,8 +280,7 @@ impl RemoteBreakAnims {
             self.anims.remove(&update.gid);
             Some(BreakAnimAction::Stop { pos: update.pos })
         } else {
-            self.anims
-                .insert(update.gid, (update.pos, update.stage));
+            self.anims.insert(update.gid, (update.pos, update.stage));
             Some(BreakAnimAction::Stage {
                 pos: update.pos,
                 stage: update.stage,

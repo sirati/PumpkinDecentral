@@ -723,7 +723,14 @@ impl BedrockClient {
 
     pub async fn progress_player_packets(self: &Arc<Self>, player: &Arc<Player>) {
         while let Some(packet) = self.get_packet().await {
-            player.inbound_packets.push(packet);
+            if player.inbound_packets.push(packet).is_err() {
+                self.kick(
+                    DisconnectReason::BadPacket,
+                    "Client packet queue is full".to_string(),
+                )
+                .await;
+                return;
+            }
         }
     }
 
@@ -780,6 +787,23 @@ impl BedrockClient {
             }
             SText::PACKET_ID => {
                 let text = SText::read(reader)?;
+                if server.advanced_config.cluster.enabled && !server.basic_config.allow_chat_reports {
+                    player.update_last_action_time();
+                    if crate::server::cluster_session_ingress::stage(
+                        player,
+                        crate::server::cluster_session_ingress::StagedSessionInput::Bedrock {
+                            body: text.message.into_owned(),
+                            xuid: text.xuid.into_owned(),
+                            filtered: text.filtered_message.map(std::borrow::Cow::into_owned),
+                            received_at: std::time::Instant::now(),
+                        },
+                    )
+                    .is_err()
+                    {
+                        player.send_system_message(&pumpkin_util::text::TextComponent::text("Cluster chat queue is full"));
+                    }
+                    return Ok(());
+                }
                 let client = self.clone();
                 let player_c = player.clone();
                 let server_c = server.clone();
@@ -789,6 +813,22 @@ impl BedrockClient {
             }
             SCommandRequest::PACKET_ID => {
                 let req = SCommandRequest::read(reader)?;
+                if server.advanced_config.cluster.enabled {
+                    player.update_last_action_time();
+                    let command = req.command.strip_prefix('/').unwrap_or(&req.command);
+                    if crate::server::cluster_session_ingress::stage(
+                        player,
+                        crate::server::cluster_session_ingress::StagedSessionInput::Command {
+                            command: command.to_string(),
+                            received_at: std::time::Instant::now(),
+                        },
+                    )
+                    .is_err()
+                    {
+                        player.send_system_message(&pumpkin_util::text::TextComponent::text("Cluster command queue is full"));
+                    }
+                    return Ok(());
+                }
                 let client = self.clone();
                 let player_c = player.clone();
                 let server_c = server.clone();

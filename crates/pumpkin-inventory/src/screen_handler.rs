@@ -1222,6 +1222,10 @@ pub trait ScreenHandlerListener: Send + Sync {
 pub type SharedScreenHandler = Arc<Mutex<dyn ScreenHandler>>;
 
 pub trait ScreenHandlerFactory: Send + Sync {
+    fn cluster_ender_chest_tracker(&self) -> Option<Arc<crate::viewer::ViewerCountTracker>> {
+        None
+    }
+
     fn create_screen_handler(
         &self,
         sync_id: u8,

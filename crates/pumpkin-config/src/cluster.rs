@@ -8,6 +8,16 @@ pub enum ClusterRole {
     Secondary,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+#[repr(u8)]
+pub enum HealthMaskMode {
+    Off,
+    #[default]
+    Players,
+    All,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PinnedPeerConfig {
     pub server_id: u16,
@@ -27,6 +37,7 @@ pub struct ClusterConfig {
     pub peers: Vec<PinnedPeerConfig>,
     pub ntp_servers: Vec<String>,
     pub max_offset_millis: i64,
+    pub health_mask: HealthMaskMode,
 }
 
 impl Default for ClusterConfig {
@@ -41,6 +52,7 @@ impl Default for ClusterConfig {
             peers: Vec::new(),
             ntp_servers: Vec::new(),
             max_offset_millis: 25,
+            health_mask: HealthMaskMode::Players,
         }
     }
 }
@@ -82,10 +94,16 @@ impl ClusterConfig {
                 ));
             }
             if peer.addr.trim().is_empty() {
-                errors.push(format!("pinned peer {} has an empty address", peer.server_id));
+                errors.push(format!(
+                    "pinned peer {} has an empty address",
+                    peer.server_id
+                ));
             }
             if peer.pubkey_sha256_hex.len() != 64
-                || !peer.pubkey_sha256_hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || !peer
+                    .pubkey_sha256_hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
             {
                 errors.push(format!(
                     "pinned peer {} pubkey must be 64 hex chars (SHA-256)",

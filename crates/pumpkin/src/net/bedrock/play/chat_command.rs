@@ -9,6 +9,21 @@ impl BedrockClient {
         packet: SCommandRequest<'_>,
     ) {
         player.update_last_action_time();
+        if server.advanced_config.cluster.enabled {
+            let command = packet.command.strip_prefix('/').unwrap_or(&packet.command);
+            if crate::server::cluster_session_ingress::stage(
+                player,
+                crate::server::cluster_session_ingress::StagedSessionInput::Command {
+                    command: command.to_string(),
+                    received_at: std::time::Instant::now(),
+                },
+            )
+            .is_err()
+            {
+                player.send_system_message(&TextComponent::text("Cluster command queue is full"));
+            }
+            return;
+        }
         if player.check_chat_spam(server, crate::entity::player::SpamType::Command) {
             return;
         }

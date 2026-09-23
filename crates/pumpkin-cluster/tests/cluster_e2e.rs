@@ -5,7 +5,6 @@
     clippy::uninlined_format_args
 )]
 
-use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -14,10 +13,10 @@ use pumpkin_cluster::buckets::BucketTable;
 use pumpkin_cluster::codec::{decode_batch, encode_batch};
 use pumpkin_cluster::identity::{GlobalPlayerId, PlayerSeq, PlayerSlot, ServerId};
 use pumpkin_cluster::membership::{JoinVotes, Membership, can_leave_network};
-use pumpkin_cluster::order::order_players;
 use pumpkin_cluster::protocol::{
-    BlockPos, BreakBlockUpdate, ChunkAddr, PlaceBlockUpdate, PosUpdate, TickBatch,
+    BlockPos, BlockUndo, BreakBlockUpdate, ChunkKey, PlaceBlockUpdate, PosUpdate, WorldId,
 };
+use pumpkin_cluster::resolve::{ConflictKey, ContenderKind, Resolver};
 use pumpkin_cluster::time::TickStamp;
 use tokio::sync::mpsc;
 
@@ -29,32 +28,33 @@ const fn gid(server: u16, player: u16) -> GlobalPlayerId {
     GlobalPlayerId::new(ServerId(server), PlayerSlot(player))
 }
 
-const fn chunk(x: i32, z: i32) -> ChunkAddr {
-    ChunkAddr { x, z }
+const fn world() -> WorldId {
+    WorldId::new(0, 1)
+}
+
+const fn chunk(x: i32, z: i32) -> ChunkKey {
+    ChunkKey::new(world(), x, z)
 }
 
 const fn cell() -> BlockPos {
     BlockPos { x: 4, y: 64, z: -2 }
 }
 
-fn place_update(
-    player: GlobalPlayerId,
-    seq: u16,
-    tick: TickStamp,
-    state: u16,
-) -> PlaceBlockUpdate {
+fn place_update(player: GlobalPlayerId, seq: u16, tick: TickStamp, state: u16) -> PlaceBlockUpdate {
     PlaceBlockUpdate {
         gid: player,
         seq: PlayerSeq(seq),
         tick,
         pos: cell(),
+        expected_old_state: 0,
         new_state: state,
         inv: pumpkin_cluster::inventory::INV_MAIN,
         slot: 0,
         item: 40,
         count_before: 64,
         count_after: 63,
-        chunk: chunk(0, 0),
+        actor_chunk: chunk(0, 0),
+        chunk: chunk(0, -1),
     }
 }
 
@@ -65,7 +65,8 @@ fn break_update(player: GlobalPlayerId, expected_old_state: u16) -> BreakBlockUp
         tick: TickStamp(12),
         pos: cell(),
         expected_old_state,
-        chunk: chunk(0, 0),
+        actor_chunk: chunk(0, 0),
+        chunk: chunk(0, -1),
     }
 }
 
@@ -81,33 +82,30 @@ fn double_place_same_cell_converges() {
     let contender_first = place_update(first, 1, tick, 5);
     let contender_second = place_update(second, 1, tick, 6);
 
-    let forward = order_players(CLUSTER_SEED, tick, first, second);
-    assert_eq!(forward.reverse(), order_players(CLUSTER_SEED, tick, second, first));
-    assert_eq!(
-        order_players(CLUSTER_SEED, tick, first, first),
-        Ordering::Equal
-    );
-
-    let mut arrival_a = [contender_first, contender_second];
-    let mut arrival_b = [contender_second, contender_first];
-    for arrival in [&mut arrival_a, &mut arrival_b] {
-        arrival.sort_by(|left, right| order_players(CLUSTER_SEED, tick, left.gid, right.gid));
-    }
-    assert_eq!(arrival_a[0].gid, arrival_b[0].gid);
-
-    let winner = arrival_a[0];
-    let mut truth_eu: HashMap<BlockPos, u16> = HashMap::new();
-    let mut truth_jp: HashMap<BlockPos, u16> = HashMap::new();
-    for update in arrival_a {
-        truth_eu.insert(update.pos, update.new_state);
-    }
-    for update in arrival_b {
-        truth_jp.insert(update.pos, update.new_state);
-    }
-    truth_eu.insert(winner.pos, winner.new_state);
-    truth_jp.insert(winner.pos, winner.new_state);
-    assert_eq!(truth_eu, truth_jp);
-    assert_eq!(truth_eu.get(&cell()), Some(&winner.new_state));
+    let resolve = |arrival: [PlaceBlockUpdate; 2]| {
+        let mut resolver = Resolver::new(CLUSTER_SEED, tick);
+        for update in arrival {
+            resolver.ingest_place(
+                update,
+                BlockUndo {
+                    old_state: 0,
+                    count_before: update.count_before,
+                },
+            );
+        }
+        let mut ground = HashMap::new();
+        ground.insert(ConflictKey::Block(chunk(0, -1), cell()), 0);
+        resolver.resolve_with_context(&ground, &[])
+    };
+    let resolved_a = resolve([contender_first, contender_second]);
+    let resolved_b = resolve([contender_second, contender_first]);
+    assert_eq!(resolved_a, resolved_b);
+    let winner = resolved_a[0].winner.expect("one valid placement wins");
+    let ContenderKind::Place(winner) = winner.kind else {
+        panic!("placement conflict produced a break winner");
+    };
+    assert_eq!(resolved_a[0].losers.len(), 1);
+    assert!(winner.new_state == 5 || winner.new_state == 6);
 }
 
 #[test]
@@ -131,10 +129,13 @@ async fn bank_fuse_batch_decode_roundtrip() {
         gid: mover,
         seq: PlayerSeq(1),
         tick,
+        world: world(),
         pos: [8.0, 64.0, 8.0],
         vel: [0.0, 0.0, 0.0],
         yaw: 90.0,
+        head_yaw: 90.0,
         pitch: 0.0,
+        on_ground: true,
     });
     let builder = gid(2, 4);
     worker_b
@@ -222,29 +223,11 @@ async fn delayed_accept_still_closes() {
         accept_tx.send((12, Vec::new())).await.unwrap();
     });
 
-    let (peer, new_holders) =
-        tokio::time::timeout(Duration::from_secs(5), accept_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-    table.accept(tick, watched, peer, &new_holders);
-    assert!(table.is_tick_complete(tick));
-    assert!(table.remove_tick(tick));
-}
-
-#[tokio::test]
-#[ignore = "needs QUIC ACCEPT transport wiring (not yet merged); loopback mpsc double stands in"]
-async fn quic_accept_wire_closure() {
-    let tick = TickStamp(30);
-    let (wire_tx, mut wire_rx) = mpsc::channel::<Vec<u8>>(2);
-    let mut batch = TickBatch::new(tick);
-    batch
-        .place_block
-        .push(place_update(gid(1, 1), 1, tick, 3));
-    wire_tx.send(encode_batch(&batch).unwrap()).await.unwrap();
-    let bytes = tokio::time::timeout(Duration::from_secs(5), wire_rx.recv())
+    let (peer, new_holders) = tokio::time::timeout(Duration::from_secs(5), accept_rx.recv())
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(decode_batch(&bytes).unwrap(), batch);
+    table.accept(tick, watched, peer, &new_holders);
+    assert!(table.is_tick_complete(tick));
+    assert!(table.remove_tick(tick));
 }

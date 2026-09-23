@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 
 use tokio::sync::mpsc;
 
-use crate::protocol::ChunkAddr;
+use crate::protocol::ChunkKey;
 use crate::time::TickStamp;
 
 #[derive(Debug, Default)]
@@ -67,7 +67,7 @@ impl ChunkAcceptance {
 
 #[derive(Debug, Default)]
 pub struct BucketTable {
-    pub buckets: HashMap<TickStamp, HashMap<ChunkAddr, ChunkAcceptance>>,
+    pub buckets: HashMap<TickStamp, HashMap<ChunkKey, ChunkAcceptance>>,
 }
 
 impl BucketTable {
@@ -76,7 +76,7 @@ impl BucketTable {
         Self::default()
     }
 
-    pub fn require(&mut self, tick: TickStamp, chunk: ChunkAddr, holders: &[u16]) {
+    pub fn require(&mut self, tick: TickStamp, chunk: ChunkKey, holders: &[u16]) {
         self.buckets
             .entry(tick)
             .or_default()
@@ -85,13 +85,7 @@ impl BucketTable {
             .add_holders(holders);
     }
 
-    pub fn accept(
-        &mut self,
-        tick: TickStamp,
-        chunk: ChunkAddr,
-        peer: u16,
-        new_holders: &[u16],
-    ) {
+    pub fn accept(&mut self, tick: TickStamp, chunk: ChunkKey, peer: u16, new_holders: &[u16]) {
         let acceptance = self
             .buckets
             .entry(tick)
@@ -102,7 +96,7 @@ impl BucketTable {
         acceptance.accept(peer);
     }
 
-    pub fn merge_holders(&mut self, tick: TickStamp, chunk: ChunkAddr, new_holders: &[u16]) {
+    pub fn merge_holders(&mut self, tick: TickStamp, chunk: ChunkKey, new_holders: &[u16]) {
         self.buckets
             .entry(tick)
             .or_default()
@@ -111,7 +105,7 @@ impl BucketTable {
             .add_holders(new_holders);
     }
 
-    pub fn accept_peers(&mut self, tick: TickStamp, chunk: ChunkAddr, peers: &[u16]) {
+    pub fn accept_peers(&mut self, tick: TickStamp, chunk: ChunkKey, peers: &[u16]) {
         self.buckets
             .entry(tick)
             .or_default()
@@ -124,15 +118,17 @@ impl BucketTable {
     pub fn is_tick_complete(&self, tick: TickStamp) -> bool {
         match self.buckets.get(&tick) {
             None => true,
-            Some(chunks) => chunks
-                .values()
-                .all(ChunkAcceptance::is_complete),
+            Some(chunks) => chunks.values().all(ChunkAcceptance::is_complete),
         }
     }
 
     #[must_use]
-    pub fn missing(&self, tick: TickStamp, chunk: ChunkAddr) -> Vec<u16> {
-        match self.buckets.get(&tick).and_then(|chunks| chunks.get(&chunk)) {
+    pub fn missing(&self, tick: TickStamp, chunk: ChunkKey) -> Vec<u16> {
+        match self
+            .buckets
+            .get(&tick)
+            .and_then(|chunks| chunks.get(&chunk))
+        {
             Some(acceptance) => acceptance.missing(),
             None => Vec::new(),
         }
@@ -147,10 +143,20 @@ impl BucketTable {
         self.buckets.len()
     }
 
-    pub fn drain_all_without_waiting(&mut self) -> usize {
-        let dropped = self.buckets.len();
-        self.buckets.clear();
-        dropped
+    #[must_use]
+    pub fn pending_tick_stamps(&self) -> Vec<TickStamp> {
+        let mut ticks: Vec<_> = self
+            .buckets
+            .iter()
+            .filter_map(|(tick, chunks)| {
+                chunks
+                    .values()
+                    .any(|acceptance| !acceptance.is_complete())
+                    .then_some(*tick)
+            })
+            .collect();
+        ticks.sort_unstable();
+        ticks
     }
 
     pub fn evict_holder(&mut self, peer: u16) -> usize {
@@ -165,19 +171,6 @@ impl BucketTable {
         }
         touched
     }
-
-    pub fn expire_stale(&mut self, max_ticks: usize) -> usize {
-        if self.buckets.len() <= max_ticks {
-            return 0;
-        }
-        let mut ticks: Vec<TickStamp> = self.buckets.keys().copied().collect();
-        ticks.sort();
-        let drop_count = ticks.len() - max_ticks;
-        for tick in ticks.into_iter().take(drop_count) {
-            self.buckets.remove(&tick);
-        }
-        drop_count
-    }
 }
 
 /// One not-yet-accepted update parked inside its tick bucket.
@@ -187,7 +180,7 @@ impl BucketTable {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueuedUpdate<P> {
     /// Chunk this update belongs to.
-    pub chunk: ChunkAddr,
+    pub chunk: ChunkKey,
     /// Opaque payload applied to ground truth only after global resolve.
     pub payload: P,
 }
@@ -195,7 +188,7 @@ pub struct QueuedUpdate<P> {
 impl<P> QueuedUpdate<P> {
     /// Stages a payload for `chunk` without touching ground truth.
     #[must_use]
-    pub fn new(chunk: ChunkAddr, payload: P) -> Self {
+    pub fn new(chunk: ChunkKey, payload: P) -> Self {
         Self { chunk, payload }
     }
 }
@@ -209,7 +202,7 @@ impl<P> QueuedUpdate<P> {
 pub struct TickBucket<P> {
     tick: TickStamp,
     queued: Vec<QueuedUpdate<P>>,
-    acceptance: HashMap<ChunkAddr, ChunkAcceptance>,
+    acceptance: HashMap<ChunkKey, ChunkAcceptance>,
 }
 
 impl<P> TickBucket<P> {
@@ -235,7 +228,7 @@ impl<P> TickBucket<P> {
     }
 
     /// Records which peers must accept `chunk` before the tick can resolve.
-    pub fn require(&mut self, chunk: ChunkAddr, holders: &[u16]) {
+    pub fn require(&mut self, chunk: ChunkKey, holders: &[u16]) {
         self.acceptance
             .entry(chunk)
             .or_default()
@@ -243,7 +236,7 @@ impl<P> TickBucket<P> {
     }
 
     /// Records one peer acceptance, widening holders when gossip arrives late.
-    pub fn accept(&mut self, chunk: ChunkAddr, peer: u16, new_holders: &[u16]) {
+    pub fn accept(&mut self, chunk: ChunkKey, peer: u16, new_holders: &[u16]) {
         let acceptance = self.acceptance.entry(chunk).or_default();
         acceptance.add_holders(new_holders);
         acceptance.accept(peer);
@@ -257,7 +250,7 @@ impl<P> TickBucket<P> {
 
     /// Holders still missing for `chunk`; empty when unknown or complete.
     #[must_use]
-    pub fn missing(&self, chunk: ChunkAddr) -> Vec<u16> {
+    pub fn missing(&self, chunk: ChunkKey) -> Vec<u16> {
         self.acceptance
             .get(&chunk)
             .map_or_else(Vec::new, ChunkAcceptance::missing)
@@ -265,7 +258,7 @@ impl<P> TickBucket<P> {
 
     /// Queued updates targeting `chunk`, in queue order.
     #[must_use]
-    pub fn queued_for(&self, chunk: ChunkAddr) -> Vec<&QueuedUpdate<P>> {
+    pub fn queued_for(&self, chunk: ChunkKey) -> Vec<&QueuedUpdate<P>> {
         self.queued
             .iter()
             .filter(|update| update.chunk == chunk)
@@ -355,10 +348,9 @@ impl<P> AgreedTick<P> {
 
     /// Chunks touched by this tick, sorted and deduplicated.
     #[must_use]
-    pub fn chunks(&self) -> Vec<ChunkAddr> {
-        let mut chunks: Vec<ChunkAddr> =
-            self.updates.iter().map(|update| update.chunk).collect();
-        chunks.sort_unstable_by(|left, right| (left.x, left.z).cmp(&(right.x, right.z)));
+    pub fn chunks(&self) -> Vec<ChunkKey> {
+        let mut chunks: Vec<ChunkKey> = self.updates.iter().map(|update| update.chunk).collect();
+        chunks.sort_unstable();
         chunks.dedup();
         chunks
     }
@@ -371,7 +363,7 @@ impl<P> AgreedTick<P> {
 /// of its updates before returning.
 #[derive(Debug)]
 pub struct GroundTruth<P> {
-    state: HashMap<ChunkAddr, Vec<P>>,
+    state: HashMap<ChunkKey, Vec<P>>,
     applied: Vec<TickStamp>,
 }
 
@@ -397,7 +389,10 @@ impl<P> GroundTruth<P> {
     pub fn apply_agreed(&mut self, agreed: AgreedTick<P>) -> usize {
         let count = agreed.updates.len();
         for update in agreed.updates {
-            self.state.entry(update.chunk).or_default().push(update.payload);
+            self.state
+                .entry(update.chunk)
+                .or_default()
+                .push(update.payload);
         }
         self.applied.push(agreed.tick);
         count
@@ -405,7 +400,7 @@ impl<P> GroundTruth<P> {
 
     /// Committed payloads for `chunk`, in apply order.
     #[must_use]
-    pub fn get(&self, chunk: ChunkAddr) -> &[P] {
+    pub fn get(&self, chunk: ChunkKey) -> &[P] {
         self.state.get(&chunk).map_or(&[], Vec::as_slice)
     }
 
@@ -449,7 +444,7 @@ pub enum BucketInput<P> {
         /// Tick bucket to track.
         tick: TickStamp,
         /// Chunk awaiting acceptance.
-        chunk: ChunkAddr,
+        chunk: ChunkKey,
         /// Peers that must accept.
         holders: Vec<u16>,
     },
@@ -458,7 +453,7 @@ pub enum BucketInput<P> {
         /// Tick bucket being accepted.
         tick: TickStamp,
         /// Chunk the peer accepted.
-        chunk: ChunkAddr,
+        chunk: ChunkKey,
         /// Peer that accepted.
         peer: u16,
         /// Newly discovered holders.
@@ -487,10 +482,7 @@ pub struct BucketActor<P> {
 
 impl<P> BucketActor<P> {
     /// Takes channel halves; this task becomes the sole state owner.
-    pub fn new(
-        inputs: mpsc::Receiver<BucketInput<P>>,
-        committed: mpsc::Sender<TickStamp>,
-    ) -> Self {
+    pub fn new(inputs: mpsc::Receiver<BucketInput<P>>, committed: mpsc::Sender<TickStamp>) -> Self {
         Self {
             pending: HashMap::new(),
             ground: GroundTruth::new(),
@@ -622,8 +614,8 @@ where
 mod tests {
     use super::*;
 
-    fn chunk(x: i32, z: i32) -> ChunkAddr {
-        ChunkAddr { x, z }
+    fn chunk(x: i32, z: i32) -> ChunkKey {
+        ChunkKey::new(crate::protocol::WorldId::new(0, 7), x, z)
     }
 
     #[test]

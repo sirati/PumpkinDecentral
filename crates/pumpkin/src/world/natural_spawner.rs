@@ -620,6 +620,13 @@ pub fn spawn_mobs_for_chunk_generation(
                         entity
                             .get_entity()
                             .set_rotation(rand::random::<f32>() * 360.0, 0.0);
+                        #[cfg(feature = "cluster-e2e")]
+                        if let Some(server) = world.server.upgrade() {
+                            crate::server::cluster_entity_emit::record_natural_spawn_if_cluster(
+                                &server,
+                                entity.as_ref(),
+                            );
+                        }
                         world.spawn_entity_non_save(entity);
                         success = true;
                     }
@@ -822,6 +829,13 @@ pub fn spawn_category_for_position(
                     });
 
                     if is_valid_for_mob {
+                        #[cfg(feature = "cluster-e2e")]
+                        if let Some(server) = world.server.upgrade() {
+                            crate::server::cluster_entity_emit::record_natural_spawn_if_cluster(
+                                &server,
+                                entity.as_ref(),
+                            );
+                        }
                         cluster_size += 1;
                         group_size += 1;
                         batch_buffer.push(entity);

@@ -58,9 +58,7 @@ pub fn peer_by_id(config: &MeshConfig, server: ServerId) -> Option<&PinnedPeer> 
 
 #[must_use]
 pub fn peer_by_cert<'a>(peers: &'a [PinnedPeer], cert_der: &[u8]) -> Option<&'a PinnedPeer> {
-    peers
-        .iter()
-        .find(|peer| peer_authorized(cert_der, peer))
+    peers.iter().find(|peer| peer_authorized(cert_der, peer))
 }
 
 /// True when the presented cert matches the setup-time pin.
@@ -110,15 +108,9 @@ mod tests {
     fn finds_peers_by_id_and_cert() {
         let peer = pinned_for(b"cert-a");
         let mesh = mesh_with(peer);
-        assert_eq!(
-            peer_by_id(&mesh, ServerId(2)),
-            Some(&mesh.peers[0])
-        );
+        assert_eq!(peer_by_id(&mesh, ServerId(2)), Some(&mesh.peers[0]));
         assert_eq!(peer_by_id(&mesh, ServerId(9)), None);
-        assert_eq!(
-            peer_by_cert(&mesh.peers, b"cert-a"),
-            Some(&mesh.peers[0])
-        );
+        assert_eq!(peer_by_cert(&mesh.peers, b"cert-a"), Some(&mesh.peers[0]));
         assert_eq!(peer_by_cert(&mesh.peers, b"cert-b"), None);
     }
 }

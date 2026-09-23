@@ -30,9 +30,7 @@ impl ReconcilePlan {
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.block_rollbacks.len()
-            + self.equipment_corrections.len()
-            + self.ghost_despawns.len()
+        self.block_rollbacks.len() + self.equipment_corrections.len() + self.ghost_despawns.len()
     }
 
     pub fn clear(&mut self) {
@@ -70,11 +68,8 @@ impl ReconcilePlan {
     }
 
     pub fn push_equipment_correction(&mut self, player: GlobalPlayerId, slot: u8, item: u16) {
-        self.equipment_corrections.push(EquipmentCorrection {
-            player,
-            slot,
-            item,
-        });
+        self.equipment_corrections
+            .push(EquipmentCorrection { player, slot, item });
     }
 
     pub fn push_ghost_despawn(&mut self, ghost: EntityRef) {
@@ -115,7 +110,6 @@ impl ReconcilePlan {
 mod tests {
     use super::*;
     use crate::identity::{PlayerSlot, ServerId};
-    use crate::protocol::ChunkAddr;
 
     fn pos(x: i32, y: i32, z: i32) -> BlockPos {
         BlockPos { x, y, z }
@@ -151,9 +145,10 @@ mod tests {
         let gid = GlobalPlayerId::new(ServerId(1), PlayerSlot(2));
         plan.push_equipment_correction(gid, 4, 11);
         let ghost = EntityRef {
-            owner: ServerId(1),
+            origin: ServerId(1),
             local_id: 8,
-            chunk: ChunkAddr { x: 0, z: 0 },
+            generation: 0,
+            chunk: crate::protocol::ChunkKey::new(crate::protocol::WorldId::new(0, 7), 0, 0),
         };
         plan.push_ghost_despawn(ghost);
 

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::buckets::BucketTable;
 use crate::identity::{GlobalPlayerId, PlayerSlot, ServerId};
 use crate::order::order_players;
-use crate::protocol::{BlockPos, BlockUndo, ChunkAddr, StreamKind};
+use crate::protocol::{BlockPos, BlockUndo, ChunkKey, StreamKind, WorldId};
 use crate::reconcile::ReconcilePlan;
 use crate::time::TickStamp;
 
@@ -16,6 +16,7 @@ pub const WORLD_DELTA_MAGIC: [u8; 4] = [0x57, 0x44, 0x4C, 0x54];
 pub const WORLD_DELTA_TAG_RANDOM_TICK: u8 = 1;
 pub const WORLD_DELTA_TAG_REDSTONE: u8 = 2;
 pub const WORLD_DELTA_TAG_EXPLOSION: u8 = 3;
+pub const WORLD_DELTA_TAG_ADMINISTRATIVE: u8 = 4;
 pub const WORLD_DELTA_MAX_EDITS: usize = 256;
 pub const WORLD_DELTA_NO_INVENTORY: u8 = u8::MAX;
 
@@ -28,7 +29,7 @@ pub struct BlockDelta {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RandomTickDelta {
-    pub chunk: ChunkAddr,
+    pub chunk: ChunkKey,
     pub tick: TickStamp,
     pub edits: Vec<BlockDelta>,
 }
@@ -40,7 +41,7 @@ impl RandomTickDelta {
     }
 
     #[must_use]
-    pub const fn chunk(&self) -> ChunkAddr {
+    pub const fn chunk(&self) -> ChunkKey {
         self.chunk
     }
 
@@ -67,7 +68,7 @@ impl RandomTickDelta {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RedstoneFallibleUpdate {
     pub holder: ServerId,
-    pub chunk: ChunkAddr,
+    pub chunk: ChunkKey,
     pub tick: TickStamp,
     pub trigger: BlockPos,
     pub edits: Vec<BlockDelta>,
@@ -80,7 +81,7 @@ impl RedstoneFallibleUpdate {
     }
 
     #[must_use]
-    pub const fn chunk(&self) -> ChunkAddr {
+    pub const fn chunk(&self) -> ChunkKey {
         self.chunk
     }
 
@@ -107,7 +108,7 @@ impl RedstoneFallibleUpdate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExplosionFallibleUpdate {
     pub holder: ServerId,
-    pub chunk: ChunkAddr,
+    pub chunk: ChunkKey,
     pub tick: TickStamp,
     pub center: BlockPos,
     pub edits: Vec<BlockDelta>,
@@ -120,7 +121,7 @@ impl ExplosionFallibleUpdate {
     }
 
     #[must_use]
-    pub const fn chunk(&self) -> ChunkAddr {
+    pub const fn chunk(&self) -> ChunkKey {
         self.chunk
     }
 
@@ -145,10 +146,31 @@ impl ExplosionFallibleUpdate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdministrativeDelta {
+    pub holder: ServerId,
+    pub sequence: u16,
+    pub chunk: ChunkKey,
+    pub tick: TickStamp,
+    pub edits: Vec<BlockDelta>,
+}
+
+impl AdministrativeDelta {
+    #[must_use]
+    pub const fn stream_kind() -> StreamKind {
+        StreamKind::PlayerWorld
+    }
+
+    pub fn normalize(&mut self) {
+        normalize_edits(&mut self.edits);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorldDelta {
     RandomTick(RandomTickDelta),
     Redstone(RedstoneFallibleUpdate),
     Explosion(ExplosionFallibleUpdate),
+    Administrative(AdministrativeDelta),
 }
 
 impl WorldDelta {
@@ -163,15 +185,17 @@ impl WorldDelta {
             Self::RandomTick(_) => WORLD_DELTA_TAG_RANDOM_TICK,
             Self::Redstone(_) => WORLD_DELTA_TAG_REDSTONE,
             Self::Explosion(_) => WORLD_DELTA_TAG_EXPLOSION,
+            Self::Administrative(_) => WORLD_DELTA_TAG_ADMINISTRATIVE,
         }
     }
 
     #[must_use]
-    pub fn chunk(&self) -> ChunkAddr {
+    pub fn chunk(&self) -> ChunkKey {
         match self {
             Self::RandomTick(update) => update.chunk,
             Self::Redstone(update) => update.chunk,
             Self::Explosion(update) => update.chunk,
+            Self::Administrative(update) => update.chunk,
         }
     }
 
@@ -181,6 +205,7 @@ impl WorldDelta {
             Self::RandomTick(update) => update.tick,
             Self::Redstone(update) => update.tick,
             Self::Explosion(update) => update.tick,
+            Self::Administrative(update) => update.tick,
         }
     }
 }
@@ -211,11 +236,8 @@ fn frame_error(message: &str) -> WorldDeltaCodecError {
 }
 
 #[must_use]
-pub fn chunk_of_block(x: i32, z: i32) -> ChunkAddr {
-    ChunkAddr {
-        x: x.div_euclid(16),
-        z: z.div_euclid(16),
-    }
+pub const fn chunk_of_block(world: WorldId, x: i32, z: i32) -> ChunkKey {
+    ChunkKey::new(world, x.div_euclid(16), z.div_euclid(16))
 }
 
 pub fn normalize_edits(edits: &mut Vec<BlockDelta>) {
@@ -229,7 +251,7 @@ pub fn normalize_edits(edits: &mut Vec<BlockDelta>) {
 
 #[must_use]
 pub fn capture_random_tick_delta(
-    chunk: ChunkAddr,
+    chunk: ChunkKey,
     tick: TickStamp,
     mut edits: Vec<BlockDelta>,
 ) -> Option<RandomTickDelta> {
@@ -244,7 +266,7 @@ pub fn capture_random_tick_delta(
 #[must_use]
 pub fn capture_redstone_update(
     holder: ServerId,
-    chunk: ChunkAddr,
+    chunk: ChunkKey,
     tick: TickStamp,
     trigger: BlockPos,
     mut edits: Vec<BlockDelta>,
@@ -266,7 +288,7 @@ pub fn capture_redstone_update(
 #[must_use]
 pub fn capture_explosion_update(
     holder: ServerId,
-    chunk: ChunkAddr,
+    chunk: ChunkKey,
     tick: TickStamp,
     center: BlockPos,
     mut edits: Vec<BlockDelta>,
@@ -280,6 +302,28 @@ pub fn capture_explosion_update(
             chunk,
             tick,
             center,
+            edits,
+        })
+    }
+}
+
+#[must_use]
+pub fn capture_administrative_delta(
+    holder: ServerId,
+    sequence: u16,
+    chunk: ChunkKey,
+    tick: TickStamp,
+    mut edits: Vec<BlockDelta>,
+) -> Option<AdministrativeDelta> {
+    normalize_edits(&mut edits);
+    if edits.is_empty() {
+        None
+    } else {
+        Some(AdministrativeDelta {
+            holder,
+            sequence,
+            chunk,
+            tick,
             edits,
         })
     }
@@ -346,7 +390,9 @@ pub fn encode_redstone_to_slice<'out>(
     postcard::to_slice(update, out).map_err(|error| codec_error("encode redstone", error))
 }
 
-pub fn encoded_redstone_len(update: &RedstoneFallibleUpdate) -> Result<usize, WorldDeltaCodecError> {
+pub fn encoded_redstone_len(
+    update: &RedstoneFallibleUpdate,
+) -> Result<usize, WorldDeltaCodecError> {
     postcard::experimental::serialized_size(update)
         .map_err(|error| codec_error("size redstone", error))
 }
@@ -413,6 +459,10 @@ pub fn encode_frame(update: &WorldDelta) -> Result<Vec<u8>, WorldDeltaCodecError
             WORLD_DELTA_TAG_EXPLOSION,
             postcard::to_allocvec(inner).map_err(|error| codec_error("encode frame", error))?,
         ),
+        WorldDelta::Administrative(inner) => (
+            WORLD_DELTA_TAG_ADMINISTRATIVE,
+            postcard::to_allocvec(inner).map_err(|error| codec_error("encode frame", error))?,
+        ),
     };
     Ok(push_frame_tag(body, tag))
 }
@@ -432,6 +482,8 @@ pub fn encoded_frame_len(update: &WorldDelta) -> Result<usize, WorldDeltaCodecEr
         WorldDelta::RandomTick(inner) => encoded_random_tick_len(inner)?,
         WorldDelta::Redstone(inner) => encoded_redstone_len(inner)?,
         WorldDelta::Explosion(inner) => encoded_explosion_len(inner)?,
+        WorldDelta::Administrative(inner) => postcard::experimental::serialized_size(inner)
+            .map_err(|error| codec_error("size administrative", error))?,
     };
     Ok(WORLD_DELTA_FRAME_PREFIX.saturating_add(body))
 }
@@ -446,6 +498,9 @@ pub fn decode_frame(bytes: &[u8]) -> Result<WorldDelta, WorldDeltaCodecError> {
         WORLD_DELTA_TAG_RANDOM_TICK => decode_random_tick(body).map(WorldDelta::RandomTick),
         WORLD_DELTA_TAG_REDSTONE => decode_redstone(body).map(WorldDelta::Redstone),
         WORLD_DELTA_TAG_EXPLOSION => decode_explosion(body).map(WorldDelta::Explosion),
+        WORLD_DELTA_TAG_ADMINISTRATIVE => postcard::from_bytes(body)
+            .map(WorldDelta::Administrative)
+            .map_err(|error| codec_error("decode administrative", error)),
         _ => Err(frame_error("decode frame: unknown world delta tag")),
     }
 }
@@ -459,10 +514,14 @@ pub fn decode_frame_prefix(bytes: &[u8]) -> Result<(WorldDelta, &[u8]), WorldDel
     match tag {
         WORLD_DELTA_TAG_RANDOM_TICK => decode_random_tick_prefix(body)
             .map(|(update, rest)| (WorldDelta::RandomTick(update), rest)),
-        WORLD_DELTA_TAG_REDSTONE => decode_redstone_prefix(body)
-            .map(|(update, rest)| (WorldDelta::Redstone(update), rest)),
+        WORLD_DELTA_TAG_REDSTONE => {
+            decode_redstone_prefix(body).map(|(update, rest)| (WorldDelta::Redstone(update), rest))
+        }
         WORLD_DELTA_TAG_EXPLOSION => decode_explosion_prefix(body)
             .map(|(update, rest)| (WorldDelta::Explosion(update), rest)),
+        WORLD_DELTA_TAG_ADMINISTRATIVE => postcard::take_from_bytes(body)
+            .map(|(update, rest)| (WorldDelta::Administrative(update), rest))
+            .map_err(|error| codec_error("decode administrative", error)),
         _ => Err(frame_error("decode frame: unknown world delta tag")),
     }
 }
@@ -548,10 +607,7 @@ pub fn apply_fallible_to_map(
     (applied, conflicts)
 }
 
-pub fn revert_undos_to_map(
-    states: &mut HashMap<BlockPos, u16>,
-    undos: &[(BlockPos, BlockUndo)],
-) {
+pub fn revert_undos_to_map(states: &mut HashMap<BlockPos, u16>, undos: &[(BlockPos, BlockUndo)]) {
     for (pos, undo) in undos {
         states.insert(*pos, undo.old_state);
     }
@@ -599,11 +655,7 @@ pub fn elect_fallible_claim(
                 (right.pos.x, right.pos.y, right.pos.z),
                 right.undo.old_state,
             );
-            if left_key <= right_key {
-                *left
-            } else {
-                *right
-            }
+            if left_key <= right_key { *left } else { *right }
         }
     }
 }
@@ -624,11 +676,11 @@ impl WorldDeltaAcceptance {
         &self.table
     }
 
-    pub fn require(&mut self, tick: TickStamp, chunk: ChunkAddr, holders: &[u16]) {
+    pub fn require(&mut self, tick: TickStamp, chunk: ChunkKey, holders: &[u16]) {
         self.table.require(tick, chunk, holders);
     }
 
-    pub fn accept(&mut self, tick: TickStamp, chunk: ChunkAddr, peer: u16, new_holders: &[u16]) {
+    pub fn accept(&mut self, tick: TickStamp, chunk: ChunkKey, peer: u16, new_holders: &[u16]) {
         self.table.accept(tick, chunk, peer, new_holders);
     }
 
@@ -638,7 +690,7 @@ impl WorldDeltaAcceptance {
     }
 
     #[must_use]
-    pub fn missing(&self, tick: TickStamp, chunk: ChunkAddr) -> Vec<u16> {
+    pub fn missing(&self, tick: TickStamp, chunk: ChunkKey) -> Vec<u16> {
         self.table.missing(tick, chunk)
     }
 
@@ -661,6 +713,12 @@ pub fn loser_revert_plan(losers: &[(BlockPos, BlockUndo)]) -> ReconcilePlan {
 mod tests {
     use super::*;
 
+    const WORLD: WorldId = WorldId::new(0, 7);
+
+    fn chunk(x: i32, z: i32) -> ChunkKey {
+        ChunkKey::new(WORLD, x, z)
+    }
+
     fn holder(id: u16) -> ServerId {
         ServerId(id)
     }
@@ -679,7 +737,7 @@ mod tests {
 
     fn sample_random_tick() -> RandomTickDelta {
         RandomTickDelta {
-            chunk: ChunkAddr { x: 0, z: 0 },
+            chunk: chunk(0, 0),
             tick: TickStamp(41),
             edits: vec![edit(1, 64, 1, 7, 8), edit(2, 64, 3, 9, 10)],
         }
@@ -688,7 +746,7 @@ mod tests {
     fn sample_redstone() -> RedstoneFallibleUpdate {
         RedstoneFallibleUpdate {
             holder: holder(3),
-            chunk: ChunkAddr { x: 0, z: -1 },
+            chunk: chunk(0, -1),
             tick: TickStamp(42),
             trigger: pos(4, 64, -20),
             edits: vec![edit(4, 64, -21, 100, 115)],
@@ -698,7 +756,7 @@ mod tests {
     fn sample_explosion() -> ExplosionFallibleUpdate {
         ExplosionFallibleUpdate {
             holder: holder(5),
-            chunk: ChunkAddr { x: 1, z: 1 },
+            chunk: chunk(1, 1),
             tick: TickStamp(43),
             center: pos(20, 65, 20),
             edits: vec![edit(20, 65, 21, 12, 0), edit(21, 65, 20, 13, 0)],
@@ -714,7 +772,9 @@ mod tests {
         assert_eq!(into_bytes, bytes);
         assert_eq!(encoded_random_tick_len(&update).unwrap(), bytes.len());
         let mut slice = vec![0_u8; bytes.len()];
-        let used = encode_random_tick_to_slice(&update, &mut slice).unwrap().len();
+        let used = encode_random_tick_to_slice(&update, &mut slice)
+            .unwrap()
+            .len();
         assert_eq!(&slice[..used], bytes);
         let (back, rest) = decode_random_tick_prefix(&bytes).unwrap();
         assert_eq!(back, update);
@@ -746,7 +806,9 @@ mod tests {
         assert_eq!(into_bytes, bytes);
         assert_eq!(encoded_explosion_len(&update).unwrap(), bytes.len());
         let mut slice = vec![0_u8; bytes.len()];
-        let used = encode_explosion_to_slice(&update, &mut slice).unwrap().len();
+        let used = encode_explosion_to_slice(&update, &mut slice)
+            .unwrap()
+            .len();
         assert_eq!(&slice[..used], bytes);
         let (back, rest) = decode_explosion_prefix(&bytes).unwrap();
         assert_eq!(back, update);
@@ -777,7 +839,9 @@ mod tests {
     fn frame_rejects_non_delta_and_unknown_tag() {
         assert!(!is_world_delta_frame(&[]));
         assert!(!is_world_delta_frame(&[0x57, 0x44]));
-        assert!(!is_world_delta_frame(&encode_random_tick(&sample_random_tick()).unwrap()));
+        assert!(!is_world_delta_frame(
+            &encode_random_tick(&sample_random_tick()).unwrap()
+        ));
         assert!(decode_frame(&[]).is_err());
         let mut bad = encode_frame(&WorldDelta::RandomTick(sample_random_tick())).unwrap();
         bad[WORLD_DELTA_MAGIC.len()] = 0x7F;
@@ -787,15 +851,15 @@ mod tests {
 
     #[test]
     fn chunk_of_block_handles_negatives() {
-        assert_eq!(chunk_of_block(0, 0), ChunkAddr { x: 0, z: 0 });
-        assert_eq!(chunk_of_block(15, 15), ChunkAddr { x: 0, z: 0 });
-        assert_eq!(chunk_of_block(16, -1), ChunkAddr { x: 1, z: -1 });
-        assert_eq!(chunk_of_block(-17, -17), ChunkAddr { x: -2, z: -2 });
+        assert_eq!(chunk_of_block(WORLD, 0, 0), chunk(0, 0));
+        assert_eq!(chunk_of_block(WORLD, 15, 15), chunk(0, 0));
+        assert_eq!(chunk_of_block(WORLD, 16, -1), chunk(1, -1));
+        assert_eq!(chunk_of_block(WORLD, -17, -17), chunk(-2, -2));
     }
 
     #[test]
     fn capture_drops_noops_and_empty() {
-        let chunk = ChunkAddr { x: 0, z: 0 };
+        let chunk = chunk(0, 0);
         assert!(capture_random_tick_delta(chunk, TickStamp(1), Vec::new()).is_none());
         assert!(
             capture_random_tick_delta(chunk, TickStamp(1), vec![edit(0, 0, 0, 5, 5)]).is_none()
@@ -820,7 +884,7 @@ mod tests {
 
     #[test]
     fn capture_sorts_and_caps() {
-        let chunk = ChunkAddr { x: 0, z: 0 };
+        let chunk = chunk(0, 0);
         let mut edits = Vec::new();
         for index in 0..(WORLD_DELTA_MAX_EDITS + 40) {
             let index_u16 = u16::try_from(index).unwrap_or(u16::MAX);
@@ -953,9 +1017,17 @@ mod tests {
             Ordering::Less => first,
             Ordering::Greater => second,
             Ordering::Equal => {
-                if (first.trigger.x, first.trigger.y, first.trigger.z, first.new_state)
-                    <= (second.trigger.x, second.trigger.y, second.trigger.z, second.new_state)
-                {
+                if (
+                    first.trigger.x,
+                    first.trigger.y,
+                    first.trigger.z,
+                    first.new_state,
+                ) <= (
+                    second.trigger.x,
+                    second.trigger.y,
+                    second.trigger.z,
+                    second.new_state,
+                ) {
                     first
                 } else {
                     second
@@ -964,14 +1036,17 @@ mod tests {
         };
         assert_eq!(elect_fallible_claim(seed, &first, &second), expected);
         assert_eq!(elect_fallible_claim(seed, &second, &first), expected);
-        assert_eq!(holder_gid(holder(2)), GlobalPlayerId::new(holder(2), PlayerSlot(0)));
+        assert_eq!(
+            holder_gid(holder(2)),
+            GlobalPlayerId::new(holder(2), PlayerSlot(0))
+        );
     }
 
     #[test]
     fn acceptance_tracks_holders_per_chunk_tick() {
         let mut acceptance = WorldDeltaAcceptance::new();
         let tick = TickStamp(12);
-        let chunk = ChunkAddr { x: 3, z: -2 };
+        let chunk = chunk(3, -2);
         acceptance.require(tick, chunk, &[1, 2]);
         assert!(!acceptance.is_complete(tick));
         assert_eq!(acceptance.missing(tick, chunk), vec![1, 2]);

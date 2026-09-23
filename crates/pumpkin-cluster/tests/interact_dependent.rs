@@ -8,13 +8,12 @@
 use std::collections::HashMap;
 
 use pumpkin_cluster::dependent::{
-    AppliedDependent, DependentBatch, DependentCause, DependentDecision, DependentUpdate,
-    decode_dependent, decode_dependent_batch, encode_dependent,
-    encode_dependent_batch, is_dependent_due, join_dependent_batch, judge_dependent,
-    make_dependent_undo, partition_due, revoke_cause_for, sort_dependents,
-    split_dependent_batch, DependentAcceptance, DependentMetrics, capture_comparator,
-    capture_observer, decode_comparator, decode_observer, encode_comparator, encode_observer,
-    fire_tick_for,
+    AppliedDependent, DependentAcceptance, DependentBatch, DependentCause, DependentDecision,
+    DependentMetrics, DependentUpdate, capture_comparator, capture_observer, decode_comparator,
+    decode_dependent, decode_dependent_batch, decode_observer, encode_comparator, encode_dependent,
+    encode_dependent_batch, encode_observer, fire_tick_for, is_dependent_due, join_dependent_batch,
+    judge_dependent, make_dependent_undo, partition_due, revoke_cause_for, sort_dependents,
+    split_dependent_batch,
 };
 use pumpkin_cluster::identity::{GlobalPlayerId, PlayerSeq, PlayerSlot, ServerId};
 use pumpkin_cluster::interact::{
@@ -25,7 +24,7 @@ use pumpkin_cluster::interact::{
     interact_claim_for, interact_loser_revert_plan, make_interact_undo,
     revert_interact_undos_to_map,
 };
-use pumpkin_cluster::protocol::{BlockPos, ChunkAddr, StreamKind};
+use pumpkin_cluster::protocol::{BlockPos, ChunkKey, StreamKind, WorldId};
 use pumpkin_cluster::time::TickStamp;
 
 const fn gid(server: u16, player: u16) -> GlobalPlayerId {
@@ -36,8 +35,8 @@ const fn cell(x: i32, y: i32, z: i32) -> BlockPos {
     BlockPos { x, y, z }
 }
 
-const fn chunk(x: i32, z: i32) -> ChunkAddr {
-    ChunkAddr { x, z }
+const fn chunk(x: i32, z: i32) -> ChunkKey {
+    ChunkKey::new(WorldId::new(0, 1), x, z)
 }
 
 #[test]
@@ -238,13 +237,25 @@ fn dependents_encode_order_delay_and_revert_on_cause_loss() {
     .unwrap();
     assert_eq!(fire_tick_for(TickStamp(40), 2), TickStamp(42));
     assert!(!encode_comparator(&comparator).unwrap().is_empty());
-    assert_eq!(decode_comparator(&encode_comparator(&comparator).unwrap()).unwrap(), comparator);
-    assert_eq!(decode_observer(&encode_observer(&observer).unwrap()).unwrap(), observer);
+    assert_eq!(
+        decode_comparator(&encode_comparator(&comparator).unwrap()).unwrap(),
+        comparator
+    );
+    assert_eq!(
+        decode_observer(&encode_observer(&observer).unwrap()).unwrap(),
+        observer
+    );
 
     let early = DependentUpdate::Observer(observer);
     let late = DependentUpdate::Comparator(comparator);
-    assert_eq!(decode_dependent(&encode_dependent(&early).unwrap()).unwrap(), early);
-    assert_eq!(decode_dependent(&encode_dependent(&late).unwrap()).unwrap(), late);
+    assert_eq!(
+        decode_dependent(&encode_dependent(&early).unwrap()).unwrap(),
+        early
+    );
+    assert_eq!(
+        decode_dependent(&encode_dependent(&late).unwrap()).unwrap(),
+        late
+    );
     assert!(is_dependent_due(early.fire_tick(), TickStamp(41)));
     assert!(!is_dependent_due(late.fire_tick(), TickStamp(41)));
     let mut ordered = vec![late, early];

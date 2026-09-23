@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::buckets::BucketTable;
 use crate::identity::{GlobalPlayerId, PlayerSeq};
 use crate::order::order_players;
-use crate::protocol::{BlockPos, BlockUndo, ChunkAddr, StreamKind};
+use crate::protocol::{BlockPos, BlockUndo, ChunkKey, StreamKind, WorldId};
 use crate::reconcile::ReconcilePlan;
 use crate::time::TickStamp;
 
@@ -25,7 +25,7 @@ pub struct DoorToggleUpdate {
     pub pos: BlockPos,
     pub expected_old_state: u16,
     pub new_state: u16,
-    pub chunk: ChunkAddr,
+    pub chunk: ChunkKey,
 }
 
 impl DoorToggleUpdate {
@@ -35,7 +35,7 @@ impl DoorToggleUpdate {
     }
 
     #[must_use]
-    pub const fn chunk(&self) -> ChunkAddr {
+    pub const fn chunk(&self) -> ChunkKey {
         self.chunk
     }
 
@@ -53,7 +53,7 @@ pub struct TrapdoorToggleUpdate {
     pub pos: BlockPos,
     pub expected_old_state: u16,
     pub new_state: u16,
-    pub chunk: ChunkAddr,
+    pub chunk: ChunkKey,
 }
 
 impl TrapdoorToggleUpdate {
@@ -63,7 +63,7 @@ impl TrapdoorToggleUpdate {
     }
 
     #[must_use]
-    pub const fn chunk(&self) -> ChunkAddr {
+    pub const fn chunk(&self) -> ChunkKey {
         self.chunk
     }
 
@@ -81,7 +81,7 @@ pub struct EndEyePlaceUpdate {
     pub pos: BlockPos,
     pub expected_old_state: u16,
     pub new_state: u16,
-    pub chunk: ChunkAddr,
+    pub chunk: ChunkKey,
 }
 
 impl EndEyePlaceUpdate {
@@ -91,7 +91,7 @@ impl EndEyePlaceUpdate {
     }
 
     #[must_use]
-    pub const fn chunk(&self) -> ChunkAddr {
+    pub const fn chunk(&self) -> ChunkKey {
         self.chunk
     }
 
@@ -110,7 +110,7 @@ pub struct AnchorChargeUpdate {
     pub expected_old_state: u16,
     pub new_state: u16,
     pub charges_after: u8,
-    pub chunk: ChunkAddr,
+    pub chunk: ChunkKey,
 }
 
 impl AnchorChargeUpdate {
@@ -120,7 +120,7 @@ impl AnchorChargeUpdate {
     }
 
     #[must_use]
-    pub const fn chunk(&self) -> ChunkAddr {
+    pub const fn chunk(&self) -> ChunkKey {
         self.chunk
     }
 
@@ -145,7 +145,7 @@ impl InteractUpdate {
     }
 
     #[must_use]
-    pub fn chunk(&self) -> ChunkAddr {
+    pub fn chunk(&self) -> ChunkKey {
         match *self {
             Self::Door(update) => update.chunk,
             Self::Trapdoor(update) => update.chunk,
@@ -280,10 +280,7 @@ impl InteractBatch {
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.doors.len()
-            + self.trapdoors.len()
-            + self.end_eyes.len()
-            + self.anchors.len()
+        self.doors.len() + self.trapdoors.len() + self.end_eyes.len() + self.anchors.len()
     }
 
     pub fn push(&mut self, update: InteractUpdate) {
@@ -336,11 +333,8 @@ impl InteractBatch {
 }
 
 #[must_use]
-pub const fn chunk_of_block(x: i32, z: i32) -> ChunkAddr {
-    ChunkAddr {
-        x: x.div_euclid(16),
-        z: z.div_euclid(16),
-    }
+pub const fn chunk_of_block(world: WorldId, x: i32, z: i32) -> ChunkKey {
+    ChunkKey::new(world, x.div_euclid(16), z.div_euclid(16))
 }
 
 pub fn normalize_interact_updates(updates: &mut Vec<InteractUpdate>) {
@@ -367,7 +361,7 @@ pub fn capture_door_toggle(
     pos: BlockPos,
     expected_old_state: u16,
     new_state: u16,
-    chunk: ChunkAddr,
+    chunk: ChunkKey,
 ) -> Option<DoorToggleUpdate> {
     if expected_old_state == new_state {
         None
@@ -392,7 +386,7 @@ pub fn capture_trapdoor_toggle(
     pos: BlockPos,
     expected_old_state: u16,
     new_state: u16,
-    chunk: ChunkAddr,
+    chunk: ChunkKey,
 ) -> Option<TrapdoorToggleUpdate> {
     if expected_old_state == new_state {
         None
@@ -417,7 +411,7 @@ pub fn capture_end_eye(
     pos: BlockPos,
     expected_old_state: u16,
     new_state: u16,
-    chunk: ChunkAddr,
+    chunk: ChunkKey,
 ) -> Option<EndEyePlaceUpdate> {
     if expected_old_state == new_state {
         None
@@ -443,7 +437,7 @@ pub fn capture_anchor_charge(
     expected_old_state: u16,
     new_state: u16,
     charges_after: u8,
-    chunk: ChunkAddr,
+    chunk: ChunkKey,
 ) -> Option<AnchorChargeUpdate> {
     if expected_old_state == new_state {
         None
@@ -624,9 +618,7 @@ pub fn decode_interact(bytes: &[u8]) -> Result<InteractUpdate, InteractCodecErro
     postcard::from_bytes(bytes).map_err(|error| interact_codec_error("decode interact", error))
 }
 
-pub fn decode_interact_prefix(
-    bytes: &[u8],
-) -> Result<(InteractUpdate, &[u8]), InteractCodecError> {
+pub fn decode_interact_prefix(bytes: &[u8]) -> Result<(InteractUpdate, &[u8]), InteractCodecError> {
     postcard::take_from_bytes(bytes).map_err(|error| interact_codec_error("decode interact", error))
 }
 
@@ -759,7 +751,10 @@ pub fn apply_interact_to_map(
     update: &InteractUpdate,
 ) -> Option<(BlockPos, BlockUndo)> {
     let pos = update.pos();
-    let current = states.get(&pos).copied().unwrap_or(update.expected_old_state());
+    let current = states
+        .get(&pos)
+        .copied()
+        .unwrap_or(update.expected_old_state());
     match apply_interact_edit(current, update.expected_old_state()) {
         InteractDecision::Accept { undo } => {
             states.insert(pos, update.new_state());
@@ -889,11 +884,7 @@ pub fn elect_interact_claim(
                 right.new_state,
                 right.undo.old_state,
             );
-            if left_key <= right_key {
-                *left
-            } else {
-                *right
-            }
+            if left_key <= right_key { *left } else { *right }
         }
     }
 }
@@ -934,11 +925,11 @@ impl InteractAcceptance {
         &self.table
     }
 
-    pub fn require(&mut self, tick: TickStamp, chunk: ChunkAddr, holders: &[u16]) {
+    pub fn require(&mut self, tick: TickStamp, chunk: ChunkKey, holders: &[u16]) {
         self.table.require(tick, chunk, holders);
     }
 
-    pub fn accept(&mut self, tick: TickStamp, chunk: ChunkAddr, peer: u16, new_holders: &[u16]) {
+    pub fn accept(&mut self, tick: TickStamp, chunk: ChunkKey, peer: u16, new_holders: &[u16]) {
         self.table.accept(tick, chunk, peer, new_holders);
     }
 
@@ -948,7 +939,7 @@ impl InteractAcceptance {
     }
 
     #[must_use]
-    pub fn missing(&self, tick: TickStamp, chunk: ChunkAddr) -> Vec<u16> {
+    pub fn missing(&self, tick: TickStamp, chunk: ChunkKey) -> Vec<u16> {
         self.table.missing(tick, chunk)
     }
 
@@ -980,8 +971,10 @@ mod tests {
         BlockPos { x, y, z }
     }
 
-    fn chunk(x: i32, z: i32) -> ChunkAddr {
-        ChunkAddr { x, z }
+    const WORLD: WorldId = WorldId::new(0, 7);
+
+    fn chunk(x: i32, z: i32) -> ChunkKey {
+        ChunkKey::new(WORLD, x, z)
     }
 
     fn door() -> DoorToggleUpdate {
@@ -1107,7 +1100,9 @@ mod tests {
         assert_eq!(encode_door_toggle_into(&update, Vec::new()).unwrap(), bytes);
         assert_eq!(encoded_door_toggle_len(&update).unwrap(), bytes.len());
         let mut slice = vec![0_u8; bytes.len()];
-        let used = encode_door_toggle_to_slice(&update, &mut slice).unwrap().len();
+        let used = encode_door_toggle_to_slice(&update, &mut slice)
+            .unwrap()
+            .len();
         assert_eq!(&slice[..used], bytes);
         let (back, rest) = decode_door_toggle_prefix(&bytes).unwrap();
         assert_eq!(back, update);
@@ -1116,10 +1111,15 @@ mod tests {
         let update = trapdoor();
         let bytes = encode_trapdoor_toggle(&update).unwrap();
         assert_eq!(decode_trapdoor_toggle(&bytes).unwrap(), update);
-        assert_eq!(encode_trapdoor_toggle_into(&update, Vec::new()).unwrap(), bytes);
+        assert_eq!(
+            encode_trapdoor_toggle_into(&update, Vec::new()).unwrap(),
+            bytes
+        );
         assert_eq!(encoded_trapdoor_toggle_len(&update).unwrap(), bytes.len());
         let mut slice = vec![0_u8; bytes.len()];
-        let used = encode_trapdoor_toggle_to_slice(&update, &mut slice).unwrap().len();
+        let used = encode_trapdoor_toggle_to_slice(&update, &mut slice)
+            .unwrap()
+            .len();
         assert_eq!(&slice[..used], bytes);
         let (back, rest) = decode_trapdoor_toggle_prefix(&bytes).unwrap();
         assert_eq!(back, update);
@@ -1140,10 +1140,15 @@ mod tests {
         let update = anchor();
         let bytes = encode_anchor_charge(&update).unwrap();
         assert_eq!(decode_anchor_charge(&bytes).unwrap(), update);
-        assert_eq!(encode_anchor_charge_into(&update, Vec::new()).unwrap(), bytes);
+        assert_eq!(
+            encode_anchor_charge_into(&update, Vec::new()).unwrap(),
+            bytes
+        );
         assert_eq!(encoded_anchor_charge_len(&update).unwrap(), bytes.len());
         let mut slice = vec![0_u8; bytes.len()];
-        let used = encode_anchor_charge_to_slice(&update, &mut slice).unwrap().len();
+        let used = encode_anchor_charge_to_slice(&update, &mut slice)
+            .unwrap()
+            .len();
         assert_eq!(&slice[..used], bytes);
         let (back, rest) = decode_anchor_charge_prefix(&bytes).unwrap();
         assert_eq!(back, update);
@@ -1187,10 +1192,15 @@ mod tests {
         assert_eq!(InteractBatch::stream_kind(), StreamKind::PlayerWorld);
         let bytes = encode_interact_batch(&batch).unwrap();
         assert_eq!(decode_interact_batch(&bytes).unwrap(), batch);
-        assert_eq!(encode_interact_batch_into(&batch, Vec::new()).unwrap(), bytes);
+        assert_eq!(
+            encode_interact_batch_into(&batch, Vec::new()).unwrap(),
+            bytes
+        );
         assert_eq!(encoded_interact_batch_len(&batch).unwrap(), bytes.len());
         let mut slice = vec![0_u8; bytes.len()];
-        let used = encode_interact_batch_to_slice(&batch, &mut slice).unwrap().len();
+        let used = encode_interact_batch_to_slice(&batch, &mut slice)
+            .unwrap()
+            .len();
         assert_eq!(&slice[..used], bytes);
         let (back, rest) = decode_interact_batch_prefix(&bytes).unwrap();
         assert_eq!(back, batch);
@@ -1280,10 +1290,7 @@ mod tests {
 
     #[test]
     fn election_is_order_independent() {
-        let left = interact_claim_for(
-            &InteractUpdate::Door(door()),
-            make_interact_undo(11),
-        );
+        let left = interact_claim_for(&InteractUpdate::Door(door()), make_interact_undo(11));
         let right = interact_claim_for(
             &InteractUpdate::Trapdoor(trapdoor()),
             make_interact_undo(21),
@@ -1324,9 +1331,9 @@ mod tests {
 
     #[test]
     fn chunk_of_block_handles_negatives() {
-        assert_eq!(chunk_of_block(0, 0), chunk(0, 0));
-        assert_eq!(chunk_of_block(15, 15), chunk(0, 0));
-        assert_eq!(chunk_of_block(16, -1), chunk(1, -1));
-        assert_eq!(chunk_of_block(-17, -17), chunk(-2, -2));
+        assert_eq!(chunk_of_block(WORLD, 0, 0), chunk(0, 0));
+        assert_eq!(chunk_of_block(WORLD, 15, 15), chunk(0, 0));
+        assert_eq!(chunk_of_block(WORLD, 16, -1), chunk(1, -1));
+        assert_eq!(chunk_of_block(WORLD, -17, -17), chunk(-2, -2));
     }
 }

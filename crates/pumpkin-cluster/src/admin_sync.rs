@@ -1,12 +1,17 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::identity::{GlobalPlayerId, ServerId};
 use crate::primary::{AcceptedTick, PrimarySaveHandle};
 use crate::protocol::StreamKind;
 use crate::time::TickStamp;
+
+pub const ADMIN_CONTROL_FRAME_BYTES: usize = 1_048_576;
+pub const ADMIN_SNAPSHOT_PART_BYTES: usize = 900_000;
+pub const ADMIN_SNAPSHOT_MAX_PARTS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdminSyncError {
@@ -108,6 +113,102 @@ pub enum AdminMutation {
     RemoveBan(BanRevoke),
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminSnapshot {
+    pub revision: u64,
+    pub operators: Vec<OpGrant>,
+    pub banned_players: Vec<BanEntry>,
+}
+
+pub struct AdminSnapshotAssembler {
+    revision: u64,
+    digest: [u8; 32],
+    parts: Vec<Option<Vec<u8>>>,
+    received: usize,
+}
+
+impl AdminSnapshotAssembler {
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    pub fn accept(
+        pending: &mut Option<Self>,
+        revision: u64,
+        index: u16,
+        total: u16,
+        digest: [u8; 32],
+        bytes: Vec<u8>,
+    ) -> Result<Option<AdminSnapshot>, AdminSyncError> {
+        if total == 0
+            || usize::from(total) > ADMIN_SNAPSHOT_MAX_PARTS
+            || index >= total
+            || bytes.is_empty()
+            || bytes.len() > ADMIN_SNAPSHOT_PART_BYTES
+        {
+            return Err(AdminSyncError {
+                message: String::from("invalid admin snapshot part"),
+            });
+        }
+        if pending
+            .as_ref()
+            .is_some_and(|current| revision < current.revision)
+        {
+            return Ok(None);
+        }
+        if pending.as_ref().is_none_or(|current| {
+            current.revision != revision
+                || current.digest != digest
+                || current.parts.len() != usize::from(total)
+        }) {
+            *pending = Some(Self {
+                revision,
+                digest,
+                parts: vec![None; usize::from(total)],
+                received: 0,
+            });
+        }
+        let current = pending.as_mut().expect("snapshot assembler initialized");
+        match &current.parts[usize::from(index)] {
+            Some(existing) if existing != &bytes => {
+                *pending = None;
+                return Err(AdminSyncError {
+                    message: String::from("conflicting admin snapshot part"),
+                });
+            }
+            Some(_) => return Ok(None),
+            None => {}
+        }
+        current.received += 1;
+        current.parts[usize::from(index)] = Some(bytes);
+        if current.received != current.parts.len() {
+            return Ok(None);
+        }
+        let current = pending.take().expect("snapshot assembler complete");
+        let mut joined = Vec::new();
+        for part in current.parts {
+            joined.extend(part.expect("all snapshot parts received"));
+        }
+        let actual: [u8; 32] = sha2::Sha256::digest(&joined).into();
+        if actual != current.digest {
+            return Err(AdminSyncError {
+                message: String::from("admin snapshot digest mismatch"),
+            });
+        }
+        let snapshot: AdminSnapshot =
+            postcard::from_bytes(&joined).map_err(|error| AdminSyncError {
+                message: format!("decode admin snapshot: {error}"),
+            })?;
+        if snapshot.revision != revision {
+            return Err(AdminSyncError {
+                message: String::from("admin snapshot revision mismatch"),
+            });
+        }
+        Ok(Some(snapshot))
+    }
+}
+
 /// An operator-visible record of a mutation performed on another cluster
 /// member.  Mutations themselves deliberately contain only state: this
 /// companion message carries the command issuer so peers can present the same
@@ -132,6 +233,14 @@ pub struct KickRequest {
     pub target_name: String,
     pub reason: String,
     pub issuer: String,
+    pub issuer_identity: Option<KickIssuerIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KickIssuerIdentity {
+    pub gid: GlobalPlayerId,
+    pub uuid: [u8; 16],
+    pub permission_revision: u64,
 }
 
 impl KickRequest {
@@ -147,6 +256,7 @@ impl KickRequest {
             target_name,
             reason,
             issuer,
+            issuer_identity: None,
         }
     }
 }
@@ -190,12 +300,79 @@ impl SpectateLocation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdminControlMessage {
     Mutation(AdminMutation),
+    Snapshot(AdminSnapshot),
+    SnapshotPart {
+        revision: u64,
+        index: u16,
+        total: u16,
+        digest: [u8; 32],
+        bytes: Vec<u8>,
+    },
+    SnapshotRequest,
     /// A state mutation together with the one operator-visible notification
     /// that belongs to it. Keeping them in one reliable control parcel means
     /// a peer cannot display a success before it has applied the change.
     MutationWithAudit(AdminAudit),
+    VersionedMutationWithAudit {
+        revision: u64,
+        audit: AdminAudit,
+    },
+    SequencedMutation {
+        id: [u8; 16],
+        audit: AdminAudit,
+    },
+    MutationApplied {
+        id: [u8; 16],
+    },
     Kick(KickRequest),
     Spectate(SpectateRequest),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminAuthority {
+    Primary,
+    Secondary,
+}
+
+#[must_use]
+pub fn authorized_control_message(
+    authority: AdminAuthority,
+    local: ServerId,
+    source: ServerId,
+    parcel_generation: u64,
+    current_generation: Option<u64>,
+    source_is_primary: bool,
+    message: &AdminControlMessage,
+) -> bool {
+    if source == local || current_generation != Some(parcel_generation) {
+        return false;
+    }
+    match message {
+        AdminControlMessage::Mutation(_)
+        | AdminControlMessage::MutationWithAudit(_)
+        | AdminControlMessage::VersionedMutationWithAudit { .. }
+        | AdminControlMessage::Snapshot(_)
+        | AdminControlMessage::SnapshotPart { .. } => {
+            matches!(authority, AdminAuthority::Secondary) && source_is_primary
+        }
+        AdminControlMessage::SnapshotRequest => matches!(authority, AdminAuthority::Primary),
+        AdminControlMessage::SequencedMutation { .. } => {
+            matches!(authority, AdminAuthority::Primary)
+        }
+        AdminControlMessage::MutationApplied { .. } => {
+            matches!(authority, AdminAuthority::Secondary) && source_is_primary
+        }
+        AdminControlMessage::Kick(request) => {
+            request.target.server == local
+                && match request.issuer_identity.as_ref() {
+                    Some(issuer) => issuer.gid.server == source,
+                    None => source_is_primary,
+                }
+        }
+        AdminControlMessage::Spectate(request) => {
+            request.target.server == local && request.viewer.server == source
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,15 +416,56 @@ pub fn decode_mutation(bytes: &[u8]) -> Result<AdminMutation, AdminSyncError> {
     })
 }
 
-pub fn encode_control_message(
-    message: &AdminControlMessage,
-) -> Result<Vec<u8>, AdminSyncError> {
+pub fn encode_control_message(message: &AdminControlMessage) -> Result<Vec<u8>, AdminSyncError> {
     postcard::to_allocvec(message).map_err(|error| AdminSyncError {
         message: format!("encode admin control: {error}"),
     })
 }
 
+pub fn encode_admin_snapshot_frames(
+    snapshot: &AdminSnapshot,
+) -> Result<VecDeque<Vec<u8>>, AdminSyncError> {
+    let raw = postcard::to_allocvec(snapshot).map_err(|error| AdminSyncError {
+        message: format!("encode admin snapshot: {error}"),
+    })?;
+    if raw.len() <= ADMIN_CONTROL_FRAME_BYTES {
+        let whole = encode_control_message(&AdminControlMessage::Snapshot(snapshot.clone()))?;
+        if whole.len() <= ADMIN_CONTROL_FRAME_BYTES {
+            return Ok(VecDeque::from([whole]));
+        }
+    }
+    let total = raw.len().div_ceil(ADMIN_SNAPSHOT_PART_BYTES);
+    if total == 0 || total > ADMIN_SNAPSHOT_MAX_PARTS {
+        return Err(AdminSyncError {
+            message: format!("admin snapshot requires {total} parts"),
+        });
+    }
+    let digest: [u8; 32] = sha2::Sha256::digest(&raw).into();
+    let mut frames = VecDeque::with_capacity(total);
+    for (index, part) in raw.chunks(ADMIN_SNAPSHOT_PART_BYTES).enumerate() {
+        let frame = encode_control_message(&AdminControlMessage::SnapshotPart {
+            revision: snapshot.revision,
+            index: index as u16,
+            total: total as u16,
+            digest,
+            bytes: part.to_vec(),
+        })?;
+        if frame.len() > ADMIN_CONTROL_FRAME_BYTES {
+            return Err(AdminSyncError {
+                message: String::from("admin snapshot part exceeds control frame bound"),
+            });
+        }
+        frames.push_back(frame);
+    }
+    Ok(frames)
+}
+
 pub fn decode_control_message(bytes: &[u8]) -> Result<AdminControlMessage, AdminSyncError> {
+    if bytes.len() > ADMIN_CONTROL_FRAME_BYTES {
+        return Err(AdminSyncError {
+            message: String::from("admin control frame exceeds maximum length"),
+        });
+    }
     postcard::from_bytes(bytes).map_err(|error| AdminSyncError {
         message: format!("decode admin control: {error}"),
     })
@@ -328,9 +546,11 @@ pub fn submit_admin_mutation(
     mutation: &AdminMutation,
 ) -> Result<(), AdminSyncError> {
     let payload = encode_mutation(mutation)?;
-    handle.try_submit(tick, payload).map_err(|_| AdminSyncError {
-        message: String::from("primary admin queue full"),
-    })
+    handle
+        .try_submit(tick, payload)
+        .map_err(|_| AdminSyncError {
+            message: String::from("primary admin queue full"),
+        })
 }
 
 pub fn try_submit_admin_mutation(
@@ -607,10 +827,7 @@ pub fn resolve_kick_by_id(
     reason: String,
     issuer: String,
 ) -> Option<KickDelivery> {
-    let canonical = directory
-        .player_name(&target)
-        .cloned()
-        .unwrap_or_default();
+    let canonical = directory.player_name(&target).cloned().unwrap_or_default();
     if canonical.is_empty() && directory.player_name(&target).is_none() {
         return None;
     }
@@ -703,6 +920,20 @@ where
             let changed = apply_mutation_to_stores(op_store, ban_store, &mutation);
             AdminInboundEffect::MutationApplied { mutation, changed }
         }
+        AdminControlMessage::VersionedMutationWithAudit { audit, .. } => {
+            let mutation = audit.mutation;
+            let changed = apply_mutation_to_stores(op_store, ban_store, &mutation);
+            AdminInboundEffect::MutationApplied { mutation, changed }
+        }
+        AdminControlMessage::SequencedMutation { audit, .. } => {
+            let mutation = audit.mutation;
+            let changed = apply_mutation_to_stores(op_store, ban_store, &mutation);
+            AdminInboundEffect::MutationApplied { mutation, changed }
+        }
+        AdminControlMessage::Snapshot(_)
+        | AdminControlMessage::SnapshotPart { .. }
+        | AdminControlMessage::SnapshotRequest
+        | AdminControlMessage::MutationApplied { .. } => AdminInboundEffect::Ignored,
         AdminControlMessage::Kick(request) => {
             if should_deliver_kick_locally(&request, local) {
                 AdminInboundEffect::KickDelivery(request)
@@ -748,7 +979,8 @@ pub fn answer_spectate_query(directory: &PlayerDirectorySnapshot, query: Spectat
         target_name,
         reply,
     } = query;
-    let location = resolve_spectate_by_name(directory, viewer, &target_name).map(|found| found.location);
+    let location =
+        resolve_spectate_by_name(directory, viewer, &target_name).map(|found| found.location);
     let _ = reply.send(location);
 }
 
@@ -814,7 +1046,12 @@ mod tests {
 
     #[test]
     fn control_message_roundtrips() {
-        let kick = KickRequest::new(gid(2, 7), String::from("Bob"), String::from("stop"), String::from("Alice"));
+        let kick = KickRequest::new(
+            gid(2, 7),
+            String::from("Bob"),
+            String::from("stop"),
+            String::from("Alice"),
+        );
         let message = AdminControlMessage::Kick(kick);
         let bytes = encode_control_message(&message).unwrap();
         assert_eq!(decode_control_message(&bytes).unwrap(), message);
@@ -822,10 +1059,8 @@ mod tests {
 
     #[test]
     fn mutation_with_audit_roundtrips_and_applies_once() {
-        let message = AdminControlMessage::MutationWithAudit(AdminAudit::new(
-            String::from("Alice"),
-            grant(),
-        ));
+        let message =
+            AdminControlMessage::MutationWithAudit(AdminAudit::new(String::from("Alice"), grant()));
         let bytes = encode_control_message(&message).unwrap();
         assert_eq!(decode_control_message(&bytes).unwrap(), message);
 
@@ -921,7 +1156,11 @@ mod tests {
     fn parcels_fan_out_to_every_peer() {
         let parcels = mutation_parcels_for_peers(&grant(), &[2, 3]).unwrap();
         assert_eq!(parcels.len(), 2);
-        assert!(parcels.iter().all(|parcel| parcel.kind == StreamKind::Control));
+        assert!(
+            parcels
+                .iter()
+                .all(|parcel| parcel.kind == StreamKind::Control)
+        );
         assert_eq!(parcels[0].peer, 2);
         assert_eq!(parcels[1].peer, 3);
     }
@@ -929,12 +1168,23 @@ mod tests {
     #[test]
     fn kick_routes_by_global_id() {
         let snapshot = directory();
-        let local = resolve_kick_by_name(&snapshot, String::from("alice").as_str(), String::from("stop"), String::from("op")).unwrap();
+        let local = resolve_kick_by_name(
+            &snapshot,
+            String::from("alice").as_str(),
+            String::from("stop"),
+            String::from("op"),
+        )
+        .unwrap();
         assert!(local.local);
-        let remote = resolve_kick_by_name(&snapshot, "BOB", String::from("stop"), String::from("op")).unwrap();
+        let remote =
+            resolve_kick_by_name(&snapshot, "BOB", String::from("stop"), String::from("op"))
+                .unwrap();
         assert!(!remote.local);
         assert_eq!(remote.gid, gid(2, 7));
-        assert!(resolve_kick_by_name(&snapshot, "Nobody", String::from("x"), String::from("op")).is_none());
+        assert!(
+            resolve_kick_by_name(&snapshot, "Nobody", String::from("x"), String::from("op"))
+                .is_none()
+        );
         let parcel = kick_parcel_for_host(&remote.request).unwrap();
         assert_eq!(parcel.peer, 2);
         assert!(should_deliver_kick_locally(&remote.request, ServerId(2)));
@@ -968,22 +1218,298 @@ mod tests {
             effect,
             AdminInboundEffect::MutationApplied { changed: true, .. }
         ));
-        let kick = KickRequest::new(gid(1, 1), String::from("Alice"), String::from("stop"), String::from("op"));
+        let kick = KickRequest::new(
+            gid(1, 1),
+            String::from("Alice"),
+            String::from("stop"),
+            String::from("op"),
+        );
         let bytes = encode_control_message(&AdminControlMessage::Kick(kick)).unwrap();
         let effect = handle_control_bytes(&mut ops, &mut bans, ServerId(1), &bytes).unwrap();
         assert!(matches!(effect, AdminInboundEffect::KickDelivery(_)));
-        let remote_kick = KickRequest::new(gid(2, 7), String::from("Bob"), String::from("stop"), String::from("op"));
+        let remote_kick = KickRequest::new(
+            gid(2, 7),
+            String::from("Bob"),
+            String::from("stop"),
+            String::from("op"),
+        );
         let bytes = encode_control_message(&AdminControlMessage::Kick(remote_kick)).unwrap();
         let effect = handle_control_bytes(&mut ops, &mut bans, ServerId(1), &bytes).unwrap();
         assert_eq!(effect, AdminInboundEffect::Ignored);
     }
 
+    #[test]
+    fn full_admin_snapshot_is_primary_only_and_bounded_before_decode() {
+        let admin_snapshot = AdminSnapshot {
+            revision: 17,
+            operators: vec![OpGrant::new([1; 16], String::from("Alice"), 4, false)],
+            banned_players: Vec::new(),
+        };
+        let frames = encode_admin_snapshot_frames(&admin_snapshot).unwrap();
+        assert_eq!(frames.len(), 1);
+        let encoded = frames[0].clone();
+        let snapshot = AdminControlMessage::Snapshot(admin_snapshot);
+        assert_eq!(decode_control_message(&encoded).unwrap(), snapshot);
+        assert!(authorized_control_message(
+            AdminAuthority::Secondary,
+            ServerId(2),
+            ServerId(1),
+            3,
+            Some(3),
+            true,
+            &snapshot,
+        ));
+        assert!(!authorized_control_message(
+            AdminAuthority::Secondary,
+            ServerId(2),
+            ServerId(3),
+            3,
+            Some(3),
+            false,
+            &snapshot,
+        ));
+        assert!(decode_control_message(&vec![0; 1_048_577]).is_err());
+    }
+
+    #[test]
+    fn multipart_admin_snapshot_converges_out_of_order_and_rejects_corruption() {
+        let snapshot = AdminSnapshot {
+            revision: 23,
+            operators: Vec::new(),
+            banned_players: (0_u16..400)
+                .map(|index| {
+                    let mut uuid = [0; 16];
+                    uuid[..2].copy_from_slice(&index.to_le_bytes());
+                    BanEntry::new(
+                        uuid,
+                        format!("Player{index}"),
+                        String::from("console"),
+                        "x".repeat(4_000),
+                        0,
+                        None,
+                    )
+                })
+                .collect(),
+        };
+        let raw = postcard::to_allocvec(&snapshot).unwrap();
+        assert!(raw.len() > ADMIN_CONTROL_FRAME_BYTES);
+        let frames = encode_admin_snapshot_frames(&snapshot).unwrap();
+        assert_eq!(frames.len(), 2);
+        let parts: Vec<_> = frames
+            .into_iter()
+            .map(|frame| {
+                assert!(frame.len() <= ADMIN_CONTROL_FRAME_BYTES);
+                match decode_control_message(&frame).unwrap() {
+                    AdminControlMessage::SnapshotPart {
+                        revision,
+                        index,
+                        total,
+                        digest,
+                        bytes,
+                    } => (revision, index, total, digest, bytes),
+                    _ => panic!("large snapshot did not use multipart control frames"),
+                }
+            })
+            .collect();
+        let mut pending = None;
+        assert!(
+            AdminSnapshotAssembler::accept(
+                &mut pending,
+                parts[1].0,
+                parts[1].1,
+                parts[1].2,
+                parts[1].3,
+                parts[1].4.clone(),
+            )
+            .unwrap()
+            .is_none()
+        );
+        let mut corrupted = parts[0].4.clone();
+        corrupted[0] ^= 1;
+        assert!(
+            AdminSnapshotAssembler::accept(
+                &mut pending,
+                parts[0].0,
+                parts[0].1,
+                parts[0].2,
+                parts[0].3,
+                corrupted,
+            )
+            .is_err()
+        );
+        assert!(pending.is_none());
+        assert!(
+            AdminSnapshotAssembler::accept(
+                &mut pending,
+                parts[1].0,
+                parts[1].1,
+                parts[1].2,
+                parts[1].3,
+                parts[1].4.clone(),
+            )
+            .unwrap()
+            .is_none()
+        );
+        let recovered = AdminSnapshotAssembler::accept(
+            &mut pending,
+            parts[0].0,
+            parts[0].1,
+            parts[0].2,
+            parts[0].3,
+            parts[0].4.clone(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(recovered, snapshot);
+    }
+
+    #[test]
+    fn control_authority_tracks_connection_generation_and_role() {
+        let mutation = AdminControlMessage::Mutation(grant());
+        assert!(!authorized_control_message(
+            AdminAuthority::Primary,
+            ServerId(1),
+            ServerId(2),
+            7,
+            Some(7),
+            false,
+            &mutation,
+        ));
+        let sequenced = AdminControlMessage::SequencedMutation {
+            id: [3; 16],
+            audit: AdminAudit::new(String::from("issuer"), grant()),
+        };
+        assert!(authorized_control_message(
+            AdminAuthority::Primary,
+            ServerId(1),
+            ServerId(2),
+            7,
+            Some(7),
+            false,
+            &sequenced,
+        ));
+        assert!(!authorized_control_message(
+            AdminAuthority::Secondary,
+            ServerId(3),
+            ServerId(2),
+            7,
+            Some(7),
+            false,
+            &mutation,
+        ));
+        assert!(authorized_control_message(
+            AdminAuthority::Secondary,
+            ServerId(3),
+            ServerId(1),
+            9,
+            Some(9),
+            true,
+            &mutation,
+        ));
+        assert!(!authorized_control_message(
+            AdminAuthority::Secondary,
+            ServerId(3),
+            ServerId(1),
+            8,
+            Some(9),
+            true,
+            &mutation,
+        ));
+
+        let unauthenticated = AdminControlMessage::Kick(KickRequest::new(
+            gid(3, 4),
+            String::from("Carol"),
+            String::from("stop"),
+            String::from("Alice"),
+        ));
+        assert!(!authorized_control_message(
+            AdminAuthority::Secondary,
+            ServerId(3),
+            ServerId(2),
+            4,
+            Some(4),
+            false,
+            &unauthenticated,
+        ));
+        assert!(authorized_control_message(
+            AdminAuthority::Secondary,
+            ServerId(3),
+            ServerId(1),
+            4,
+            Some(4),
+            true,
+            &unauthenticated,
+        ));
+        let mut kick = unauthenticated;
+        if let AdminControlMessage::Kick(request) = &mut kick {
+            request.issuer_identity = Some(KickIssuerIdentity {
+                gid: gid(2, 1),
+                uuid: [8; 16],
+                permission_revision: 3,
+            });
+        }
+        assert!(authorized_control_message(
+            AdminAuthority::Secondary,
+            ServerId(3),
+            ServerId(2),
+            4,
+            Some(4),
+            false,
+            &kick,
+        ));
+        assert!(!authorized_control_message(
+            AdminAuthority::Secondary,
+            ServerId(3),
+            ServerId(1),
+            4,
+            Some(4),
+            false,
+            &kick,
+        ));
+
+        let forged = AdminControlMessage::Spectate(SpectateRequest::new(
+            gid(4, 1),
+            gid(3, 4),
+            String::from("Carol"),
+        ));
+        assert!(!authorized_control_message(
+            AdminAuthority::Secondary,
+            ServerId(3),
+            ServerId(2),
+            4,
+            Some(4),
+            false,
+            &forged,
+        ));
+
+        let ack = AdminControlMessage::MutationApplied { id: [7; 16] };
+        assert!(authorized_control_message(
+            AdminAuthority::Secondary,
+            ServerId(3),
+            ServerId(1),
+            9,
+            Some(9),
+            true,
+            &ack,
+        ));
+        assert!(!authorized_control_message(
+            AdminAuthority::Secondary,
+            ServerId(3),
+            ServerId(2),
+            9,
+            Some(9),
+            false,
+            &ack,
+        ));
+    }
+
     #[tokio::test]
     async fn broadcast_sends_to_all_peers() {
         let (tx, mut rx) = mpsc::channel(8);
-        let count = broadcast_control_message(&tx, &AdminControlMessage::Mutation(grant()), &[2, 3])
-            .await
-            .unwrap();
+        let count =
+            broadcast_control_message(&tx, &AdminControlMessage::Mutation(grant()), &[2, 3])
+                .await
+                .unwrap();
         assert_eq!(count, 2);
         assert!(rx.recv().await.is_some());
         assert!(rx.recv().await.is_some());
@@ -1000,7 +1526,9 @@ mod tests {
             };
             answer_spectate_query(&snapshot, query);
         });
-        let found = query_spectate_location(&tx, viewer, String::from("Bob")).await.unwrap();
+        let found = query_spectate_location(&tx, viewer, String::from("Bob"))
+            .await
+            .unwrap();
         assert_eq!(found.host, ServerId(2));
         task.await.unwrap();
     }
@@ -1049,7 +1577,11 @@ mod tests {
             persist_and_parcels_for_peers(&handle, TickStamp(4), &grant(), &[2, 3]).unwrap();
         assert_eq!(parcels.len(), 2);
         assert_eq!(parcels[0].peer, 2);
-        assert!(parcels.iter().all(|parcel| parcel.kind == StreamKind::Control));
+        assert!(
+            parcels
+                .iter()
+                .all(|parcel| parcel.kind == StreamKind::Control)
+        );
         for parcel in &parcels {
             assert_eq!(
                 decode_control_message(&parcel.bytes).unwrap(),

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use crate::banks::Bank;
 use crate::codec::PosDatagram;
 use crate::identity::{GlobalPlayerId, PlayerSeq};
-use crate::protocol::{PosUpdate, TickBatch};
+use crate::protocol::{PosUpdate, TickBatch, WorldId};
 use crate::time::TickStamp;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -12,10 +12,13 @@ pub struct AcceptedPos {
     pub gid: GlobalPlayerId,
     pub seq: PlayerSeq,
     pub tick: TickStamp,
+    pub world: WorldId,
     pub pos: [f64; 3],
     pub vel: [f64; 3],
     pub yaw: f32,
+    pub head_yaw: f32,
     pub pitch: f32,
+    pub on_ground: bool,
 }
 
 impl From<&PosUpdate> for AcceptedPos {
@@ -24,10 +27,13 @@ impl From<&PosUpdate> for AcceptedPos {
             gid: update.gid,
             seq: update.seq,
             tick: update.tick,
+            world: update.world,
             pos: update.pos,
             vel: update.vel,
             yaw: update.yaw,
+            head_yaw: update.head_yaw,
             pitch: update.pitch,
+            on_ground: update.on_ground,
         }
     }
 }
@@ -60,9 +66,17 @@ impl RemotePlayerTable {
 
     #[must_use]
     pub fn apply_pos_datagram(&mut self, datagram: &PosDatagram) -> Vec<AcceptedPos> {
-        let mut accepted = Vec::with_capacity(datagram.updates.len());
-        for update in &datagram.updates {
-            if let Some(sample) = self.apply_update(update) {
+        self.apply_updates(datagram.updates.iter().copied())
+    }
+
+    #[must_use]
+    pub fn apply_updates(
+        &mut self,
+        updates: impl IntoIterator<Item = PosUpdate>,
+    ) -> Vec<AcceptedPos> {
+        let mut accepted = Vec::new();
+        for update in updates {
+            if let Some(sample) = self.apply_update(&update) {
                 accepted.push(sample);
             }
         }
@@ -110,19 +124,25 @@ pub fn sample_local_player(
     gid: GlobalPlayerId,
     seq: PlayerSeq,
     tick: TickStamp,
+    world: WorldId,
     pos: [f64; 3],
     vel: [f64; 3],
     yaw: f32,
+    head_yaw: f32,
     pitch: f32,
+    on_ground: bool,
 ) {
     let update = PosUpdate {
         gid,
         seq,
         tick,
+        world,
         pos,
         vel,
         yaw,
+        head_yaw,
         pitch,
+        on_ground,
     };
     with_bank(|bank| bank.pos.push(update));
 }
@@ -213,10 +233,13 @@ mod tests {
             gid: gid(player),
             seq: PlayerSeq(seq),
             tick: TickStamp(seq),
+            world: WorldId::new(0, 7),
             pos: [f64::from(seq), 64.0, 0.0],
             vel: [0.0, 0.0, 0.0],
             yaw: 0.0,
+            head_yaw: 0.0,
             pitch: 0.0,
+            on_ground: true,
         }
     }
 
@@ -244,10 +267,7 @@ mod tests {
         let mut table = RemotePlayerTable::new();
         assert!(table.apply_update(&sample(2, u16::MAX)).is_some());
         assert!(table.apply_update(&sample(2, 0)).is_some());
-        assert_eq!(
-            table.ghost(&gid(2)).unwrap().pos[0],
-            f64::from(0u16)
-        );
+        assert_eq!(table.ghost(&gid(2)).unwrap().pos[0], f64::from(0u16));
     }
 
     #[test]
@@ -275,7 +295,18 @@ mod tests {
     #[test]
     fn local_sample_bank_roundtrip() {
         let _ = drain_local_samples();
-        sample_local_player(gid(7), PlayerSeq(3), TickStamp(3), [1.0, 2.0, 3.0], [0.0; 3], 90.0, 0.0);
+        sample_local_player(
+            gid(7),
+            PlayerSeq(3),
+            TickStamp(3),
+            WorldId::new(0, 7),
+            [1.0, 2.0, 3.0],
+            [0.0; 3],
+            90.0,
+            90.0,
+            0.0,
+            true,
+        );
         let drained = drain_local_samples();
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].pos, [1.0, 2.0, 3.0]);

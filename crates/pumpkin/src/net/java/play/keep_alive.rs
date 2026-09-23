@@ -3,15 +3,22 @@ use super::*;
 
 impl JavaClient {
     pub fn handle_keep_alive(&self, player: &Player, keep_alive: &SKeepAlive) {
-        let mut pending = self
-            .pending_keep_alives
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(pos) = pending
+        let pending = self.pending_keep_alives.load();
+        if let Some((_, send_time)) = pending
             .iter()
-            .position(|(id, _)| *id == keep_alive.keep_alive_id)
+            .find(|(id, _)| *id == keep_alive.keep_alive_id)
         {
-            let (_, send_time) = pending.swap_remove(pos);
+            let send_time = *send_time;
+            self.pending_keep_alives.rcu(|current| {
+                let mut pending = (**current).clone();
+                if let Some(pos) = pending
+                    .iter()
+                    .position(|(id, _)| *id == keep_alive.keep_alive_id)
+                {
+                    pending.swap_remove(pos);
+                }
+                pending
+            });
             let ping = send_time.elapsed().as_millis() as u32;
             // Vanilla logic
             player.ping.store(

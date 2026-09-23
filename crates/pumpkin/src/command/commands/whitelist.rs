@@ -17,6 +17,7 @@ use crate::command::suggestion::suggestions::SuggestionsBuilder;
 use crate::data::{LoadJSONConfiguration, SaveJSONConfiguration, whitelist::WhitelistConfig};
 use crate::net::DisconnectReason;
 use crate::server::Server;
+use crate::server::cluster_access_policy::{AccessPolicyCommand, WhitelistRecord};
 
 const DESCRIPTION: &str = "Manage server whitelists.";
 const PERMISSION: &str = "minecraft:command.whitelist";
@@ -42,12 +43,38 @@ const ERROR_REMOVE_FAILED: CommandErrorType<0> = CommandErrorType::new(
 );
 
 pub fn kick_non_whitelisted_players(server: &Server) {
-    let whitelist = server.data.whitelist_config.read().unwrap();
-    let ops = server.data.operator_config.read().unwrap();
+    let policy = server
+        .advanced_config
+        .cluster
+        .enabled
+        .then(|| server.cluster_access_policy.snapshot());
+    let whitelist = policy
+        .is_none()
+        .then(|| server.data.whitelist_config.read().unwrap());
+    let admin = server
+        .advanced_config
+        .cluster
+        .enabled
+        .then(|| server.cluster_admin_view.load_full());
+    let ops = admin
+        .is_none()
+        .then(|| server.data.operator_config.read().unwrap());
     if server.basic_config.enforce_whitelist && server.white_list.load(Ordering::Relaxed) {
         for player in server.get_all_players() {
-            if ops.get_entry(&player.gameprofile.id).is_some()
-                || whitelist.is_whitelisted(&player.gameprofile)
+            if admin.as_ref().is_some_and(|snapshot| {
+                snapshot
+                    .operators
+                    .iter()
+                    .any(|op| op.uuid == *player.gameprofile.id.as_bytes())
+            }) || ops
+                .as_ref()
+                .is_some_and(|config| config.get_entry(&player.gameprofile.id).is_some())
+                || policy
+                    .as_ref()
+                    .is_some_and(|view| view.is_whitelisted(player.gameprofile.id))
+                || whitelist
+                    .as_ref()
+                    .is_some_and(|config| config.is_whitelisted(&player.gameprofile))
             {
                 continue;
             }
@@ -110,6 +137,39 @@ struct ListExecutor;
 impl CommandExecutor for ListExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let server = context.source.server();
+        if server.advanced_config.cluster.enabled {
+            let policy = server.cluster_access_policy.snapshot();
+            if policy.whitelist.is_empty() {
+                context.source.send_feedback(
+                    TextComponent::translate_cross(
+                        translation::java::COMMANDS_WHITELIST_NONE,
+                        translation::java::COMMANDS_WHITELIST_NONE,
+                        [],
+                    ),
+                    false,
+                );
+                return Ok(0);
+            }
+            let names = policy
+                .whitelist
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let count = policy.whitelist.len() as i32;
+            context.source.send_feedback(
+                TextComponent::translate_cross(
+                    translation::java::COMMANDS_WHITELIST_LIST,
+                    translation::java::COMMANDS_WHITELIST_LIST,
+                    [
+                        TextComponent::text(count.to_string()),
+                        TextComponent::text(names),
+                    ],
+                ),
+                false,
+            );
+            return Ok(count);
+        }
         let whitelist_guard = server.data.whitelist_config.read().unwrap();
         let whitelist = &whitelist_guard.whitelist;
         if whitelist.is_empty() {
@@ -153,6 +213,18 @@ struct ReloadExecutor;
 impl CommandExecutor for ReloadExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let server = context.source.server();
+        if server.advanced_config.cluster.enabled {
+            if !server
+                .cluster_access_policy
+                .try_submit(AccessPolicyCommand::ReloadWhitelist)
+            {
+                return Err(crate::server::cluster_admin_apply::admin_busy_error());
+            }
+            context
+                .source
+                .send_feedback(TextComponent::text("Whitelist reload queued."), false);
+            return Ok(1);
+        }
         *server.data.whitelist_config.write().unwrap() = WhitelistConfig::load();
         context.source.send_feedback(
             pumpkin_macros::translate_cross!(
@@ -174,6 +246,15 @@ impl SuggestionProvider for AddSuggestionProvider {
         context: &CommandContext,
         mut builder: SuggestionsBuilder,
     ) -> SuggestionProviderResult {
+        if context.server().advanced_config.cluster.enabled {
+            let policy = context.server().cluster_access_policy.snapshot();
+            for player in context.server().get_all_players() {
+                if !policy.is_whitelisted(player.gameprofile.id) {
+                    builder = builder.suggest(player.gameprofile.name.clone());
+                }
+            }
+            return builder.build();
+        }
         let whitelist = context.server().data.whitelist_config.read().unwrap();
         for player in context.server().get_all_players() {
             if !whitelist.is_whitelisted(&player.gameprofile) {
@@ -190,6 +271,38 @@ impl CommandExecutor for AddExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let targets = GameProfileArgumentType::get(context, "targets")?;
         let server = context.source.server();
+        if server.advanced_config.cluster.enabled {
+            let policy = server.cluster_access_policy.snapshot();
+            let mut successes = 0;
+            let mut busy = false;
+            for profile in &targets {
+                if policy.is_whitelisted(profile.id) {
+                    continue;
+                }
+                if !server
+                    .cluster_access_policy
+                    .try_submit(AccessPolicyCommand::AddWhitelist(WhitelistRecord {
+                        uuid: profile.id,
+                        name: profile.name.clone(),
+                    }))
+                {
+                    busy = true;
+                    continue;
+                }
+                context.source.send_feedback(
+                    TextComponent::text(format!("Queued whitelist add for {}.", profile.name)),
+                    false,
+                );
+                successes += 1;
+            }
+            return if successes > 0 {
+                Ok(successes)
+            } else if busy {
+                Err(crate::server::cluster_admin_apply::admin_busy_error())
+            } else {
+                Err(ERROR_ADD_FAILED.create_without_context())
+            };
+        }
         let mut whitelist = server.data.whitelist_config.write().unwrap();
         let mut successes: i32 = 0;
         let mut modified = false;
@@ -241,6 +354,12 @@ impl SuggestionProvider for RemoveSuggestionProvider {
         context: &CommandContext,
         mut builder: SuggestionsBuilder,
     ) -> SuggestionProviderResult {
+        if context.server().advanced_config.cluster.enabled {
+            for entry in &context.server().cluster_access_policy.snapshot().whitelist {
+                builder = builder.suggest(entry.name.clone());
+            }
+            return builder.build();
+        }
         let whitelist = context.server().data.whitelist_config.read().unwrap();
         for entry in &whitelist.whitelist {
             builder = builder.suggest(entry.name.clone());
@@ -255,6 +374,35 @@ impl CommandExecutor for RemoveExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let targets = GameProfileArgumentType::get(context, "targets")?;
         let server = context.source.server();
+        if server.advanced_config.cluster.enabled {
+            let policy = server.cluster_access_policy.snapshot();
+            let mut successes = 0;
+            let mut busy = false;
+            for profile in &targets {
+                if !policy.is_whitelisted(profile.id) {
+                    continue;
+                }
+                if !server
+                    .cluster_access_policy
+                    .try_submit(AccessPolicyCommand::RemoveWhitelist(profile.id))
+                {
+                    busy = true;
+                    continue;
+                }
+                context.source.send_feedback(
+                    TextComponent::text(format!("Queued whitelist removal for {}.", profile.name)),
+                    false,
+                );
+                successes += 1;
+            }
+            return if successes > 0 {
+                Ok(successes)
+            } else if busy {
+                Err(crate::server::cluster_admin_apply::admin_busy_error())
+            } else {
+                Err(ERROR_REMOVE_FAILED.create_without_context())
+            };
+        }
         let mut whitelist = server.data.whitelist_config.write().unwrap();
         let mut successes: i32 = 0;
         for player in &targets {

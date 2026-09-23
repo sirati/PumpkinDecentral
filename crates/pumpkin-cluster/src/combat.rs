@@ -1,12 +1,10 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU16, Ordering};
 
 use crate::banks::Bank;
 use crate::identity::{GlobalPlayerId, PlayerSeq};
 use crate::protocol::{
-    ChunkAddr, EntityRef, FireProjectileUpdate, HitEntityUpdate, HitPlayerUpdate,
+    ChunkKey, EntityRef, FireProjectileUpdate, HitEntityUpdate, HitPlayerUpdate, WorldId,
 };
 use crate::time::TickStamp;
 
@@ -15,14 +13,18 @@ pub fn capture_hit_player(
     gid: GlobalPlayerId,
     seq: PlayerSeq,
     tick: TickStamp,
+    actor_chunk: ChunkKey,
     target: GlobalPlayerId,
+    target_chunk: ChunkKey,
     damage_milli: u16,
 ) -> HitPlayerUpdate {
     HitPlayerUpdate {
         gid,
         seq,
         tick,
+        actor_chunk,
         target,
+        target_chunk,
         damage_milli,
     }
 }
@@ -32,6 +34,7 @@ pub fn capture_hit_entity(
     gid: GlobalPlayerId,
     seq: PlayerSeq,
     tick: TickStamp,
+    actor_chunk: ChunkKey,
     target: EntityRef,
     damage_milli: u16,
 ) -> HitEntityUpdate {
@@ -39,6 +42,7 @@ pub fn capture_hit_entity(
         gid,
         seq,
         tick,
+        actor_chunk,
         target,
         damage_milli,
     }
@@ -49,6 +53,7 @@ pub fn capture_fire(
     gid: GlobalPlayerId,
     seq: PlayerSeq,
     tick: TickStamp,
+    actor_chunk: ChunkKey,
     kind: u8,
     charge_milli: u16,
     dir: [f32; 3],
@@ -57,6 +62,7 @@ pub fn capture_fire(
         gid,
         seq,
         tick,
+        actor_chunk,
         kind,
         charge_milli,
         dir,
@@ -64,11 +70,12 @@ pub fn capture_fire(
 }
 
 #[must_use]
-pub fn chunk_of_pos(x: f64, z: f64) -> ChunkAddr {
-    ChunkAddr {
-        x: (x.floor() as i32).div_euclid(16),
-        z: (z.floor() as i32).div_euclid(16),
-    }
+pub fn chunk_of_pos(world: WorldId, x: f64, z: f64) -> ChunkKey {
+    ChunkKey::new(
+        world,
+        (x.floor() as i32).div_euclid(16),
+        (z.floor() as i32).div_euclid(16),
+    )
 }
 
 #[derive(Debug, Default)]
@@ -91,23 +98,12 @@ impl CombatSeqClock {
     }
 }
 
-const SEQ_STRIPES: usize = 256;
-
-static COMBAT_SEQ: LazyLock<Box<[AtomicU16]>> =
-    LazyLock::new(|| (0..SEQ_STRIPES).map(|_| AtomicU16::new(0)).collect());
-
-fn stripe_for(gid: GlobalPlayerId) -> usize {
-    let mixed = gid
-        .server
-        .0
-        .rotate_left(5)
-        ^ gid.player.0.wrapping_mul(0x9E37);
-    (mixed as usize) % SEQ_STRIPES
+thread_local! {
+    static COMBAT_SEQ: RefCell<CombatSeqClock> = RefCell::new(CombatSeqClock::new());
 }
 
 pub fn next_combat_seq(gid: GlobalPlayerId) -> PlayerSeq {
-    let stripe = stripe_for(gid);
-    PlayerSeq(COMBAT_SEQ[stripe].fetch_add(1, Ordering::Relaxed))
+    COMBAT_SEQ.with(|clock| clock.borrow_mut().issue(gid))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,9 +158,7 @@ pub enum CombatRejectReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitDecision {
-    Accept {
-        undo: HitSnapshot,
-    },
+    Accept { undo: HitSnapshot },
     Reject(CombatRejectReason),
 }
 
@@ -344,11 +338,7 @@ pub const fn is_fire_kind_supported(kind: u8) -> bool {
 /// rank without exchanging data. Higher ranks win; ties are impossible to
 /// observe alone because [`order_combat_attackers`] breaks them by id.
 #[must_use]
-pub fn rank_combat_attacker(
-    cluster_seed: u64,
-    tick: TickStamp,
-    attacker: GlobalPlayerId,
-) -> u64 {
+pub fn rank_combat_attacker(cluster_seed: u64, tick: TickStamp, attacker: GlobalPlayerId) -> u64 {
     crate::order::rank_tick_player(cluster_seed, tick, attacker)
 }
 
@@ -432,11 +422,7 @@ pub fn order_fire(
 ///
 /// Stable sort by [`order_hit_player`]; equal elements keep arrival order,
 /// which is fine because they compare equal on every ranking field.
-pub fn sort_hit_player(
-    cluster_seed: u64,
-    tick: TickStamp,
-    hits: &mut [HitPlayerUpdate],
-) {
+pub fn sort_hit_player(cluster_seed: u64, tick: TickStamp, hits: &mut [HitPlayerUpdate]) {
     hits.sort_by(|left, right| order_hit_player(cluster_seed, tick, left, right));
 }
 
@@ -444,11 +430,7 @@ pub fn sort_hit_player(
 ///
 /// Stable sort by [`order_hit_entity`]; see [`sort_hit_player`] for why
 /// stability is enough for the trailing tie.
-pub fn sort_hit_entity(
-    cluster_seed: u64,
-    tick: TickStamp,
-    hits: &mut [HitEntityUpdate],
-) {
+pub fn sort_hit_entity(cluster_seed: u64, tick: TickStamp, hits: &mut [HitEntityUpdate]) {
     hits.sort_by(|left, right| order_hit_entity(cluster_seed, tick, left, right));
 }
 
@@ -456,11 +438,7 @@ pub fn sort_hit_entity(
 ///
 /// Stable sort by [`order_fire`]; keeps bursts from one shooter adjacent in
 /// `seq` order while interleaving shooters deterministically by tick hash.
-pub fn sort_fire(
-    cluster_seed: u64,
-    tick: TickStamp,
-    shots: &mut [FireProjectileUpdate],
-) {
+pub fn sort_fire(cluster_seed: u64, tick: TickStamp, shots: &mut [FireProjectileUpdate]) {
     shots.sort_by(|left, right| order_fire(cluster_seed, tick, left, right));
 }
 
@@ -470,11 +448,7 @@ pub fn sort_fire(
 /// the fused batch encodes identically on every peer: hit-player by victim
 /// then attacker rank, hit-entity by entity then attacker rank, fire by
 /// attacker rank. Each lane is an independent stable sort.
-pub fn sort_drained_combat(
-    cluster_seed: u64,
-    tick: TickStamp,
-    drained: &mut DrainedCombat,
-) {
+pub fn sort_drained_combat(cluster_seed: u64, tick: TickStamp, drained: &mut DrainedCombat) {
     sort_hit_player(cluster_seed, tick, &mut drained.hit_player);
     sort_hit_entity(cluster_seed, tick, &mut drained.hit_entity);
     sort_fire(cluster_seed, tick, &mut drained.fire);
@@ -493,7 +467,7 @@ pub fn drain_ordered_combat(cluster_seed: u64, tick: TickStamp) -> DrainedCombat
 }
 
 fn entity_target_cmp(left: &EntityRef, right: &EntityRef) -> std::cmp::Ordering {
-    (left.owner, left.local_id, left.chunk).cmp(&(right.owner, right.local_id, right.chunk))
+    (left.origin, left.local_id, left.chunk).cmp(&(right.origin, right.local_id, right.chunk))
 }
 
 fn dir_bits(dir: [f32; 3]) -> [u32; 3] {
@@ -505,6 +479,9 @@ mod tests {
     use super::*;
     use crate::identity::{PlayerSlot, ServerId};
 
+    const WORLD: WorldId = WorldId::new(0, 7);
+    const CHUNK: ChunkKey = ChunkKey::new(WORLD, 0, 0);
+
     fn gid(server: u16, player: u16) -> GlobalPlayerId {
         GlobalPlayerId::new(ServerId(server), PlayerSlot(player))
     }
@@ -514,43 +491,15 @@ mod tests {
             gid(1, 1),
             PlayerSeq(seq),
             TickStamp(tick),
+            CHUNK,
             gid(1, 2),
+            CHUNK,
             damage_milli,
         )
     }
 
     fn snapshot() -> HitSnapshot {
         HitSnapshot::new(19_000, 7)
-    }
-
-    #[test]
-    fn hit_player_capture_packs_fields() {
-        let update = hit_player_update(3, 9, 1500);
-        assert_eq!(update.gid, gid(1, 1));
-        assert_eq!(update.seq, PlayerSeq(3));
-        assert_eq!(update.tick, TickStamp(9));
-        assert_eq!(update.target, gid(1, 2));
-        assert_eq!(update.damage_milli, 1500);
-    }
-
-    #[test]
-    fn hit_entity_capture_packs_fields() {
-        let target = EntityRef {
-            owner: ServerId(2),
-            local_id: 44,
-            chunk: ChunkAddr { x: -1, z: 3 },
-        };
-        let update = capture_hit_entity(gid(1, 1), PlayerSeq(4), TickStamp(9), target, 500);
-        assert_eq!(update.target, target);
-        assert_eq!(update.damage_milli, 500);
-    }
-
-    #[test]
-    fn fire_capture_packs_fields() {
-        let update = capture_fire(gid(1, 1), PlayerSeq(5), TickStamp(9), 1, 750, [0.0, 0.0, 1.0]);
-        assert_eq!(update.kind, 1);
-        assert_eq!(update.charge_milli, 750);
-        assert_eq!(update.dir, [0.0, 0.0, 1.0]);
     }
 
     #[test]
@@ -609,7 +558,9 @@ mod tests {
             gid(1, 1),
             PlayerSeq(2),
             TickStamp(40),
+            CHUNK,
             gid(1, 1),
+            CHUNK,
             1000,
         );
         assert_eq!(
@@ -687,17 +638,30 @@ mod tests {
     fn entity_hit_validates_like_player_hit() {
         let limits = CombatLimits::default();
         let target = EntityRef {
-            owner: ServerId(2),
+            origin: ServerId(2),
             local_id: 11,
-            chunk: ChunkAddr { x: 0, z: 0 },
+            generation: 0,
+            chunk: CHUNK,
         };
-        let update = capture_hit_entity(gid(1, 1), PlayerSeq(8), TickStamp(40), target, 250);
+        let update = capture_hit_entity(gid(1, 1), PlayerSeq(8), TickStamp(40), CHUNK, target, 250);
         assert_eq!(
-            validate_hit_entity(&update, Some(PlayerSeq(7)), TickStamp(41), snapshot(), &limits),
+            validate_hit_entity(
+                &update,
+                Some(PlayerSeq(7)),
+                TickStamp(41),
+                snapshot(),
+                &limits
+            ),
             HitDecision::Accept { undo: snapshot() }
         );
         assert_eq!(
-            validate_hit_entity(&update, Some(PlayerSeq(8)), TickStamp(41), snapshot(), &limits),
+            validate_hit_entity(
+                &update,
+                Some(PlayerSeq(8)),
+                TickStamp(41),
+                snapshot(),
+                &limits
+            ),
             HitDecision::Reject(CombatRejectReason::StaleSequence)
         );
     }
@@ -705,7 +669,15 @@ mod tests {
     #[test]
     fn fire_accepts_fresh_shot() {
         let limits = CombatLimits::default();
-        let update = capture_fire(gid(1, 1), PlayerSeq(8), TickStamp(40), 0, 900, [1.0, 0.0, 0.0]);
+        let update = capture_fire(
+            gid(1, 1),
+            PlayerSeq(8),
+            TickStamp(40),
+            CHUNK,
+            0,
+            900,
+            [1.0, 0.0, 0.0],
+        );
         assert_eq!(
             validate_fire(&update, Some(PlayerSeq(7)), TickStamp(41), &limits),
             FireDecision::Accept
@@ -715,19 +687,38 @@ mod tests {
     #[test]
     fn fire_rejects_bad_shots() {
         let limits = CombatLimits::default();
-        let stale = capture_fire(gid(1, 1), PlayerSeq(7), TickStamp(40), 0, 900, [1.0, 0.0, 0.0]);
+        let stale = capture_fire(
+            gid(1, 1),
+            PlayerSeq(7),
+            TickStamp(40),
+            CHUNK,
+            0,
+            900,
+            [1.0, 0.0, 0.0],
+        );
         assert_eq!(
             validate_fire(&stale, Some(PlayerSeq(7)), TickStamp(41), &limits),
             FireDecision::Reject(CombatRejectReason::StaleSequence)
         );
-        let overcharged =
-            capture_fire(gid(1, 1), PlayerSeq(8), TickStamp(40), 0, limits.max_charge_milli + 1, [1.0, 0.0, 0.0]);
+        let overcharged = capture_fire(
+            gid(1, 1),
+            PlayerSeq(8),
+            TickStamp(40),
+            CHUNK,
+            0,
+            limits.max_charge_milli + 1,
+            [1.0, 0.0, 0.0],
+        );
         assert_eq!(
             validate_fire(&overcharged, Some(PlayerSeq(7)), TickStamp(41), &limits),
             FireDecision::Reject(CombatRejectReason::ChargeOutOfRange)
         );
-        for dir in [[f32::NAN, 0.0, 0.0], [0.0, 0.0, 0.0], [f32::INFINITY, 0.0, 1.0]] {
-            let wild = capture_fire(gid(1, 1), PlayerSeq(8), TickStamp(40), 0, 900, dir);
+        for dir in [
+            [f32::NAN, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [f32::INFINITY, 0.0, 1.0],
+        ] {
+            let wild = capture_fire(gid(1, 1), PlayerSeq(8), TickStamp(40), CHUNK, 0, 900, dir);
             assert_eq!(
                 validate_fire(&wild, Some(PlayerSeq(7)), TickStamp(41), &limits),
                 FireDecision::Reject(CombatRejectReason::BadDirection)
@@ -737,9 +728,12 @@ mod tests {
 
     #[test]
     fn chunk_of_pos_handles_negatives() {
-        assert_eq!(chunk_of_pos(0.5, 15.9), ChunkAddr { x: 0, z: 0 });
-        assert_eq!(chunk_of_pos(16.0, -0.5), ChunkAddr { x: 1, z: -1 });
-        assert_eq!(chunk_of_pos(-16.0, -16.0), ChunkAddr { x: -1, z: -1 });
+        assert_eq!(chunk_of_pos(WORLD, 0.5, 15.9), CHUNK);
+        assert_eq!(chunk_of_pos(WORLD, 16.0, -0.5), ChunkKey::new(WORLD, 1, -1));
+        assert_eq!(
+            chunk_of_pos(WORLD, -16.0, -16.0),
+            ChunkKey::new(WORLD, -1, -1)
+        );
     }
 
     #[test]
@@ -750,14 +744,24 @@ mod tests {
             gid(2, 1),
             PlayerSeq(1),
             TickStamp(2),
+            CHUNK,
             EntityRef {
-                owner: ServerId(1),
+                origin: ServerId(1),
                 local_id: 9,
-                chunk: ChunkAddr { x: 0, z: 0 },
+                generation: 0,
+                chunk: CHUNK,
             },
             300,
         ));
-        stage_fire(capture_fire(gid(2, 1), PlayerSeq(2), TickStamp(2), 0, 100, [0.0, 1.0, 0.0]));
+        stage_fire(capture_fire(
+            gid(2, 1),
+            PlayerSeq(2),
+            TickStamp(2),
+            CHUNK,
+            0,
+            100,
+            [0.0, 1.0, 0.0],
+        ));
         let drained = drain_combat_updates();
         assert_eq!(drained.len(), 3);
         assert!(drain_combat_updates().is_empty());

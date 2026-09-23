@@ -23,7 +23,9 @@ use std::collections::HashMap;
 
 use crate::identity::{GlobalPlayerId, PlayerSeq};
 use crate::order::order_players;
-use crate::protocol::{BlockPos, BlockUndo, BreakBlockUpdate, EntityRef, PlaceBlockUpdate};
+use crate::protocol::{
+    BlockPos, BlockUndo, BreakBlockUpdate, ChunkKey, EntityRef, PlaceBlockUpdate,
+};
 use crate::time::TickStamp;
 
 /// Identity of one conflict cell.
@@ -34,7 +36,7 @@ use crate::time::TickStamp;
 /// regardless of grouping-map iteration order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConflictKey {
-    Block(BlockPos),
+    Block(ChunkKey, BlockPos),
     Player(GlobalPlayerId),
     Entity(EntityRef),
 }
@@ -42,16 +44,21 @@ pub enum ConflictKey {
 impl Ord for ConflictKey {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
-            (Self::Block(left), Self::Block(right)) => {
-                (left.x, left.y, left.z).cmp(&(right.x, right.y, right.z))
+            (Self::Block(left_chunk, left), Self::Block(right_chunk, right)) => {
+                (left_chunk, left.x, left.y, left.z).cmp(&(right_chunk, right.x, right.y, right.z))
             }
-            (Self::Block(_), _) => Ordering::Less,
-            (Self::Player(_), Self::Block(_)) => Ordering::Greater,
+            (Self::Block(..), _) => Ordering::Less,
+            (Self::Player(_), Self::Block(..)) => Ordering::Greater,
             (Self::Player(left), Self::Player(right)) => left.cmp(right),
             (Self::Player(_), _) => Ordering::Less,
-            (Self::Entity(_), Self::Block(_) | Self::Player(_)) => Ordering::Greater,
-            (Self::Entity(left), Self::Entity(right)) => (left.owner, left.local_id, left.chunk)
-                .cmp(&(right.owner, right.local_id, right.chunk)),
+            (Self::Entity(_), Self::Block(..) | Self::Player(_)) => Ordering::Greater,
+            (Self::Entity(left), Self::Entity(right)) => (
+                left.origin,
+                left.local_id,
+                left.generation,
+                left.chunk,
+            )
+                .cmp(&(right.origin, right.local_id, right.generation, right.chunk)),
         }
     }
 }
@@ -59,12 +66,6 @@ impl Ord for ConflictKey {
 impl PartialOrd for ConflictKey {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
-    }
-}
-
-impl From<BlockPos> for ConflictKey {
-    fn from(pos: BlockPos) -> Self {
-        Self::Block(pos)
     }
 }
 
@@ -142,8 +143,8 @@ impl Contender {
     #[must_use]
     pub fn key(&self) -> ConflictKey {
         match &self.kind {
-            ContenderKind::Break(update) => ConflictKey::Block(update.pos),
-            ContenderKind::Place(update) => ConflictKey::Block(update.pos),
+            ContenderKind::Break(update) => ConflictKey::Block(update.chunk, update.pos),
+            ContenderKind::Place(update) => ConflictKey::Block(update.chunk, update.pos),
         }
     }
 
@@ -288,8 +289,7 @@ impl Resolver {
         }
         let mut out = Vec::with_capacity(grouped.len());
         for (key, group) in grouped {
-            let unique = dedupe_by_player(&group);
-            let mut rejected = Vec::new();
+            let (unique, mut rejected) = dedupe_by_player(&group);
             let mut eligible: Vec<&Contender> = Vec::new();
             for contender in &unique {
                 if is_rejected(contender, ground_states, occupied_cells) {
@@ -325,7 +325,10 @@ impl Resolver {
 fn tiebreak_value(contender: &Contender) -> u16 {
     match &contender.kind {
         ContenderKind::Break(update) => update.expected_old_state,
-        ContenderKind::Place(update) => update.new_state,
+        ContenderKind::Place(update) => update
+            .expected_old_state
+            .wrapping_mul(31)
+            .wrapping_add(update.new_state),
     }
 }
 
@@ -348,12 +351,7 @@ fn dedupe_fallback_cmp(current: &Contender, incoming: &Contender) -> Ordering {
         .then_with(|| tiebreak_value(current).cmp(&tiebreak_value(incoming)))
         .then_with(|| current.seq().0.cmp(&incoming.seq().0))
         .then_with(|| current.undo.old_state.cmp(&incoming.undo.old_state))
-        .then_with(|| {
-            current
-                .undo
-                .count_before
-                .cmp(&incoming.undo.count_before)
-        })
+        .then_with(|| current.undo.count_before.cmp(&incoming.undo.count_before))
 }
 
 /// Collapses two same-player, same-key claims to one, independent of call order.
@@ -381,13 +379,20 @@ fn pick_newer(current: &Contender, incoming: &Contender) -> Contender {
 /// Keeps one claim per player within a key group by folding duplicates with
 /// [`pick_newer`]. Because that fold is commutative, the surviving set (though
 /// accumulated in ingest order) is identical for every arrival permutation.
-fn dedupe_by_player(group: &[Contender]) -> Vec<Contender> {
+fn dedupe_by_player(group: &[Contender]) -> (Vec<Contender>, Vec<Contender>) {
     let mut unique: Vec<Contender> = Vec::with_capacity(group.len());
+    let mut superseded = Vec::new();
     for contender in group {
         let mut merged = false;
         for slot in unique.iter_mut() {
             if slot.gid == contender.gid {
-                *slot = pick_newer(slot, contender);
+                let winner = pick_newer(slot, contender);
+                if winner == *slot {
+                    superseded.push(*contender);
+                } else {
+                    superseded.push(*slot);
+                    *slot = winner;
+                }
                 merged = true;
                 break;
             }
@@ -396,7 +401,7 @@ fn dedupe_by_player(group: &[Contender]) -> Vec<Contender> {
             unique.push(*contender);
         }
     }
-    unique
+    (unique, superseded)
 }
 
 /// Validity split, evaluated before any ranking: stale breaks and
@@ -411,7 +416,12 @@ fn is_rejected(
             Some(ground) => is_break_stale(update, *ground),
             None => false,
         },
-        ContenderKind::Place(update) => is_cell_occupied(update.pos, occupied_cells),
+        ContenderKind::Place(update) => {
+            is_cell_occupied(update.pos, occupied_cells)
+                || ground_states
+                    .get(&contender.key())
+                    .is_some_and(|ground| update.expected_old_state != *ground)
+        }
     }
 }
 
@@ -438,10 +448,15 @@ fn reduce_winner<'c>(
 mod tests {
     use super::*;
     use crate::identity::{PlayerSlot, ServerId};
-    use crate::protocol::ChunkAddr;
+    use crate::protocol::{ChunkKey, WorldId};
 
     const DIRT: u16 = 1;
     const WOOD: u16 = 5;
+    const WORLD: WorldId = WorldId::new(0, 7);
+
+    const fn chunk() -> ChunkKey {
+        ChunkKey::new(WORLD, 0, 0)
+    }
 
     fn gid(server: u16, player: u16) -> GlobalPlayerId {
         GlobalPlayerId::new(ServerId(server), PlayerSlot(player))
@@ -455,7 +470,8 @@ mod tests {
                 tick: TickStamp(11),
                 pos,
                 expected_old_state: expected,
-                chunk: ChunkAddr { x: 0, z: 0 },
+                actor_chunk: chunk(),
+                chunk: chunk(),
             },
             BlockUndo {
                 old_state: expected,
@@ -471,13 +487,15 @@ mod tests {
                 seq: PlayerSeq(0),
                 tick: TickStamp(11),
                 pos,
+                expected_old_state: DIRT,
                 new_state,
                 inv: crate::inventory::INV_MAIN,
                 slot: 3,
                 item: 40,
                 count_before: 64,
                 count_after: 63,
-                chunk: ChunkAddr { x: 0, z: 0 },
+                actor_chunk: chunk(),
+                chunk: chunk(),
             },
             BlockUndo {
                 old_state: DIRT,
@@ -539,7 +557,7 @@ mod tests {
             resolver.ingest(break_contender(stale_player, pos, DIRT));
             resolver.ingest(break_contender(fresh_player, pos, WOOD));
             let mut ground = HashMap::new();
-            ground.insert(ConflictKey::Block(pos), WOOD);
+            ground.insert(ConflictKey::Block(chunk(), pos), WOOD);
             let resolved = resolver.resolve_with_context(&ground, &[]);
             assert_eq!(resolved.len(), 1);
             let outcome = resolved.first().map(|resolution| {
@@ -560,17 +578,12 @@ mod tests {
         let mut solo = Resolver::new(7, tick);
         solo.ingest(break_contender(stale_player, pos, DIRT));
         let mut ground = HashMap::new();
-        ground.insert(ConflictKey::Block(pos), WOOD);
+        ground.insert(ConflictKey::Block(chunk(), pos), WOOD);
         let resolved = solo.resolve_with_context(&ground, &[]);
         assert_eq!(resolved.len(), 1);
         assert_eq!(winner_of(&resolved), None);
         assert_eq!(resolved.first().map(|r| r.losers.len()), Some(1));
-        assert_eq!(
-            resolved
-                .first()
-                .map(|r| r.loser_undos().len()),
-            Some(1)
-        );
+        assert_eq!(resolved.first().map(|r| r.loser_undos().len()), Some(1));
     }
 
     #[test]
@@ -622,11 +635,32 @@ mod tests {
         }
         assert!(outcomes.iter().all(|outcome| *outcome == outcomes[0]));
         assert_eq!(
-            outcomes[0]
-                .as_ref()
-                .and_then(|(winner, _)| *winner),
+            outcomes[0].as_ref().and_then(|(winner, _)| *winner),
             Some(left_grouped)
         );
+    }
+
+    #[test]
+    fn superseded_same_player_claim_is_returned_for_undo() {
+        let player = gid(1, 3);
+        let pos = BlockPos { x: 2, y: 64, z: 2 };
+        let mut older = place_contender(player, pos, 7);
+        let mut newer = place_contender(player, pos, 8);
+        if let ContenderKind::Place(update) = &mut older.kind {
+            update.seq = PlayerSeq(4);
+        }
+        if let ContenderKind::Place(update) = &mut newer.kind {
+            update.seq = PlayerSeq(5);
+        }
+        let mut resolver = Resolver::new(91, TickStamp(11));
+        resolver.ingest(newer);
+        resolver.ingest(older);
+
+        let resolved = resolver.resolve();
+
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].winner, Some(newer));
+        assert_eq!(resolved[0].losers, vec![older]);
     }
 
     #[test]
@@ -665,5 +699,19 @@ mod tests {
         assert_eq!(resolved_lone.len(), 1);
         assert_eq!(winner_of(&resolved_lone), None);
         assert_eq!(resolved_lone.first().map(|r| r.losers.len()), Some(1));
+    }
+
+    #[test]
+    fn placement_with_stale_expected_state_cannot_win_by_hash_rank() {
+        let tick = TickStamp(31);
+        let pos = BlockPos { x: 8, y: 65, z: 8 };
+        let stale = gid(1, 4);
+        let mut resolver = Resolver::new(0, tick);
+        resolver.ingest(place_contender(stale, pos, 9));
+        let mut ground = HashMap::new();
+        ground.insert(ConflictKey::Block(chunk(), pos), WOOD);
+        let resolved = resolver.resolve_with_context(&ground, &[]);
+        assert_eq!(winner_of(&resolved), None);
+        assert!(resolved[0].losers.iter().any(|loser| loser.gid == stale));
     }
 }

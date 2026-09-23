@@ -149,7 +149,8 @@ pub fn encode_batch_to_slice<'out>(
 ///
 /// Pre-size-and-reuse pattern: `out.clear(); out.reserve(len); encode_into`.
 pub fn encoded_batch_len(batch: &TickBatch) -> Result<usize, CodecError> {
-    postcard::experimental::serialized_size(batch).map_err(|error| encode_error("size batch", error))
+    postcard::experimental::serialized_size(batch)
+        .map_err(|error| encode_error("size batch", error))
 }
 
 /// Postcard-encodes a position slice into a fresh buffer.
@@ -231,10 +232,13 @@ mod tests {
             gid: sample_gid(),
             seq: PlayerSeq(12),
             tick: TickStamp(90),
+            world: crate::protocol::WorldId::new(0, 7),
             pos: [1.0, 64.0, -3.0],
             vel: [0.0, 0.0, 0.0],
             yaw: 45.0,
+            head_yaw: 30.0,
             pitch: 0.0,
+            on_ground: true,
         }
     }
 

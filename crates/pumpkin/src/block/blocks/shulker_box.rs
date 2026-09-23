@@ -83,8 +83,10 @@ impl BlockBehaviour for ShulkerBoxBlock {
                 pumpkin_data::statistic::CustomStatistic::OpenShulkerBox as i32,
                 1,
             );
-            args.player
-                .open_handled_screen(factory.as_ref(), Some(*args.position));
+            args.player.open_handled_screen(
+                factory.as_ref(),
+                crate::entity::player::InventoryScreenSource::Block(*args.position),
+            );
         }
 
         BlockActionResult::Success

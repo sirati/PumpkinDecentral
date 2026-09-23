@@ -17,6 +17,7 @@ use crate::data::banlist_serializer::BannedIpEntry;
 use crate::entity::EntityBase;
 use crate::net::DisconnectReason;
 use crate::server::Server;
+use crate::server::cluster_access_policy::{AccessPolicyCommand, IpBanRecord};
 
 const DESCRIPTION: &str = "bans a player-ip";
 const PERMISSION: &str = "minecraft:command.banip";
@@ -36,9 +37,10 @@ fn parse_ip(target: &str, server: &Server) -> Option<IpAddr> {
         server
             .get_player_by_name(target)
             .or_else(|| {
-                server.get_all_players().into_iter().find(|player| {
-                    player.gameprofile.name.eq_ignore_ascii_case(target)
-                })
+                server
+                    .get_all_players()
+                    .into_iter()
+                    .find(|player| player.gameprofile.name.eq_ignore_ascii_case(target))
             })
             .map(|player| player.client.address().ip())
     })
@@ -51,33 +53,56 @@ fn ban_ip(context: &CommandContext, target: &str, reason: Option<String>) -> Com
     let target_ip =
         parse_ip(target, server).ok_or_else(|| ERROR_BANIP_INVALID.create_without_context())?;
 
-    let mut banned_ips = server.data.banned_ip_list.write().unwrap();
-
-    if banned_ips.get_entry(&target_ip).is_some() {
-        return Err(ERROR_BANIP_FAILED.create_without_context());
+    if server.advanced_config.cluster.enabled {
+        if server
+            .cluster_access_policy
+            .snapshot()
+            .active_ip_ban(target_ip)
+            .is_some()
+        {
+            return Err(ERROR_BANIP_FAILED.create_without_context());
+        }
+        if !server
+            .cluster_access_policy
+            .try_submit(AccessPolicyCommand::BanIp(IpBanRecord {
+                ip: target_ip,
+                created: time::OffsetDateTime::now_utc(),
+                source: context.source.name.clone(),
+                expires: None,
+                reason: reason.clone(),
+            }))
+        {
+            return Err(crate::server::cluster_admin_apply::admin_busy_error());
+        }
+        context.source.send_feedback(
+            TextComponent::text(format!("Queued IP ban for {target_ip}.")),
+            false,
+        );
+    } else {
+        let mut banned_ips = server.data.banned_ip_list.write().unwrap();
+        if banned_ips.get_entry(&target_ip).is_some() {
+            return Err(ERROR_BANIP_FAILED.create_without_context());
+        }
+        banned_ips.banned_ips.push(BannedIpEntry::new(
+            target_ip,
+            context.source.name.clone(),
+            None,
+            reason.clone(),
+        ));
+        banned_ips.save();
+        drop(banned_ips);
+        context.source.send_feedback(
+            TextComponent::translate_cross(
+                translation::java::COMMANDS_BANIP_SUCCESS,
+                translation::bedrock::COMMANDS_BANIP_SUCCESS,
+                [
+                    TextComponent::text(target_ip.to_string()),
+                    TextComponent::text(reason),
+                ],
+            ),
+            true,
+        );
     }
-
-    banned_ips.banned_ips.push(BannedIpEntry::new(
-        target_ip,
-        context.source.name.clone(),
-        None,
-        reason.clone(),
-    ));
-
-    banned_ips.save();
-    drop(banned_ips);
-
-    context.source.send_feedback(
-        TextComponent::translate_cross(
-            translation::java::COMMANDS_BANIP_SUCCESS,
-            translation::bedrock::COMMANDS_BANIP_SUCCESS,
-            [
-                TextComponent::text(target_ip.to_string()),
-                TextComponent::text(reason),
-            ],
-        ),
-        true,
-    );
 
     let players_to_kick: Vec<_> = server
         .get_all_players()

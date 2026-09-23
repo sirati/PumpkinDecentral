@@ -26,6 +26,10 @@ pub struct EnderChestScreenFactory {
 }
 
 impl ScreenHandlerFactory for EnderChestScreenFactory {
+    fn cluster_ender_chest_tracker(&self) -> Option<Arc<ViewerCountTracker>> {
+        self.tracker.clone()
+    }
+
     fn create_screen_handler(
         &self,
         sync_id: u8,
@@ -73,6 +77,9 @@ impl BlockBehaviour for EnderChestBlock {
     }
 
     fn normal_use(&self, args: NormalUseArgs<'_>) -> BlockActionResult {
+        if args.server.advanced_config.cluster.enabled {
+            return BlockActionResult::Fail;
+        }
         if let Some(factory) = self.get_screen_handler_factory(GetScreenHandlerFactoryArgs {
             server: args.server,
             world: args.world,
@@ -85,8 +92,10 @@ impl BlockBehaviour for EnderChestBlock {
                 pumpkin_data::statistic::CustomStatistic::OpenEnderchest as i32,
                 1,
             );
-            args.player
-                .open_handled_screen(factory.as_ref(), Some(*args.position));
+            args.player.open_handled_screen(
+                factory.as_ref(),
+                crate::entity::player::InventoryScreenSource::Block(*args.position),
+            );
             // TODO: PiglinBrain.onGuardedBlockInteracted(serverWorld, player, true);
         }
 

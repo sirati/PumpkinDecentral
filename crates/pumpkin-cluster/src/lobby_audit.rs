@@ -35,7 +35,13 @@ pub struct LobbyFrame {
 impl LobbyPosition {
     #[must_use]
     pub const fn new(x: f64, y: f64, z: f64, yaw: f32, pitch: f32) -> Self {
-        Self { x, y, z, yaw, pitch }
+        Self {
+            x,
+            y,
+            z,
+            yaw,
+            pitch,
+        }
     }
 }
 
@@ -178,11 +184,41 @@ mod tests {
     #[test]
     fn position_audit_rejects_any_drift() {
         let base = lobby_fake_position();
-        assert!(!is_lobby_position(&LobbyPosition::new(base.x + 1.0, base.y, base.z, base.yaw, base.pitch)));
-        assert!(!is_lobby_position(&LobbyPosition::new(base.x, base.y - 1.0, base.z, base.yaw, base.pitch)));
-        assert!(!is_lobby_position(&LobbyPosition::new(base.x, base.y, base.z + 16.0, base.yaw, base.pitch)));
-        assert!(!is_lobby_position(&LobbyPosition::new(base.x, base.y, base.z, base.yaw + 1.0, base.pitch)));
-        assert!(!is_lobby_position(&LobbyPosition::new(base.x, base.y, base.z, base.yaw, base.pitch - 1.0)));
+        assert!(!is_lobby_position(&LobbyPosition::new(
+            base.x + 1.0,
+            base.y,
+            base.z,
+            base.yaw,
+            base.pitch
+        )));
+        assert!(!is_lobby_position(&LobbyPosition::new(
+            base.x,
+            base.y - 1.0,
+            base.z,
+            base.yaw,
+            base.pitch
+        )));
+        assert!(!is_lobby_position(&LobbyPosition::new(
+            base.x,
+            base.y,
+            base.z + 16.0,
+            base.yaw,
+            base.pitch
+        )));
+        assert!(!is_lobby_position(&LobbyPosition::new(
+            base.x,
+            base.y,
+            base.z,
+            base.yaw + 1.0,
+            base.pitch
+        )));
+        assert!(!is_lobby_position(&LobbyPosition::new(
+            base.x,
+            base.y,
+            base.z,
+            base.yaw,
+            base.pitch - 1.0
+        )));
         assert!(!lobby_looks_straight_down(0.0, 0.0));
         assert!(!lobby_looks_straight_down(180.0, 90.0));
     }

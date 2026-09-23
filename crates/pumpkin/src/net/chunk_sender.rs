@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::VecDeque;
 use std::num::NonZero;
 use std::sync::{Arc, Weak};
 
@@ -43,6 +44,19 @@ pub struct EncodedChunk {
     pub chunk_ref: Weak<ChunkData>,
 }
 
+#[derive(Debug)]
+struct AwaitingBatchAck {
+    epoch: u32,
+    positions: Vec<Vector2<i32>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchAckResult {
+    Applied,
+    Missing,
+    RevisionMismatch { expected: u32, received: u32 },
+}
+
 impl EncodedChunk {
     #[must_use]
     pub fn is_fresh_for(&self, candidate: &PreparedChunk) -> bool {
@@ -60,6 +74,7 @@ pub struct ChunkSender {
     sent_chunks: FxHashSet<Vector2<i32>>,
     /// Committed Bedrock chunks packets are still being encoded.
     awaiting_delivery: FxHashSet<Vector2<i32>>,
+    awaiting_batch_ack: VecDeque<AwaitingBatchAck>,
     pub in_flight_batches: u16,
     pub desired_rate: f32,
     pub send_quota: f32,
@@ -73,10 +88,11 @@ impl ChunkSender {
             pending_chunks: FxHashSet::default(),
             sent_chunks: FxHashSet::default(),
             awaiting_delivery: FxHashSet::default(),
+            awaiting_batch_ack: VecDeque::new(),
             in_flight_batches: 0,
             desired_rate: INITIAL_CHUNKS_PER_TICK,
             send_quota: 0.0,
-            max_in_flight: 1,
+            max_in_flight: MAX_CONCURRENT_BATCHES,
         }
     }
 
@@ -84,6 +100,7 @@ impl ChunkSender {
         self.pending_chunks.clear();
         self.sent_chunks.clear();
         self.awaiting_delivery.clear();
+        self.awaiting_batch_ack.clear();
         self.in_flight_batches = 0;
         self.send_quota = 0.0;
     }
@@ -111,10 +128,25 @@ impl ChunkSender {
         self.sent_chunks.len()
     }
 
-    pub const fn on_batch_acknowledged(&mut self, client_requested_rate: f32) -> bool {
-        if self.in_flight_batches == 0 {
-            return false;
+    pub fn on_batch_acknowledged(
+        &mut self,
+        client_requested_rate: f32,
+        current_epoch: u32,
+    ) -> BatchAckResult {
+        let Some(front) = self.awaiting_batch_ack.front() else {
+            return BatchAckResult::Missing;
+        };
+        if front.epoch != current_epoch {
+            return BatchAckResult::RevisionMismatch {
+                expected: front.epoch,
+                received: current_epoch,
+            };
         }
+        let Some(delivered) = self.awaiting_batch_ack.pop_front() else {
+            return BatchAckResult::Missing;
+        };
+
+        self.mark_delivered(&delivered.positions);
 
         self.in_flight_batches = self.in_flight_batches.saturating_sub(1);
         self.desired_rate = if client_requested_rate.is_nan() {
@@ -123,17 +155,21 @@ impl ChunkSender {
             client_requested_rate.clamp(MIN_CHUNKS_PER_TICK, MAX_CHUNKS_PER_TICK)
         };
 
-        if self.in_flight_batches == 0 {
-            self.send_quota = 1.0;
-        }
+        BatchAckResult::Applied
+    }
 
-        self.max_in_flight = MAX_CONCURRENT_BATCHES;
-        true
+    pub fn register_batch_for_acknowledgement(&mut self, epoch: u32, positions: Vec<Vector2<i32>>) {
+        self.in_flight_batches = self.in_flight_batches.saturating_add(1);
+        self.awaiting_batch_ack
+            .push_back(AwaitingBatchAck { epoch, positions });
     }
 
     pub fn enqueue_chunk(&mut self, pos: Vector2<i32>) {
         self.sent_chunks.remove(&pos);
         self.awaiting_delivery.remove(&pos);
+        for batch in &mut self.awaiting_batch_ack {
+            batch.positions.retain(|batch_pos| *batch_pos != pos);
+        }
         self.pending_chunks.insert(pos);
     }
 
@@ -359,7 +395,12 @@ impl ChunkSender {
                 && let ClientPlatform::Java(java_client) = client
             {
                 java_client.try_send_packet(&CChunkBatchEnd::new(sent_count as u16));
-                self.in_flight_batches = self.in_flight_batches.saturating_add(1);
+                self.awaiting_delivery
+                    .extend(dispatched_positions.iter().copied());
+                self.register_batch_for_acknowledgement(
+                    current_epoch,
+                    dispatched_positions.clone(),
+                );
             }
 
             self.send_quota -= sent_count as f32;
@@ -497,6 +538,95 @@ mod tests {
         first.enqueue_chunk(position);
         assert!(!first.is_chunk_ready(&position));
         assert!(second.is_chunk_ready(&position));
+    }
+
+    #[test]
+    fn java_acknowledgements_release_batches_in_fifo_order() {
+        let first = Vector2::new(1, 2);
+        let second = Vector2::new(3, 4);
+        let mut sender = ChunkSender::new();
+        sender.sent_chunks.extend([first, second]);
+        sender.awaiting_delivery.extend([first, second]);
+        sender.awaiting_batch_ack.push_back(AwaitingBatchAck {
+            epoch: 7,
+            positions: vec![first],
+        });
+        sender.awaiting_batch_ack.push_back(AwaitingBatchAck {
+            epoch: 7,
+            positions: vec![second],
+        });
+        sender.in_flight_batches = 2;
+
+        assert!(!sender.is_chunk_ready(&first));
+        assert!(!sender.is_chunk_ready(&second));
+        assert_eq!(
+            sender.on_batch_acknowledged(20.0, 7),
+            BatchAckResult::Applied
+        );
+        assert!(sender.is_chunk_ready(&first));
+        assert!(!sender.is_chunk_ready(&second));
+        assert_eq!(sender.in_flight_batches, 1);
+        assert_eq!(
+            sender.on_batch_acknowledged(20.0, 7),
+            BatchAckResult::Applied
+        );
+        assert!(sender.is_chunk_ready(&second));
+        assert_eq!(sender.in_flight_batches, 0);
+        assert_eq!(
+            sender.on_batch_acknowledged(20.0, 7),
+            BatchAckResult::Missing
+        );
+    }
+
+    #[test]
+    fn an_earlier_virtual_batch_cannot_acknowledge_real_chunks() {
+        let real = Vector2::new(3, 4);
+        let mut sender = ChunkSender::new();
+        sender.sent_chunks.insert(real);
+        sender.awaiting_delivery.insert(real);
+        sender.register_batch_for_acknowledgement(7, Vec::new());
+        sender.register_batch_for_acknowledgement(7, vec![real]);
+
+        assert_eq!(
+            sender.on_batch_acknowledged(20.0, 7),
+            BatchAckResult::Applied
+        );
+        assert!(!sender.is_chunk_ready(&real));
+        assert_eq!(
+            sender.on_batch_acknowledged(20.0, 7),
+            BatchAckResult::Applied
+        );
+        assert!(sender.is_chunk_ready(&real));
+    }
+
+    #[test]
+    fn stale_session_acknowledgement_cannot_release_current_chunks() {
+        let position = Vector2::new(1, 2);
+        let mut sender = ChunkSender::new();
+        sender.sent_chunks.insert(position);
+        sender.awaiting_delivery.insert(position);
+        sender.awaiting_batch_ack.push_back(AwaitingBatchAck {
+            epoch: 6,
+            positions: vec![position],
+        });
+        sender.in_flight_batches = 1;
+
+        assert_eq!(
+            sender.on_batch_acknowledged(20.0, 7),
+            BatchAckResult::RevisionMismatch {
+                expected: 6,
+                received: 7,
+            }
+        );
+        assert!(!sender.is_chunk_ready(&position));
+        assert_eq!(sender.in_flight_batches, 1);
+    }
+
+    #[test]
+    fn java_sender_starts_with_a_pipelined_window() {
+        let sender = ChunkSender::new();
+        assert_eq!(sender.max_in_flight, MAX_CONCURRENT_BATCHES);
+        assert!(sender.max_in_flight > 1);
     }
 
     #[test]

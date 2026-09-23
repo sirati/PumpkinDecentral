@@ -63,6 +63,7 @@ pub struct PendingConnection {
     pub close_token: CancellationToken,
     pub network_writer: TCPNetworkEncoder<BufWriter<OwnedWriteHalf>>,
     pub network_reader: TCPNetworkDecoder<BufReader<OwnedReadHalf>>,
+    pub compression_enabled: bool,
     pub gameprofile: Option<GameProfile>,
     pub config: Option<PlayerConfig>,
     pub brand: Option<String>,
@@ -89,6 +90,7 @@ impl PendingConnection {
             close_token: CancellationToken::new(),
             network_writer: TCPNetworkEncoder::new(BufWriter::new(write)),
             network_reader: TCPNetworkDecoder::new(BufReader::new(read)),
+            compression_enabled: false,
             gameprofile: None,
             config: None,
             brand: None,
@@ -133,6 +135,7 @@ impl PendingConnection {
 
         self.network_writer
             .set_compression((compression.threshold as usize, compression.level));
+        self.compression_enabled = true;
     }
 
     pub async fn get_packet(&mut self) -> Option<RawPacket> {
@@ -414,6 +417,8 @@ impl PendingConnection {
                 let Some(profile) = self.gameprofile.clone() else {
                     return Ok(Some(PacketHandlerResult::Stop));
                 };
+                #[cfg(feature = "cluster-e2e")]
+                tracing::info!(uuid = %profile.id, micros = crate::server::cluster_lobby::e2e_lobby_clock_micros(), "cluster e2e final configuration received");
                 let config = self.config.clone().unwrap_or_default();
                 self.connection_state.store(ConnectionState::Play);
                 if let Some(reason) = can_not_join(&profile, &self.address, server).await {

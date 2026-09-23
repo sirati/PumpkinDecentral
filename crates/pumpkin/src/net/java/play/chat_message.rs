@@ -18,6 +18,27 @@ impl JavaClient {
             return;
         }
 
+        if server.advanced_config.cluster.enabled && server.basic_config.allow_chat_reports {
+            let _ = crate::server::cluster_session_ingress::stage(
+                player,
+                crate::server::cluster_session_ingress::StagedSessionInput::SecureJava {
+                    input: crate::server::cluster_secure_chat::SignedInput {
+                        body: chat_message.message.to_string(),
+                        timestamp: chat_message.timestamp,
+                        salt: chat_message.salt,
+                        signature: chat_message
+                            .signature
+                            .map(|signature| signature.to_vec().into_boxed_slice()),
+                        message_count: chat_message.message_count.0,
+                        acknowledged: chat_message.acknowledged.to_vec().into_boxed_slice(),
+                        checksum: chat_message.checksum,
+                    },
+                    received_at: std::time::Instant::now(),
+                },
+            );
+            return;
+        }
+
         let gameprofile = &player.gameprofile;
 
         if let Err(err) = self.validate_chat_message(server, player, &chat_message) {
@@ -36,6 +57,20 @@ impl JavaClient {
             return;
         }
 
+        if server.advanced_config.cluster.enabled && !server.basic_config.allow_chat_reports {
+            if crate::server::cluster_session_ingress::stage(
+                player,
+                crate::server::cluster_session_ingress::StagedSessionInput::Java {
+                    body: chat_message.message.to_string(),
+                    received_at: std::time::Instant::now(),
+                },
+            )
+            .is_err()
+            {
+                player.send_system_message(&TextComponent::text("Cluster chat queue is full"));
+            }
+            return;
+        }
         if player.check_chat_spam(server, crate::entity::player::SpamType::Chat) {
             return;
         }
@@ -59,9 +94,13 @@ impl JavaClient {
                     None => event.message.clone(),
                 };
 
-                crate::server::cluster_chat_out::broadcast_public_chat_from_player(
+                let accepted = crate::server::cluster_chat_out::broadcast_public_chat_from_player(
                     server, player, &message,
                 );
+
+                if !accepted {
+                    player.send_system_message(&TextComponent::text("Cluster chat queue is full"));
+                } else {
 
                 let decorated_message = TextComponent::chat_decorated(
                     &config.chat.format,
@@ -83,6 +122,7 @@ impl JavaClient {
                         &TextComponent::empty(),
                         None,
                     );
+                }
                 }
             }
         }}
@@ -202,6 +242,25 @@ impl JavaClient {
             return;
         }
 
+        if server.advanced_config.cluster.enabled {
+            if let Err(err) = self.validate_chat_session(player, server, &session).await {
+                player.kick(
+                    crate::net::DisconnectReason::Kicked,
+                    &TextComponent::text(
+                        err.client_kick_reason().unwrap_or_else(|| err.to_string()),
+                    ),
+                );
+                return;
+            }
+            if !server.cluster_secure_chat.install(player.clone(), session) {
+                player.kick(
+                    crate::net::DisconnectReason::Kicked,
+                    &TextComponent::text("Cluster secure chat queue is full"),
+                );
+            }
+            return;
+        }
+
         if let Err(err) = self.validate_chat_session(player, server, &session).await {
             log_at_level!(
                 err.severity(),
@@ -250,6 +309,16 @@ impl JavaClient {
         server: &Server,
         session: &SPlayerSession,
     ) -> Result<(), ChatError> {
+        self.validate_chat_session_uuid(player.gameprofile.id, server, session)
+            .await
+    }
+
+    pub async fn validate_chat_session_uuid(
+        &self,
+        uuid: uuid::Uuid,
+        server: &Server,
+        session: &SPlayerSession,
+    ) -> Result<(), ChatError> {
         // Verify session expiry
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -263,7 +332,7 @@ impl JavaClient {
             .map_err(|_| ChatError::InvalidPublicKey)?;
 
         let mut signable = Vec::new();
-        signable.extend_from_slice(player.gameprofile.id.as_bytes());
+        signable.extend_from_slice(uuid.as_bytes());
         signable.extend_from_slice(&session.expires_at.to_be_bytes());
         signable.extend_from_slice(&session.public_key);
 

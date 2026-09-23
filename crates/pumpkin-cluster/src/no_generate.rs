@@ -117,8 +117,7 @@ impl NoGenerateViolation {
             SecondaryChunkOp::Generate { .. } => {
                 "cluster secondary must not generate chunks; fetch from the holding peer"
             }
-            SecondaryChunkOp::PersistChunks { .. }
-            | SecondaryChunkOp::PersistPlayerdata { .. } => {
+            SecondaryChunkOp::PersistChunks { .. } | SecondaryChunkOp::PersistPlayerdata { .. } => {
                 "cluster secondary must not persist to disk; the primary owns saves"
             }
             SecondaryChunkOp::Fetch { .. } => "fetch is allowed",
@@ -166,10 +165,7 @@ pub const fn secondary_must_fetch() -> bool {
 /// The primary path is unaffected (`Ok(())` for every op). The secondary path
 /// accepts only [`SecondaryChunkOp::Fetch`] and rejects generation plus both
 /// persistence kinds with [`NoGenerateViolation`].
-pub fn authorize(
-    role: NodeRole,
-    op: SecondaryChunkOp,
-) -> Result<(), NoGenerateViolation> {
+pub fn authorize(role: NodeRole, op: SecondaryChunkOp) -> Result<(), NoGenerateViolation> {
     match role {
         NodeRole::Primary => Ok(()),
         NodeRole::Secondary => check_secondary_op(op),

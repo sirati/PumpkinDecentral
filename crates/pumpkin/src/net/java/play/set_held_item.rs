@@ -10,6 +10,10 @@ impl JavaClient {
             return;
         }
         let slot = slot as u8;
+        if server.advanced_config.cluster.enabled {
+            crate::server::cluster_inventory_protocol::stage_selected_hotbar(player, slot, false);
+            return;
+        }
         let previous_slot = player.inventory.get_selected_slot();
         let Some(player_arc) = player.world().get_player_by_uuid(player.gameprofile.id) else {
             return;
@@ -26,11 +30,24 @@ impl JavaClient {
         pumpkin_cluster::visual::emit_held(
             player.cluster_gid(),
             pumpkin_cluster::visual::tick_from_counter(
-                player.tick_counter.load(std::sync::atomic::Ordering::Relaxed),
+                player
+                    .tick_counter
+                    .load(std::sync::atomic::Ordering::Relaxed),
             ),
             slot,
         );
         let stack = inv.held_item();
+        pumpkin_cluster::visual::emit_equipment(
+            player.cluster_gid(),
+            pumpkin_cluster::visual::tick_from_counter(
+                player
+                    .tick_counter
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            0,
+            if stack.is_empty() { 0 } else { stack.item.id },
+            stack.item_count,
+        );
         let equipment = &[(EquipmentSlot::MAIN_HAND, stack)];
         player.living_entity.send_equipment_changes(equipment);
     }

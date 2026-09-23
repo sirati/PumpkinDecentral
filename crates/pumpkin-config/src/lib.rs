@@ -26,13 +26,13 @@ pub mod plugins;
 /// Recipe system configuration options.
 pub mod recipe;
 
-/// Resource pack configuration options.
-pub mod resource_pack;
 #[allow(missing_docs)]
 pub mod cluster;
+/// Resource pack configuration options.
+pub mod resource_pack;
 
 pub use chat::{AntiSpamConfig, ChatConfig};
-pub use cluster::{ClusterConfig, ClusterRole, PinnedPeerConfig};
+pub use cluster::{ClusterConfig, ClusterRole, HealthMaskMode, PinnedPeerConfig};
 pub use commands::{CommandOverride, CommandsConfig};
 pub use networking::auth::AuthenticationConfig;
 pub use networking::bedrock::BedrockConfig;

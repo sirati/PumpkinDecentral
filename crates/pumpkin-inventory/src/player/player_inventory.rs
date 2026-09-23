@@ -11,6 +11,7 @@ use crate::entity_equipment::EntityEquipment;
 use crate::screen_handler::InventoryPlayer;
 
 use crate::inventory::{Clearable, Inventory};
+use arc_swap::ArcSwapOption;
 use pumpkin_data::data_component_impl::EquipmentSlot;
 use pumpkin_data::item::Item;
 use pumpkin_data::item_stack::ItemStack;
@@ -42,6 +43,12 @@ pub struct PlayerInventory {
     ///
     /// This is separate from the main inventory and is rendered on the player model.
     pub entity_equipment: Arc<Mutex<EntityEquipment>>,
+    cluster_snapshot: ArcSwapOption<ClusterPlayerInventorySnapshot>,
+}
+
+pub struct ClusterPlayerInventorySnapshot {
+    pub stacks: Vec<ItemStack>,
+    pub selected_slot: u8,
 }
 
 impl PlayerInventory {
@@ -67,11 +74,38 @@ impl PlayerInventory {
             equipment_slots,
             selected_slot: AtomicU8::new(0),
             entity_equipment,
+            cluster_snapshot: ArcSwapOption::empty(),
         }
+    }
+
+    pub fn publish_cluster_snapshot(&self, snapshot: ClusterPlayerInventorySnapshot) -> bool {
+        if snapshot.stacks.len() != Self::OFF_HAND_SLOT + 1 || snapshot.selected_slot >= Self::HOTBAR_SIZE as u8 {
+            return false;
+        }
+        self.cluster_snapshot.store(Some(Arc::new(snapshot)));
+        true
+    }
+
+    pub fn clear_cluster_snapshot(&self) {
+        self.cluster_snapshot.store(None);
+    }
+
+    fn cluster_stack(&self, slot: usize) -> Option<ItemStack> {
+        self.cluster_snapshot
+            .load_full()
+            .and_then(|snapshot| snapshot.stacks.get(slot).cloned())
     }
 
     /// Fast non-blocking count of an item across all main inventory slots.
     pub fn count_item(&self, item: &'static Item) -> u32 {
+        if let Some(snapshot) = self.cluster_snapshot.load_full() {
+            return snapshot
+                .stacks
+                .iter()
+                .filter(|stack| stack.get_item().id == item.id)
+                .map(|stack| u32::from(stack.item_count))
+                .sum();
+        }
         let mut total = 0u32;
         if let Ok(inv) = self.main_inventory.try_read() {
             for stack in inv.iter() {
@@ -85,6 +119,12 @@ impl PlayerInventory {
 
     /// Fast non-blocking check if the main inventory contains a given item.
     pub fn contains_item(&self, item: &'static Item) -> bool {
+        if let Some(snapshot) = self.cluster_snapshot.load_full() {
+            return snapshot
+                .stacks
+                .iter()
+                .any(|stack| !stack.is_empty() && stack.get_item().id == item.id);
+        }
         if let Ok(inv) = self.main_inventory.try_read() {
             for stack in inv.iter() {
                 if !stack.is_empty() && stack.get_item().id == item.id {
@@ -99,6 +139,9 @@ impl PlayerInventory {
     ///
     /// This is the item the player is currently holding in their main hand.
     pub fn held_item(&self) -> ItemStack {
+        if let Some(stack) = self.cluster_stack(self.get_selected_slot() as usize) {
+            return stack;
+        }
         let inv = self
             .main_inventory
             .read()
@@ -144,6 +187,12 @@ impl PlayerInventory {
     }
 
     pub fn try_get_stack_in_hand(&self, hand: Hand) -> Option<ItemStack> {
+        if self.cluster_snapshot.load().is_some() {
+            return Some(match hand {
+                Hand::Right => self.held_item(),
+                Hand::Left => self.off_hand_item(),
+            });
+        }
         match hand {
             Hand::Right => {
                 let selected = self.get_selected_slot() as usize;
@@ -162,6 +211,9 @@ impl PlayerInventory {
     ///
     /// Mojang name: `getOffHandStack`
     pub fn off_hand_item(&self) -> ItemStack {
+        if let Some(stack) = self.cluster_stack(Self::OFF_HAND_SLOT) {
+            return stack;
+        }
         let Some(slot) = self.equipment_slots.get(&Self::OFF_HAND_SLOT) else {
             return ItemStack::EMPTY.clone();
         };
@@ -420,6 +472,9 @@ impl PlayerInventory {
 
     /// Gets the item in the specified slot (synchronously).
     pub fn get_slot(&self, slot: usize) -> ItemStack {
+        if let Some(stack) = self.cluster_stack(slot) {
+            return stack;
+        }
         if slot < Self::MAIN_SIZE {
             let inv = self
                 .main_inventory
@@ -508,6 +563,9 @@ impl Inventory for PlayerInventory {
     }
 
     fn is_empty(&self) -> bool {
+        if let Some(snapshot) = self.cluster_snapshot.load_full() {
+            return snapshot.stacks.iter().all(ItemStack::is_empty);
+        }
         let inv = self
             .main_inventory
             .read()
@@ -531,6 +589,9 @@ impl Inventory for PlayerInventory {
     }
 
     fn get_stack(&self, slot: usize) -> ItemStack {
+        if let Some(stack) = self.cluster_stack(slot) {
+            return stack;
+        }
         if slot < Self::MAIN_SIZE {
             let inv = self
                 .main_inventory
@@ -631,17 +692,14 @@ impl PlayerInventory {
 
     /// Gets the currently selected hotbar slot index.
     pub fn get_selected_slot(&self) -> u8 {
-        self.selected_slot.load(Ordering::Relaxed)
+        self.cluster_snapshot
+            .load_full()
+            .map_or_else(|| self.selected_slot.load(Ordering::Relaxed), |snapshot| snapshot.selected_slot)
     }
 }
 
 impl PlayerInventory {
-    pub fn consume_for_place(
-        &self,
-        hand: Hand,
-        consume: bool,
-        emit: impl FnOnce(u8, u8),
-    ) -> bool {
+    pub fn consume_for_place(&self, hand: Hand, consume: bool, emit: impl FnOnce(u8, u8)) -> bool {
         match hand {
             Hand::Right => {
                 let selected = self.get_selected_slot();

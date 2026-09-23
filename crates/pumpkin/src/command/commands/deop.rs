@@ -1,3 +1,4 @@
+use pumpkin_cluster::admin_sync::{AdminMutation, OpRevoke};
 use pumpkin_util::PermissionLvl;
 use pumpkin_util::permission::{Permission, PermissionDefault, PermissionRegistry};
 use pumpkin_util::text::TextComponent;
@@ -26,8 +27,53 @@ impl CommandExecutor for DeopExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let targets = GameProfileArgumentType::get(context, "targets")?;
         let server = context.source.server();
+        if server.advanced_config.cluster.enabled {
+            let snapshot = server.cluster_admin_view.load_full();
+            let mut changed = 0;
+            let mut busy = false;
+            for profile in &targets {
+                if !snapshot
+                    .operators
+                    .iter()
+                    .any(|entry| entry.uuid == *profile.id.as_bytes())
+                {
+                    continue;
+                }
+                let mutation = AdminMutation::RevokeOp(OpRevoke::new(
+                    *profile.id.as_bytes(),
+                    profile.name.clone(),
+                ));
+                let Some(prepared) = crate::server::cluster_admin_apply::prepare_admin_mutation(
+                    server,
+                    mutation,
+                    &context.source.name,
+                ) else {
+                    busy = true;
+                    continue;
+                };
+                crate::server::cluster_admin_apply::commit_admin_mutation(server, prepared);
+                context.source.send_feedback(
+                    TextComponent::text(format!(
+                        "Queued /deop for {}; pending primary durability.",
+                        profile.name
+                    )),
+                    false,
+                );
+                changed += 1;
+            }
+            if changed == 0 {
+                return if busy {
+                    Err(crate::server::cluster_admin_apply::admin_busy_error())
+                } else {
+                    Err(ERROR_DEOP_FAILED.create_without_context())
+                };
+            }
+            return Ok(changed);
+        }
 
         let mut revoked: Vec<(uuid::Uuid, String)> = Vec::new();
+        let mut prepared = Vec::new();
+        let mut queue_full = false;
         {
             let mut config = server
                 .data
@@ -37,39 +83,63 @@ impl CommandExecutor for DeopExecutor {
 
             for profile in &targets {
                 if let Some(op_index) = config.ops.iter().position(|o| o.uuid == profile.id) {
-                    config.ops.remove(op_index);
+                    let mutation = AdminMutation::RevokeOp(OpRevoke::new(
+                        *profile.id.as_bytes(),
+                        profile.name.clone(),
+                    ));
+                    let Some(reservation) =
+                        crate::server::cluster_admin_apply::prepare_admin_mutation(
+                            server,
+                            mutation,
+                            &context.source.name,
+                        )
+                    else {
+                        queue_full = true;
+                        continue;
+                    };
+                    prepared.push(reservation);
+                    if !crate::server::cluster_admin_apply::defer_local_admin_apply(server) {
+                        config.ops.remove(op_index);
+                    }
                     revoked.push((profile.id, profile.name.clone()));
                 }
             }
 
-            if !revoked.is_empty() {
+            if !revoked.is_empty()
+                && crate::server::cluster_admin_apply::stores_authoritative_files(server)
+                && !crate::server::cluster_admin_apply::defer_local_admin_apply(server)
+            {
                 config.save();
             }
         }
 
         if revoked.is_empty() {
+            if queue_full {
+                return Err(crate::server::cluster_admin_apply::admin_busy_error());
+            }
             return Err(ERROR_DEOP_FAILED.create_without_context());
         }
 
-        for (id, name) in &revoked {
-            crate::server::cluster_admin_apply::publish_op_revoke(
-                server,
-                *id,
-                name,
-                &context.source.name,
+        if queue_full {
+            context.source.send_feedback(
+                TextComponent::text(
+                    "Some cluster admin targets could not be queued; they were not changed.",
+                ),
+                false,
             );
         }
 
+        for reservation in prepared {
+            crate::server::cluster_admin_apply::commit_admin_mutation(server, reservation);
+        }
+
         for (id, name) in &revoked {
-            if let Some(player) = server.get_player_by_uuid(*id)
+            if !crate::server::cluster_admin_apply::defer_local_admin_apply(server)
+                && let Some(player) = server.get_player_by_uuid(*id)
                 && let Some(server_arc) = player.world().server.upgrade()
             {
                 let command_dispatcher = server_arc.command_dispatcher.load();
-                player.set_permission_lvl(
-                    &server_arc,
-                    PermissionLvl::Zero,
-                    &command_dispatcher,
-                );
+                player.set_permission_lvl(&server_arc, PermissionLvl::Zero, &command_dispatcher);
             }
 
             let msg = TextComponent::translate_cross(
@@ -77,7 +147,16 @@ impl CommandExecutor for DeopExecutor {
                 pumpkin_data::translation::bedrock::COMMANDS_DEOP_SUCCESS,
                 [TextComponent::text(name.clone())],
             );
-            context.source.send_feedback(msg, true);
+            if crate::server::cluster_admin_apply::mutation_pending_primary(server) {
+                context.source.send_feedback(
+                    TextComponent::text(format!(
+                        "Queued /deop for {name}; pending primary durability."
+                    )),
+                    false,
+                );
+            } else {
+                context.source.send_feedback(msg, true);
+            }
         }
 
         crate::command::commands::whitelist::kick_non_whitelisted_players(server);
@@ -98,18 +177,28 @@ impl SuggestionProvider for DeopSuggestionProvider {
         context: &CommandContext,
         mut builder: SuggestionsBuilder,
     ) -> SuggestionProviderResult {
-        let ops = context
-            .server()
-            .data
-            .operator_config
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for name in operator_completion_names(&ops.ops) {
-            // `ops.json` is cluster-replicated, so this is the complete
-            // cluster-visible operator set, including operators hosted by a
-            // different peer.  Filter here instead of relying on the client
-            // to discard unrelated candidates.
-            builder = builder.filter_and_suggest_one(name);
+        let names = if context.server().advanced_config.cluster.enabled {
+            context
+                .server()
+                .cluster_admin_view
+                .load()
+                .operators
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect::<Vec<_>>()
+        } else {
+            let ops = context
+                .server()
+                .data
+                .operator_config
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            operator_completion_names(&ops.ops)
+        };
+        for name in names {
+            if !crate::server::cluster_chat_pm::is_hidden_completion_name(context.server(), &name) {
+                builder = builder.filter_and_suggest_one(name);
+            }
         }
         builder.build()
     }

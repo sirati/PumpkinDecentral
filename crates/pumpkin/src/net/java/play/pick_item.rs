@@ -7,6 +7,20 @@ impl JavaClient {
         player: &Arc<Player>,
         pick_item: &SPickItemFromBlock,
     ) {
+        if player
+            .world()
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            crate::server::cluster_inventory_protocol::stage_pick_block(
+                player,
+                pick_item.pos,
+                None,
+                false,
+            );
+            return;
+        }
         if !player.can_interact_with_block_at(&pick_item.pos, 1.0) {
             return;
         }
@@ -53,6 +67,15 @@ impl JavaClient {
         player: &Arc<Player>,
         pick_item: &SPickItemFromEntity,
     ) {
+        if player
+            .world()
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            crate::server::cluster_inventory_protocol::stage_pick_entity(player, pick_item.id.0);
+            return;
+        }
         use pumpkin_data::entity::{entity_from_egg, spawn_egg_ids};
 
         let world = player.world();

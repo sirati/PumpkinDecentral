@@ -29,6 +29,15 @@ impl BedrockClient {
 
     #[allow(clippy::too_many_lines, clippy::collapsible_if, clippy::unreachable)]
     pub fn handle_inventory_action(&self, player: &Arc<Player>, packet: SInventoryTransaction) {
+        if player
+            .world()
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            crate::server::cluster_inventory_protocol::stage_bedrock_transaction(player, packet);
+            return;
+        }
         tracing::debug!("handle_inventory_action: packet={:?}", packet);
         let mut inventory_updated = false;
         let mut updates = Vec::new();
@@ -191,7 +200,12 @@ impl BedrockClient {
                         &server,
                         &world,
                     ) {
-                        player.open_handled_screen(factory.as_ref(), Some(data.block_position));
+                        player.open_handled_screen(
+                            factory.as_ref(),
+                            crate::entity::player::InventoryScreenSource::Block(
+                                data.block_position,
+                            ),
+                        );
                     }
                     return;
                 }
@@ -370,10 +384,7 @@ impl BedrockClient {
                                         held.clone(),
                                         held.get_max_use_time(),
                                     );
-                                    if held
-                                        .get_data_component::<BlocksAttacksImpl>()
-                                        .is_some()
-                                    {
+                                    if held.get_data_component::<BlocksAttacksImpl>().is_some() {
                                         pumpkin_cluster::visual::emit_blocking(
                                             player.cluster_gid(),
                                             pumpkin_cluster::visual::tick_from_counter(
@@ -508,8 +519,7 @@ impl BedrockClient {
                     }
                     ActionType::Attack => {
                         let victim = world.get_player_by_id(target_runtime_id);
-                        let victim_gid =
-                            victim.as_ref().and_then(|victim| victim.cluster_gid());
+                        let victim_gid = victim.as_ref().and_then(|victim| victim.cluster_gid());
                         crate::net::java::play::attack::attack_and_replicate(
                             player,
                             &event.target,

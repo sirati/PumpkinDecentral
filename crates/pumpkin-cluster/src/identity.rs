@@ -11,18 +11,14 @@
 use serde::{Deserialize, Serialize};
 
 /// Statically assigned host server number.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ServerId(pub u16);
 
 /// Player slot handed out by the hosting server alone.
 ///
 /// Slots are scoped to one [`ServerId`]: wrapping here is local rotation,
 /// never a cluster-wide allocation.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PlayerSlot(pub u16);
 
 impl PlayerSlot {
@@ -39,9 +35,7 @@ impl PlayerSlot {
 /// that were issued independently on different servers. Ordering is
 /// `server` first, then `player`, so all of one server's players sort
 /// together.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct GlobalPlayerId {
     pub server: ServerId,
     pub player: PlayerSlot,
@@ -140,11 +134,12 @@ mod tests {
     fn player_identity_stays_distinct_from_entity_identity() {
         let player = GlobalPlayerId::new(ServerId(1), PlayerSlot(7));
         let entity = EntityRef {
-            owner: ServerId(1),
+            origin: ServerId(1),
             local_id: 7,
-            chunk: crate::protocol::ChunkAddr { x: 0, z: 0 },
+            generation: 0,
+            chunk: crate::protocol::ChunkKey::new(crate::protocol::WorldId::new(0, 7), 0, 0),
         };
-        assert_eq!(player.host(), entity.owner);
+        assert_eq!(player.host(), entity.origin);
         assert_eq!(player.slot().0, entity.local_id as u16);
         fn route_player(id: GlobalPlayerId) -> ServerId {
             id.host()

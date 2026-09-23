@@ -71,7 +71,7 @@ impl JavaClient {
                 )
             };
 
-            if update_watched {
+            if update_watched && !player.is_in_cluster_lobby() {
                 chunker::update_position(player);
             }
 
@@ -93,7 +93,9 @@ impl JavaClient {
                 pumpkin_cluster::visual::emit_skin(
                     player.cluster_gid(),
                     pumpkin_cluster::visual::tick_from_counter(
-                        player.tick_counter.load(std::sync::atomic::Ordering::Relaxed),
+                        player
+                            .tick_counter
+                            .load(std::sync::atomic::Ordering::Relaxed),
                     ),
                     client_information.skin_parts,
                 );

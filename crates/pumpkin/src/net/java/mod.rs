@@ -3,7 +3,7 @@ use pumpkin_protocol::java::client::play::{
 };
 use pumpkin_world::level::SyncChunk;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{collections::VecDeque, io::Write, sync::Arc};
 
@@ -46,7 +46,7 @@ use tokio::{
     sync::oneshot,
 };
 use tokio::{
-    sync::mpsc::{UnboundedReceiver, UnboundedSender, error::TryRecvError},
+    sync::mpsc::{Receiver, Sender, error::TryRecvError},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -73,7 +73,6 @@ use crate::net::{
     PlayerConfig, decrement_pending_bytes,
 };
 use crate::plugin::api::events::world::chunk_send::ChunkSend;
-use crate::plugin::player::player_custom_payload::PlayerCustomPayloadEvent;
 use crate::{error::PumpkinError, server::Server};
 
 pub struct JavaClient {
@@ -93,25 +92,26 @@ pub struct JavaClient {
     pub brand: ArcSwap<Option<String>>,
     /// Associated player reference. Lock-free `ArcSwap`.
     pub player: ArcSwap<Option<Arc<Player>>>,
+    cluster_lobby_request: AtomicU8,
+    cluster_lobby_notify: tokio::sync::Notify,
     /// A collection of tasks associated with this client. The tasks await completion when removing the client.
     tasks: TaskTracker,
     rt_handle: tokio::runtime::Handle,
     /// An notifier that is triggered when this client is closed.
     close_token: CancellationToken,
     /// A normal-priority queue of serialized packets to send to the network.
-    outgoing_packet_queue_send: UnboundedSender<OutgoingPacket>,
+    outgoing_packet_queue_send: Sender<OutgoingPacket>,
     /// A normal-priority queue of serialized packets to send to the network.
-    outgoing_packet_queue_recv: Option<UnboundedReceiver<OutgoingPacket>>,
+    outgoing_packet_queue_recv: Option<Receiver<OutgoingPacket>>,
     /// A high-priority queue of serialized packets to send to the network.
-    outgoing_packet_priority_send: UnboundedSender<OutgoingPacket>,
+    outgoing_packet_priority_send: Sender<OutgoingPacket>,
     /// A high-priority queue of serialized packets to send to the network.
-    outgoing_packet_priority_recv: Option<UnboundedReceiver<OutgoingPacket>>,
+    outgoing_packet_priority_recv: Option<Receiver<OutgoingPacket>>,
     /// Tracks total buffered payload bytes in the outgoing queues.
     pub pending_bytes: Arc<AtomicUsize>,
+    pub(crate) compression_enabled: bool,
     /// The packet encoder for outgoing packets.
-    network_writer: std::sync::Mutex<Option<TCPNetworkEncoder<BufWriter<OwnedWriteHalf>>>>,
     /// The packet decoder for incoming packets.
-    network_reader: std::sync::Mutex<Option<TCPNetworkDecoder<BufReader<OwnedReadHalf>>>>,
     /// Keep Alive:
     ///
     /// Whether we are waiting for a response after sending a keep alive packet.
@@ -127,11 +127,17 @@ pub struct JavaClient {
     /// The last time any packet was received from the client.
     pub last_packet_time: AtomicCell<Instant>,
     /// Recent in-flight keep alive IDs with their sent timestamps.
-    pub pending_keep_alives: std::sync::Mutex<Vec<(i64, Instant)>>,
+    pub pending_keep_alives: ArcSwap<Vec<(i64, Instant)>>,
 
     pub packet_sequence: AtomicI32,
     /// Packet rate limiter for incoming client packets.
     pub packet_limiter: PacketRateLimiter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayerPacketLoopResult {
+    Closed,
+    EnterLobby { forced: bool },
 }
 
 pub enum OutgoingPacketType {
@@ -141,6 +147,7 @@ pub enum OutgoingPacketType {
 
 struct OutgoingPacket {
     data: Bytes,
+    preframed: bool,
     completion: Option<oneshot::Sender<()>>,
 }
 
@@ -175,7 +182,13 @@ fn frame_packet_batch(
     let mut frame = Vec::new();
     let mut frame_err = None;
     for packet in batch {
-        if let Err(err) = writer.frame_packet(&packet.data, &mut frame) {
+        let result = if packet.preframed {
+            frame.extend_from_slice(&packet.data);
+            Ok(())
+        } else {
+            writer.frame_packet(&packet.data, &mut frame)
+        };
+        if let Err(err) = result {
             frame_err = Some(err);
             break;
         }
@@ -197,7 +210,7 @@ async fn frame_batch_maybe_offload(
 > {
     let needs_offload = packet_batch
         .iter()
-        .any(|packet| writer.is_compressing_packet(&packet.data));
+        .any(|packet| !packet.preframed && writer.is_compressing_packet(&packet.data));
 
     if needs_offload {
         tokio::task::spawn_blocking(move || {
@@ -215,6 +228,15 @@ impl OutgoingPacket {
     const fn normal(data: Bytes) -> Self {
         Self {
             data,
+            preframed: false,
+            completion: None,
+        }
+    }
+
+    const fn preframed(data: Bytes) -> Self {
+        Self {
+            data,
+            preframed: true,
             completion: None,
         }
     }
@@ -222,66 +244,141 @@ impl OutgoingPacket {
     const fn high_priority(data: Bytes, completion: oneshot::Sender<()>) -> Self {
         Self {
             data,
+            preframed: false,
             completion: Some(completion),
         }
     }
 }
 
 impl JavaClient {
+    pub(crate) fn dispatch_common_session_packet(
+        &self,
+        player: Option<&Player>,
+        packet: &RawPacket,
+    ) -> Result<bool, Box<dyn PumpkinError>> {
+        let version = self.version.load();
+        let mut payload = &packet.payload[..];
+        if packet.id == SConfirmTeleport::to_id(version) {
+            let confirmation = SConfirmTeleport::read(&mut payload, &version)?;
+            if let Some(player) = player {
+                self.handle_confirm_teleport(player, &confirmation);
+            }
+        } else if packet.id == pumpkin_protocol::java::server::play::SKeepAlive::to_id(version) {
+            let response =
+                pumpkin_protocol::java::server::play::SKeepAlive::read(&mut payload, &version)?;
+            if let Some(player) = player {
+                self.handle_keep_alive(player, &response);
+            } else if response.keep_alive_id == self.keep_alive_id.load() {
+                self.wait_for_keep_alive.store(false, Ordering::Relaxed);
+            }
+        } else if packet.id == SPlayPingRequest::to_id(version) {
+            self.handle_play_ping_request(&SPlayPingRequest::read(&mut payload, &version)?);
+        } else if packet.id == SPCookieResponse::to_id(version) {
+            self.handle_cookie_response(&SPCookieResponse::read(&mut payload, &version)?);
+        } else {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn lobby_packet_allowed(packet_id: i32, version: JavaMinecraftVersion) -> bool {
+        packet_id == SConfirmTeleport::to_id(version)
+            || packet_id == SChatAck::to_id(version)
+            || packet_id == SChatCommand::to_id(version)
+            || packet_id == SChatCommandSigned::to_id(version)
+            || packet_id == SChatMessage::to_id(version)
+            || packet_id == SClientInformationPlay::to_id(version)
+            || packet_id == pumpkin_protocol::java::server::play::SKeepAlive::to_id(version)
+            || packet_id == SCommandSuggestion::to_id(version)
+            || packet_id == SPCookieResponse::to_id(version)
+            || packet_id == SChunkBatch::to_id(version)
+            || packet_id == SPlayerSession::to_id(version)
+            || packet_id == SCustomPayload::to_id(version)
+            || packet_id == pumpkin_protocol::java::server::play::SCustomClickAction::to_id(version)
+            || packet_id == SPlayResourcePack::to_id(version)
+            || packet_id == SPlayPingRequest::to_id(version)
+            || packet_id == SPlayPong::to_id(version)
+    }
+
     #[must_use]
     pub fn from_pending(
         pending: PendingConnection,
         gameprofile: GameProfile,
         config: PlayerConfig,
-    ) -> Self {
-        let (send, recv) = tokio::sync::mpsc::unbounded_channel();
-        let (priority_send, priority_recv) = tokio::sync::mpsc::unbounded_channel();
+    ) -> (
+        Self,
+        TCPNetworkDecoder<BufReader<OwnedReadHalf>>,
+        TCPNetworkEncoder<BufWriter<OwnedWriteHalf>>,
+    ) {
+        let (send, recv) = tokio::sync::mpsc::channel(4096);
+        let (priority_send, priority_recv) = tokio::sync::mpsc::channel(256);
+        let network_reader = pending.network_reader;
+        let network_writer = pending.network_writer;
 
-        Self {
-            id: pending.id,
-            gameprofile,
-            config: ArcSwap::from_pointee(config),
-            server_address: pending.server_address,
-            address: pending.address,
-            connection_state: pending.connection_state,
-            close_token: pending.close_token,
-            tasks: TaskTracker::new(),
-            rt_handle: tokio::runtime::Handle::current(),
-            outgoing_packet_queue_send: send,
-            outgoing_packet_queue_recv: Some(recv),
-            outgoing_packet_priority_send: priority_send,
-            outgoing_packet_priority_recv: Some(priority_recv),
-            pending_bytes: Arc::new(AtomicUsize::new(0)),
-            version: pending.version,
-            network_writer: std::sync::Mutex::new(Some(pending.network_writer)),
-            network_reader: std::sync::Mutex::new(Some(pending.network_reader)),
-            brand: ArcSwap::from_pointee(pending.brand),
-            player: ArcSwap::from_pointee(None),
-            wait_for_keep_alive: AtomicBool::new(false),
-            received_movement_this_tick: AtomicBool::new(false),
-            keep_alive_id: AtomicCell::new(0),
-            last_keep_alive_time: AtomicCell::new(Instant::now()),
-            last_packet_time: AtomicCell::new(Instant::now()),
-            pending_keep_alives: std::sync::Mutex::new(Vec::new()),
-            packet_sequence: AtomicI32::new(-1),
-            packet_limiter: pending.packet_limiter,
-        }
+        (
+            Self {
+                id: pending.id,
+                gameprofile,
+                config: ArcSwap::from_pointee(config),
+                server_address: pending.server_address,
+                address: pending.address,
+                connection_state: pending.connection_state,
+                close_token: pending.close_token,
+                tasks: TaskTracker::new(),
+                rt_handle: tokio::runtime::Handle::current(),
+                outgoing_packet_queue_send: send,
+                outgoing_packet_queue_recv: Some(recv),
+                outgoing_packet_priority_send: priority_send,
+                outgoing_packet_priority_recv: Some(priority_recv),
+                pending_bytes: Arc::new(AtomicUsize::new(0)),
+                compression_enabled: pending.compression_enabled,
+                version: pending.version,
+                brand: ArcSwap::from_pointee(pending.brand),
+                player: ArcSwap::from_pointee(None),
+                cluster_lobby_request: AtomicU8::new(0),
+                cluster_lobby_notify: tokio::sync::Notify::new(),
+                wait_for_keep_alive: AtomicBool::new(false),
+                received_movement_this_tick: AtomicBool::new(false),
+                keep_alive_id: AtomicCell::new(0),
+                last_keep_alive_time: AtomicCell::new(Instant::now()),
+                last_packet_time: AtomicCell::new(Instant::now()),
+                pending_keep_alives: ArcSwap::from_pointee(Vec::new()),
+                packet_sequence: AtomicI32::new(-1),
+                packet_limiter: pending.packet_limiter,
+            },
+            network_reader,
+            network_writer,
+        )
     }
 
     pub fn set_player(&self, player: Arc<Player>) {
         self.player.store(Arc::new(Some(player)));
     }
 
-    pub async fn progress_player_packets(&self, player: &Arc<Player>, server: &Arc<Server>) {
-        let Some(mut network_reader) = self
-            .network_reader
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        else {
-            return;
-        };
+    pub fn clear_player(&self) {
+        self.player.store(Arc::new(None));
+    }
 
+    #[must_use]
+    pub fn request_cluster_lobby(&self, forced: bool) -> bool {
+        let request = if forced { 2 } else { 1 };
+        if self
+            .cluster_lobby_request
+            .compare_exchange(0, request, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        self.cluster_lobby_notify.notify_one();
+        true
+    }
+
+    pub async fn progress_player_packets(
+        &self,
+        player: &Arc<Player>,
+        server: &Arc<Server>,
+        network_reader: &mut TCPNetworkDecoder<BufReader<OwnedReadHalf>>,
+    ) -> PlayerPacketLoopResult {
         let keep_alive_time = server.advanced_config.networking.java.keep_alive_time;
         let mut keep_alive_interval =
             tokio::time::interval(std::time::Duration::from_secs(keep_alive_time.max(1)));
@@ -293,16 +390,18 @@ impl JavaClient {
 
         loop {
             tokio::select! {
+                _ = self.cluster_lobby_notify.notified() => {
+                    let request = self.cluster_lobby_request.swap(0, Ordering::AcqRel);
+                    if request == 0 {
+                        continue;
+                    }
+                    return PlayerPacketLoopResult::EnterLobby { forced: request == 2 };
+                }
                 // KEEP-ALIVE TIMER
                 _ = keep_alive_interval.tick() => {
                     // Check if the client has timed out on keep-alive responses or no packet activity
-                    let has_timed_out = {
-                        let pending = self
-                            .pending_keep_alives
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        pending.iter().any(|(_, send_time)| send_time.elapsed() > timeout_duration)
-                    } || (self.wait_for_keep_alive.load(Ordering::Relaxed) && self.last_keep_alive_time.load().elapsed() > timeout_duration)
+                    let has_timed_out = self.pending_keep_alives.load().iter().any(|(_, send_time)| send_time.elapsed() > timeout_duration)
+                      || (self.wait_for_keep_alive.load(Ordering::Relaxed) && self.last_keep_alive_time.load().elapsed() > timeout_duration)
                       || (self.last_packet_time.load().elapsed() > timeout_duration);
 
                     if has_timed_out {
@@ -320,16 +419,14 @@ impl JavaClient {
                     self.keep_alive_id.store(keep_alive_id);
                     self.wait_for_keep_alive.store(true, Ordering::Relaxed);
                     self.last_keep_alive_time.store(Instant::now());
-                    {
-                        let mut pending = self
-                            .pending_keep_alives
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    self.pending_keep_alives.rcu(|current| {
+                        let mut pending = (**current).clone();
                         pending.push((keep_alive_id, Instant::now()));
                         if pending.len() > 16 {
                             pending.remove(0);
                         }
-                    }
+                        pending
+                    });
                     let packet = pumpkin_protocol::java::client::play::CKeepAlive::new(keep_alive_id);
                     self.enqueue_client_packet(&packet).await;
                 }
@@ -339,7 +436,7 @@ impl JavaClient {
                 }
 
                 // INCOMING PACKETS
-                packet_opt = self.get_packet_with_reader(&mut network_reader) => {
+                packet_opt = self.get_packet_with_reader(network_reader) => {
                     let Some(packet) = packet_opt else {
                         break;
                     };
@@ -365,7 +462,109 @@ impl JavaClient {
                         break;
                     }
 
-                    player.inbound_packets.push(packet);
+                    if player.inbound_packets.push(packet).is_err() {
+                        self.try_kick(&TextComponent::text("Client packet queue is full"));
+                        break;
+                    }
+                }
+            }
+        }
+        PlayerPacketLoopResult::Closed
+    }
+
+    pub async fn progress_lobby_packets(
+        &self,
+        session: &mut crate::server::cluster_lobby::LobbySession,
+        server: &Arc<Server>,
+        network_reader: &mut TCPNetworkDecoder<BufReader<OwnedReadHalf>>,
+    ) -> Option<crate::server::cluster_lobby::LobbyPromotion> {
+        let keep_alive_time = server.advanced_config.networking.java.keep_alive_time;
+        let mut keep_alive_interval =
+            tokio::time::interval(std::time::Duration::from_secs(keep_alive_time.max(1)));
+        let mut progress_interval = tokio::time::interval(std::time::Duration::from_millis(50));
+        keep_alive_interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = progress_interval.tick() => {
+                    if let Some(promotion) = session.tick(server) {
+                        return Some(promotion);
+                    }
+                }
+                _ = keep_alive_interval.tick() => {
+                    if self.wait_for_keep_alive.load(Ordering::Relaxed) {
+                        self.try_kick(&TextComponent::text("Timed out"));
+                        return None;
+                    }
+                    let id = i64::from(SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i32);
+                    self.keep_alive_id.store(id);
+                    self.wait_for_keep_alive.store(true, Ordering::Relaxed);
+                    self.last_keep_alive_time.store(Instant::now());
+                    self.try_send_packet(&pumpkin_protocol::java::client::play::CKeepAlive::new(id));
+                }
+                () = self.close_token.cancelled() => return None,
+                packet = self.get_packet_with_reader(network_reader) => {
+                    let packet = packet?;
+                    self.last_packet_time.store(Instant::now());
+                    if !self.packet_limiter.check_packet() {
+                        self.try_kick(&TextComponent::text(
+                            server.advanced_config.networking.java.packet_limiter.kick_message.clone()
+                        ));
+                        return None;
+                    }
+                    session.handle_packet(&packet, server);
+                }
+            }
+        }
+    }
+
+    pub async fn progress_lobby_during_login_event<F>(
+        &self,
+        session: &mut crate::server::cluster_lobby::LobbySession,
+        server: &Arc<Server>,
+        network_reader: &mut TCPNetworkDecoder<BufReader<OwnedReadHalf>>,
+        join: F,
+    ) -> Option<F::Output>
+    where
+        F: Future,
+    {
+        let keep_alive_time = server.advanced_config.networking.java.keep_alive_time;
+        let mut keep_alive_interval =
+            tokio::time::interval(std::time::Duration::from_secs(keep_alive_time.max(1)));
+        let mut progress_interval = tokio::time::interval(std::time::Duration::from_millis(50));
+        keep_alive_interval.tick().await;
+        tokio::pin!(join);
+        loop {
+            tokio::select! {
+                result = &mut join => return Some(result),
+                _ = progress_interval.tick() => session.poll_virtual_events(server),
+                _ = keep_alive_interval.tick() => {
+                    if self.wait_for_keep_alive.load(Ordering::Relaxed) {
+                        self.try_kick(&TextComponent::text("Timed out"));
+                        return None;
+                    }
+                    let id = i64::from(SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i32);
+                    self.keep_alive_id.store(id);
+                    self.wait_for_keep_alive.store(true, Ordering::Relaxed);
+                    self.last_keep_alive_time.store(Instant::now());
+                    self.try_send_packet(&pumpkin_protocol::java::client::play::CKeepAlive::new(id));
+                }
+                () = self.close_token.cancelled() => return None,
+                packet = self.get_packet_with_reader(network_reader) => {
+                    let packet = packet?;
+                    self.last_packet_time.store(Instant::now());
+                    if !self.packet_limiter.check_packet() {
+                        self.try_kick(&TextComponent::text(
+                            server.advanced_config.networking.java.packet_limiter.kick_message.clone()
+                        ));
+                        return None;
+                    }
+                    session.handle_packet(&packet, server);
                 }
             }
         }
@@ -507,11 +706,19 @@ impl JavaClient {
     }
 
     pub fn try_enqueue_packet_data(&self, packet_data: Bytes) {
+        self.try_enqueue_outgoing(OutgoingPacket::normal(packet_data));
+    }
+
+    pub(crate) fn try_enqueue_preframed(&self, frame: Bytes) {
+        self.try_enqueue_outgoing(OutgoingPacket::preframed(frame));
+    }
+
+    fn try_enqueue_outgoing(&self, packet: OutgoingPacket) {
         if self.close_token.is_cancelled() {
             return;
         }
 
-        let packet_len = packet_data.len();
+        let packet_len = packet.data.len();
         let prev_bytes = self.pending_bytes.fetch_add(packet_len, Ordering::AcqRel);
         let new_bytes = prev_bytes.saturating_add(packet_len);
 
@@ -527,10 +734,7 @@ impl JavaClient {
             return;
         }
 
-        if let Err(err) = self
-            .outgoing_packet_queue_send
-            .send(OutgoingPacket::normal(packet_data))
-        {
+        if let Err(err) = self.outgoing_packet_queue_send.try_send(packet) {
             decrement_pending_bytes(&self.pending_bytes, packet_len);
             // This is expected to fail if we are closed
             if !self.close_token.is_cancelled() {
@@ -597,9 +801,13 @@ impl JavaClient {
         if let Some(data) = serialized {
             let packet_len = data.len();
             let _ = self.pending_bytes.fetch_add(packet_len, Ordering::AcqRel);
-            let _ = self
+            if self
                 .outgoing_packet_priority_send
-                .send(OutgoingPacket::normal(data));
+                .try_send(OutgoingPacket::normal(data))
+                .is_err()
+            {
+                decrement_pending_bytes(&self.pending_bytes, packet_len);
+            }
         }
         let reason_text = reason.clone().get_text();
         warn!("Closing connection for {}: {reason_text}", self.id);
@@ -662,7 +870,7 @@ impl JavaClient {
 
         if let Err(err) = self
             .outgoing_packet_priority_send
-            .send(OutgoingPacket::high_priority(packet, completion_tx))
+            .try_send(OutgoingPacket::high_priority(packet, completion_tx))
         {
             decrement_pending_bytes(&self.pending_bytes, packet_len);
             // It is expected that the packet will fail if we are closed
@@ -739,7 +947,10 @@ impl JavaClient {
     /// - **Login/Transfer:** Handles login and transfer packets.
     /// - **Config:** Handles configuration packets.
     #[expect(clippy::too_many_lines)]
-    pub fn start_outgoing_packet_task(&mut self) {
+    pub fn start_outgoing_packet_task(
+        &mut self,
+        mut writer: TCPNetworkEncoder<BufWriter<OwnedWriteHalf>>,
+    ) {
         const MAX_BATCH_SIZE: usize = 64;
 
         let Some(mut packet_receiver) = self.outgoing_packet_queue_recv.take() else {
@@ -750,14 +961,6 @@ impl JavaClient {
         };
         let close_token = self.close_token.clone();
         let pending_bytes = self.pending_bytes.clone();
-        let Some(mut writer) = self
-            .network_writer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        else {
-            return;
-        };
         let id = self.id;
         self.spawn_task(async move {
             loop {
@@ -882,8 +1085,6 @@ impl JavaClient {
         server: &Arc<Server>,
         packet: &RawPacket,
     ) -> Result<(), Box<dyn PumpkinError>> {
-        let version = self.version.load();
-
         let mut event = crate::plugin::server::packet::PacketReceivedEvent::new(
             player.clone(),
             packet.id,
@@ -894,14 +1095,33 @@ impl JavaClient {
             return Ok(());
         }
 
-        let mut payload = &event.payload[..];
-        match event.packet_id {
-            id if id == SConfirmTeleport::to_id(version) => {
-                self.handle_confirm_teleport(
-                    player,
-                    &SConfirmTeleport::read(&mut payload, &version)?,
-                );
-            }
+        self.handle_play_packet_preflighted(
+            player,
+            server,
+            &RawPacket {
+                id: event.packet_id,
+                payload: event.payload,
+            },
+        )
+    }
+
+    pub(crate) fn handle_play_packet_preflighted(
+        &self,
+        player: &Arc<Player>,
+        server: &Arc<Server>,
+        packet: &RawPacket,
+    ) -> Result<(), Box<dyn PumpkinError>> {
+        let version = self.version.load();
+
+        if player.is_in_cluster_lobby() && !Self::lobby_packet_allowed(packet.id, version) {
+            return Ok(());
+        }
+        if self.dispatch_common_session_packet(Some(player), packet)? {
+            return Ok(());
+        }
+
+        let mut payload = &packet.payload[..];
+        match packet.id {
             id if id == SChangeGameMode::to_id(version) => {
                 self.handle_change_game_mode(
                     player,
@@ -910,15 +1130,51 @@ impl JavaClient {
             }
             id if id == SChatAck::to_id(version) => {
                 let packet = SChatAck::read(&mut payload, &version)?;
+                if server.advanced_config.cluster.enabled {
+                    if server.basic_config.allow_chat_reports
+                        && crate::server::cluster_session_ingress::stage(
+                            player,
+                            crate::server::cluster_session_ingress::StagedSessionInput::SecureAck {
+                                offset: packet.offset.0,
+                                received_at: Instant::now(),
+                            },
+                        )
+                        .is_err()
+                    {
+                        player.send_system_message(&TextComponent::text(
+                            "Cluster chat queue is full",
+                        ));
+                    }
+                    return Ok(());
+                }
                 self.handle_chat_ack(player, &packet);
             }
             id if id == SChatCommand::to_id(version) => {
                 let packet = SChatCommand::read(&mut payload, &version)?;
                 let cmd = packet.command.to_string();
+                if server.advanced_config.cluster.enabled {
+                    if crate::server::cluster_session_ingress::stage(
+                        player,
+                        crate::server::cluster_session_ingress::StagedSessionInput::Command {
+                            command: cmd.strip_prefix('/').unwrap_or(&cmd).to_string(),
+                            received_at: Instant::now(),
+                        },
+                    )
+                    .is_err()
+                    {
+                        player.send_system_message(&TextComponent::text(
+                            "Cluster command queue is full",
+                        ));
+                    }
+                    return Ok(());
+                }
                 let client_platform = player.client.clone();
                 let player_c = player.clone();
                 let server_c = server.clone();
                 server.spawn_task(async move {
+                    if player_c.cluster_departing.load(Ordering::Acquire) {
+                        return;
+                    }
                     if let ClientPlatform::Java(client) = client_platform.as_ref() {
                         let packet = SChatCommand { command: &cmd };
                         client
@@ -937,10 +1193,29 @@ impl JavaClient {
                             .command
                             .to_string()
                     };
+                if server.advanced_config.cluster.enabled {
+                    if crate::server::cluster_session_ingress::stage(
+                        player,
+                        crate::server::cluster_session_ingress::StagedSessionInput::Command {
+                            command: cmd.strip_prefix('/').unwrap_or(&cmd).to_string(),
+                            received_at: Instant::now(),
+                        },
+                    )
+                    .is_err()
+                    {
+                        player.send_system_message(&TextComponent::text(
+                            "Cluster command queue is full",
+                        ));
+                    }
+                    return Ok(());
+                }
                 let client_platform = player.client.clone();
                 let player_c = player.clone();
                 let server_c = server.clone();
                 server.spawn_task(async move {
+                    if player_c.cluster_departing.load(Ordering::Acquire) {
+                        return;
+                    }
                     if let ClientPlatform::Java(client) = client_platform.as_ref() {
                         let packet = SChatCommand { command: &cmd };
                         client
@@ -951,6 +1226,77 @@ impl JavaClient {
             }
             id if id == SChatMessage::to_id(version) => {
                 let packet = SChatMessage::read(&mut payload, &version)?;
+                if server.advanced_config.cluster.enabled {
+                    if let Some(command) = packet.message.strip_prefix('/') {
+                        if crate::server::cluster_session_ingress::stage(
+                            player,
+                            crate::server::cluster_session_ingress::StagedSessionInput::Command {
+                                command: command.to_string(),
+                                received_at: Instant::now(),
+                            },
+                        )
+                        .is_err()
+                        {
+                            player.send_system_message(&TextComponent::text(
+                                "Cluster command queue is full",
+                            ));
+                        }
+                        return Ok(());
+                    }
+                    if !server.basic_config.allow_chat_reports {
+                        if let Err(error) = self.validate_chat_message(server, player, &packet) {
+                            if error.is_kick() {
+                                player.client.try_kick(
+                                    crate::net::DisconnectReason::Kicked,
+                                    &TextComponent::text(
+                                        error
+                                            .client_kick_reason()
+                                            .unwrap_or_else(|| "Invalid chat message".to_string()),
+                                    ),
+                                );
+                            }
+                            return Ok(());
+                        }
+                        if crate::server::cluster_session_ingress::stage(
+                            player,
+                            crate::server::cluster_session_ingress::StagedSessionInput::Java {
+                                body: packet.message.to_string(),
+                                received_at: Instant::now(),
+                            },
+                        )
+                        .is_err()
+                        {
+                            player.send_system_message(&TextComponent::text(
+                                "Cluster chat queue is full",
+                            ));
+                        }
+                        return Ok(());
+                    }
+                    if crate::server::cluster_session_ingress::stage(
+                        player,
+                        crate::server::cluster_session_ingress::StagedSessionInput::SecureJava {
+                            input: crate::server::cluster_secure_chat::SignedInput {
+                                body: packet.message.to_string(),
+                                timestamp: packet.timestamp,
+                                salt: packet.salt,
+                                signature: packet
+                                    .signature
+                                    .map(|signature| signature.to_vec().into_boxed_slice()),
+                                message_count: packet.message_count.0,
+                                acknowledged: packet.acknowledged.to_vec().into_boxed_slice(),
+                                checksum: packet.checksum,
+                            },
+                            received_at: Instant::now(),
+                        },
+                    )
+                    .is_err()
+                    {
+                        player.send_system_message(&TextComponent::text(
+                            "Cluster chat queue is full",
+                        ));
+                    }
+                    return Ok(());
+                }
                 let msg = packet.message.to_string();
                 let signature = packet.signature.map(<[u8]>::to_vec);
                 let ack = packet.acknowledged.to_vec();
@@ -962,6 +1308,9 @@ impl JavaClient {
                 let player_c = player.clone();
                 let server_c = server.clone();
                 server.spawn_task(async move {
+                    if player_c.cluster_departing.load(Ordering::Acquire) {
+                        return;
+                    }
                     if let ClientPlatform::Java(client) = client_platform.as_ref() {
                         let packet = SChatMessage {
                             message: &msg,
@@ -1020,15 +1369,6 @@ impl JavaClient {
                     server,
                 );
             }
-            id if id == pumpkin_protocol::java::server::play::SKeepAlive::to_id(version) => {
-                self.handle_keep_alive(
-                    player,
-                    &pumpkin_protocol::java::server::play::SKeepAlive::read(
-                        &mut payload,
-                        &version,
-                    )?,
-                );
-            }
             id if id == SClientTickEnd::to_id(version) => {
                 self.handle_client_tick_end(player);
             }
@@ -1068,10 +1408,18 @@ impl JavaClient {
                 );
             }
             id if id == SPlayerRotation::to_id(version) => {
-                self.handle_rotation(player, &SPlayerRotation::read(&mut payload, &version)?);
+                self.handle_rotation(
+                    player,
+                    &SPlayerRotation::read(&mut payload, &version)?,
+                    server,
+                );
             }
             id if id == SSetPlayerGround::to_id(version) => {
-                self.handle_player_ground(player, &SSetPlayerGround::read(&mut payload, &version)?);
+                self.handle_player_ground(
+                    player,
+                    &SSetPlayerGround::read(&mut payload, &version)?,
+                    server,
+                );
             }
             id if id == SPickItemFromBlock::to_id(version) => {
                 self.handle_pick_item_from_block(
@@ -1132,17 +1480,36 @@ impl JavaClient {
             id if id == SPlayerLoaded::to_id(version) => {
                 Self::handle_player_loaded(player);
             }
-            id if id == SPlayPingRequest::to_id(version) => {
-                self.handle_play_ping_request(&SPlayPingRequest::read(&mut payload, &version)?);
-            }
             id if id == SClickSlot::to_id(version) => {
-                player.on_slot_click(SClickSlot::read(&mut payload, &version)?, server);
+                let packet = SClickSlot::read(&mut payload, &version)?;
+                if server.advanced_config.cluster.enabled {
+                    if !crate::server::cluster_inventory_protocol::stage_inventory_input(
+                        player,
+                        crate::server::cluster_inventory_protocol::StagedInventoryInput::JavaClick(
+                            packet,
+                        ),
+                    ) {
+                        crate::server::cluster_inventory_protocol::resync_inventory_screen(player);
+                    }
+                } else {
+                    player.on_slot_click(packet, server);
+                }
             }
             id if id == SContainerButtonClick::to_id(version) => {
-                player.on_container_button_click(&SContainerButtonClick::read(
-                    &mut payload,
-                    &version,
-                )?);
+                let packet = SContainerButtonClick::read(&mut payload, &version)?;
+                if server.advanced_config.cluster.enabled {
+                    if !crate::server::cluster_inventory_protocol::stage_java_menu(
+                        player,
+                        crate::server::cluster_inventory_protocol::JavaMenuInput::Button {
+                            sync_id: packet.window_id.0,
+                            button: packet.button_id.0,
+                        },
+                    ) {
+                        crate::server::cluster_inventory_protocol::resync_inventory_screen(player);
+                    }
+                } else {
+                    player.on_container_button_click(&packet);
+                }
             }
             id if id == SSetHeldItem::to_id(version) => {
                 self.handle_set_held_item(
@@ -1183,22 +1550,39 @@ impl JavaClient {
                     server,
                 );
             }
-            id if id == SPCookieResponse::to_id(version) => {
-                self.handle_cookie_response(&SPCookieResponse::read(&mut payload, &version)?);
-            }
             id if id == SCloseContainer::to_id(version) => {
-                let _ = SCloseContainer::read(&mut payload, &version)?;
-                self.handle_close_container(player);
+                let packet = SCloseContainer::read(&mut payload, &version)?;
+                self.handle_close_container(player, &packet);
             }
             id if id == SChunkBatch::to_id(version) => {
                 self.handle_chunk_batch(player, &SChunkBatch::read(&mut payload, &version)?);
             }
             id if id == SPlayerSession::to_id(version) => {
                 let session = SPlayerSession::read(&mut payload, &version)?;
+                if server.advanced_config.cluster.enabled {
+                    if server.basic_config.allow_chat_reports
+                        && crate::server::cluster_session_ingress::stage(
+                            player,
+                            crate::server::cluster_session_ingress::StagedSessionInput::SecureSession {
+                                session,
+                                received_at: Instant::now(),
+                            },
+                        )
+                        .is_err()
+                    {
+                        player.send_system_message(&TextComponent::text(
+                            "Cluster chat queue is full",
+                        ));
+                    }
+                    return Ok(());
+                }
                 let client_platform = player.client.clone();
                 let player_c = player.clone();
                 let server_c = server.clone();
                 server.spawn_task(async move {
+                    if player_c.cluster_departing.load(Ordering::Acquire) {
+                        return;
+                    }
                     if let ClientPlatform::Java(client) = client_platform.as_ref() {
                         client
                             .handle_chat_session_update(&player_c, &server_c, session)
@@ -1208,47 +1592,7 @@ impl JavaClient {
             }
             id if id == SCustomPayload::to_id(version) => {
                 let payload = SCustomPayload::read(&mut payload, &version)?;
-                let channel_str = payload.channel.to_string();
-                let mut event = PlayerCustomPayloadEvent::new(
-                    player.clone(),
-                    channel_str.clone(),
-                    Bytes::copy_from_slice(payload.data),
-                );
-                server.plugin_manager.fire_blocking(server, &mut event);
-
-                if channel_str == "minecraft:register" {
-                    if let Ok(channels_data) = std::str::from_utf8(payload.data) {
-                        for ch in channels_data.split('\0') {
-                            if !ch.is_empty() {
-                                let mut reg_event = crate::plugin::api::events::player::player_register_channel::PlayerRegisterChannelEvent::new(
-                                    player.clone(),
-                                    ch.to_string(),
-                                );
-                                server.plugin_manager.fire_blocking(server, &mut reg_event);
-                                let mut ch_event = crate::plugin::api::events::player::player_channel::PlayerChannelEvent {
-                                    player: player.clone(),
-                                    channel: ch.to_string(),
-                                    cancelled: false,
-                                };
-                                server.plugin_manager.fire_blocking(server, &mut ch_event);
-                            }
-                        }
-                    }
-                } else if channel_str == "minecraft:unregister"
-                    && let Ok(channels_data) = std::str::from_utf8(payload.data)
-                {
-                    for ch in channels_data.split('\0') {
-                        if !ch.is_empty() {
-                            let mut unreg_event = crate::plugin::api::events::player::player_unregister_channel::PlayerUnregisterChannelEvent::new(
-                                player.clone(),
-                                ch.to_string(),
-                            );
-                            server
-                                .plugin_manager
-                                .fire_blocking(server, &mut unreg_event);
-                        }
-                    }
-                }
+                self.handle_play_custom_payload(server, player, payload.channel, payload.data);
             }
             id if id == SRecipeBookChangeSettings::to_id(version) => {
                 self.handle_recipe_book_change_settings(
@@ -1265,7 +1609,19 @@ impl JavaClient {
                 );
             }
             id if id == SRenameItem::to_id(version) => {
-                player.on_rename_item(&SRenameItem::read(&mut payload, &version)?);
+                let packet = SRenameItem::read(&mut payload, &version)?;
+                if server.advanced_config.cluster.enabled {
+                    if !crate::server::cluster_inventory_protocol::stage_java_menu(
+                        player,
+                        crate::server::cluster_inventory_protocol::JavaMenuInput::Rename(
+                            packet.item_name.to_owned(),
+                        ),
+                    ) {
+                        crate::server::cluster_inventory_protocol::resync_inventory_screen(player);
+                    }
+                } else {
+                    player.on_rename_item(&packet);
+                }
             }
             id if id == SPlaceRecipe::to_id(version) => {
                 let packet = SPlaceRecipe::read(&mut payload, &version)?;
@@ -1286,7 +1642,19 @@ impl JavaClient {
                 server.plugin_manager.fire_blocking(server, &mut event);
             }
             id if id == SSelectTrade::to_id(version) => {
-                self.handle_select_trade(player, &SSelectTrade::read(&mut payload, &version)?);
+                let packet = SSelectTrade::read(&mut payload, &version)?;
+                if server.advanced_config.cluster.enabled {
+                    if !crate::server::cluster_inventory_protocol::stage_java_menu(
+                        player,
+                        crate::server::cluster_inventory_protocol::JavaMenuInput::SelectTrade(
+                            packet.selected_slot.0,
+                        ),
+                    ) {
+                        crate::server::cluster_inventory_protocol::resync_inventory_screen(player);
+                    }
+                } else {
+                    self.handle_select_trade(player, &packet);
+                }
             }
             id if id == SSeenAdvancement::to_id(version) => {
                 self.handle_seen_advancement(
@@ -1319,7 +1687,20 @@ impl JavaClient {
                 );
             }
             id if id == SSetBeacon::to_id(version) => {
-                self.handle_set_beacon(player, &SSetBeacon::read(&mut payload, &version)?);
+                let packet = SSetBeacon::read(&mut payload, &version)?;
+                if server.advanced_config.cluster.enabled {
+                    if !crate::server::cluster_inventory_protocol::stage_java_menu(
+                        player,
+                        crate::server::cluster_inventory_protocol::JavaMenuInput::SetBeacon {
+                            primary: packet.primary_effect.map(|effect| effect.0),
+                            secondary: packet.secondary_effect.map(|effect| effect.0),
+                        },
+                    ) {
+                        crate::server::cluster_inventory_protocol::resync_inventory_screen(player);
+                    }
+                } else {
+                    self.handle_set_beacon(player, &packet);
+                }
             }
             id if id == SContainerSlotStateChanged::to_id(version) => {
                 self.handle_container_slot_state_changed(
@@ -1365,7 +1746,7 @@ impl JavaClient {
                 self.handle_configuration_acknowledged(player);
             }
             _ => {
-                warn!("Failed to handle player packet id {}", event.packet_id);
+                warn!("Failed to handle player packet id {}", packet.id);
             }
         }
         Ok(())

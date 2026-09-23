@@ -181,6 +181,161 @@ pub fn set_enchantments(result: &mut ItemStack, enchantments: Vec<(&'static Ench
     }
 }
 
+pub struct AnvilCalculation {
+    pub result: ItemStack,
+    pub cost: i32,
+    pub repair_item_count_cost: i32,
+    pub only_renaming: bool,
+}
+
+pub fn calculate_anvil_result(
+    input: &ItemStack,
+    addition: &ItemStack,
+    item_name: Option<&str>,
+    has_infinite_materials: bool,
+) -> AnvilCalculation {
+    let empty = || AnvilCalculation {
+        result: ItemStack::EMPTY.clone(),
+        cost: 0,
+        repair_item_count_cost: 0,
+        only_renaming: false,
+    };
+    if input.is_empty() || !can_store_enchantments(input) {
+        return empty();
+    }
+    let mut result = input.clone();
+    let mut price = 0;
+    let tax = i64::from(input.get_repair_cost()) + i64::from(addition.get_repair_cost());
+    let mut naming_cost = 0;
+    let mut repair_item_count_cost = 0;
+    let mut enchantments = get_enchantments_for_crafting(&result);
+
+    if !addition.is_empty() {
+        let using_book = addition.item == &Item::ENCHANTED_BOOK
+            || addition
+                .get_data_component::<StoredEnchantmentsImpl>()
+                .is_some_and(|stored| !stored.enchantment.is_empty());
+        if result.is_damageable() && input.is_valid_repair_item(addition) {
+            let max_damage = result.get_max_damage().unwrap_or(0);
+            let mut repair_amount = result.get_damage().min(max_damage / 4);
+            if repair_amount <= 0 {
+                return empty();
+            }
+            while repair_amount > 0 && repair_item_count_cost < i32::from(addition.item_count) {
+                result.set_damage(result.get_damage() - repair_amount);
+                price += 1;
+                repair_amount = result.get_damage().min(max_damage / 4);
+                repair_item_count_cost += 1;
+            }
+        } else {
+            if !using_book && (result.item != addition.item || !result.is_damageable()) {
+                return empty();
+            }
+            if result.is_damageable() && !using_book {
+                let max_damage = result.get_max_damage().unwrap_or(0);
+                let remaining1 = max_damage - input.get_damage();
+                let remaining2 = addition.get_max_damage().unwrap_or(0) - addition.get_damage();
+                let additional = remaining2 + max_damage * 12 / 100;
+                let remaining = remaining1 + additional;
+                let result_damage = (max_damage - remaining).max(0);
+                if result_damage < result.get_damage() {
+                    result.set_damage(result_damage);
+                    price += 2;
+                }
+            }
+            let additional_enchantments = get_enchantments_for_crafting(addition);
+            let mut any_compatible = false;
+            let mut any_incompatible = false;
+            for (enchantment, entry_level) in additional_enchantments {
+                let current = enchantments
+                    .iter()
+                    .find(|(existing, _)| *existing == enchantment)
+                    .map_or(0, |(_, level)| *level);
+                let mut level = if current == entry_level {
+                    entry_level + 1
+                } else {
+                    entry_level.max(current)
+                };
+                let mut compatible = has_infinite_materials
+                    || input.item == &Item::ENCHANTED_BOOK
+                    || enchantment.can_enchant(input.item);
+                for (other, _) in &enchantments {
+                    if *other != enchantment && !other.are_compatible(enchantment) {
+                        compatible = false;
+                        price += 1;
+                    }
+                }
+                if compatible {
+                    any_compatible = true;
+                    level = level.min(enchantment.max_level);
+                    if let Some(entry) = enchantments
+                        .iter_mut()
+                        .find(|(existing, _)| *existing == enchantment)
+                    {
+                        entry.1 = level;
+                    } else {
+                        enchantments.push((enchantment, level));
+                    }
+                    let mut fee = enchantment.anvil_cost as i32;
+                    if using_book {
+                        fee = 1.max(fee / 2);
+                    }
+                    price += fee * level;
+                    if input.item_count > 1 {
+                        price = 40;
+                    }
+                } else {
+                    any_incompatible = true;
+                }
+            }
+            if any_incompatible && !any_compatible {
+                return empty();
+            }
+        }
+    }
+
+    let input_hover_name = input.get_hover_name();
+    if let Some(name) = item_name.filter(|name| !name.trim().is_empty()) {
+        if name != input_hover_name {
+            naming_cost = 1;
+            price += 1;
+            result.set_custom_name(name.to_string());
+        }
+    } else if input.has_custom_name() {
+        naming_cost = 1;
+        price += 1;
+        result.remove_custom_name();
+    }
+
+    let mut cost = if price <= 0 {
+        result = ItemStack::EMPTY.clone();
+        0
+    } else {
+        (tax + i64::from(price)).clamp(0, i64::from(i32::MAX)) as i32
+    };
+    let only_renaming = naming_cost == price && naming_cost > 0;
+    if only_renaming && cost >= 40 {
+        cost = 39;
+    }
+    if cost >= 40 && !has_infinite_materials {
+        result = ItemStack::EMPTY.clone();
+    }
+    if !result.is_empty() {
+        let mut base_cost = result.get_repair_cost().max(addition.get_repair_cost());
+        if naming_cost != price || naming_cost == 0 {
+            base_cost = calculate_increased_repair_cost(base_cost);
+        }
+        result.set_repair_cost(base_cost);
+        set_enchantments(&mut result, enchantments);
+    }
+    AnvilCalculation {
+        result,
+        cost,
+        repair_item_count_cost,
+        only_renaming,
+    }
+}
+
 impl AnvilScreenHandler {
     #[expect(clippy::needless_pass_by_value)]
     pub fn new(
@@ -272,191 +427,22 @@ impl AnvilScreenHandler {
     #[allow(clippy::too_many_lines)]
     pub fn create_result(&mut self, has_infinite_materials: bool) {
         let input = self.inventory.get_stack(0);
-        self.only_renaming.store(false, Ordering::Relaxed);
-        self.set_repair_cost(1);
-        let mut price: i32 = 0;
-        let mut tax: i64 = 0;
-        let mut naming_cost: i32 = 0;
-
-        if !input.is_empty() && can_store_enchantments(&input) {
-            let mut result = input.clone();
-            let addition = self.inventory.get_stack(1);
-            let mut enchantments = get_enchantments_for_crafting(&result);
-            tax += input.get_repair_cost() as i64 + addition.get_repair_cost() as i64;
-            self.repair_item_count_cost.store(0, Ordering::Relaxed);
-
-            if !addition.is_empty() {
-                let using_book = addition.item == &Item::ENCHANTED_BOOK
-                    || addition
-                        .get_data_component::<StoredEnchantmentsImpl>()
-                        .is_some_and(|s| !s.enchantment.is_empty());
-
-                if result.is_damageable() && input.is_valid_repair_item(&addition) {
-                    let max_damage = result.get_max_damage().unwrap_or(0);
-                    let mut repair_amount = result.get_damage().min(max_damage / 4);
-                    if repair_amount <= 0 {
-                        self.inventory.set_stack(2, ItemStack::EMPTY.clone());
-                        self.set_repair_cost(0);
-                        return;
-                    }
-
-                    let mut count = 0;
-                    while repair_amount > 0 && count < addition.item_count as i32 {
-                        let result_damage = result.get_damage() - repair_amount;
-                        result.set_damage(result_damage);
-                        price += 1;
-                        repair_amount = result.get_damage().min(max_damage / 4);
-                        count += 1;
-                    }
-
-                    self.repair_item_count_cost.store(count, Ordering::Relaxed);
-                } else {
-                    if !using_book && (result.item != addition.item || !result.is_damageable()) {
-                        self.inventory.set_stack(2, ItemStack::EMPTY.clone());
-                        self.set_repair_cost(0);
-                        return;
-                    }
-
-                    if result.is_damageable() && !using_book {
-                        let max_damage = result.get_max_damage().unwrap_or(0);
-                        let remaining1 = max_damage - input.get_damage();
-                        let remaining2 =
-                            addition.get_max_damage().unwrap_or(0) - addition.get_damage();
-                        let additional = remaining2 + max_damage * 12 / 100;
-                        let remaining = remaining1 + additional;
-                        let mut result_damage = max_damage - remaining;
-                        if result_damage < 0 {
-                            result_damage = 0;
-                        }
-
-                        if result_damage < result.get_damage() {
-                            result.set_damage(result_damage);
-                            price += 2;
-                        }
-                    }
-
-                    let additional_enchantments = get_enchantments_for_crafting(&addition);
-                    let mut is_any_enchantment_compatible = false;
-                    let mut is_any_enchantment_not_compatible = false;
-
-                    for (enchantment, entry_level) in additional_enchantments {
-                        let current = enchantments
-                            .iter()
-                            .find(|(e, _)| *e == enchantment)
-                            .map_or(0, |(_, lvl)| *lvl);
-                        let mut level = if current == entry_level {
-                            entry_level + 1
-                        } else {
-                            entry_level.max(current)
-                        };
-
-                        let mut compatible =
-                            if has_infinite_materials || input.item == &Item::ENCHANTED_BOOK {
-                                true
-                            } else {
-                                enchantment.can_enchant(input.item)
-                            };
-
-                        for (other, _) in &enchantments {
-                            if *other != enchantment && !other.are_compatible(enchantment) {
-                                compatible = false;
-                                price += 1;
-                            }
-                        }
-
-                        if compatible {
-                            is_any_enchantment_compatible = true;
-                            if level > enchantment.max_level {
-                                level = enchantment.max_level;
-                            }
-
-                            if let Some(entry) =
-                                enchantments.iter_mut().find(|(e, _)| *e == enchantment)
-                            {
-                                entry.1 = level;
-                            } else {
-                                enchantments.push((enchantment, level));
-                            }
-
-                            let mut fee = enchantment.anvil_cost as i32;
-                            if using_book {
-                                fee = 1.max(fee / 2);
-                            }
-
-                            price += fee * level;
-                            if input.item_count > 1 {
-                                price = 40;
-                            }
-                        } else {
-                            is_any_enchantment_not_compatible = true;
-                        }
-                    }
-
-                    if is_any_enchantment_not_compatible && !is_any_enchantment_compatible {
-                        self.inventory.set_stack(2, ItemStack::EMPTY.clone());
-                        self.set_repair_cost(0);
-                        return;
-                    }
-                }
-            }
-
-            let input_hover_name = input.get_hover_name();
-            if let Some(item_name) = &self.item_name
-                && !item_name.trim().is_empty()
-            {
-                if item_name != &input_hover_name {
-                    naming_cost = 1;
-                    price += naming_cost;
-                    result.set_custom_name(item_name.clone());
-                }
-            } else if input.has_custom_name() {
-                naming_cost = 1;
-                price += naming_cost;
-                result.remove_custom_name();
-            }
-
-            let final_price = if price <= 0 {
-                0
-            } else {
-                (tax + price as i64).clamp(0, i32::MAX as i64) as i32
-            };
-            self.set_repair_cost(final_price);
-            if price <= 0 {
-                result = ItemStack::EMPTY.clone();
-            }
-
-            if naming_cost == price && naming_cost > 0 {
-                if self.repair_cost.load(Ordering::Relaxed) >= 40 {
-                    self.set_repair_cost(39);
-                }
-                self.only_renaming.store(true, Ordering::Relaxed);
-            }
-
-            if self.repair_cost.load(Ordering::Relaxed) >= 40 && !has_infinite_materials {
-                result = ItemStack::EMPTY.clone();
-            }
-
-            if !result.is_empty() {
-                let mut base_cost = result.get_repair_cost();
-                if base_cost < addition.get_repair_cost() {
-                    base_cost = addition.get_repair_cost();
-                }
-
-                if naming_cost != price || naming_cost == 0 {
-                    base_cost = calculate_increased_repair_cost(base_cost);
-                }
-
-                result.set_repair_cost(base_cost);
-                set_enchantments(&mut result, enchantments);
-            }
-
-            self.inventory.set_stack(2, result);
-            self.send_content_updates();
-        } else {
-            self.inventory.set_stack(2, ItemStack::EMPTY.clone());
-            self.set_repair_cost(0);
-        }
+        let addition = self.inventory.get_stack(1);
+        let calculation = calculate_anvil_result(
+            &input,
+            &addition,
+            self.item_name.as_deref(),
+            has_infinite_materials,
+        );
+        self.only_renaming
+            .store(calculation.only_renaming, Ordering::Relaxed);
+        self.repair_item_count_cost
+            .store(calculation.repair_item_count_cost, Ordering::Relaxed);
+        self.set_repair_cost(calculation.cost);
+        self.inventory.set_stack(2, calculation.result);
+        self.send_content_updates();
     }
+
 }
 
 impl ScreenHandler for AnvilScreenHandler {

@@ -27,18 +27,20 @@ pub const DEFAULT_QUEUE_DEPTH: usize = 64;
 
 pub const HEADER_PREFIX_LEN: usize = 4;
 
-pub const PLAYER_STREAM_KINDS: [StreamKind; 4] = [
+pub const PLAYER_STREAM_KINDS: [StreamKind; 5] = [
+    StreamKind::PlayerBoundary,
     StreamKind::PlayerVisual,
     StreamKind::PlayerTransient,
     StreamKind::PlayerWorld,
     StreamKind::PlayerCombat,
 ];
 
-pub const SHARED_STREAM_KINDS: [StreamKind; 9] = [
+pub const SHARED_STREAM_KINDS: [StreamKind; 10] = [
     StreamKind::EntityPos,
     StreamKind::EntityVisual,
     StreamKind::EntityTransient,
     StreamKind::EntityCombat,
+    StreamKind::EntityWorld,
     StreamKind::Control,
     StreamKind::ChunkRequest,
     StreamKind::ChunkData,
@@ -47,10 +49,10 @@ pub const SHARED_STREAM_KINDS: [StreamKind; 9] = [
 ];
 
 /// Uni streams opened per player on each mesh connection.
-pub const PLAYER_STREAM_COUNT: usize = 4;
+pub const PLAYER_STREAM_COUNT: usize = 5;
 
 /// Shared (player-independent) uni streams on each mesh connection.
-pub const SHARED_STREAM_COUNT: usize = 9;
+pub const SHARED_STREAM_COUNT: usize = 10;
 
 const _: () = assert!(PLAYER_STREAM_COUNT == PLAYER_STREAM_KINDS.len());
 const _: () = assert!(SHARED_STREAM_COUNT == SHARED_STREAM_KINDS.len());
@@ -59,7 +61,8 @@ const _: () = assert!(SHARED_STREAM_COUNT == SHARED_STREAM_KINDS.len());
 ///
 /// [`MAX_MUX_STREAMS_PER_PEER`] uni streams stay under the QUIC
 /// `max_concurrent_uni_streams` transport limit with headroom to spare.
-pub const MAX_PLAYERS_PER_PEER: usize = 200_000;
+pub const MAX_PLAYERS_PER_PEER: usize =
+    (crate::mesh::MAX_UNI_STREAMS as usize - SHARED_STREAM_COUNT) / PLAYER_STREAM_COUNT;
 
 /// Highest uni-stream count on a single mesh connection.
 ///
@@ -83,7 +86,8 @@ pub const MAX_HEADER_FRAME_LEN: usize = HEADER_PREFIX_LEN + MAX_HEADER_BODY_LEN;
 pub const fn is_player_kind(kind: StreamKind) -> bool {
     matches!(
         kind,
-        StreamKind::PlayerVisual
+        StreamKind::PlayerBoundary
+            | StreamKind::PlayerVisual
             | StreamKind::PlayerTransient
             | StreamKind::PlayerWorld
             | StreamKind::PlayerCombat
@@ -123,6 +127,7 @@ impl StreamHeader {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundParcel {
     pub peer: ServerId,
+    pub generation: u64,
     pub header: StreamHeader,
     pub bytes: Vec<u8>,
 }
@@ -188,10 +193,7 @@ pub fn encode_header_into(header: StreamHeader, mut out: Vec<u8>) -> Result<Vec<
 ///
 /// Returns the bytes written; `buf` needs at least [`MAX_HEADER_FRAME_LEN`]
 /// bytes. Backs QUIC send paths that frame headers on the stack.
-pub fn encode_header_to_slice(
-    header: StreamHeader,
-    buf: &mut [u8],
-) -> Result<usize, StreamError> {
+pub fn encode_header_to_slice(header: StreamHeader, buf: &mut [u8]) -> Result<usize, StreamError> {
     let too_small = || StreamError {
         message: String::from("encode stream header: buffer too small"),
     };
@@ -206,8 +208,7 @@ pub fn encode_header_to_slice(
     let prefix = u32::try_from(body_len).map_err(|_| StreamError {
         message: String::from("encode stream header: body too large"),
     })?;
-    buf[..HEADER_PREFIX_LEN]
-        .copy_from_slice(&prefix.to_le_bytes());
+    buf[..HEADER_PREFIX_LEN].copy_from_slice(&prefix.to_le_bytes());
     Ok(HEADER_PREFIX_LEN + body_len)
 }
 
@@ -286,9 +287,11 @@ pub fn split_header_frame(buffer: &[u8]) -> Result<HeaderFrame, StreamError> {
     let mut prefix = [0_u8; HEADER_PREFIX_LEN];
     prefix.copy_from_slice(&buffer[..HEADER_PREFIX_LEN]);
     let body_len = u32::from_le_bytes(prefix) as usize;
-    let total = body_len.checked_add(HEADER_PREFIX_LEN).ok_or_else(|| StreamError {
-        message: String::from("decode stream header: frame length overflows"),
-    })?;
+    let total = body_len
+        .checked_add(HEADER_PREFIX_LEN)
+        .ok_or_else(|| StreamError {
+            message: String::from("decode stream header: frame length overflows"),
+        })?;
     if buffer.len() < total {
         return Err(StreamError {
             message: String::from("decode stream header: buffer shorter than frame"),
@@ -426,6 +429,12 @@ impl StreamRegistry {
     ) -> bool {
         let key = StreamKey::new(peer, kind, player);
         if self.open.contains(&key) {
+            return true;
+        }
+        if kind == StreamKind::PlayerBoundary
+            && player.is_some_and(|gid| gid.server == peer)
+            && !self.tombstones.contains(&key)
+        {
             return true;
         }
         if self.tombstones.contains(&key) {
@@ -571,9 +580,11 @@ pub enum DemuxCategory {
 #[must_use]
 pub const fn category_for(kind: StreamKind) -> DemuxCategory {
     match kind {
+        StreamKind::PlayerBoundary => DemuxCategory::World,
         StreamKind::PlayerVisual => DemuxCategory::Visual,
         StreamKind::PlayerTransient => DemuxCategory::Transient,
         StreamKind::PlayerWorld => DemuxCategory::World,
+        StreamKind::EntityWorld => DemuxCategory::World,
         StreamKind::PlayerCombat => DemuxCategory::Combat,
         StreamKind::EntityPos
         | StreamKind::EntityVisual
@@ -813,12 +824,12 @@ pub async fn run_demux(
 }
 
 #[must_use]
-pub fn make_outbound(
-    peer: ServerId,
-    header: StreamHeader,
-    bytes: Vec<u8>,
-) -> OutboundParcel {
-    OutboundParcel { peer, header, bytes }
+pub fn make_outbound(peer: ServerId, header: StreamHeader, bytes: Vec<u8>) -> OutboundParcel {
+    OutboundParcel {
+        peer,
+        header,
+        bytes,
+    }
 }
 
 pub fn outbound_for_batch(
@@ -855,6 +866,7 @@ mod tests {
     fn parcel_for(kind: StreamKind, player: Option<GlobalPlayerId>) -> InboundParcel {
         InboundParcel {
             peer: test_peer(),
+            generation: 0,
             header: StreamHeader::new(kind, player),
             bytes: vec![1, 2, 3],
         }
@@ -946,6 +958,18 @@ mod tests {
     }
 
     #[test]
+    fn boundary_arriving_before_presence_stream_open_reaches_world_owner() {
+        let mut registry = StreamRegistry::new();
+        let peer = test_peer();
+        let player = test_player();
+        assert!(registry.should_deliver(peer, StreamKind::PlayerBoundary, Some(player)));
+        assert!(!registry.should_deliver(ServerId(8), StreamKind::PlayerBoundary, Some(player),));
+        assert!(!registry.should_deliver(peer, StreamKind::PlayerVisual, Some(player)));
+        registry.close_player(peer, player);
+        assert!(!registry.should_deliver(peer, StreamKind::PlayerBoundary, Some(player)));
+    }
+
+    #[test]
     fn control_messages_apply_to_registry() {
         let mut registry = StreamRegistry::new();
         DemuxControl::OpenPlayer {
@@ -969,6 +993,7 @@ mod tests {
     #[test]
     fn every_stream_kind_has_a_category() {
         let kinds = [
+            StreamKind::PlayerBoundary,
             StreamKind::PlayerVisual,
             StreamKind::PlayerTransient,
             StreamKind::PlayerWorld,
@@ -977,19 +1002,27 @@ mod tests {
             StreamKind::EntityVisual,
             StreamKind::EntityTransient,
             StreamKind::EntityCombat,
+            StreamKind::EntityWorld,
             StreamKind::Control,
             StreamKind::ChunkRequest,
             StreamKind::ChunkData,
             StreamKind::ChunkAdvert,
             StreamKind::Accept,
         ];
-        assert_eq!(category_for(StreamKind::PlayerVisual), DemuxCategory::Visual);
+        assert_eq!(
+            category_for(StreamKind::PlayerVisual),
+            DemuxCategory::Visual
+        );
         assert_eq!(
             category_for(StreamKind::PlayerTransient),
             DemuxCategory::Transient
         );
         assert_eq!(category_for(StreamKind::PlayerWorld), DemuxCategory::World);
-        assert_eq!(category_for(StreamKind::PlayerCombat), DemuxCategory::Combat);
+        assert_eq!(category_for(StreamKind::EntityWorld), DemuxCategory::World);
+        assert_eq!(
+            category_for(StreamKind::PlayerCombat),
+            DemuxCategory::Combat
+        );
         for kind in [
             StreamKind::EntityPos,
             StreamKind::EntityVisual,
@@ -1003,7 +1036,7 @@ mod tests {
         assert_eq!(category_for(StreamKind::ChunkData), DemuxCategory::Chunk);
         assert_eq!(category_for(StreamKind::ChunkAdvert), DemuxCategory::Chunk);
         assert_eq!(category_for(StreamKind::Accept), DemuxCategory::Accept);
-        assert_eq!(kinds.len(), 13);
+        assert_eq!(kinds.len(), 15);
     }
 
     #[tokio::test]
@@ -1040,6 +1073,10 @@ mod tests {
             .await
             .unwrap();
         inbound_tx
+            .send(parcel_for(StreamKind::EntityWorld, None))
+            .await
+            .unwrap();
+        inbound_tx
             .send(parcel_for(StreamKind::Control, None))
             .await
             .unwrap();
@@ -1054,20 +1091,45 @@ mod tests {
         drop(inbound_tx);
 
         let stats = task.await.unwrap();
-        assert_eq!(stats.total_forwarded(), 8);
+        assert_eq!(stats.total_forwarded(), 9);
         assert_eq!(stats.dropped_late, 0);
         assert_eq!(stats.dropped_unknown, 0);
-        assert_eq!(queues.visual.recv().await.unwrap().header.kind, StreamKind::PlayerVisual);
+        assert_eq!(
+            queues.visual.recv().await.unwrap().header.kind,
+            StreamKind::PlayerVisual
+        );
         assert_eq!(
             queues.transient.recv().await.unwrap().header.kind,
             StreamKind::PlayerTransient
         );
-        assert_eq!(queues.world.recv().await.unwrap().header.kind, StreamKind::PlayerWorld);
-        assert_eq!(queues.combat.recv().await.unwrap().header.kind, StreamKind::PlayerCombat);
-        assert_eq!(queues.entity.recv().await.unwrap().header.kind, StreamKind::EntityPos);
-        assert_eq!(queues.control.recv().await.unwrap().header.kind, StreamKind::Control);
-        assert_eq!(queues.chunk.recv().await.unwrap().header.kind, StreamKind::ChunkData);
-        assert_eq!(queues.accept.recv().await.unwrap().header.kind, StreamKind::Accept);
+        assert_eq!(
+            queues.world.recv().await.unwrap().header.kind,
+            StreamKind::PlayerWorld
+        );
+        assert_eq!(
+            queues.combat.recv().await.unwrap().header.kind,
+            StreamKind::PlayerCombat
+        );
+        assert_eq!(
+            queues.world.recv().await.unwrap().header.kind,
+            StreamKind::EntityWorld
+        );
+        assert_eq!(
+            queues.entity.recv().await.unwrap().header.kind,
+            StreamKind::EntityPos
+        );
+        assert_eq!(
+            queues.control.recv().await.unwrap().header.kind,
+            StreamKind::Control
+        );
+        assert_eq!(
+            queues.chunk.recv().await.unwrap().header.kind,
+            StreamKind::ChunkData
+        );
+        assert_eq!(
+            queues.accept.recv().await.unwrap().header.kind,
+            StreamKind::Accept
+        );
     }
 
     #[tokio::test]
@@ -1122,7 +1184,10 @@ mod tests {
 
         let stats = task.await.unwrap();
         assert_eq!(stats.total_forwarded(), 1);
-        assert_eq!(queues.combat.recv().await.unwrap().header.kind, StreamKind::PlayerCombat);
+        assert_eq!(
+            queues.combat.recv().await.unwrap().header.kind,
+            StreamKind::PlayerCombat
+        );
     }
 
     #[test]
@@ -1159,7 +1224,10 @@ mod tests {
         let owned = encode_header(header).unwrap();
         let appended = encode_header_into(header, Vec::new()).unwrap();
         assert_eq!(owned, appended);
-        assert_eq!(header_body_len(header).unwrap() + HEADER_PREFIX_LEN, owned.len());
+        assert_eq!(
+            header_body_len(header).unwrap() + HEADER_PREFIX_LEN,
+            owned.len()
+        );
 
         let mut stack = [0_u8; MAX_HEADER_FRAME_LEN];
         let written = encode_header_to_slice(header, &mut stack).unwrap();
@@ -1169,16 +1237,10 @@ mod tests {
         assert_eq!(frame_len(header, 3).unwrap(), owned.len() + 3);
 
         let batch = TickBatch::new(crate::time::TickStamp(9));
-        let parcel =
-            outbound_for_batch(test_peer(), StreamKind::EntityPos, None, &batch).unwrap();
-        let reused = outbound_for_batch_into(
-            test_peer(),
-            StreamKind::EntityPos,
-            None,
-            &batch,
-            Vec::new(),
-        )
-        .unwrap();
+        let parcel = outbound_for_batch(test_peer(), StreamKind::EntityPos, None, &batch).unwrap();
+        let reused =
+            outbound_for_batch_into(test_peer(), StreamKind::EntityPos, None, &batch, Vec::new())
+                .unwrap();
         assert_eq!(parcel, reused);
 
         let framed = parcel_frame(&reused).unwrap();
@@ -1223,8 +1285,10 @@ mod tests {
         registry.close_peer(test_peer());
         assert_eq!(registry.open_count(), 0);
         assert_eq!(registry.open_count_for_peer(test_peer()), 0);
-        assert!(
-            !registry.should_deliver(test_peer(), StreamKind::PlayerVisual, Some(test_player()))
-        );
+        assert!(!registry.should_deliver(
+            test_peer(),
+            StreamKind::PlayerVisual,
+            Some(test_player())
+        ));
     }
 }

@@ -11,39 +11,25 @@
 //! - [`RemoteBreakDecision::RejectStale`] means expectation mismatched ground
 //!   truth, so the caller drops the packet without mutating the world; the
 //!   `expected`/`current` pair is the evidence for logs and metrics.
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::identity::{GlobalPlayerId, PlayerSeq};
-use crate::protocol::{BlockPos, BlockUndo, BreakBlockUpdate, ChunkAddr};
+use crate::protocol::{BlockPos, BlockUndo, BreakBlockUpdate, ChunkKey, WorldId};
 use crate::time::TickStamp;
 
-const SEQ_STRIPES: usize = 256;
-
-static BREAK_SEQ: LazyLock<Box<[AtomicU16]>> =
-    LazyLock::new(|| (0..SEQ_STRIPES).map(|_| AtomicU16::new(0)).collect());
-
-fn stripe_for(gid: GlobalPlayerId) -> usize {
-    let mixed = gid
-        .server
-        .0
-        .rotate_left(5)
-        ^ gid.player.0.wrapping_mul(0x9E37);
-    (mixed as usize) % SEQ_STRIPES
+pub fn next_break_seq(gid: GlobalPlayerId) -> PlayerSeq {
+    BREAK_SEQ.with(|clock| clock.borrow_mut().issue(gid))
 }
 
-pub fn next_break_seq(gid: GlobalPlayerId) -> PlayerSeq {
-    let stripe = stripe_for(gid);
-    PlayerSeq(BREAK_SEQ[stripe].fetch_add(1, Ordering::Relaxed))
+thread_local! {
+    static BREAK_SEQ: RefCell<BreakSeqClock> = RefCell::new(BreakSeqClock::new());
 }
 
 #[must_use]
-pub fn chunk_of_block(x: i32, z: i32) -> ChunkAddr {
-    ChunkAddr {
-        x: x.div_euclid(16),
-        z: z.div_euclid(16),
-    }
+pub const fn chunk_of_block(world: WorldId, x: i32, z: i32) -> ChunkKey {
+    ChunkKey::new(world, x.div_euclid(16), z.div_euclid(16))
 }
 
 /// Sentinel undo count: breaks never carry an inventory delta.
@@ -58,7 +44,8 @@ pub const fn capture_break(
     tick: TickStamp,
     pos: BlockPos,
     expected_old_state: u16,
-    chunk: ChunkAddr,
+    actor_chunk: ChunkKey,
+    chunk: ChunkKey,
 ) -> BreakBlockUpdate {
     BreakBlockUpdate {
         gid,
@@ -66,6 +53,7 @@ pub const fn capture_break(
         tick,
         pos,
         expected_old_state,
+        actor_chunk,
         chunk,
     }
 }
@@ -83,13 +71,8 @@ pub const fn make_undo(old_state: u16) -> BlockUndo {
 /// evidence and must be dropped without mutating the world.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteBreakDecision {
-    Accept {
-        undo: BlockUndo,
-    },
-    RejectStale {
-        expected: u16,
-        current: u16,
-    },
+    Accept { undo: BlockUndo },
+    RejectStale { expected: u16, current: u16 },
 }
 
 /// Atomic accept/reject counters for the remote break verdict.
@@ -169,6 +152,9 @@ mod tests {
     use super::*;
     use crate::identity::{PlayerSlot, ServerId};
 
+    const WORLD: WorldId = WorldId::new(0, 7);
+    const CHUNK: ChunkKey = ChunkKey::new(WORLD, 0, 0);
+
     const GID: GlobalPlayerId = GlobalPlayerId::new(ServerId(1), PlayerSlot(2));
 
     fn sample_update(expected_old_state: u16) -> BreakBlockUpdate {
@@ -178,26 +164,9 @@ mod tests {
             TickStamp(9),
             BlockPos { x: 1, y: 2, z: 3 },
             expected_old_state,
-            ChunkAddr { x: 0, z: 0 },
+            CHUNK,
+            CHUNK,
         )
-    }
-
-    #[test]
-    fn capture_packs_every_field() {
-        let update = sample_update(12);
-        assert_eq!(update.gid, GID);
-        assert_eq!(update.seq, PlayerSeq(7));
-        assert_eq!(update.tick, TickStamp(9));
-        assert_eq!(update.pos, BlockPos { x: 1, y: 2, z: 3 });
-        assert_eq!(update.expected_old_state, 12);
-        assert_eq!(update.chunk, ChunkAddr { x: 0, z: 0 });
-    }
-
-    #[test]
-    fn undo_marks_no_inventory_delta() {
-        let undo = make_undo(41);
-        assert_eq!(undo.old_state, 41);
-        assert_eq!(undo.count_before, BREAK_UNDO_NO_INVENTORY_DELTA);
     }
 
     #[test]

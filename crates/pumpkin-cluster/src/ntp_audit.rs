@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ntp::{DEFAULT_NTP_SERVER, NtpHandle, with_default_port};
-use crate::time::{MILLIS_PER_TICK, TICKS_PER_WRAP, NtpDiscipline, TickStamp};
+use crate::time::{MILLIS_PER_TICK, NtpDiscipline, TICKS_PER_WRAP, TickStamp};
 
 pub const AUDIT_MILLIS_PER_TICK: i64 = 50;
 pub const AUDIT_TICKS_PER_WRAP: i64 = 65_536;
@@ -152,7 +152,8 @@ pub fn audit_ntp_wiring(
     let mut stray = NtpDiscipline::unconfigured(max_offset_millis);
     stray.observe(max_offset_millis.saturating_add(1).max(1));
     let want = TickStamp::from_disciplined_millis(probe_unix_millis, 0);
-    let discipline_ok = if tolerance_ok && undisciplined.tick_at(probe_unix_millis).is_none()
+    let discipline_ok = if tolerance_ok
+        && undisciplined.tick_at(probe_unix_millis).is_none()
         && healthy.tick_at(probe_unix_millis) == Some(want)
         && stray.tick_at(probe_unix_millis).is_none()
         && audited_tick_at(probe_unix_millis, None, max_offset_millis).is_none()
@@ -160,7 +161,8 @@ pub fn audit_ntp_wiring(
     {
         true
     } else {
-        failures.push("discipline gating drift undisciplined or stray clock minted a stamp".to_owned());
+        failures
+            .push("discipline gating drift undisciplined or stray clock minted a stamp".to_owned());
         false
     };
 
@@ -191,7 +193,9 @@ pub fn audit_ntp_wiring(
             let has_port = entry.contains(':');
             if !has_port && port != want_port {
                 servers_ok = false;
-                failures.push(format!("ntp server {entry} missed default port {want_port}"));
+                failures.push(format!(
+                    "ntp server {entry} missed default port {want_port}"
+                ));
             }
         }
     }
@@ -266,7 +270,10 @@ mod tests {
     #[test]
     fn audit_passes_on_external_config() {
         let report = audit_ntp_wiring(
-            &[String::from("pool.ntp.org"), String::from("time.cloudflare.com")],
+            &[
+                String::from("pool.ntp.org"),
+                String::from("time.cloudflare.com"),
+            ],
             25,
             1_700_000_000_123,
         );
@@ -276,11 +283,7 @@ mod tests {
 
     #[test]
     fn audit_rejects_full_tick_tolerance() {
-        let report = audit_ntp_wiring(
-            &[String::from("pool.ntp.org")],
-            50,
-            1_700_000_000_123,
-        );
+        let report = audit_ntp_wiring(&[String::from("pool.ntp.org")], 50, 1_700_000_000_123);
         assert!(!report.passed());
         assert!(!report.discipline_ok);
         assert!(report.quantization_ok);

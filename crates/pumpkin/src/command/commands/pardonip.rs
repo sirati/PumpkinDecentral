@@ -13,6 +13,7 @@ use crate::command::errors::error_types::CommandErrorType;
 use crate::command::node::dispatcher::CommandDispatcher;
 use crate::command::node::{CommandExecutor, CommandExecutorResult};
 use crate::data::SaveJSONConfiguration;
+use crate::server::cluster_access_policy::AccessPolicyCommand;
 
 const DESCRIPTION: &str = "unbans a ip";
 const PERMISSION: &str = "minecraft:command.pardonip";
@@ -36,6 +37,27 @@ impl CommandExecutor for PardonIpExecutor {
             .map_err(|_| ERROR_PARDONIP_INVALID.create_without_context())?;
 
         let server = context.source.server();
+        if server.advanced_config.cluster.enabled {
+            if server
+                .cluster_access_policy
+                .snapshot()
+                .active_ip_ban(ip)
+                .is_none()
+            {
+                return Err(ERROR_PARDONIP_FAILED.create_without_context());
+            }
+            if !server
+                .cluster_access_policy
+                .try_submit(AccessPolicyCommand::PardonIp(ip))
+            {
+                return Err(crate::server::cluster_admin_apply::admin_busy_error());
+            }
+            context.source.send_feedback(
+                TextComponent::text(format!("Queued IP pardon for {ip}.")),
+                false,
+            );
+            return Ok(1);
+        }
         let mut lock = server
             .data
             .banned_ip_list

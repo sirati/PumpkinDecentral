@@ -338,6 +338,15 @@ impl HostContainerBlockEntity for PluginHostState {
     }
 
     async fn get_size(&mut self, res: Resource<ContainerBlockEntity>) -> wasmtime::Result<u32> {
+        if self
+            .server
+            .as_ref()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            return Err(wasmtime::Error::msg(
+                "Cluster container inventory requires an immutable snapshot",
+            ));
+        }
         let container = self
             .resource_table
             .get::<ContainerBlockEntityResource>(&Resource::new_own(res.rep()))
@@ -346,6 +355,15 @@ impl HostContainerBlockEntity for PluginHostState {
     }
 
     async fn is_empty(&mut self, res: Resource<ContainerBlockEntity>) -> wasmtime::Result<bool> {
+        if self
+            .server
+            .as_ref()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            return Err(wasmtime::Error::msg(
+                "Cluster container inventory requires an immutable snapshot",
+            ));
+        }
         let container = self
             .resource_table
             .get::<ContainerBlockEntityResource>(&Resource::new_own(res.rep()))
@@ -359,6 +377,15 @@ impl HostContainerBlockEntity for PluginHostState {
         res: Resource<ContainerBlockEntity>,
         slot: u32,
     ) -> wasmtime::Result<Option<Resource<WitHostItemStack>>> {
+        if self
+            .server
+            .as_ref()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            return Err(wasmtime::Error::msg(
+                "Cluster container inventory requires an immutable snapshot",
+            ));
+        }
         let container = self
             .resource_table
             .get::<ContainerBlockEntityResource>(&Resource::new_own(res.rep()))
@@ -380,6 +407,15 @@ impl HostContainerBlockEntity for PluginHostState {
         slot: u32,
         stack_res: Option<Resource<WitHostItemStack>>,
     ) -> wasmtime::Result<()> {
+        if self
+            .server
+            .as_ref()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            return Err(wasmtime::Error::msg(
+                "Cluster container mutation requires the semantic inventory service",
+            ));
+        }
         let container = self
             .resource_table
             .get::<ContainerBlockEntityResource>(&Resource::new_own(res.rep()))
@@ -403,6 +439,15 @@ impl HostContainerBlockEntity for PluginHostState {
         res: Resource<ContainerBlockEntity>,
         slot: u32,
     ) -> wasmtime::Result<Option<Resource<WitHostItemStack>>> {
+        if self
+            .server
+            .as_ref()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            return Err(wasmtime::Error::msg(
+                "Cluster container mutation requires the semantic inventory service",
+            ));
+        }
         let container = self
             .resource_table
             .get::<ContainerBlockEntityResource>(&Resource::new_own(res.rep()))
@@ -419,6 +464,15 @@ impl HostContainerBlockEntity for PluginHostState {
     }
 
     async fn clear(&mut self, res: Resource<ContainerBlockEntity>) -> wasmtime::Result<()> {
+        if self
+            .server
+            .as_ref()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            return Err(wasmtime::Error::msg(
+                "Cluster container mutation requires the semantic inventory service",
+            ));
+        }
         let container = self
             .resource_table
             .get::<ContainerBlockEntityResource>(&Resource::new_own(res.rep()))

@@ -8,12 +8,14 @@ license.workspace = true
 [dependencies]
 serde.workspace = true
 postcard.workspace = true
-tokio = { workspace = true, features = ["sync", "time", "net", "rt"] }
+tokio = { workspace = true, features = ["sync", "time", "net", "rt", "macros"] }
 sha2.workspace = true
 xxhash-rust.workspace = true
 tracing.workspace = true
 quinn.workspace = true
 rcgen.workspace = true
+bytes.workspace = true
+zerocopy.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["sync", "time", "macros", "rt"] }

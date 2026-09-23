@@ -11,7 +11,15 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::chunks::{ChunkAdvert, ChunkDrop, Directory};
-use crate::protocol::{ChunkAddr, StreamKind};
+use crate::protocol::{ChunkKey, StreamKind};
+
+pub const CLUSTER_PROTOCOL_VERSION: u16 = 26;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClusterNodeRole {
+    Primary,
+    Secondary,
+}
 
 /// Live members of one cluster.
 #[derive(Debug, Default)]
@@ -119,7 +127,10 @@ impl JoinVotes {
     #[must_use]
     pub fn is_unanimous(&self, membership: &Membership, candidate: u16) -> bool {
         match self.votes.get(&candidate) {
-            Some(voters) => membership.members.iter().all(|member| voters.contains(member)),
+            Some(voters) => membership
+                .members
+                .iter()
+                .all(|member| voters.contains(member)),
             None => false,
         }
     }
@@ -156,6 +167,8 @@ pub struct JoinHello {
     pub candidate: u16,
     /// Certificate fingerprint receivers pin against.
     pub cert_fingerprint: [u8; 32],
+    pub protocol_version: u16,
+    pub role: ClusterNodeRole,
 }
 
 /// Second join step: a member asks every other member to vote.
@@ -178,6 +191,12 @@ pub struct JoinVote {
     pub approve: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerView {
+    pub reporter: u16,
+    pub connected: Vec<u16>,
+}
+
 /// Final join step: admission announced after a full approval vote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdmitBroadcast {
@@ -188,7 +207,7 @@ pub struct AdmitBroadcast {
 }
 
 /// Wire envelope for the hello, votes, and admit flow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JoinHandshake {
     /// Candidate announcement.
     Hello(JoinHello),
@@ -198,6 +217,99 @@ pub enum JoinHandshake {
     Vote(JoinVote),
     /// Unanimous admission announcement.
     Admit(AdmitBroadcast),
+    PeerView(PeerView),
+}
+
+pub const ADMISSION_SETTLE_MILLIS: u64 = 10_000;
+
+#[derive(Debug, Clone)]
+pub struct DynamicAdmission {
+    candidate: u16,
+    started_millis: u64,
+    direct: HashSet<u16>,
+    views: HashMap<u16, HashSet<u16>>,
+    acknowledged: HashSet<u16>,
+}
+
+impl DynamicAdmission {
+    #[must_use]
+    pub fn new(candidate: u16, started_millis: u64) -> Self {
+        Self {
+            candidate,
+            started_millis,
+            direct: HashSet::new(),
+            views: HashMap::new(),
+            acknowledged: HashSet::new(),
+        }
+    }
+
+    pub fn connected(&mut self, peer: u16) {
+        if peer != self.candidate {
+            self.direct.insert(peer);
+        }
+    }
+
+    pub fn disconnected(&mut self, peer: u16) {
+        self.direct.remove(&peer);
+        self.views.remove(&peer);
+        self.acknowledged.remove(&peer);
+        for view in self.views.values_mut() {
+            view.remove(&peer);
+        }
+    }
+
+    pub fn advertise(&mut self, view: PeerView) -> bool {
+        if !self.direct.contains(&view.reporter) {
+            return false;
+        }
+        self.views.insert(
+            view.reporter,
+            view.connected
+                .into_iter()
+                .filter(|peer| *peer != self.candidate)
+                .collect(),
+        );
+        true
+    }
+
+    pub fn acknowledge(&mut self, peer: u16) {
+        if peer != self.candidate {
+            self.acknowledged.insert(peer);
+        }
+    }
+
+    #[must_use]
+    pub fn required(&self) -> HashSet<u16> {
+        let mut required = self.direct.clone();
+        for reporter in &self.direct {
+            if let Some(view) = self.views.get(reporter) {
+                required.extend(view.iter().copied());
+            }
+        }
+        required.remove(&self.candidate);
+        required
+    }
+
+    #[must_use]
+    pub fn direct_peers(&self) -> Vec<u16> {
+        let mut peers: Vec<u16> = self.direct.iter().copied().collect();
+        peers.sort_unstable();
+        peers
+    }
+
+    #[must_use]
+    pub fn admitted(&self, now_millis: u64) -> bool {
+        if self.direct.is_empty() {
+            return false;
+        }
+        if !self.direct.iter().all(|peer| self.views.contains_key(peer)) {
+            return false;
+        }
+        let required = self.required();
+        required.is_subset(&self.direct)
+            || (now_millis.saturating_sub(self.started_millis) >= ADMISSION_SETTLE_MILLIS
+                && required.is_subset(&self.acknowledged))
+    }
 }
 
 /// Codec failure for [`JoinHandshake`] envelopes.
@@ -318,10 +430,12 @@ impl ClusterState {
 
     /// Builds this peer's hello announcement.
     #[must_use]
-    pub const fn hello(&self, cert_fingerprint: [u8; 32]) -> JoinHello {
+    pub const fn hello(&self, cert_fingerprint: [u8; 32], role: ClusterNodeRole) -> JoinHello {
         JoinHello {
             candidate: self.local,
             cert_fingerprint,
+            protocol_version: CLUSTER_PROTOCOL_VERSION,
+            role,
         }
     }
 
@@ -432,17 +546,17 @@ impl ClusterState {
     /// Eviction clears the peer from membership, drops it as a voter and as
     /// a candidate, prunes it from the directory, and returns each touched
     /// chunk so callers can refetch.
-    pub fn evict(&mut self, peer: u16) -> Vec<ChunkAddr> {
+    pub fn evict(&mut self, peer: u16) -> Vec<ChunkKey> {
         self.membership.remove(peer);
         self.votes.discard_candidate(peer);
         self.votes.discard_voter(peer);
-        let mut touched: Vec<ChunkAddr> = Vec::new();
+        let mut touched: Vec<ChunkKey> = Vec::new();
         for (chunk, holders) in self.directory.holders.iter_mut() {
             if holders.remove(&peer) {
                 touched.push(*chunk);
             }
         }
-        touched.sort_by(|left, right| (left.x, left.z).cmp(&(right.x, right.z)));
+        touched.sort_by(|left, right| left.cmp(right));
         self.directory
             .holders
             .retain(|_, holders| !holders.is_empty());
@@ -451,7 +565,7 @@ impl ClusterState {
 
     /// Lists chunk holders in deterministic order.
     #[must_use]
-    pub fn sorted_holders(&self, chunk: &ChunkAddr) -> Vec<u16> {
+    pub fn sorted_holders(&self, chunk: &ChunkKey) -> Vec<u16> {
         self.directory.sorted_holders(chunk)
     }
 
@@ -468,6 +582,9 @@ impl ClusterState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::WorldId;
+
+    const TEST_WORLD: WorldId = WorldId::new(0, 1);
 
     #[test]
     fn join_needs_unanimity() {
@@ -491,11 +608,114 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_admission_uses_live_peer_views_instead_of_bootstrap_configuration() {
+        let mut admission = DynamicAdmission::new(9, 1_000);
+        admission.connected(1);
+        assert!(admission.advertise(PeerView {
+            reporter: 1,
+            connected: vec![2, 3],
+        }));
+        admission.acknowledge(1);
+        admission.acknowledge(2);
+        assert!(!admission.admitted(11_000));
+        admission.acknowledge(3);
+        assert!(admission.admitted(11_000));
+    }
+
+    #[test]
+    fn direct_full_mesh_admits_without_the_settle_delay() {
+        let mut admission = DynamicAdmission::new(9, 10_000);
+        admission.connected(1);
+        admission.connected(2);
+        assert!(admission.advertise(PeerView {
+            reporter: 1,
+            connected: vec![2],
+        }));
+        assert!(!admission.admitted(10_000));
+        assert!(admission.advertise(PeerView {
+            reporter: 2,
+            connected: vec![1],
+        }));
+        assert!(admission.admitted(10_000));
+    }
+
+    #[test]
+    fn disconnected_peer_is_removed_from_admission_requirements() {
+        let mut admission = DynamicAdmission::new(9, 0);
+        admission.connected(1);
+        admission.connected(2);
+        assert!(admission.advertise(PeerView {
+            reporter: 1,
+            connected: vec![2],
+        }));
+        admission.disconnected(2);
+        assert!(admission.admitted(0));
+        assert_eq!(admission.required(), HashSet::from([1]));
+    }
+
+    #[test]
+    fn disconnected_candidate_does_not_self_admit_after_settle_window() {
+        let mut admission = DynamicAdmission::new(9, 0);
+        admission.connected(1);
+        assert!(admission.advertise(PeerView {
+            reporter: 1,
+            connected: Vec::new(),
+        }));
+        admission.acknowledge(1);
+        admission.disconnected(1);
+
+        assert!(!admission.admitted(10_000));
+        assert!(admission.required().is_empty());
+    }
+
+    #[test]
+    fn advertised_set_expansion_keeps_original_settle_deadline() {
+        let mut admission = DynamicAdmission::new(9, 1_000);
+        admission.connected(1);
+        assert!(admission.advertise(PeerView {
+            reporter: 1,
+            connected: vec![2],
+        }));
+        admission.acknowledge(1);
+        admission.acknowledge(2);
+        assert!(!admission.admitted(10_999));
+
+        assert!(admission.advertise(PeerView {
+            reporter: 1,
+            connected: vec![2, 3],
+        }));
+        admission.acknowledge(3);
+        assert!(admission.admitted(11_000));
+    }
+
+    #[test]
+    fn every_direct_peer_must_publish_a_view_before_admission() {
+        let mut admission = DynamicAdmission::new(9, 0);
+        admission.connected(1);
+        admission.connected(2);
+        assert!(admission.advertise(PeerView {
+            reporter: 1,
+            connected: vec![2],
+        }));
+        admission.acknowledge(1);
+        admission.acknowledge(2);
+
+        assert!(!admission.admitted(10_000));
+        assert!(admission.advertise(PeerView {
+            reporter: 2,
+            connected: vec![1],
+        }));
+        assert!(admission.admitted(10_000));
+    }
+
+    #[test]
     fn handshake_roundtrips() {
         let messages = [
             JoinHandshake::Hello(JoinHello {
                 candidate: 4,
                 cert_fingerprint: [9_u8; 32],
+                protocol_version: CLUSTER_PROTOCOL_VERSION,
+                role: ClusterNodeRole::Secondary,
             }),
             JoinHandshake::VoteRequest(JoinVoteRequest {
                 candidate: 4,
@@ -530,6 +750,8 @@ mod tests {
         let hello = JoinHello {
             candidate,
             cert_fingerprint: [7_u8; 32],
+            protocol_version: CLUSTER_PROTOCOL_VERSION,
+            role: ClusterNodeRole::Secondary,
         };
         assert_eq!(hello.candidate, candidate);
         assert!(cluster.record_approval(candidate, 1).is_none());
@@ -538,8 +760,11 @@ mod tests {
         assert!(cluster.is_member(candidate));
         assert!(!cluster.is_new_candidate(candidate));
 
-        let chunk = ChunkAddr { x: 0, z: 0 };
-        assert!(cluster.apply_advert(ChunkAdvert { holder: candidate, chunk }));
+        let chunk = ChunkKey::new(TEST_WORLD, 0, 0);
+        assert!(cluster.apply_advert(ChunkAdvert {
+            holder: candidate,
+            chunk
+        }));
         assert_eq!(cluster.sorted_holders(&chunk), vec![candidate]);
         assert_eq!(cluster.chunk_count(), 1);
     }
@@ -580,11 +805,20 @@ mod tests {
     #[test]
     fn drops_withdraw_adverts_and_evict_clears_holder() {
         let mut cluster = ClusterState::new(1, &[1, 2]);
-        let first = ChunkAddr { x: 1, z: 1 };
-        let second = ChunkAddr { x: 2, z: 2 };
-        assert!(cluster.apply_advert(ChunkAdvert { holder: 2, chunk: first }));
-        assert!(cluster.apply_advert(ChunkAdvert { holder: 2, chunk: second }));
-        assert!(cluster.apply_drop(ChunkDrop { holder: 2, chunk: first }));
+        let first = ChunkKey::new(TEST_WORLD, 1, 1);
+        let second = ChunkKey::new(TEST_WORLD, 2, 2);
+        assert!(cluster.apply_advert(ChunkAdvert {
+            holder: 2,
+            chunk: first
+        }));
+        assert!(cluster.apply_advert(ChunkAdvert {
+            holder: 2,
+            chunk: second
+        }));
+        assert!(cluster.apply_drop(ChunkDrop {
+            holder: 2,
+            chunk: first
+        }));
         assert!(cluster.sorted_holders(&first).is_empty());
         assert_eq!(cluster.sorted_holders(&second), vec![2]);
 
@@ -599,7 +833,7 @@ mod tests {
         let mut cluster = ClusterState::new(1, &[1]);
         assert!(!cluster.apply_advert(ChunkAdvert {
             holder: 9,
-            chunk: ChunkAddr { x: 0, z: 0 }
+            chunk: ChunkKey::new(TEST_WORLD, 0, 0)
         }));
         assert!(cluster.directory().is_empty());
     }

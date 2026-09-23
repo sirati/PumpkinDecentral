@@ -4,6 +4,7 @@ use pumpkin_util::permission::{Permission, PermissionDefault, PermissionRegistry
 use pumpkin_util::text::TextComponent;
 use tracing::info;
 
+use crate::command::CommandSender;
 use crate::command::argument_builder::{ArgumentBuilder, argument, command};
 use crate::command::argument_types::core::string::StringArgumentType;
 use crate::command::context::command_context::CommandContext;
@@ -24,35 +25,66 @@ impl CommandExecutor for MeExecutor {
         let hidden_sender = context
             .source
             .player_or_none()
-            .is_some_and(|player| crate::server::cluster_hide::is_hidden_player(&player));
+            .is_some_and(|player| crate::server::cluster_hide::is_hidden_player(server, &player))
+            || matches!(&context.source.output, CommandSender::PreJoin(lobby) if crate::server::cluster_hide::is_hidden_gid(server, &lobby.gid));
         if hidden_sender {
             let body = TextComponent::text(msg.to_string());
             for viewer in server.get_all_players() {
-                if viewer.gameprofile.id != context.source.player_or_none().map(|player| player.gameprofile.id).unwrap_or_default()
-                    && !viewer.has_permission(server, crate::server::cluster_hide::HIDE_PERMISSION)
+                if viewer.gameprofile.id
+                    != context
+                        .source
+                        .player_or_none()
+                        .map(|player| player.gameprofile.id)
+                        .unwrap_or_default()
                 {
                     continue;
                 }
                 viewer.send_message(&body, EMOTE_COMMAND, &context.source.display_name, None);
             }
         } else {
-            server.broadcast_message(
-                &TextComponent::text(msg.to_string()),
-                &context.source.display_name,
-                EMOTE_COMMAND,
-                None,
-            );
+            let message = TextComponent::text(msg.to_string());
+            if server.advanced_config.cluster.enabled {
+                let Ok(permit) = server.cluster_chat_presentation_tx.try_reserve() else {
+                    context
+                        .source
+                        .send_error(TextComponent::text("Cluster chat queue is full"));
+                    return Ok(0);
+                };
+                let sent = if let Some(player) = context.source.player_or_none() {
+                    crate::server::cluster_chat_out::broadcast_emote_from_player(
+                        server, &player, msg,
+                    )
+                } else {
+                    crate::server::cluster_chat_out::broadcast_emote_from_console(
+                        server,
+                        &context.source.name,
+                        msg,
+                    )
+                };
+                if !sent {
+                    context
+                        .source
+                        .send_error(TextComponent::text("Cluster chat queue is full"));
+                    return Ok(0);
+                }
+                permit.send(crate::server::cluster_chat_presentation::ChatPresentation {
+                    message,
+                    sender: context.source.display_name.clone(),
+                    chat_type: EMOTE_COMMAND,
+                });
+            } else {
+                server.broadcast_message(
+                    &message,
+                    &context.source.display_name,
+                    EMOTE_COMMAND,
+                    None,
+                );
+            }
         }
         if let Some(player) = context.source.player_or_none() {
             info!("* {} {}", player.gameprofile.name, msg);
-            crate::server::cluster_chat_out::broadcast_emote_from_player(server, &player, msg);
         } else {
             info!("* {} {}", context.source.name, msg);
-            crate::server::cluster_chat_out::broadcast_emote_from_console(
-                server,
-                &context.source.name,
-                msg,
-            );
         }
 
         Ok(1)

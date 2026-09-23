@@ -24,6 +24,11 @@ const ERROR_FAILED: CommandErrorType<0> = CommandErrorType::new(
     translation::java::COMMANDS_ENCHANT_FAILED,
 );
 
+const ERROR_CLUSTER_INVENTORY_UNAVAILABLE: CommandErrorType<0> = CommandErrorType::new(
+    "commands.inventory.unavailable",
+    "Inventory change unavailable",
+);
+
 const ERROR_FAILED_LEVEL: CommandErrorType<2> = CommandErrorType::new(
     translation::java::COMMANDS_ENCHANT_FAILED_LEVEL,
     translation::java::COMMANDS_ENCHANT_FAILED_LEVEL,
@@ -79,6 +84,15 @@ struct EnchantExecutor {
 
 impl CommandExecutor for EnchantExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
+        if context
+            .source
+            .world()
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            return Err(ERROR_CLUSTER_INVENTORY_UNAVAILABLE.create_without_context());
+        }
         let targets = EntityArgumentType::get_entities(context, "targets")?;
         let enchantment = ResourceArgument::get_enchantment(context, "enchantment")?;
         let level = if self.has_level {

@@ -23,22 +23,41 @@ impl CommandExecutor for Executor {
         let msg = context.get_argument::<String>(ARG_MESSAGE)?;
 
         let server = context.server();
-        server.broadcast_message(
-            &TextComponent::text(msg.clone()),
-            &context.source.display_name,
-            SAY_COMMAND,
-            None,
-        );
+        let message = TextComponent::text(msg.clone());
+        if server.advanced_config.cluster.enabled {
+            let Ok(permit) = server.cluster_chat_presentation_tx.try_reserve() else {
+                context
+                    .source
+                    .send_error(TextComponent::text("Cluster chat queue is full"));
+                return Ok(0);
+            };
+            let sent = if let Some(player) = context.source.player_or_none() {
+                crate::server::cluster_chat_out::broadcast_say_from_player(server, &player, msg)
+            } else {
+                crate::server::cluster_chat_out::broadcast_say_from_console(
+                    server,
+                    &context.source.name,
+                    msg,
+                )
+            };
+            if !sent {
+                context
+                    .source
+                    .send_error(TextComponent::text("Cluster chat queue is full"));
+                return Ok(0);
+            }
+            permit.send(crate::server::cluster_chat_presentation::ChatPresentation {
+                message,
+                sender: context.source.display_name.clone(),
+                chat_type: SAY_COMMAND,
+            });
+        } else {
+            server.broadcast_message(&message, &context.source.display_name, SAY_COMMAND, None);
+        }
         if let Some(player) = context.source.player_or_none() {
             info!("<chat> {}: {}", player.gameprofile.name, msg);
-            crate::server::cluster_chat_out::broadcast_say_from_player(server, &player, msg);
         } else {
             info!("<chat> {}: {}", context.source.name, msg);
-            crate::server::cluster_chat_out::broadcast_say_from_console(
-                server,
-                &context.source.name,
-                msg,
-            );
         }
 
         Ok(1)

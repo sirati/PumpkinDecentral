@@ -100,12 +100,8 @@ impl NetherNetDiscovery {
     }
 
     async fn advertise(&self, server: &Server, address: SocketAddr) -> Result<(), Error> {
-        let players = crate::server::cluster_status::cluster_status_online();
-        let game_mode = server
-            .defaultgamemode
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .gamemode as u8;
+        let players = crate::server::cluster_status::cluster_status_online(server);
+        let game_mode = server.defaultgamemode.load().gamemode as u8;
         let response = encode_response(
             self.network_id,
             self.advertisement_id,

@@ -23,6 +23,11 @@ pub const UNKNOWN_PLAYER_ERROR_TYPE: CommandErrorType<0> = CommandErrorType::new
     translation::java::ARGUMENT_PLAYER_UNKNOWN,
 );
 
+const PROFILE_LOOKUP_PENDING_ERROR_TYPE: CommandErrorType<0> = CommandErrorType::new(
+    "cluster.profile.lookup_pending",
+    "cluster.profile.lookup_pending",
+);
+
 /// A result from the [`GameProfileArgumentType`], which can be resolved into
 /// one or more [`GameProfile`]s, successfully or not.
 pub enum GameProfileResult {
@@ -64,6 +69,34 @@ impl GameProfileResult {
                 let server = source.server();
                 if let Some(player) = server.get_player_by_name(name) {
                     return Ok(vec![player.gameprofile.clone()]);
+                }
+
+                if let Some((_, entry)) =
+                    crate::server::cluster_presence::all_presence_entries(server)
+                        .into_iter()
+                        .find(|(_, entry)| entry.name.eq_ignore_ascii_case(name))
+                {
+                    return Ok(vec![Self::profile_from_presence(entry)]);
+                }
+
+                if server.advanced_config.cluster.enabled {
+                    if let Some(profile) = Self::resolve_known_profile_by_name(server, name) {
+                        return Ok(vec![profile]);
+                    }
+                    if !server.advanced_config.networking.java.online_mode
+                        && let Ok(uuid) = offline_uuid(name)
+                    {
+                        return Ok(vec![Self::profile_from_uuid_name(uuid, name.clone())]);
+                    }
+                    if crate::server::cluster_presence::request_profile_name_lookup(server, name) {
+                        return Err(CommandSyntaxError::create_without_context(
+                            &PROFILE_LOOKUP_PENDING_ERROR_TYPE,
+                            pumpkin_util::text::TextComponent::text(
+                                "Profile lookup pending; retry this command shortly.",
+                            ),
+                        ));
+                    }
+                    return Err(Self::unknown_player_syntax_error());
                 }
 
                 let cached_entry = server
@@ -116,6 +149,20 @@ impl GameProfileResult {
                     return Ok(vec![player.gameprofile.clone()]);
                 }
 
+                if let Some((_, entry)) =
+                    crate::server::cluster_presence::all_presence_entries(server)
+                        .into_iter()
+                        .find(|(_, entry)| entry.uuid == *uuid.as_bytes())
+                {
+                    return Ok(vec![Self::profile_from_presence(entry)]);
+                }
+
+                if server.advanced_config.cluster.enabled {
+                    return Self::resolve_known_profile_by_uuid(server, *uuid)
+                        .map(|profile| vec![profile])
+                        .ok_or_else(Self::unknown_player_syntax_error);
+                }
+
                 let cached_entry = server
                     .data
                     .user_cache
@@ -136,6 +183,46 @@ impl GameProfileResult {
     }
 
     fn resolve_known_profile_by_name(server: &Server, name: &str) -> Option<GameProfile> {
+        if server.advanced_config.cluster.enabled {
+            let presence = server.cluster_presence.snapshot();
+            if let Some((uuid, known_name)) = presence
+                .known_profiles
+                .iter()
+                .find(|(_, known_name)| known_name.eq_ignore_ascii_case(name))
+            {
+                return Some(Self::profile_from_uuid_name(
+                    Uuid::from_bytes(*uuid),
+                    known_name.clone(),
+                ));
+            }
+            let admin = server.cluster_admin_view.load();
+            if let Some(op) = admin
+                .operators
+                .iter()
+                .find(|op| op.name.eq_ignore_ascii_case(name))
+            {
+                return Some(Self::profile_from_uuid_name(
+                    Uuid::from_bytes(op.uuid),
+                    op.name.clone(),
+                ));
+            }
+            if let Some(entry) = server
+                .cluster_access_policy
+                .snapshot()
+                .whitelist
+                .iter()
+                .find(|entry| entry.name.eq_ignore_ascii_case(name))
+            {
+                return Some(Self::profile_from_uuid_name(entry.uuid, entry.name.clone()));
+            }
+            return admin
+                .banned_players
+                .iter()
+                .find(|entry| entry.name.eq_ignore_ascii_case(name))
+                .map(|entry| {
+                    Self::profile_from_uuid_name(Uuid::from_bytes(entry.uuid), entry.name.clone())
+                });
+        }
         let ops = server
             .data
             .operator_config
@@ -175,6 +262,34 @@ impl GameProfileResult {
     }
 
     fn resolve_known_profile_by_uuid(server: &Server, uuid: Uuid) -> Option<GameProfile> {
+        if server.advanced_config.cluster.enabled {
+            let presence = server.cluster_presence.snapshot();
+            if let Some(name) = presence.known_profiles.get(uuid.as_bytes()) {
+                return Some(Self::profile_from_uuid_name(uuid, name.clone()));
+            }
+            let admin = server.cluster_admin_view.load();
+            if let Some(op) = admin
+                .operators
+                .iter()
+                .find(|op| op.uuid == *uuid.as_bytes())
+            {
+                return Some(Self::profile_from_uuid_name(uuid, op.name.clone()));
+            }
+            if let Some(entry) = server
+                .cluster_access_policy
+                .snapshot()
+                .whitelist
+                .iter()
+                .find(|entry| entry.uuid == uuid)
+            {
+                return Some(Self::profile_from_uuid_name(uuid, entry.name.clone()));
+            }
+            return admin
+                .banned_players
+                .iter()
+                .find(|entry| entry.uuid == *uuid.as_bytes())
+                .map(|entry| Self::profile_from_uuid_name(uuid, entry.name.clone()));
+        }
         let ops = server
             .data
             .operator_config
@@ -215,6 +330,17 @@ impl GameProfileResult {
             id: uuid,
             name,
             properties: ArcSwap::new(Arc::new(vec![])),
+            profile_actions: None,
+        }
+    }
+
+    fn profile_from_presence(entry: pumpkin_cluster::presence::RemotePlayerEntry) -> GameProfile {
+        GameProfile {
+            id: Uuid::from_bytes(entry.uuid),
+            name: entry.name,
+            properties: ArcSwap::new(Arc::new(
+                crate::server::cluster_chat_pm::protocol_properties(&entry.properties),
+            )),
             profile_actions: None,
         }
     }

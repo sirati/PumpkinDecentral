@@ -23,6 +23,7 @@ proc-macro2 = { workspace = true, optional = true }
 
 uuid.workspace = true
 dashmap.workspace = true
+arc-swap.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

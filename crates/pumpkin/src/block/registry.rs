@@ -615,7 +615,7 @@ impl BlockRegistry {
         use_item_on: &SUseItemOn,
         location: BlockPos,
         face: BlockDirection,
-    ) -> Result<Option<(BlockPos, BlockStateId)>, BlockPlacingError> {
+    ) -> Result<Option<(BlockPos, BlockStateId, BlockStateId)>, BlockPlacingError> {
         let entity = &player.get_entity();
 
         match player.gamemode.load() {
@@ -786,7 +786,7 @@ impl BlockRegistry {
             return Ok(None);
         }
 
-        let _replaced_id =
+        let replaced_id =
             world.set_block_state(&final_block_pos, new_state, BlockFlags::NOTIFY_ALL);
 
         world.play_bedrock_level_sound(
@@ -817,7 +817,7 @@ impl BlockRegistry {
             },
         );
 
-        Ok(Some((final_block_pos, new_state)))
+        Ok(Some((final_block_pos, new_state, replaced_id)))
     }
     #[allow(clippy::expect_used)]
     pub fn register<T: BlockBehaviour + BlockMetadata + 'static>(&mut self, block: T) {
@@ -945,6 +945,9 @@ impl BlockRegistry {
         server: &Server,
         world: &Arc<World>,
     ) -> BlockActionResult {
+        if server.advanced_config.cluster.enabled {
+            return BlockActionResult::Fail;
+        }
         let pumpkin_block = self.get_pumpkin_block(block.id);
         if let Some(pumpkin_block) = pumpkin_block {
             return pumpkin_block.normal_use(NormalUseArgs {
@@ -967,6 +970,9 @@ impl BlockRegistry {
         server: &Server,
         world: &Arc<World>,
     ) -> Option<Box<dyn ScreenHandlerFactory>> {
+        if server.advanced_config.cluster.enabled {
+            return None;
+        }
         let pumpkin_block = self.get_pumpkin_block(block.id);
         if let Some(pumpkin_block) = pumpkin_block {
             return pumpkin_block.get_screen_handler_factory(GetScreenHandlerFactoryArgs {
@@ -1003,6 +1009,9 @@ impl BlockRegistry {
         server: &Server,
         world: &Arc<World>,
     ) -> BlockActionResult {
+        if server.advanced_config.cluster.enabled {
+            return BlockActionResult::Fail;
+        }
         let pumpkin_block = self.get_pumpkin_block(block.id);
         if let Some(pumpkin_block) = pumpkin_block {
             return pumpkin_block.use_with_item(UseWithItemArgs {
@@ -1028,6 +1037,9 @@ impl BlockRegistry {
         server: &Server,
         world: &Arc<World>,
     ) -> BlockActionResult {
+        if server.advanced_config.cluster.enabled {
+            return BlockActionResult::Fail;
+        }
         let pumpkin_fluid = self.get_pumpkin_fluid(fluid.id);
         if let Some(pumpkin_fluid) = pumpkin_fluid {
             return pumpkin_fluid.use_with_item(fluid, player, position, item, server, world);

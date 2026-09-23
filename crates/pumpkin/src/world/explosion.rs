@@ -535,9 +535,7 @@ impl Explosion {
                 if crate::server::cluster_world_delta::mesh_active() {
                     let destroyed: Vec<(BlockPos, u16)> = blocks
                         .iter()
-                        .map(|(block_pos, (_, block_state))| {
-                            (*block_pos, block_state.id.as_u16())
-                        })
+                        .map(|(block_pos, (_, block_state))| (*block_pos, block_state.id.as_u16()))
                         .collect();
                     crate::server::cluster_world_delta::emit_explosion_blocks(
                         world,

@@ -7,36 +7,27 @@
 //! which node hosts them.
 
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use pumpkin_cluster::admin_sync::{
-    AdminAudit, AdminControlMessage, AdminMutation, BanEntry, BanRevoke, KickRequest, OpGrant,
-    OpRevoke, SpectateRequest, encode_control_message, is_valid_op_level,
-    should_deliver_kick_locally, submit_admin_mutation,
+    AdminAudit, AdminControlMessage, AdminMutation, AdminSnapshot, BanEntry, BanRevoke,
+    KickRequest, OpGrant, OpRevoke, SpectateRequest, encode_admin_snapshot_frames,
+    encode_control_message, is_valid_op_level, should_deliver_kick_locally, submit_admin_mutation,
 };
-use pumpkin_cluster::identity::{PlayerSlot, ServerId};
-use pumpkin_cluster::protocol::StreamKind;
-use pumpkin_cluster::streams::{OutboundParcel, StreamHeader};
+use pumpkin_cluster::identity::ServerId;
 use pumpkin_config::ClusterRole;
 use pumpkin_util::GameMode;
 use pumpkin_util::PermissionLvl;
 use pumpkin_util::text::TextComponent;
 use pumpkin_util::text::color::{Color, NamedColor};
-use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::Server;
+use super::cluster_global_outbound::EventReservation;
 use crate::data::SaveJSONConfiguration;
 use crate::entity::EntityBase;
 use crate::net::DisconnectReason;
 
-struct AdminOutbox {
-    peers: Vec<u16>,
-    outbound: mpsc::Sender<OutboundParcel>,
-}
-
-static ADMIN_OUTBOX: OnceLock<AdminOutbox> = OnceLock::new();
 static ADMIN_MUTATION_APPLIED: AtomicU64 = AtomicU64::new(0);
 static ADMIN_MUTATION_SENT: AtomicU64 = AtomicU64::new(0);
 static ADMIN_MUTATION_UNSENT: AtomicU64 = AtomicU64::new(0);
@@ -60,7 +51,7 @@ pub fn admin_mutations_unsent() -> u64 {
     ADMIN_MUTATION_UNSENT.load(Ordering::Relaxed)
 }
 
-fn admin_broadcast_warn_cooldown_elapsed() -> bool {
+pub(crate) fn admin_broadcast_warn_cooldown_elapsed() -> bool {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|age| age.as_millis() as u64)
@@ -86,22 +77,47 @@ pub fn spectates_delivered() -> u64 {
     ADMIN_SPECTATE_DELIVERED.load(Ordering::Relaxed)
 }
 
-/// Installs the outbound admin channel used to propagate mutations and kick/spectate requests.
-pub fn install_admin_outbox(peers: Vec<u16>, outbound: mpsc::Sender<OutboundParcel>) {
-    let _ = ADMIN_OUTBOX.set(AdminOutbox { peers, outbound });
-}
-
 fn cluster_enabled(server: &Server) -> bool {
     server.advanced_config.cluster.enabled
+}
+
+pub fn mutation_pending_primary(server: &Server) -> bool {
+    cluster_enabled(server)
+}
+
+pub fn defer_local_admin_apply(server: &Server) -> bool {
+    cluster_enabled(server) && matches!(server.advanced_config.cluster.role, ClusterRole::Primary)
+}
+
+pub(crate) fn notify_durable_admin_ack(server: &Server, issuer: &str) {
+    let message = TextComponent::text("Cluster admin change is durable on the primary.");
+    if server
+        .cluster_lobby_directory
+        .route_message(issuer, &message)
+    {
+        return;
+    }
+    if let Some(player) = server.get_player_by_name(issuer) {
+        player.send_system_message(&message);
+    } else {
+        info!(
+            issuer,
+            "cluster admin change durable on primary; issuer is offline"
+        );
+    }
 }
 
 fn local_server_id(server: &Server) -> ServerId {
     ServerId(server.advanced_config.cluster.server_id)
 }
 
-fn persist_on_primary(server: &Server, mutation: &AdminMutation) {
+pub(crate) fn stores_authoritative_files(server: &Server) -> bool {
+    !cluster_enabled(server) || matches!(server.advanced_config.cluster.role, ClusterRole::Primary)
+}
+
+fn persist_on_primary(server: &Server, mutation: &AdminMutation) -> bool {
     let Some(handle) = server.primary_save.as_ref() else {
-        return;
+        return false;
     };
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -114,19 +130,120 @@ fn persist_on_primary(server: &Server, mutation: &AdminMutation) {
     )
     .is_err()
     {
-        warn!("cluster admin mutation persist queue full");
+        if admin_broadcast_warn_cooldown_elapsed() {
+            warn!("cluster admin mutation persist queue full");
+        }
+        return false;
+    }
+    true
+}
+
+pub struct PreparedAdminMutation {
+    mutation: AdminMutation,
+    outbound: Option<PreparedAdminRoute>,
+}
+
+pub(crate) struct LocalAdminMutation {
+    pub id: [u8; 16],
+    pub audit: AdminAudit,
+}
+
+enum PreparedAdminRoute {
+    Primary(
+        tokio::sync::mpsc::OwnedPermit<LocalAdminMutation>,
+        LocalAdminMutation,
+    ),
+    Secondary(EventReservation, Vec<u8>),
+}
+
+pub fn admin_busy_error() -> crate::command::errors::command_syntax_error::CommandSyntaxError {
+    use crate::command::errors::command_syntax_error::CommandSyntaxError;
+    use crate::command::errors::error_types::CommandErrorType;
+
+    static CLUSTER_ADMIN_BUSY: CommandErrorType<0> =
+        CommandErrorType::new("cluster.admin.busy", "cluster.admin.busy");
+    CommandSyntaxError::create_without_context(
+        &CLUSTER_ADMIN_BUSY,
+        TextComponent::text("Cluster admin operation could not be queued; try again."),
+    )
+}
+
+pub fn prepare_admin_mutation(
+    server: &Server,
+    mutation: AdminMutation,
+    issuer: &str,
+) -> Option<PreparedAdminMutation> {
+    if !cluster_enabled(server) {
+        return Some(PreparedAdminMutation {
+            mutation,
+            outbound: None,
+        });
+    }
+    let audit = AdminAudit::new(issuer.to_string(), mutation.clone());
+    let is_primary = matches!(server.advanced_config.cluster.role, ClusterRole::Primary);
+    let id = *uuid::Uuid::new_v4().as_bytes();
+    let outbound = if is_primary {
+        let route = server.cluster_admin_local_route.load_full()?;
+        let reservation = route.as_ref().clone().try_reserve_owned().ok()?;
+        PreparedAdminRoute::Primary(reservation, LocalAdminMutation { id, audit })
+    } else {
+        let bytes =
+            encode_control_message(&AdminControlMessage::SequencedMutation { id, audit }).ok()?;
+        let reservation = server
+            .cluster_global_outbound
+            .try_reserve_primary_event(id)?;
+        PreparedAdminRoute::Secondary(reservation, bytes)
+    };
+    Some(PreparedAdminMutation {
+        mutation,
+        outbound: Some(outbound),
+    })
+}
+
+pub fn commit_admin_mutation(server: &Server, prepared: PreparedAdminMutation) {
+    let PreparedAdminMutation { mutation, outbound } = prepared;
+    let outbound = match outbound {
+        Some(PreparedAdminRoute::Primary(reservation, command)) => {
+            reservation.send(command);
+            ADMIN_MUTATION_SENT.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        other => other,
+    };
+    match &mutation {
+        AdminMutation::GrantOp(grant) => {
+            if let Some(level) = permission_level_from_u8(grant.level) {
+                super::cluster_presence::publish_permission(
+                    server,
+                    uuid::Uuid::from_bytes(grant.uuid),
+                    Some(level),
+                );
+            }
+        }
+        AdminMutation::RevokeOp(revoke) => {
+            super::cluster_presence::publish_permission(
+                server,
+                uuid::Uuid::from_bytes(revoke.uuid),
+                None,
+            );
+        }
+        AdminMutation::AddBan(_) | AdminMutation::RemoveBan(_) => {}
+    }
+    let revision = server.cluster_admin_view.load().revision;
+    apply_mutation_to_view(server, revision, &mutation);
+    if !cluster_enabled(server) {
+        return;
+    }
+    let _ = persist_on_primary(server, &mutation);
+    if let Some(PreparedAdminRoute::Secondary(reservation, bytes)) = outbound {
+        reservation.commit(bytes);
+        ADMIN_MUTATION_SENT.fetch_add(1, Ordering::Relaxed);
     }
 }
 
-fn try_broadcast(message: &AdminControlMessage) -> usize {
-    let Some(outbox) = ADMIN_OUTBOX.get() else {
-        ADMIN_MUTATION_UNSENT.fetch_add(1, Ordering::Relaxed);
-        if admin_broadcast_warn_cooldown_elapsed() {
-            warn!("cluster admin broadcast dropped: outbox not installed");
-        }
-        return 0;
-    };
-    if outbox.peers.is_empty() {
+fn try_broadcast(server: &Server, message: &AdminControlMessage) -> usize {
+    let peers = server.cluster_connected_peers.load();
+    if peers.is_empty() {
         ADMIN_MUTATION_UNSENT.fetch_add(1, Ordering::Relaxed);
         if admin_broadcast_warn_cooldown_elapsed() {
             warn!("cluster admin broadcast dropped: no peers");
@@ -137,25 +254,19 @@ fn try_broadcast(message: &AdminControlMessage) -> usize {
         warn!("cluster admin control encode failed");
         return 0;
     };
-    let mut sent = 0_usize;
-    for peer in &outbox.peers {
-        let parcel = OutboundParcel {
-            peer: ServerId(*peer),
-            header: StreamHeader::new(StreamKind::Control, None),
-            bytes: bytes.clone(),
-        };
-        if outbox.outbound.try_send(parcel).is_ok() {
-            sent = sent.saturating_add(1);
-        }
-    }
+    let accepted =
+        server
+            .cluster_global_outbound
+            .try_event(server, peers.iter().copied().collect(), bytes);
+    let sent = if accepted { peers.len() } else { 0 };
     ADMIN_MUTATION_SENT.fetch_add(sent as u64, Ordering::Relaxed);
-    let unsent = outbox.peers.len().saturating_sub(sent);
+    let unsent = peers.len().saturating_sub(sent);
     if unsent > 0 {
         ADMIN_MUTATION_UNSENT.fetch_add(unsent as u64, Ordering::Relaxed);
         if admin_broadcast_warn_cooldown_elapsed() {
             warn!(
                 sent = sent,
-                peers = outbox.peers.len(),
+                peers = peers.len(),
                 "cluster admin broadcast partially dropped: mesh queue full"
             );
         }
@@ -163,20 +274,14 @@ fn try_broadcast(message: &AdminControlMessage) -> usize {
     sent
 }
 
-fn try_send_to_host(host: u16, message: &AdminControlMessage) -> bool {
-    let Some(outbox) = ADMIN_OUTBOX.get() else {
-        return false;
-    };
+fn try_send_to_host(server: &Server, host: u16, message: &AdminControlMessage) -> bool {
     let Ok(bytes) = encode_control_message(message) else {
         warn!("cluster admin control encode failed");
         return false;
     };
-    let parcel = OutboundParcel {
-        peer: ServerId(host),
-        header: StreamHeader::new(StreamKind::Control, None),
-        bytes,
-    };
-    outbox.outbound.try_send(parcel).is_ok()
+    server
+        .cluster_global_outbound
+        .try_event(server, vec![ServerId(host)], bytes)
 }
 
 /// The primary is the mesh fan-out point for inbound administrative changes.
@@ -189,11 +294,23 @@ const fn should_relay_inbound_mutation(role: ClusterRole) -> bool {
     matches!(role, ClusterRole::Primary)
 }
 
-fn relay_inbound_mutation_from_primary(server: &Server, message: &AdminControlMessage) -> usize {
+pub(crate) fn relay_inbound_mutation_from_primary(
+    server: &Server,
+    message: &AdminControlMessage,
+) -> bool {
     if !should_relay_inbound_mutation(server.advanced_config.cluster.role) {
-        return 0;
+        return true;
     }
-    try_broadcast(message)
+    let peers = server.cluster_connected_peers.load();
+    if peers.is_empty() {
+        return true;
+    }
+    let Ok(bytes) = encode_control_message(message) else {
+        return false;
+    };
+    server
+        .cluster_global_outbound
+        .try_event(server, peers.iter().copied().collect(), bytes)
 }
 
 /// Propagates a locally-applied admin mutation to peers and persists it on the primary.
@@ -201,25 +318,36 @@ pub fn propagate_admin_mutation(server: &Server, mutation: &AdminMutation, issue
     if !cluster_enabled(server) {
         return;
     }
-    persist_on_primary(server, mutation);
-    // One control parcel carries both the state transition and its operator
-    // feedback. This preserves ordering and prevents a remote peer from
-    // displaying a success for a transition it did not receive.
-    let sent = try_broadcast(&AdminControlMessage::MutationWithAudit(AdminAudit::new(
-        issuer.to_string(),
-        mutation.clone(),
-    )));
+    let _ = persist_on_primary(server, mutation);
+    let sent = try_broadcast(
+        server,
+        &AdminControlMessage::MutationWithAudit(AdminAudit::new(
+            issuer.to_string(),
+            mutation.clone(),
+        )),
+    );
     if sent > 0 {
         debug!(peers = sent, "cluster admin mutation broadcast");
     }
 }
 
-pub fn publish_ops_to_peer(server: &Server, peer: u16) {
-    let Some(outbox) = ADMIN_OUTBOX.get() else {
-        return;
-    };
-    let target = ServerId(peer);
-    let grants: Vec<OpGrant> = {
+pub fn publish_admin_snapshot_to_peer(server: &Server, peer: u16) -> bool {
+    if !matches!(server.advanced_config.cluster.role, ClusterRole::Primary) {
+        let Ok(bytes) = encode_control_message(&AdminControlMessage::SnapshotRequest) else {
+            return false;
+        };
+        return server
+            .cluster_global_outbound
+            .try_event(server, vec![ServerId(peer)], bytes);
+    }
+    server
+        .cluster_admin_seed_route
+        .load_full()
+        .is_some_and(|route| route.try_send(ServerId(peer)).is_ok())
+}
+
+pub(crate) fn snapshot_from_stores(server: &Server, revision: u64) -> AdminSnapshot {
+    let mut grants: Vec<OpGrant> = {
         let guard = server
             .data
             .operator_config
@@ -238,19 +366,180 @@ pub fn publish_ops_to_peer(server: &Server, peer: u16) {
             })
             .collect()
     };
-    for grant in grants {
-        let Ok(bytes) = encode_control_message(&AdminControlMessage::Mutation(
-            AdminMutation::GrantOp(grant),
-        )) else {
-            continue;
-        };
-        let parcel = OutboundParcel {
-            peer: target,
-            header: StreamHeader::new(StreamKind::Control, None),
-            bytes,
-        };
-        let _ = outbox.outbound.try_send(parcel);
+    grants.sort_unstable_by_key(|grant| grant.uuid);
+    let mut bans: Vec<BanEntry> = {
+        let guard = server
+            .data
+            .banned_player_list
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .banned_players
+            .iter()
+            .map(|entry| {
+                BanEntry::new(
+                    *entry.uuid.as_bytes(),
+                    entry.name.clone(),
+                    entry.source.clone(),
+                    entry.reason.clone(),
+                    entry.created.unix_timestamp(),
+                    entry.expires.map(|expires| expires.unix_timestamp()),
+                )
+            })
+            .collect()
+    };
+    bans.sort_unstable_by_key(|ban| ban.uuid);
+    AdminSnapshot {
+        revision,
+        operators: grants,
+        banned_players: bans,
     }
+}
+
+pub(crate) fn snapshot_with_revision(server: &Server, revision: u64) -> AdminSnapshot {
+    let mut snapshot = server.cluster_admin_view.load().as_ref().clone();
+    snapshot.revision = revision;
+    snapshot
+}
+
+fn apply_mutation_to_view(server: &Server, revision: u64, mutation: &AdminMutation) {
+    let mut snapshot = snapshot_with_revision(server, revision);
+    match mutation {
+        AdminMutation::GrantOp(grant) => {
+            snapshot.operators.retain(|entry| entry.uuid != grant.uuid);
+            snapshot.operators.push(grant.clone());
+            snapshot.operators.sort_unstable_by_key(|entry| entry.uuid);
+        }
+        AdminMutation::RevokeOp(revoke) => {
+            snapshot.operators.retain(|entry| entry.uuid != revoke.uuid);
+        }
+        AdminMutation::AddBan(ban) => {
+            snapshot
+                .banned_players
+                .retain(|entry| entry.uuid != ban.uuid);
+            snapshot.banned_players.push(ban.clone());
+            snapshot
+                .banned_players
+                .sort_unstable_by_key(|entry| entry.uuid);
+        }
+        AdminMutation::RemoveBan(revoke) => {
+            snapshot
+                .banned_players
+                .retain(|entry| entry.uuid != revoke.uuid);
+        }
+    }
+    server.cluster_admin_view.store(Arc::new(snapshot));
+}
+
+pub(crate) fn enqueue_admin_snapshot(server: &Server, peer: ServerId, revision: u64) -> bool {
+    let Some(reservation) = server
+        .cluster_global_outbound
+        .try_reserve_snapshot(server, peer)
+    else {
+        return false;
+    };
+    let snapshot = snapshot_with_revision(server, revision);
+    let frames = match encode_admin_snapshot_frames(&snapshot) {
+        Ok(frames) => frames,
+        Err(error) => {
+            if admin_broadcast_warn_cooldown_elapsed() {
+                tracing::error!(%error, "cluster admin snapshot encoding failed");
+            }
+            return false;
+        }
+    };
+    reservation.commit(frames);
+    true
+}
+
+pub(crate) fn apply_admin_snapshot(server: &Server, snapshot: &AdminSnapshot) -> bool {
+    if snapshot.operators.len() > 4096 || snapshot.banned_players.len() > 4096 {
+        return false;
+    }
+    let mut seen_ops = std::collections::HashSet::new();
+    let mut permissions = std::collections::HashMap::new();
+    for grant in &snapshot.operators {
+        let Some(level) = permission_level_from_u8(grant.level) else {
+            return false;
+        };
+        if grant.name.is_empty() || grant.name.len() > 256 || !seen_ops.insert(grant.uuid) {
+            return false;
+        }
+        permissions.insert(grant.uuid, level);
+    }
+    let mut seen_bans = std::collections::HashSet::new();
+    for ban in &snapshot.banned_players {
+        let Some(created) = epoch_to_datetime(ban.created_epoch_secs) else {
+            return false;
+        };
+        let expires = match ban.expires_epoch_secs {
+            Some(epoch) => match epoch_to_datetime(epoch) {
+                Some(expires) => Some(expires),
+                None => return false,
+            },
+            None => None,
+        };
+        if ban.name.is_empty()
+            || ban.name.len() > 256
+            || ban.source.len() > 4096
+            || ban.reason.len() > 4096
+            || !seen_bans.insert(ban.uuid)
+        {
+            return false;
+        }
+        let _ = (created, expires);
+    }
+    let Some(presence_permit) = server.cluster_presence.try_reserve() else {
+        return false;
+    };
+    let old_ops = server.cluster_admin_view.load().operators.clone();
+    server.cluster_admin_view.store(Arc::new(snapshot.clone()));
+    presence_permit.send(super::cluster_presence::PresenceCommand::ReplacePermissions(permissions));
+    for old in old_ops {
+        if !seen_ops.contains(&old.uuid) {
+            if let Some(player) = server.get_player_by_uuid(uuid::Uuid::from_bytes(old.uuid))
+                && let Some(server_arc) = player.world().server.upgrade()
+            {
+                let dispatcher = server_arc.command_dispatcher.load();
+                player.set_permission_lvl(&server_arc, PermissionLvl::Zero, &dispatcher);
+            }
+        }
+    }
+    for grant in &snapshot.operators {
+        if let Some(level) = permission_level_from_u8(grant.level) {
+            let uuid = uuid::Uuid::from_bytes(grant.uuid);
+            if let Some(player) = server.get_player_by_uuid(uuid)
+                && let Some(server_arc) = player.world().server.upgrade()
+            {
+                let dispatcher = server_arc.command_dispatcher.load();
+                player.set_permission_lvl(&server_arc, level, &dispatcher);
+            }
+        }
+    }
+    let local_server = local_server_id(server);
+    for ban in &snapshot.banned_players {
+        if ban
+            .expires_epoch_secs
+            .is_some_and(|expires| expires < time::OffsetDateTime::now_utc().unix_timestamp())
+        {
+            continue;
+        }
+        let uuid = uuid::Uuid::from_bytes(ban.uuid);
+        if let Some(player) = server.get_player_by_uuid(uuid) {
+            player.kick(
+                DisconnectReason::Kicked,
+                &TextComponent::text(ban.reason.clone()),
+            );
+        } else if let Some((_, entry)) = super::cluster_presence::all_presence_entries(server)
+            .into_iter()
+            .find(|(gid, entry)| gid.server == local_server && entry.uuid == ban.uuid)
+        {
+            server
+                .cluster_lobby_directory
+                .disconnect(&entry.name, &TextComponent::text(ban.reason.clone()));
+        }
+    }
+    true
 }
 
 /// Publishes a locally-applied op grant to peers and persists it on the primary.
@@ -262,6 +551,7 @@ pub fn publish_op_grant(
     bypasses_player_limit: bool,
     issuer: &str,
 ) {
+    super::cluster_presence::publish_permission(server, uuid, Some(level));
     let grant = OpGrant::new(
         *uuid.as_bytes(),
         name.to_string(),
@@ -273,6 +563,7 @@ pub fn publish_op_grant(
 
 /// Publishes a locally-applied op revoke to peers and persists it on the primary.
 pub fn publish_op_revoke(server: &Server, uuid: uuid::Uuid, name: &str, issuer: &str) {
+    super::cluster_presence::publish_permission(server, uuid, None);
     let revoke = OpRevoke::new(*uuid.as_bytes(), name.to_string());
     propagate_admin_mutation(server, &AdminMutation::RevokeOp(revoke), issuer);
 }
@@ -328,6 +619,23 @@ fn apply_grant_to_server(server: &Server, grant: &OpGrant) -> bool {
         return false;
     };
     let uuid = uuid::Uuid::from_bytes(grant.uuid);
+    if cluster_enabled(server) {
+        let changed = !server
+            .cluster_admin_view
+            .load()
+            .operators
+            .iter()
+            .any(|entry| entry == grant);
+        if changed {
+            if let Some(player) = server.get_player_by_uuid(uuid)
+                && let Some(server_arc) = player.world().server.upgrade()
+            {
+                let dispatcher = server_arc.command_dispatcher.load();
+                player.set_permission_lvl(&server_arc, level, &dispatcher);
+            }
+        }
+        return changed;
+    }
     let mut config = server
         .data
         .operator_config
@@ -354,7 +662,9 @@ fn apply_grant_to_server(server: &Server, grant: &OpGrant) -> bool {
             ));
         }
     }
-    config.save();
+    if stores_authoritative_files(server) {
+        config.save();
+    }
     drop(config);
     if let Some(player) = server.get_player_by_uuid(uuid) {
         if let Some(server_arc) = player.world().server.upgrade() {
@@ -367,6 +677,23 @@ fn apply_grant_to_server(server: &Server, grant: &OpGrant) -> bool {
 
 fn apply_revoke_to_server(server: &Server, revoke: &OpRevoke) -> bool {
     let uuid = uuid::Uuid::from_bytes(revoke.uuid);
+    if cluster_enabled(server) {
+        let changed = server
+            .cluster_admin_view
+            .load()
+            .operators
+            .iter()
+            .any(|entry| entry.uuid == revoke.uuid);
+        if changed {
+            if let Some(player) = server.get_player_by_uuid(uuid)
+                && let Some(server_arc) = player.world().server.upgrade()
+            {
+                let dispatcher = server_arc.command_dispatcher.load();
+                player.set_permission_lvl(&server_arc, PermissionLvl::Zero, &dispatcher);
+            }
+        }
+        return changed;
+    }
     let mut config = server
         .data
         .operator_config
@@ -376,7 +703,9 @@ fn apply_revoke_to_server(server: &Server, revoke: &OpRevoke) -> bool {
         return false;
     };
     config.ops.remove(index);
-    config.save();
+    if stores_authoritative_files(server) {
+        config.save();
+    }
     drop(config);
     if let Some(player) = server.get_player_by_uuid(uuid) {
         if let Some(server_arc) = player.world().server.upgrade() {
@@ -389,11 +718,24 @@ fn apply_revoke_to_server(server: &Server, revoke: &OpRevoke) -> bool {
 
 fn apply_ban_add_to_server(server: &Server, entry: &BanEntry) -> bool {
     let uuid = uuid::Uuid::from_bytes(entry.uuid);
-    let created = epoch_to_datetime(entry.created_epoch_secs)
-        .unwrap_or_else(time::OffsetDateTime::now_utc);
-    let expires = entry
-        .expires_epoch_secs
-        .and_then(epoch_to_datetime);
+    if cluster_enabled(server) {
+        let changed = !server
+            .cluster_admin_view
+            .load()
+            .banned_players
+            .iter()
+            .any(|current| current == entry);
+        if changed && let Some(player) = server.get_player_by_uuid(uuid) {
+            player.kick(
+                DisconnectReason::Kicked,
+                &TextComponent::text(entry.reason.clone()),
+            );
+        }
+        return changed;
+    }
+    let created =
+        epoch_to_datetime(entry.created_epoch_secs).unwrap_or_else(time::OffsetDateTime::now_utc);
+    let expires = entry.expires_epoch_secs.and_then(epoch_to_datetime);
     let mut list = server
         .data
         .banned_player_list
@@ -403,10 +745,13 @@ fn apply_ban_add_to_server(server: &Server, entry: &BanEntry) -> bool {
         .banned_players
         .iter()
         .find(|current| current.uuid == uuid)
+        && existing.name == entry.name
+        && existing.source == entry.source
+        && existing.reason == entry.reason
+        && existing.created == created
+        && existing.expires == expires
     {
-        if existing.name == entry.name {
-            return false;
-        }
+        return false;
     }
     if let Some(existing) = list
         .banned_players
@@ -429,7 +774,9 @@ fn apply_ban_add_to_server(server: &Server, entry: &BanEntry) -> bool {
                 reason: entry.reason.clone(),
             });
     }
-    list.save();
+    if stores_authoritative_files(server) {
+        list.save();
+    }
     drop(list);
     if let Some(player) = server.get_player_by_uuid(uuid) {
         player.kick(
@@ -442,6 +789,14 @@ fn apply_ban_add_to_server(server: &Server, entry: &BanEntry) -> bool {
 
 fn apply_ban_remove_to_server(server: &Server, revoke: &BanRevoke) -> bool {
     let uuid = uuid::Uuid::from_bytes(revoke.uuid);
+    if cluster_enabled(server) {
+        return server
+            .cluster_admin_view
+            .load()
+            .banned_players
+            .iter()
+            .any(|entry| entry.uuid == revoke.uuid);
+    }
     let mut list = server
         .data
         .banned_player_list
@@ -455,7 +810,9 @@ fn apply_ban_remove_to_server(server: &Server, revoke: &BanRevoke) -> bool {
         return false;
     };
     list.banned_players.remove(index);
-    list.save();
+    if stores_authoritative_files(server) {
+        list.save();
+    }
     true
 }
 
@@ -543,15 +900,32 @@ fn announce_inbound_admin_audit(server: &Server, audit: &AdminAudit) {
             player.send_system_message(&announcement);
         }
     }
-    if !target_notified
-        && let Some(player) = server.get_player_by_uuid(target_uuid)
-    {
+    if !target_notified && let Some(player) = server.get_player_by_uuid(target_uuid) {
         player.send_system_message(&announcement);
     }
 }
 
 /// Applies an inbound admin mutation to the local [`Server`] stores.
 pub fn apply_inbound_mutation_to_server(server: &Server, mutation: &AdminMutation) -> bool {
+    apply_inbound_mutation_to_server_with_save(server, mutation, true, false)
+}
+
+pub(crate) fn apply_sequenced_mutation_to_server(server: &Server, audit: &AdminAudit) {
+    if apply_inbound_mutation_to_server_with_save(server, &audit.mutation, false, false) {
+        announce_inbound_admin_audit(server, audit);
+    }
+}
+
+pub(crate) fn apply_replayed_mutation_to_server(server: &Server, mutation: &AdminMutation) {
+    let _ = apply_inbound_mutation_to_server_with_save(server, mutation, false, true);
+}
+
+fn apply_inbound_mutation_to_server_with_save(
+    server: &Server,
+    mutation: &AdminMutation,
+    save_to_primary_queue: bool,
+    replayed: bool,
+) -> bool {
     let changed = match mutation {
         AdminMutation::GrantOp(grant) => apply_grant_to_server(server, grant),
         AdminMutation::RevokeOp(revoke) => apply_revoke_to_server(server, revoke),
@@ -559,8 +933,34 @@ pub fn apply_inbound_mutation_to_server(server: &Server, mutation: &AdminMutatio
         AdminMutation::RemoveBan(revoke) => apply_ban_remove_to_server(server, revoke),
     };
     if changed {
-        ADMIN_MUTATION_APPLIED.fetch_add(1, Ordering::Relaxed);
-        info!("cluster admin mutation applied to server stores");
+        let revision = server.cluster_admin_view.load().revision;
+        apply_mutation_to_view(server, revision, mutation);
+        if save_to_primary_queue && stores_authoritative_files(server) {
+            let _ = persist_on_primary(server, mutation);
+        }
+        match mutation {
+            AdminMutation::GrantOp(grant) => {
+                if let Some(level) = permission_level_from_u8(grant.level) {
+                    super::cluster_presence::publish_permission(
+                        server,
+                        uuid::Uuid::from_bytes(grant.uuid),
+                        Some(level),
+                    );
+                }
+            }
+            AdminMutation::RevokeOp(revoke) => {
+                super::cluster_presence::publish_permission(
+                    server,
+                    uuid::Uuid::from_bytes(revoke.uuid),
+                    None,
+                );
+            }
+            AdminMutation::AddBan(_) | AdminMutation::RemoveBan(_) => {}
+        }
+        if !replayed {
+            ADMIN_MUTATION_APPLIED.fetch_add(1, Ordering::Relaxed);
+            info!("cluster admin mutation applied to server stores");
+        }
     }
     changed
 }
@@ -579,27 +979,19 @@ fn find_player_by_gid(
     None
 }
 
-fn find_player_including_lobby(
-    server: &Server,
-    name: &str,
-) -> Option<Arc<crate::entity::player::Player>> {
-    for world in server.worlds.load().iter() {
-        for player in world.players.load().iter() {
-            if player.gameprofile.name.eq_ignore_ascii_case(name) {
-                return Some(player.clone());
-            }
-        }
-    }
-    None
-}
-
 /// Delivers an inbound cluster kick to a locally-hosted player.
 pub fn deliver_remote_kick(server: &Server, request: &KickRequest) -> bool {
     if !should_deliver_kick_locally(request, local_server_id(server)) {
         return false;
     }
-    let target = find_player_by_gid(server, request.target)
-        .or_else(|| find_player_including_lobby(server, &request.target_name));
+    if server
+        .cluster_lobby_directory
+        .disconnect_gid(request.target, &TextComponent::text(request.reason.clone()))
+    {
+        ADMIN_KICK_DELIVERED.fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    let target = find_player_by_gid(server, request.target);
     let Some(target) = target else {
         return false;
     };
@@ -616,6 +1008,31 @@ pub fn deliver_remote_kick(server: &Server, request: &KickRequest) -> bool {
     true
 }
 
+pub(crate) fn authorized_remote_kick(
+    server: &Server,
+    source: ServerId,
+    request: &KickRequest,
+) -> bool {
+    let Some(identity) = request.issuer_identity.as_ref() else {
+        return server.cluster_primary_peers.load().contains(&source);
+    };
+    let presence = server.cluster_presence.snapshot();
+    authorized_player_kick(&presence, identity, request)
+}
+
+fn authorized_player_kick(
+    presence: &super::cluster_presence::PresenceSnapshot,
+    identity: &pumpkin_cluster::admin_sync::KickIssuerIdentity,
+    request: &KickRequest,
+) -> bool {
+    presence.permission_revision == identity.permission_revision
+        && presence
+            .entries
+            .get(&identity.gid)
+            .is_some_and(|entry| entry.uuid == identity.uuid && entry.name == request.issuer)
+        && presence.permission_for_uuid(&identity.uuid) >= PermissionLvl::Three
+}
+
 /// Delivers an inbound cluster spectate request to locally-hosted players.
 pub fn deliver_remote_spectate(server: &Server, request: &SpectateRequest) -> bool {
     let target = find_player_by_gid(server, request.target)
@@ -624,12 +1041,7 @@ pub fn deliver_remote_spectate(server: &Server, request: &SpectateRequest) -> bo
         return false;
     };
     let Some(viewer) = find_player_by_gid(server, request.viewer) else {
-        debug!(
-            target = request.target_name.as_str(),
-            "cluster spectate acknowledged without local viewer"
-        );
-        ADMIN_SPECTATE_DELIVERED.fetch_add(1, Ordering::Relaxed);
-        return true;
+        return false;
     };
     if viewer.gamemode.load() != GameMode::Spectator {
         debug!("cluster spectate dropped: viewer is not a spectator");
@@ -669,26 +1081,35 @@ pub fn deliver_remote_spectate(server: &Server, request: &SpectateRequest) -> bo
 /// Returns `true` when the message was an admin mutation, kick, or spectate
 /// request handled here. [`Server`] mutation stores are kept in sync and
 /// kick/spectate requests are delivered to locally-hosted players.
-pub fn handle_admin_message_for_server(server: &Arc<Server>, message: &AdminControlMessage) -> bool {
+pub fn handle_admin_message_for_server(
+    server: &Arc<Server>,
+    message: &AdminControlMessage,
+) -> bool {
     match message {
+        AdminControlMessage::Snapshot(_)
+        | AdminControlMessage::SnapshotPart { .. }
+        | AdminControlMessage::SnapshotRequest => false,
         AdminControlMessage::Mutation(mutation) => {
             apply_inbound_mutation_to_server(server, mutation);
-            let relayed = relay_inbound_mutation_from_primary(server, message);
-            if relayed > 0 {
-                debug!(peers = relayed, "cluster admin mutation relayed by primary");
-            }
             true
         }
         AdminControlMessage::MutationWithAudit(audit) => {
             if apply_inbound_mutation_to_server(server, &audit.mutation) {
                 announce_inbound_admin_audit(server, audit);
             }
-            let relayed = relay_inbound_mutation_from_primary(server, message);
-            if relayed > 0 {
-                debug!(peers = relayed, "cluster admin mutation relayed by primary");
+            true
+        }
+        AdminControlMessage::VersionedMutationWithAudit { audit, .. } => {
+            if apply_inbound_mutation_to_server(server, &audit.mutation) {
+                announce_inbound_admin_audit(server, audit);
             }
             true
         }
+        AdminControlMessage::SequencedMutation { audit, .. } => {
+            apply_sequenced_mutation_to_server(server, audit);
+            true
+        }
+        AdminControlMessage::MutationApplied { .. } => true,
         AdminControlMessage::Kick(request) => deliver_remote_kick(server, request),
         AdminControlMessage::Spectate(request) => deliver_remote_spectate(server, request),
     }
@@ -703,33 +1124,41 @@ mod tests {
         assert!(should_relay_inbound_mutation(ClusterRole::Primary));
         assert!(!should_relay_inbound_mutation(ClusterRole::Secondary));
     }
-}
 
-/// Broadcasts a kick for a locally-kicked player so every peer enforces it.
-pub fn broadcast_kick_for_local_player(
-    server: &Server,
-    target_gid: Option<pumpkin_cluster::identity::GlobalPlayerId>,
-    target_name: &str,
-    reason: &str,
-    issuer: &str,
-) {
-    if !cluster_enabled(server) {
-        return;
-    }
-    let local = local_server_id(server);
-    let target = target_gid.unwrap_or(pumpkin_cluster::identity::GlobalPlayerId::new(
-        local,
-        PlayerSlot(0),
-    ));
-    let request = KickRequest::new(
-        target,
-        target_name.to_string(),
-        reason.to_string(),
-        issuer.to_string(),
-    );
-    try_broadcast(&AdminControlMessage::Kick(request.clone()));
-    if target.server != local {
-        try_send_to_host(target.server.0, &AdminControlMessage::Kick(request));
+    #[test]
+    fn remote_kick_requires_current_issuer_presence_and_permission() {
+        use pumpkin_cluster::identity::{GlobalPlayerId, PlayerSlot};
+        use pumpkin_cluster::presence::RemotePlayerEntry;
+
+        let gid = GlobalPlayerId::new(ServerId(2), PlayerSlot(9));
+        let uuid = [5; 16];
+        let mut presence = super::super::cluster_presence::PresenceSnapshot::default();
+        presence.entries.insert(
+            gid,
+            RemotePlayerEntry::new(gid, uuid, String::from("Alice"), Vec::new(), 0, true, true),
+        );
+        presence.permissions.insert(uuid, PermissionLvl::Three);
+        presence.permission_revision = 7;
+        let request = KickRequest::new(
+            GlobalPlayerId::new(ServerId(3), PlayerSlot(4)),
+            String::from("Bob"),
+            String::from("reason"),
+            String::from("Alice"),
+        );
+        let identity = pumpkin_cluster::admin_sync::KickIssuerIdentity {
+            gid,
+            uuid,
+            permission_revision: 7,
+        };
+        assert!(authorized_player_kick(&presence, &identity, &request));
+        presence.permissions.remove(&uuid);
+        assert!(!authorized_player_kick(&presence, &identity, &request));
+        presence.permissions.insert(uuid, PermissionLvl::Three);
+        presence.permission_revision = 8;
+        assert!(!authorized_player_kick(&presence, &identity, &request));
+        presence.permission_revision = 7;
+        presence.entries.remove(&gid);
+        assert!(!authorized_player_kick(&presence, &identity, &request));
     }
 }
 
@@ -738,18 +1167,19 @@ pub fn route_kick_request(server: &Server, request: &KickRequest) -> bool {
         return deliver_remote_kick(server, request);
     }
     let local = local_server_id(server);
-    let mut sent = try_broadcast(&AdminControlMessage::Kick(request.clone()));
     if request.target.server == local {
-        if deliver_remote_kick(server, request) {
-            return true;
-        }
-    } else if try_send_to_host(
+        return deliver_remote_kick(server, request);
+    }
+    if request.issuer_identity.is_none()
+        && !matches!(server.advanced_config.cluster.role, ClusterRole::Primary)
+    {
+        return false;
+    }
+    try_send_to_host(
+        server,
         request.target.server.0,
         &AdminControlMessage::Kick(request.clone()),
-    ) {
-        sent = sent.saturating_add(1);
-    }
-    sent > 0
+    )
 }
 
 /// Broadcasts a spectate request toward the host of the spectated player.
@@ -773,5 +1203,9 @@ pub fn broadcast_spectate_for_players(
     if target.server == local {
         return;
     }
-    try_send_to_host(target.server.0, &AdminControlMessage::Spectate(request));
+    try_send_to_host(
+        server,
+        target.server.0,
+        &AdminControlMessage::Spectate(request),
+    );
 }

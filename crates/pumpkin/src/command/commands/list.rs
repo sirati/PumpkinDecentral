@@ -28,27 +28,45 @@ struct ListCommandExecutor(ListMode);
 
 impl CommandExecutor for ListCommandExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
-        let viewer = context.source.player_or_none().map(|player| player.gameprofile.id);
+        let server = context.server();
+        let viewer = context
+            .source
+            .player_or_none()
+            .map(|player| player.gameprofile.id);
         let players: Vec<Arc<Player>> = context
             .server()
             .get_all_players()
             .into_iter()
             .filter(|player| {
                 viewer.is_some_and(|id| id == player.gameprofile.id)
-                    || !crate::server::cluster_hide::is_hidden_player(player)
+                    || !crate::server::cluster_hide::is_hidden_player(server, player)
             })
             .collect();
-        let mut remote = crate::server::cluster_presence::remote_presence_entries();
+        let mut remote = crate::server::cluster_presence::remote_presence_entries(server);
+        remote.retain(|(_, entry)| !entry.in_lobby);
         remote.retain(|(gid, entry)| {
-            !crate::server::cluster_hide::is_hidden_gid(gid)
-                && !crate::server::cluster_hide::is_hidden_uuid_bytes(&entry.uuid)
+            !crate::server::cluster_hide::is_hidden_gid(server, gid)
+                && !crate::server::cluster_hide::is_hidden_uuid_bytes(server, &entry.uuid)
         });
         remote.sort_by(|a, b| a.1.name.cmp(&b.1.name));
-        let players_len = players.len().saturating_add(remote.len());
+        let mut lobby: Vec<_> = crate::server::cluster_presence::all_presence_entries(server)
+            .into_iter()
+            .filter(|(gid, entry)| {
+                entry.in_lobby
+                    && !crate::server::cluster_hide::is_hidden_gid(server, gid)
+                    && !crate::server::cluster_hide::is_hidden_uuid_bytes(server, &entry.uuid)
+            })
+            .map(|(_, entry)| (uuid::Uuid::from_bytes(entry.uuid), entry.name))
+            .collect();
+        lobby.sort_by(|left, right| left.1.cmp(&right.1));
+        let players_len = players
+            .len()
+            .saturating_add(remote.len())
+            .saturating_add(lobby.len());
 
         let list = match self.0 {
-            ListMode::Names => get_visible_player_names(&players, &remote),
-            ListMode::Uuids => get_visible_player_names_and_ids(&players, &remote),
+            ListMode::Names => get_visible_player_names(&players, &remote, &lobby),
+            ListMode::Uuids => get_visible_player_names_and_ids(&players, &remote, &lobby),
         };
 
         let max_players = context.source.output.as_player().map_or_else(
@@ -87,19 +105,30 @@ impl CommandExecutor for ListCommandExecutor {
 
 fn get_visible_player_names(
     players: &[Arc<Player>],
-    remote: &[(pumpkin_cluster::identity::GlobalPlayerId, pumpkin_cluster::presence::RemotePlayerEntry)],
+    remote: &[(
+        pumpkin_cluster::identity::GlobalPlayerId,
+        pumpkin_cluster::presence::RemotePlayerEntry,
+    )],
+    lobby: &[(uuid::Uuid, String)],
 ) -> TextComponent {
     let mut display_names: Vec<TextComponent> =
         players.iter().map(|p| p.get_display_name()).collect();
     for entry in remote.iter() {
         display_names.push(TextComponent::text(entry.1.name.clone()));
     }
+    for (_, name) in lobby {
+        display_names.push(TextComponent::text(name.clone()));
+    }
     TextComponent::join_with_comma(display_names)
 }
 
 fn get_visible_player_names_and_ids(
     players: &[Arc<Player>],
-    remote: &[(pumpkin_cluster::identity::GlobalPlayerId, pumpkin_cluster::presence::RemotePlayerEntry)],
+    remote: &[(
+        pumpkin_cluster::identity::GlobalPlayerId,
+        pumpkin_cluster::presence::RemotePlayerEntry,
+    )],
+    lobby: &[(uuid::Uuid, String)],
 ) -> TextComponent {
     let mut names_and_ids: Vec<TextComponent> = players
         .iter()
@@ -121,6 +150,16 @@ fn get_visible_player_names_and_ids(
             &[
                 TextComponent::text(entry.1.name.clone()),
                 TextComponent::text(uuid::Uuid::from_bytes(entry.1.uuid).to_string()),
+            ],
+        ));
+    }
+    for (uuid, name) in lobby {
+        names_and_ids.push(TextComponent::translate_cross(
+            COMMANDS_LIST_NAMEANDID,
+            COMMANDS_LIST_NAMEANDID,
+            &[
+                TextComponent::text(name.clone()),
+                TextComponent::text(uuid.to_string()),
             ],
         ));
     }

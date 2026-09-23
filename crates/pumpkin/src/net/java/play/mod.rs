@@ -230,6 +230,7 @@ pub mod configuration_acknowledged;
 pub mod confirm_teleport;
 pub mod container_slot_state_changed;
 pub mod cookie_response;
+pub mod custom_payload;
 pub mod debug_sample_subscription;
 pub mod debug_subscription_request;
 pub mod edit_book;

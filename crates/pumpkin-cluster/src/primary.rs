@@ -353,8 +353,7 @@ impl PrimaryState {
         match self.playerdata.get(&record.player_id) {
             Some(current) if current == &record.bytes => false,
             _ => {
-                self.playerdata
-                    .insert(record.player_id, record.bytes);
+                self.playerdata.insert(record.player_id, record.bytes);
                 true
             }
         }
@@ -544,9 +543,7 @@ impl PrimarySnapshotInbox {
 
 /// Builds the snapshot-request channel pair used to fan secondaries out of disk reads.
 #[must_use]
-pub fn primary_snapshot_channel(
-    capacity: usize,
-) -> (PrimarySnapshotHandle, PrimarySnapshotInbox) {
+pub fn primary_snapshot_channel(capacity: usize) -> (PrimarySnapshotHandle, PrimarySnapshotInbox) {
     let (tx, rx) = mpsc::channel(capacity.max(1));
     (
         PrimarySnapshotHandle::new(tx),
@@ -611,8 +608,7 @@ impl PrimaryInbox {
         mut state: PrimaryState,
         mut apply: Apply,
         mut save: Save,
-    )
-    where
+    ) where
         Apply: FnMut(&mut PrimaryState, &AcceptedTick),
         Save: FnMut(&PrimaryState) -> SaveFuture,
         SaveFuture: Future<Output = ()>,
@@ -824,12 +820,8 @@ mod tests {
     #[tokio::test]
     async fn primary_run_persists_every_tick_and_serves_snapshots() {
         let (handle, inbox) = primary_channel(8, 8);
-        handle
-            .try_submit(TickStamp(11), Vec::from([1_u8]))
-            .unwrap();
-        handle
-            .try_submit(TickStamp(12), Vec::from([2_u8]))
-            .unwrap();
+        handle.try_submit(TickStamp(11), Vec::from([1_u8])).unwrap();
+        handle.try_submit(TickStamp(12), Vec::from([2_u8])).unwrap();
 
         let saves = Arc::new(AtomicUsize::new(0));
         let saves_task = Arc::clone(&saves);
@@ -863,7 +855,10 @@ mod tests {
         assert_eq!(snapshot.tick, Some(TickStamp(12)));
         assert_eq!(snapshot.world_bytes, Vec::from([2_u8]));
         handle.shutdown();
-        timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(saves.load(Ordering::Relaxed), 2);
     }
 }

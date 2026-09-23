@@ -219,6 +219,14 @@ impl Nbt {
         bytes.into()
     }
 
+    pub fn write_unnamed_canonical(self) -> Result<Bytes, Error> {
+        let mut bytes = Vec::new();
+        let mut writer = NbtWriteHelperJava::new(&mut bytes);
+        writer.write_u8(COMPOUND_ID)?;
+        self.root_tag.serialize_content_canonical(&mut writer)?;
+        Ok(bytes.into())
+    }
+
     /// Writes this document without the root compound's name.
     pub fn write_unnamed_to_writer<W: Write>(self, mut writer: W) -> Result<(), io::Error> {
         writer.write_all(&self.write_unnamed())?;
@@ -253,5 +261,44 @@ where
 impl AsMut<NbtCompound> for Nbt {
     fn as_mut(&mut self) -> &mut NbtCompound {
         &mut self.root_tag
+    }
+}
+
+#[cfg(test)]
+mod canonical_tests {
+    use super::*;
+    use crate::deserializer::NbtReadHelperJava;
+
+    #[test]
+    fn nested_compound_insertion_order_does_not_change_wire_bytes() {
+        let document = |reverse: bool| {
+            let mut nested = NbtCompound::new();
+            let mut root = NbtCompound::new();
+            if reverse {
+                nested.put("z", NbtTag::Int(9));
+                nested.put("a", NbtTag::Int(1));
+                root.put("tail", NbtTag::String("end".into()));
+                root.put("list", NbtTag::List(vec![NbtTag::Compound(nested)]));
+            } else {
+                nested.put("a", NbtTag::Int(1));
+                nested.put("z", NbtTag::Int(9));
+                root.put("list", NbtTag::List(vec![NbtTag::Compound(nested)]));
+                root.put("tail", NbtTag::String("end".into()));
+            }
+            Nbt::new(String::new(), root)
+        };
+        let first = document(false);
+        let second = document(true);
+        let encoded = first
+            .clone()
+            .write_unnamed_canonical()
+            .expect("canonical document");
+        assert_eq!(
+            encoded,
+            second.write_unnamed_canonical().expect("same document")
+        );
+        let mut cursor = std::io::Cursor::new(encoded.as_ref());
+        let mut reader = NbtReadHelperJava::new(&mut cursor);
+        assert_eq!(Nbt::read_unnamed(&mut reader).expect("valid NBT"), first);
     }
 }

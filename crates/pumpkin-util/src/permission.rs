@@ -1,3 +1,4 @@
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
@@ -61,10 +62,16 @@ impl Permission {
 }
 
 /// Repository for all registered permissions in the server.
-#[derive(Default)]
 pub struct PermissionRegistry {
     /// All registered permissions.
     permissions: DashMap<String, Permission>,
+    defaults: ArcSwap<HashMap<String, PermissionDefault>>,
+}
+
+impl Default for PermissionRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PermissionRegistry {
@@ -76,6 +83,7 @@ impl PermissionRegistry {
     pub fn new() -> Self {
         Self {
             permissions: DashMap::new(),
+            defaults: ArcSwap::from_pointee(HashMap::new()),
         }
     }
 
@@ -94,7 +102,14 @@ impl PermissionRegistry {
                 permission.node
             ));
         }
-        self.permissions.insert(permission.node.clone(), permission);
+        let node = permission.node.clone();
+        let default = permission.default.clone();
+        self.permissions.insert(node.clone(), permission);
+        self.defaults.rcu(|current| {
+            let mut next = (**current).clone();
+            next.insert(node.clone(), default.clone());
+            next
+        });
         Ok(())
     }
 
@@ -127,6 +142,11 @@ impl PermissionRegistry {
         self.permissions.get(node)
     }
 
+    #[must_use]
+    pub fn get_default_snapshot(&self, node: &str) -> Option<PermissionDefault> {
+        self.defaults.load().get(node).cloned()
+    }
+
     /// Overrides the default behaviour of an already-registered permission.
     ///
     /// Used to apply per-command permission overrides from the server
@@ -142,7 +162,13 @@ impl PermissionRegistry {
     #[must_use]
     pub fn set_default(&self, node: &str, default: PermissionDefault) -> bool {
         if let Some(mut permission) = self.permissions.get_mut(node) {
-            permission.default = default;
+            permission.default = default.clone();
+            drop(permission);
+            self.defaults.rcu(|current| {
+                let mut next = (**current).clone();
+                next.insert(node.to_owned(), default.clone());
+                next
+            });
             true
         } else {
             false
@@ -265,6 +291,11 @@ impl PermissionManager {
         node: &str,
     ) -> Option<dashmap::mapref::one::Ref<'_, String, Permission>> {
         self.registry.get_permission(node)
+    }
+
+    #[must_use]
+    pub fn get_default_snapshot(&self, node: &str) -> Option<PermissionDefault> {
+        self.registry.get_default_snapshot(node)
     }
 
     /// Overrides the default behaviour of an already-registered permission in the registry.

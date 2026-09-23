@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use pumpkin_config::HealthMaskMode;
 use pumpkin_data::game_rules::{GameRule, GameRuleRegistry, GameRuleValue};
 use pumpkin_util::PermissionLvl;
 use pumpkin_util::permission::{Permission, PermissionDefault, PermissionRegistry};
@@ -113,6 +114,50 @@ impl CommandExecutor for SetBoolExecutor {
     }
 }
 
+struct QueryClusterHealthMask;
+
+impl CommandExecutor for QueryClusterHealthMask {
+    fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
+        let mode = context.server().cluster_health_mask();
+        let value = match mode {
+            HealthMaskMode::Off => "off",
+            HealthMaskMode::Players => "players",
+            HealthMaskMode::All => "all",
+        };
+        context.source.send_feedback(
+            TextComponent::text(format!("clusterHealthMask = {value}")),
+            false,
+        );
+        Ok(mode as i32)
+    }
+}
+
+struct SetClusterHealthMask(HealthMaskMode);
+
+impl CommandExecutor for SetClusterHealthMask {
+    fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
+        if !context.server().set_cluster_health_mask(self.0) {
+            context.source.send_error(TextComponent::text(
+                "clusterHealthMask could not be submitted",
+            ));
+            return Ok(0);
+        }
+        if context.server().advanced_config.cluster.enabled
+            && matches!(
+                context.server().advanced_config.cluster.role,
+                pumpkin_config::ClusterRole::Secondary
+            )
+        {
+            context.source.send_feedback(
+                TextComponent::text("clusterHealthMask change submitted to primary"),
+                false,
+            );
+            return Ok(1);
+        }
+        QueryClusterHealthMask.execute(context)
+    }
+}
+
 pub fn register(dispatcher: &mut CommandDispatcher, registry: &PermissionRegistry) {
     registry.register_permission_or_panic(Permission::new(
         PERMISSION,
@@ -136,5 +181,11 @@ pub fn register(dispatcher: &mut CommandDispatcher, registry: &PermissionRegistr
         cmd = cmd.then(branch);
     }
 
+    let cluster_health_mask = literal("clusterHealthMask")
+        .executes(QueryClusterHealthMask)
+        .then(literal("off").executes(SetClusterHealthMask(HealthMaskMode::Off)))
+        .then(literal("players").executes(SetClusterHealthMask(HealthMaskMode::Players)))
+        .then(literal("all").executes(SetClusterHealthMask(HealthMaskMode::All)));
+    cmd = cmd.then(cluster_health_mask);
     dispatcher.register(cmd);
 }

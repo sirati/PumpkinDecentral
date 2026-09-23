@@ -4,6 +4,24 @@ use super::*;
 impl BedrockClient {
     #[allow(clippy::too_many_lines)]
     pub fn handle_block_pick_request(&self, player: &Arc<Player>, packet: &SBlockPickRequest) {
+        let target_hotbar_slot = packet.max_slots as usize;
+        if target_hotbar_slot >= 9 {
+            return;
+        }
+        if player
+            .world()
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            crate::server::cluster_inventory_protocol::stage_pick_block(
+                player,
+                packet.position,
+                Some(target_hotbar_slot as u8),
+                true,
+            );
+            return;
+        }
         if !player.can_interact_with_block_at(&packet.position, 1.0) {
             return;
         }
@@ -19,11 +37,6 @@ impl BedrockClient {
             return;
         };
         let stack = ItemStack::new(1, item);
-
-        let target_hotbar_slot = packet.max_slots as usize;
-        if target_hotbar_slot >= 9 {
-            return;
-        }
 
         let slot_with_stack = player.inventory().get_slot_with_stack(&stack);
 

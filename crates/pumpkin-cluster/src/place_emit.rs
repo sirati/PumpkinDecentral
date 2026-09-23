@@ -1,28 +1,13 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::identity::{GlobalPlayerId, PlayerSeq};
-use crate::protocol::{BlockPos, BlockUndo, ChunkAddr, PlaceBlockUpdate};
+use crate::protocol::{BlockPos, BlockUndo, ChunkKey, PlaceBlockUpdate, WorldId};
 use crate::time::TickStamp;
 
-const SEQ_STRIPES: usize = 256;
-
-static PLACE_SEQ: LazyLock<Box<[AtomicU16]>> =
-    LazyLock::new(|| (0..SEQ_STRIPES).map(|_| AtomicU16::new(0)).collect());
-
-fn stripe_for(gid: GlobalPlayerId) -> usize {
-    let mixed = gid
-        .server
-        .0
-        .rotate_left(5)
-        ^ gid.player.0.wrapping_mul(0x9E37);
-    (mixed as usize) % SEQ_STRIPES
-}
-
 pub fn next_place_seq(gid: GlobalPlayerId) -> PlayerSeq {
-    let stripe = stripe_for(gid);
-    PlayerSeq(PLACE_SEQ[stripe].fetch_add(1, Ordering::Relaxed))
+    PLACE_SEQ.with(|clock| clock.borrow_mut().issue(gid))
 }
 
 #[derive(Debug, Default)]
@@ -45,31 +30,39 @@ impl PlaceSeqClock {
     }
 }
 
+thread_local! {
+    static PLACE_SEQ: RefCell<PlaceSeqClock> = RefCell::new(PlaceSeqClock::new());
+}
+
 #[must_use]
 pub fn capture_place(
     gid: GlobalPlayerId,
     seq: PlayerSeq,
     tick: TickStamp,
     pos: BlockPos,
+    expected_old_state: u16,
     new_state: u16,
     inv: u8,
     slot: u8,
     item: u16,
     count_before: u8,
     count_after: u8,
-    chunk: ChunkAddr,
+    actor_chunk: ChunkKey,
+    chunk: ChunkKey,
 ) -> PlaceBlockUpdate {
     PlaceBlockUpdate {
         gid,
         seq,
         tick,
         pos,
+        expected_old_state,
         new_state,
         inv,
         slot,
         item,
         count_before,
         count_after,
+        actor_chunk,
         chunk,
     }
 }
@@ -94,11 +87,8 @@ pub fn place_inv_precondition_met(
 }
 
 #[must_use]
-pub fn chunk_of_block(x: i32, z: i32) -> ChunkAddr {
-    ChunkAddr {
-        x: x.div_euclid(16),
-        z: z.div_euclid(16),
-    }
+pub const fn chunk_of_block(world: WorldId, x: i32, z: i32) -> ChunkKey {
+    ChunkKey::new(world, x.div_euclid(16), z.div_euclid(16))
 }
 
 #[must_use]
@@ -219,9 +209,7 @@ pub fn apply_remote_place_expected(
             current: current_state,
         }
     } else if is_place_duplicate(update.new_state, current_state) {
-        metrics
-            .rejected_duplicate
-            .fetch_add(1, Ordering::Relaxed);
+        metrics.rejected_duplicate.fetch_add(1, Ordering::Relaxed);
         RemotePlaceDecision::RejectDuplicate {
             state: current_state,
         }
@@ -238,6 +226,9 @@ mod tests {
     use super::*;
     use crate::identity::{PlayerSlot, ServerId};
 
+    const WORLD: WorldId = WorldId::new(0, 7);
+    const CHUNK: ChunkKey = ChunkKey::new(WORLD, 0, 0);
+
     fn gid(server: u16, player: u16) -> GlobalPlayerId {
         GlobalPlayerId::new(ServerId(server), PlayerSlot(player))
     }
@@ -248,13 +239,15 @@ mod tests {
             PlayerSeq(3),
             TickStamp(9),
             BlockPos { x: 0, y: 64, z: 0 },
+            0,
             new_state,
             crate::inventory::INV_MAIN,
             0,
             40,
             64,
             63,
-            ChunkAddr { x: 0, z: 0 },
+            CHUNK,
+            CHUNK,
         )
     }
 
@@ -273,13 +266,15 @@ mod tests {
             PlayerSeq(3),
             TickStamp(9),
             BlockPos { x: 1, y: 2, z: 3 },
+            5,
             12,
             crate::inventory::INV_MAIN,
             4,
             40,
             64,
             63,
-            ChunkAddr { x: 0, z: 0 },
+            CHUNK,
+            CHUNK,
         );
         assert_eq!(update.new_state, 12);
         assert_eq!(update.slot, 4);
@@ -290,10 +285,13 @@ mod tests {
 
     #[test]
     fn chunk_of_block_handles_negatives() {
-        assert_eq!(chunk_of_block(0, 0), ChunkAddr { x: 0, z: 0 });
-        assert_eq!(chunk_of_block(15, 15), ChunkAddr { x: 0, z: 0 });
-        assert_eq!(chunk_of_block(16, -1), ChunkAddr { x: 1, z: -1 });
-        assert_eq!(chunk_of_block(-16, -16), ChunkAddr { x: -1, z: -1 });
+        assert_eq!(chunk_of_block(WORLD, 0, 0), CHUNK);
+        assert_eq!(chunk_of_block(WORLD, 15, 15), CHUNK);
+        assert_eq!(chunk_of_block(WORLD, 16, -1), ChunkKey::new(WORLD, 1, -1));
+        assert_eq!(
+            chunk_of_block(WORLD, -16, -16),
+            ChunkKey::new(WORLD, -1, -1)
+        );
     }
 
     #[test]
@@ -391,10 +389,7 @@ mod tests {
     fn matching_new_state_rejects_duplicate_and_counts() {
         let metrics = PlaceMetrics::new();
         let decision = apply_remote_place_expected(&sample_update(12), 12, 12, 63, &metrics);
-        assert_eq!(
-            decision,
-            RemotePlaceDecision::RejectDuplicate { state: 12 }
-        );
+        assert_eq!(decision, RemotePlaceDecision::RejectDuplicate { state: 12 });
         assert_eq!(metrics.accepted(), 0);
         assert_eq!(metrics.rejected_stale(), 0);
         assert_eq!(metrics.rejected_duplicate(), 1);

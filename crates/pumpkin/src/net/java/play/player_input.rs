@@ -8,6 +8,21 @@ impl JavaClient {
         input: &SPlayerInput,
         server: &Arc<Server>,
     ) {
+        if server.advanced_config.cluster.enabled {
+            if player.cluster_gid().is_none() {
+                return;
+            }
+            crate::server::cluster_controller::submit_patch(
+                server,
+                player,
+                crate::server::cluster_controller::ControllerPatch::Input {
+                    flags: input.input as u8 as u64,
+                    sneaking: Some(input.input & SPlayerInput::SNEAK != 0),
+                    sprinting: Some(input.input & SPlayerInput::SPRINT != 0),
+                },
+            );
+            return;
+        }
         let mut input_event =
             crate::plugin::api::events::player::player_input::PlayerInputEvent::new(
                 player.clone(),

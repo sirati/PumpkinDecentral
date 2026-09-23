@@ -3,6 +3,18 @@ use super::*;
 
 impl JavaClient {
     pub fn handle_move_vehicle(&self, player: &Arc<Player>, packet: &SMoveVehicle) {
+        if player
+            .world()
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            player.client.try_kick(
+                crate::net::DisconnectReason::Unknown,
+                &TextComponent::text("Vehicle movement could not be verified"),
+            );
+            return;
+        }
         // A movement packet was received this tick — tracked for SClientTickEnd zeroing.
         self.received_movement_this_tick
             .store(true, Ordering::Relaxed);

@@ -4,6 +4,11 @@
 
     flake-parts.url = "github:hercules-ci/flake-parts";
 
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
     flake-compat = {
       url = "github:NixOS/flake-compat";
       flake = false;
@@ -36,6 +41,7 @@
             "pumpkin-api-macros"
             "pumpkin-auth"
             "pumpkin-codecs"
+            "pumpkin-cluster"
             "pumpkin-command"
             "pumpkin-config"
             "pumpkin-data"
@@ -223,13 +229,50 @@
             };
 
           buildCrate = crateName: buildCrateFull crateName "release";
+          buildClusterE2e = (buildCrateFull "pumpkin" "debug").overrideAttrs (old: {
+            cargoBuildFlags = old.cargoBuildFlags ++ [ "--features=cluster-e2e" ];
+          });
+          nightlyToolchain = (pkgs.extend inputs.rust-overlay.overlays.default).rust-bin.nightly."2026-09-15".minimal;
+          nightlyRustPlatform = pkgs.makeRustPlatform {
+            cargo = nightlyToolchain;
+            rustc = nightlyToolchain;
+          };
+          buildAzaleaE2e = nightlyRustPlatform.buildRustPackage {
+            pname = "pumpkin-azalea-e2e";
+            version = workspaceVersion;
+            src = ./tests/azalea-e2e;
+            cargoLock = {
+              lockFile = ./tests/azalea-e2e/Cargo.lock;
+              outputHashes = {
+                "azalea-0.16.0+mc26.2" = "sha256-Cy+g4TmUhK0zElUizRZ5Pb5Qvn7SmuJObBZHvsMlQ6w=";
+              };
+            };
+            doCheck = false;
+          };
+          clusterE2eFeatureGate = pkgs.runCommand "pumpkin-cluster-e2e-feature-gate" {
+            nativeBuildInputs = [ pkgs.binutils pkgs.gnugrep ];
+          } ''
+            if strings ${buildCrate "pumpkin"}/bin/pumpkin | grep -Fq clustertest; then
+              echo "normal Pumpkin binary contains the feature-only clustertest command" >&2
+              exit 1
+            fi
+            if ! strings ${buildClusterE2e}/bin/pumpkin | grep -Fq clustertest; then
+              echo "cluster-e2e Pumpkin binary does not contain clustertest" >&2
+              exit 1
+            fi
+            touch $out
+          '';
         in
         {
           packages = {
             default = buildCrate "pumpkin";
             pumpkin = buildCrate "pumpkin";
             pumpkin-dev = buildCrateFull "pumpkin" "debug";
+            pumpkin-cluster-e2e = buildClusterE2e;
+            pumpkin-azalea-e2e = buildAzaleaE2e;
           } // lib.genAttrs allCrates (c: buildCrate c);
+
+          checks.pumpkin-cluster-e2e-feature-gate = clusterE2eFeatureGate;
 
           devShells.default = pkgs.mkShell {
             packages = with pkgs; [
@@ -240,6 +283,10 @@
               rustfmt
               pkg-config
             ];
+          };
+
+          devShells.azalea = pkgs.mkShell {
+            packages = [ nightlyToolchain pkgs.pkg-config ];
           };
 
           formatter = pkgs.nixfmt-tree;

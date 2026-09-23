@@ -7,6 +7,22 @@ impl JavaClient {
         player: &Arc<Player>,
         packet: SSetCreativeSlot,
     ) -> Result<(), InventoryError> {
+        if player
+            .world()
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            if !crate::server::cluster_inventory_protocol::stage_inventory_input(
+                player,
+                crate::server::cluster_inventory_protocol::StagedInventoryInput::JavaCreative(
+                    packet,
+                ),
+            ) {
+                crate::server::cluster_inventory_protocol::resync_inventory_screen(player);
+            }
+            return Ok(());
+        }
         if player.gamemode.load() != GameMode::Creative {
             return Err(InventoryError::PermissionError);
         }

@@ -1,8 +1,6 @@
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
 
 use pumpkin_data::packet::{CURRENT_MC_VERSION, LOWEST_SUPPORTED_MC_VERSION};
 use pumpkin_protocol::{Players, Sample, StatusResponse, Version};
@@ -10,15 +8,14 @@ use pumpkin_util::text::TextComponent;
 
 use super::Server;
 
-static ONLINE: AtomicU32 = AtomicU32::new(0);
 static FAVICON: OnceLock<String> = OnceLock::new();
 static VERSION_NAME: LazyLock<String> =
     LazyLock::new(|| format!("{LOWEST_SUPPORTED_MC_VERSION}-{CURRENT_MC_VERSION}"));
 const SAMPLE_LIMIT: usize = 12;
 
 #[must_use]
-pub fn cluster_status_online() -> u32 {
-    ONLINE.load(Ordering::Relaxed)
+pub fn cluster_status_online(server: &Server) -> u32 {
+    live_status_players(server).0
 }
 
 pub fn install_favicon(favicon: Option<String>) {
@@ -30,36 +27,40 @@ pub fn install_favicon(favicon: Option<String>) {
 #[must_use]
 fn live_status_players(server: &Server) -> (u32, Vec<Sample>) {
     let mut sample = Vec::new();
+    let mut visible = std::collections::HashSet::new();
     for player in server.get_all_players().iter() {
-        if !player.config.load().server_listing {
+        if super::cluster_hide::is_hidden_player(server, player) {
             continue;
         }
-        if super::cluster_hide::is_hidden_player(player) {
-            continue;
+        let id = player.gameprofile.id.to_string();
+        visible.insert(id.clone());
+        if player.config.load().server_listing {
+            sample.push(Sample {
+                name: player.gameprofile.name.clone(),
+                id,
+            });
         }
-        sample.push(Sample {
-            name: player.gameprofile.name.clone(),
-            id: player.gameprofile.id.to_string(),
-        });
     }
-    for (gid, entry) in super::cluster_presence::remote_presence_entries()
-        .iter()
-    {
-        if super::cluster_hide::is_hidden_remote_gid(gid) {
+    for (gid, entry) in super::cluster_presence::all_presence_entries(server) {
+        if super::cluster_hide::is_hidden_remote_gid(server, &gid)
+            || super::cluster_hide::is_hidden_uuid_bytes(server, &entry.uuid)
+        {
             continue;
         }
-        if super::cluster_hide::is_hidden_uuid_bytes(&entry.uuid) {
-            continue;
+        let id = uuid::Uuid::from_bytes(entry.uuid).to_string();
+        if visible.insert(id.clone()) && entry.listed {
+            sample.push(Sample {
+                name: entry.name,
+                id,
+            });
         }
-        sample.push(Sample {
-            name: entry.name.clone(),
-            id: uuid::Uuid::from_bytes(entry.uuid).to_string(),
-        });
     }
     sample.sort_by(|left, right| {
-        left.name.cmp(&right.name).then_with(|| left.id.cmp(&right.id))
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.id.cmp(&right.id))
     });
-    let online = u32::try_from(sample.len()).unwrap_or(u32::MAX);
+    let online = u32::try_from(visible.len()).unwrap_or(u32::MAX);
     sample.truncate(SAMPLE_LIMIT);
     (online, sample)
 }
@@ -92,9 +93,7 @@ pub fn base_status_response(server: &Server, client_protocol: i32) -> StatusResp
             online: 0,
             sample: Vec::new(),
         }),
-        description: TextComponent::text(
-            server.advanced_config.networking.java.motd.clone(),
-        ),
+        description: TextComponent::text(server.advanced_config.networking.java.motd.clone()),
         favicon: FAVICON.get().cloned(),
         enforce_secure_chat: true,
     };
@@ -108,18 +107,11 @@ pub fn base_status_response(server: &Server, client_protocol: i32) -> StatusResp
 }
 
 pub fn refresh_cluster_status(server: &Server) {
-    ONLINE.store(live_status_players(server).0, Ordering::Relaxed);
+    let _ = live_status_players(server);
 }
 
 pub fn spawn_cluster_status_poller(server: &Arc<Server>) {
     refresh_cluster_status(server);
-    let task_server = Arc::clone(server);
-    server.spawn_task(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            refresh_cluster_status(&task_server);
-        }
-    });
 }
 
 #[cfg(test)]
@@ -140,21 +132,10 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_load_store_roundtrips() {
-        ONLINE.store(7, Ordering::Relaxed);
-        assert_eq!(cluster_status_online(), 7);
-        ONLINE.store(0, Ordering::Relaxed);
-        assert_eq!(cluster_status_online(), 0);
-    }
-
-    #[test]
     fn protocol_override_applies_in_range() {
         let supported = CURRENT_MC_VERSION.protocol_version();
         let updated = apply_protocol(empty_response(), supported);
-        assert_eq!(
-            updated.version.as_ref().unwrap().protocol,
-            supported as u32
-        );
+        assert_eq!(updated.version.as_ref().unwrap().protocol, supported as u32);
     }
 
     #[test]

@@ -7,6 +7,22 @@ impl JavaClient {
         if !player.has_client_loaded() {
             return;
         }
+        if server.advanced_config.cluster.enabled {
+            crate::server::cluster_inventory_protocol::stage_item_action(
+                player,
+                use_item.hand.0 as u8,
+                crate::server::cluster_inventory_protocol::StagedItemActionKind::Use {
+                    claimed_yaw: use_item.yaw,
+                    claimed_pitch: use_item.pitch,
+                },
+                Some(
+                    crate::server::cluster_inventory_protocol::java_item_action_origin(
+                        use_item.sequence.0,
+                    ),
+                ),
+            );
+            return;
+        }
         player.update_last_action_time();
 
         let inventory = player.inventory();
@@ -97,9 +113,7 @@ impl JavaClient {
             }
         }
 
-        let blocking = held
-            .get_data_component::<BlocksAttacksImpl>()
-            .is_some();
+        let blocking = held.get_data_component::<BlocksAttacksImpl>().is_some();
         if held.get_data_component::<ConsumableImpl>().is_some() || blocking {
             // If its food we want to make sure we can actually consume it
             if let Some(food) = held.get_data_component::<FoodImpl>() {

@@ -122,6 +122,8 @@ pub enum CommandSender {
     /// Contains a reference to the [Player] struct to access their
     /// location, permissions, and session.
     Player(Arc<Player>),
+    Lobby(Arc<Player>),
+    PreJoin(Arc<crate::server::cluster_lobby::LobbyCommandSender>),
     /// A Command Block or Command Block Minecart.
     ///
     /// Contains the block entity responsible for the command and the
@@ -141,6 +143,8 @@ impl fmt::Display for CommandSender {
                 Self::Console => "Server",
                 Self::Rcon(_) => "Rcon",
                 Self::Player(p) => &p.gameprofile.name,
+                Self::Lobby(p) => &p.gameprofile.name,
+                Self::PreJoin(p) => &p.profile.name,
                 Self::CommandBlock(..) => "@",
                 Self::Dummy => "",
             }
@@ -154,6 +158,8 @@ impl CommandSender {
             #[allow(clippy::print_stdout)]
             Self::Console => println!("{}", text.to_pretty_console()),
             Self::Player(c) => c.send_system_message(&text),
+            Self::Lobby(c) => c.send_system_message(&text),
+            Self::PreJoin(c) => c.send_message(&text),
             Self::Rcon(s) => s
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -200,12 +206,30 @@ impl CommandSender {
         }
     }
 
+    #[must_use]
+    pub fn as_lobby_player(&self) -> Option<Arc<Player>> {
+        match self {
+            Self::Lobby(player) => Some(player.clone()),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_pre_join(&self) -> Option<Arc<crate::server::cluster_lobby::LobbyCommandSender>> {
+        match self {
+            Self::PreJoin(session) => Some(session.clone()),
+            _ => None,
+        }
+    }
+
     /// prefer using `has_permission_lvl(lvl)`
     #[must_use]
     pub fn permission_lvl(&self) -> PermissionLvl {
         match self {
             Self::Console | Self::Rcon(_) => PermissionLvl::Four,
             Self::Player(p) => p.permission_lvl.load(),
+            Self::Lobby(p) => p.permission_lvl.load(),
+            Self::PreJoin(p) => p.permission,
             Self::CommandBlock(..) | Self::Dummy => PermissionLvl::Two,
         }
     }
@@ -215,6 +239,8 @@ impl CommandSender {
         match self {
             Self::Console | Self::Rcon(_) => true,
             Self::Player(p) => p.permission_lvl.load().ge(&lvl),
+            Self::Lobby(p) => p.permission_lvl.load().ge(&lvl),
+            Self::PreJoin(p) => p.permission.ge(&lvl),
             Self::CommandBlock(..) | Self::Dummy => PermissionLvl::Two >= lvl,
         }
     }
@@ -224,6 +250,17 @@ impl CommandSender {
         match self {
             Self::Console | Self::Rcon(_) => true, // Console and RCON always have all permissions
             Self::Player(p) => p.has_permission(server, node),
+            Self::Lobby(p) => p.has_permission(server, node),
+            Self::PreJoin(p) => {
+                let Some(default) = server.permission_manager.get_default_snapshot(node) else {
+                    return false;
+                };
+                match default {
+                    PermissionDefault::Allow => true,
+                    PermissionDefault::Deny => false,
+                    PermissionDefault::Op(level) => p.permission >= level,
+                }
+            }
             Self::CommandBlock(..) | Self::Dummy => {
                 let Some(p) = server.permission_manager.get_permission(node) else {
                     return false;
@@ -240,7 +277,9 @@ impl CommandSender {
     #[must_use]
     pub fn position(&self) -> Option<Vector3<f64>> {
         match self {
-            Self::Console | Self::Rcon(..) | Self::Dummy => None,
+            Self::Console | Self::Rcon(..) | Self::Dummy | Self::Lobby(_) | Self::PreJoin(_) => {
+                None
+            }
             Self::Player(p) => Some(p.living_entity.entity.pos.load()),
             Self::CommandBlock(c, _) => Some(c.get_position().to_centered_f64()),
         }
@@ -249,7 +288,9 @@ impl CommandSender {
     #[must_use]
     pub fn rotation(&self) -> Option<(f32, f32)> {
         match self {
-            Self::Console | Self::Rcon(..) | Self::Dummy => None,
+            Self::Console | Self::Rcon(..) | Self::Dummy | Self::Lobby(_) | Self::PreJoin(_) => {
+                None
+            }
             Self::Player(player) => Some(player.rotation()),
             Self::CommandBlock(command_block, world) => {
                 let pos = command_block.get_position();
@@ -277,7 +318,9 @@ impl CommandSender {
         match self {
             // These senders are not bound to a world. Use `world_or_first` to
             // fall back to the first world instead.
-            Self::Console | Self::Rcon(..) | Self::Dummy => None,
+            Self::Console | Self::Rcon(..) | Self::Dummy | Self::Lobby(_) | Self::PreJoin(_) => {
+                None
+            }
             Self::Player(p) => Some(p.living_entity.entity.world.load_full()),
             Self::CommandBlock(_, w) => Some(w.clone()),
         }
@@ -302,6 +345,10 @@ impl CommandSender {
             Self::Player(player) => {
                 Locale::from_str(&player.config.load().locale).unwrap_or(Locale::EnUs)
             }
+            Self::Lobby(player) => {
+                Locale::from_str(&player.config.load().locale).unwrap_or(Locale::EnUs)
+            }
+            Self::PreJoin(session) => Locale::from_str(&session.locale).unwrap_or(Locale::EnUs),
         }
     }
 
@@ -319,6 +366,7 @@ impl CommandSender {
                     .game_rules
                     .send_command_feedback
             }
+            Self::Lobby(_) | Self::PreJoin(_) => true,
             Self::Console | Self::Rcon(_) => true,
             Self::Dummy => false,
         }
@@ -328,7 +376,7 @@ impl CommandSender {
     pub fn should_broadcast_console_to_ops(&self) -> bool {
         match self {
             Self::CommandBlock(_, world) => world.level_info.load().game_rules.command_block_output,
-            Self::Player(..) => true,
+            Self::Player(..) | Self::Lobby(..) | Self::PreJoin(..) => true,
             Self::Console | Self::Rcon(_) => {
                 BROADCAST_CONSOLE_TO_OPS.load(std::sync::atomic::Ordering::Relaxed)
             }
@@ -340,7 +388,12 @@ impl CommandSender {
     pub const fn should_track_output(&self) -> bool {
         match self {
             Self::Dummy => false,
-            Self::Player(..) | Self::Console | Self::Rcon(_) | Self::CommandBlock(..) => true,
+            Self::Player(..)
+            | Self::Lobby(..)
+            | Self::PreJoin(..)
+            | Self::Console
+            | Self::Rcon(_)
+            | Self::CommandBlock(..) => true,
         }
     }
 
@@ -383,6 +436,32 @@ impl CommandSender {
                 player.get_display_name(),
                 server.clone(),
             ),
+            Self::Lobby(player) => {
+                let (world, spawn_point) = Self::get_world_and_spawn_point(server);
+                CommandSource::new(
+                    Self::Lobby(player.clone()),
+                    world,
+                    None,
+                    spawn_point,
+                    Vector2::new(0.0, 0.0),
+                    player.gameprofile.name.clone(),
+                    TextComponent::text(player.gameprofile.name.clone()),
+                    server.clone(),
+                )
+            }
+            Self::PreJoin(session) => {
+                let (world, spawn_point) = Self::get_world_and_spawn_point(server);
+                CommandSource::new(
+                    Self::PreJoin(session.clone()),
+                    world,
+                    None,
+                    spawn_point,
+                    Vector2::new(0.0, 0.0),
+                    session.profile.name.clone(),
+                    TextComponent::text(session.profile.name.clone()),
+                    server.clone(),
+                )
+            }
             Self::CommandBlock(command_entity, world) => {
                 let pos = command_entity.position;
 

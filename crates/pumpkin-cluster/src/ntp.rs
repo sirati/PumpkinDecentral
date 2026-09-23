@@ -36,8 +36,7 @@ pub const QUERY_RECV_LEN: usize = 512;
 static SHARED_OFFSET_MILLIS: AtomicI64 = AtomicI64::new(i64::MAX);
 
 #[cfg(test)]
-pub(crate) static SHARED_OFFSET_SERIAL: std::sync::Mutex<()> =
-    std::sync::Mutex::new(());
+pub(crate) static SHARED_OFFSET_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[must_use]
 pub fn shared_offset_millis() -> Option<i64> {
@@ -129,7 +128,6 @@ impl NtpHandle {
             }
         }
     }
-
 }
 
 /// Polling half of the discipline pair: owns the servers and the watch sender.
@@ -261,11 +259,10 @@ pub fn unix_millis_to_ntp_timestamp(millis: i64) -> (u32, u32) {
     let sub_second = millis.rem_euclid(1000);
     let ntp_seconds = seconds.saturating_add(NTP_UNIX_EPOCH_OFFSET_SECS);
     let whole = u32::try_from(ntp_seconds).unwrap_or(u32::MAX);
-    let ticks =
-        u64::from(u32::try_from(sub_second).unwrap_or(0))
-            .saturating_mul(4_294_967_296_u64)
-            .saturating_add(500)
-            / 1000;
+    let ticks = u64::from(u32::try_from(sub_second).unwrap_or(0))
+        .saturating_mul(4_294_967_296_u64)
+        .saturating_add(500)
+        / 1000;
     let fraction = u32::try_from(ticks).unwrap_or(u32::MAX);
     (whole, fraction)
 }
@@ -526,14 +523,11 @@ mod tests {
                 if len == NTP_PACKET_LEN {
                     let mut reply = [0_u8; NTP_PACKET_LEN];
                     reply[0] = 0x1C;
-                    if let (Some(origin), Some(slots)) =
-                        (buffer.get(40..48), reply.get_mut(32..48))
+                    if let (Some(origin), Some(slots)) = (buffer.get(40..48), reply.get_mut(32..48))
                     {
                         let transmit = u64::from_be_bytes(origin.try_into().unwrap());
-                        let origin_millis = ntp_timestamp_to_unix_millis(
-                            (transmit >> 32) as u32,
-                            transmit as u32,
-                        );
+                        let origin_millis =
+                            ntp_timestamp_to_unix_millis((transmit >> 32) as u32, transmit as u32);
                         let (skew_secs, skew_frac) =
                             unix_millis_to_ntp_timestamp(origin_millis + 10_000_000);
                         let mut skew = [0_u8; 8];
@@ -550,8 +544,7 @@ mod tests {
                 }
             }
         });
-        let (mut sync, handle) =
-            NtpSync::new(NtpConfig::new(vec![format!("{addr}")], 250));
+        let (mut sync, handle) = NtpSync::new(NtpConfig::new(vec![format!("{addr}")], 250));
         sync.refresh().await;
         assert!(!handle.is_healthy());
         assert_eq!(shared_offset_millis(), None);
@@ -599,8 +592,7 @@ mod tests {
                 if len == NTP_PACKET_LEN {
                     let mut reply = [0_u8; NTP_PACKET_LEN];
                     reply[0] = 0x1C;
-                    if let (Some(origin), Some(slots)) =
-                        (buffer.get(40..48), reply.get_mut(32..48))
+                    if let (Some(origin), Some(slots)) = (buffer.get(40..48), reply.get_mut(32..48))
                     {
                         if let Some(recv) = slots.get_mut(0..8) {
                             recv.copy_from_slice(origin);
@@ -613,8 +605,7 @@ mod tests {
                 }
             }
         });
-        let (mut sync, handle) =
-            NtpSync::new(NtpConfig::new(vec![format!("{addr}")], 250));
+        let (mut sync, handle) = NtpSync::new(NtpConfig::new(vec![format!("{addr}")], 250));
         sync.refresh().await;
         let offset = handle.offset().unwrap();
         assert!(

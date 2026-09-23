@@ -45,13 +45,11 @@ impl CommandExecutor for MsgExecutor {
                 return Ok(1);
             }
         };
-        let see_hidden =
-            context
-                .source
-                .has_permission(crate::server::cluster_hide::HIDE_PERMISSION);
         let visible: Vec<_> = targets
             .into_iter()
-            .filter(|target| see_hidden || !crate::server::cluster_hide::is_hidden_player(target))
+            .filter(|target| {
+                !crate::server::cluster_hide::is_hidden_player(context.server(), target)
+            })
             .collect();
         if visible.is_empty() {
             return Err(

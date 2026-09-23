@@ -138,6 +138,7 @@ tempfile.workspace = true
 
 [features]
 console-subscriber = ["dep:console-subscriber"]
+cluster-e2e = []
 
 [lints]
 workspace = true

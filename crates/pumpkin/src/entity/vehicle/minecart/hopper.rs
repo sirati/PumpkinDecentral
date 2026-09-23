@@ -117,10 +117,12 @@ impl HopperMinecart {
     pub(super) fn interact(
         &self,
         custom_name: Option<TextComponent>,
+        entity: &Entity,
         player: &Arc<Player>,
     ) -> bool {
         container::open(
             custom_name,
+            entity,
             player,
             &self.inventory,
             TextComponent::translate_cross(

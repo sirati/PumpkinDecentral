@@ -1,10 +1,13 @@
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
+
+use arc_swap::ArcSwap;
 
 use pumpkin_inventory::crafting::recipe_provider::RecipeProvider;
 pub use pumpkin_protocol::codec::recipe::DynamicRecipe;
 
 pub struct RecipeManager {
     dynamic_recipes: RwLock<Vec<DynamicRecipe>>,
+    cluster_snapshot: ArcSwap<Vec<DynamicRecipe>>,
 }
 
 impl Default for RecipeManager {
@@ -15,9 +18,10 @@ impl Default for RecipeManager {
 
 impl RecipeManager {
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             dynamic_recipes: RwLock::new(Vec::new()),
+            cluster_snapshot: ArcSwap::from_pointee(Vec::new()),
         }
     }
 
@@ -27,6 +31,7 @@ impl RecipeManager {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         recipes.push(recipe);
+        self.cluster_snapshot.store(Arc::new(recipes.clone()));
     }
 
     pub fn add_recipes(&self, new_recipes: impl IntoIterator<Item = DynamicRecipe>) {
@@ -35,6 +40,7 @@ impl RecipeManager {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         recipes.extend(new_recipes);
+        self.cluster_snapshot.store(Arc::new(recipes.clone()));
     }
 
     pub fn set_recipes(&self, new_recipes: Vec<DynamicRecipe>) {
@@ -43,6 +49,7 @@ impl RecipeManager {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *recipes = new_recipes;
+        self.cluster_snapshot.store(Arc::new(recipes.clone()));
     }
 
     pub fn clear(&self) {
@@ -51,6 +58,11 @@ impl RecipeManager {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         recipes.clear();
+        self.cluster_snapshot.store(Arc::new(recipes.clone()));
+    }
+
+    pub fn cluster_dynamic_recipes_snapshot(&self) -> Arc<Vec<DynamicRecipe>> {
+        self.cluster_snapshot.load_full()
     }
 
     pub fn get_dynamic_recipes_internal(&self) -> Vec<DynamicRecipe> {

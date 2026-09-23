@@ -1,6 +1,6 @@
+use super::attack::attack_and_replicate;
 #[allow(clippy::wildcard_imports)]
 use super::*;
-use super::attack::attack_and_replicate;
 
 impl JavaClient {
     #[expect(clippy::too_many_lines)]
@@ -17,14 +17,64 @@ impl JavaClient {
         let entity_id = interact.entity_id;
 
         let sneaking = interact.sneaking;
-        let player_entity = &player.get_entity();
-        if player_entity.is_sneaking() != sneaking {
-            player_entity.set_sneaking(sneaking);
-        }
         let Ok(action) = ActionType::try_from(interact.r#type.0) else {
             self.try_kick(&TextComponent::text("Invalid action type"));
             return;
         };
+        if server.advanced_config.cluster.enabled {
+            if !crate::server::cluster_controller::submit_patch(
+                server,
+                player,
+                crate::server::cluster_controller::ControllerPatch::Sneak(sneaking),
+            ) {
+                return;
+            }
+            let Some((target, target_chunk)) =
+                crate::server::cluster_inventory_protocol::actor_for_entity_id(player, entity_id.0)
+            else {
+                return;
+            };
+            let interaction = if action == ActionType::Attack {
+                pumpkin_cluster::item_action::ActorItemInteraction::Attack
+            } else {
+                pumpkin_cluster::item_action::ActorItemInteraction::Interact
+            };
+            let hit = match interact.target_position {
+                Some(position)
+                    if position.x.is_finite()
+                        && position.y.is_finite()
+                        && position.z.is_finite()
+                        && position.x >= f64::from(f32::MIN)
+                        && position.x <= f64::from(f32::MAX)
+                        && position.y >= f64::from(f32::MIN)
+                        && position.y <= f64::from(f32::MAX)
+                        && position.z >= f64::from(f32::MIN)
+                        && position.z <= f64::from(f32::MAX) =>
+                {
+                    Some([position.x as f32, position.y as f32, position.z as f32])
+                }
+                Some(_) => return,
+                None => None,
+            };
+            let hand = interact.hand.map_or(0, |hand| hand.0 as u8);
+            crate::server::cluster_inventory_protocol::stage_item_action(
+                player,
+                hand,
+                crate::server::cluster_inventory_protocol::StagedItemActionKind::UseOnActor {
+                    target,
+                    target_chunk,
+                    hit,
+                    interaction,
+                },
+                None,
+            );
+            return;
+        }
+
+        let player_entity = &player.get_entity();
+        if player_entity.is_sneaking() != sneaking {
+            player_entity.set_sneaking(sneaking);
+        }
 
         // Resolve the target entity for the event
         let world = player_entity.world.load_full();
@@ -83,10 +133,19 @@ impl JavaClient {
                             attack_and_replicate(
                                 player,
                                 &event.target,
-                                player_target.is_some(),
+                                player_target.is_some()
+                                    || crate::server::cluster_ghost::remote_player_gid(
+                                        event.target.as_ref(),
+                                    )
+                                    .is_some(),
                                 player_target
                                     .as_ref()
-                                    .and_then(|victim| victim.cluster_gid()),
+                                    .and_then(|victim| victim.cluster_gid())
+                                    .or_else(|| {
+                                        crate::server::cluster_ghost::remote_player_gid(
+                                            event.target.as_ref(),
+                                        )
+                                    }),
                                 server,
                             );
                         }

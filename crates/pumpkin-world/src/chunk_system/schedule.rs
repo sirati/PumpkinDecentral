@@ -138,7 +138,9 @@ impl GenerationSchedule {
         let cpus = thread::available_parallelism().map_or(1, std::num::NonZero::get);
         let gen_threads = (cpus / 2).clamp(2, 16);
         let generation_pool = if crate::level::is_cluster_secondary() {
-            info!("Cluster secondary scheduler starting in no-generate mode: local chunk generation is disabled, chunks must arrive from the holding peer");
+            info!(
+                "Cluster secondary scheduler starting in no-generate mode: local chunk generation is disabled, chunks must arrive from the holding peer"
+            );
             None
         } else {
             Some(Arc::new(
@@ -307,7 +309,10 @@ impl GenerationSchedule {
     fn secondary_cluster_arrive(&mut self, pos: ChunkPos, snapshot: SyncChunk) {
         let mut holder = self.chunk_map.remove(&pos).unwrap_or_default();
         holder.target_stage = StagedChunkEnum::level_to_stage(
-            *self.last_level.get(&pos).unwrap_or(&ChunkLoading::MAX_LEVEL),
+            *self
+                .last_level
+                .get(&pos)
+                .unwrap_or(&ChunkLoading::MAX_LEVEL),
         );
         holder.dependency_stage = StagedChunkEnum::None;
         let held = holder.public
@@ -431,7 +436,11 @@ impl GenerationSchedule {
             if let Some(level) = &self.cluster_level {
                 level.clear_cluster_fetch_wanted(&pos);
             }
-            error!(chunk_x = pos.x, chunk_z = pos.y, "cluster chunk load timed out; discarded partial holder");
+            error!(
+                chunk_x = pos.x,
+                chunk_z = pos.y,
+                "cluster chunk load timed out; discarded partial holder"
+            );
         }
     }
 
@@ -490,9 +499,7 @@ impl GenerationSchedule {
                     && target_node.in_degree > 0
                 {
                     target_node.in_degree -= 1;
-                    if target_node.in_degree == 0
-                        && !target_node.in_queue
-                        && !target_node.in_flight
+                    if target_node.in_degree == 0 && !target_node.in_queue && !target_node.in_flight
                     {
                         target_node.in_queue = true;
                         queue.push(TaskHeapNode(
@@ -1296,9 +1303,7 @@ impl GenerationSchedule {
                 let stage = StagedChunkEnum::Full;
                 self.drop_satisfied_tasks(&mut holder, stage);
                 holder.current_stage = stage;
-                if !holder.occupied.is_null()
-                    && self.graph.nodes.contains_key(holder.occupied)
-                {
+                if !holder.occupied.is_null() && self.graph.nodes.contains_key(holder.occupied) {
                     self.drop_node(holder.occupied);
                 }
                 holder.occupied = NodeKey::null();
@@ -2110,7 +2115,14 @@ mod secondary_park_regression {
         schedule.check_waiting_tasks(true);
         assert!(schedule.queue.is_empty());
         assert!(schedule.waiting_for_chunks.contains(&parked));
-        assert!(!schedule.graph.nodes.get(parked).expect("parked node exists").in_queue);
+        assert!(
+            !schedule
+                .graph
+                .nodes
+                .get(parked)
+                .expect("parked node exists")
+                .in_queue
+        );
         let waiting_snapshot = schedule.waiting_for_chunks.clone();
         let restored = GenerationSchedule::restore_ready_tasks(
             &mut schedule.graph,
@@ -2124,7 +2136,14 @@ mod secondary_park_regression {
         assert_eq!(restored, 0);
         assert!(schedule.queue.is_empty());
         assert!(schedule.waiting_for_chunks.contains(&parked));
-        assert!(!schedule.graph.nodes.get(parked).expect("parked node exists").in_queue);
+        assert!(
+            !schedule
+                .graph
+                .nodes
+                .get(parked)
+                .expect("parked node exists")
+                .in_queue
+        );
     }
 
     #[test]
@@ -2171,7 +2190,10 @@ mod secondary_park_regression {
         let _secondary_mode = SecondaryTestMode::enable();
         let mut schedule = secondary_test_schedule();
         let pos = ChunkPos::new(1, 2);
-        let dependency = schedule.graph.nodes.insert(Node::new(pos, StagedChunkEnum::Empty));
+        let dependency = schedule
+            .graph
+            .nodes
+            .insert(Node::new(pos, StagedChunkEnum::Empty));
         let mut holder = ChunkHolder::default();
         let created = GenerationSchedule::ensure_dependency_chain(
             &mut schedule.graph,
@@ -2220,7 +2242,11 @@ mod secondary_park_regression {
         );
         assert!(schedule.queue.is_empty());
         assert_eq!(restored, 0);
-        let parked_node = schedule.graph.nodes.get(parked).expect("parked node exists");
+        let parked_node = schedule
+            .graph
+            .nodes
+            .get(parked)
+            .expect("parked node exists");
         assert!(!parked_node.in_queue);
     }
 
@@ -2322,7 +2348,11 @@ mod secondary_park_regression {
         schedule.cluster_fetches.insert(pos, Instant::now());
         schedule.secondary_poll_fetches();
         assert!(schedule.cluster_fetches.contains_key(&pos));
-        let node = schedule.graph.nodes.get(fetching).expect("fetch node exists");
+        let node = schedule
+            .graph
+            .nodes
+            .get(fetching)
+            .expect("fetch node exists");
         assert!(node.in_flight);
         assert!(!node.in_queue);
         assert!(schedule.queue.is_empty());
@@ -2377,6 +2407,4 @@ mod secondary_park_regression {
         assert!(schedule.chunk_map.contains_key(&pos));
         assert!(schedule.public_chunk_map.contains_key(&pos));
     }
-
-
 }
