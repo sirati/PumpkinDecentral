@@ -3,6 +3,8 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${1:-$REPO/result-dev/bin/pumpkin}"
 BIN="$(readlink -f "$BIN")"
+LIMITED="$REPO/tools/cluster/run-pumpkin-limited.sh"
+printf -v LAUNCH '%q %q' "$LIMITED" "$BIN"
 
 stop_session() {
   local session="$1"
@@ -24,6 +26,6 @@ stop_session() {
 
 stop_session pumpkin-primary
 stop_session pumpkin-node1
-tmux new-session -d -s pumpkin-primary -c "$REPO/.cluster-run/node-primary" "$BIN"
-tmux new-session -d -s pumpkin-node1 -c "$REPO/.cluster-run/node-1" "$BIN"
+tmux new-session -d -s pumpkin-primary -c "$REPO/.cluster-run/node-primary" "$LAUNCH"
+tmux new-session -d -s pumpkin-node1 -c "$REPO/.cluster-run/node-1" "$LAUNCH"
 echo "started pumpkin-primary and pumpkin-node1"

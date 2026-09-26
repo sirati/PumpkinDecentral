@@ -27,6 +27,10 @@ wait "$local_start"
 
 Do not pass `result-dev` as an argument: the launcher already defaults to
 `result-dev/bin/pumpkin`, while an argument must be the executable itself.
+Every Pumpkin process started by the local launchers runs in its own user
+systemd scope with `MemoryMax=1G`. The launch fails if that scope cannot be
+created. This limit applies to the local primary and node 1; it does not
+change the laptop launcher.
 
 The laptop launcher has a pinned `BIN` path. Point it at this build before
 starting node 2, then run the launcher:

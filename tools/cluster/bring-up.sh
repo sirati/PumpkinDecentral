@@ -11,6 +11,8 @@ cd "$REPO"
 echo "=== 1. build ==="
 nix build
 BIN="$(readlink -f ./result)/bin/pumpkin"
+LIMITED="$REPO/tools/cluster/run-pumpkin-limited.sh"
+printf -v LOCAL_LAUNCH '%q %q' "$LIMITED" "$BIN"
 echo "binary: $BIN"
 
 echo "=== 2. copy closure to $REMOTE (cache pulls first) ==="
@@ -23,7 +25,7 @@ echo "=== 3. local configs ==="
 echo "=== 4. start primary ==="
 mkdir -p "$DIR/node-primary"
 tmux kill-session -t pumpkin-primary 2>/dev/null || true
-tmux new-session -d -s pumpkin-primary -c "$DIR/node-primary" "$BIN"
+tmux new-session -d -s pumpkin-primary -c "$DIR/node-primary" "$LOCAL_LAUNCH"
 echo "primary in tmux pumpkin-primary"
 
 echo "=== 5. wait for primary level.dat, sync seed ==="
@@ -37,7 +39,7 @@ done
 
 echo "=== 6. first-boot local nodes to generate certs ==="
 tmux kill-session -t pumpkin-node1 2>/dev/null || true
-tmux new-session -d -s pumpkin-node1 -c "$DIR/node-1" "$BIN" || true
+tmux new-session -d -s pumpkin-node1 -c "$DIR/node-1" "$LOCAL_LAUNCH" || true
 sleep 5
 
 echo "=== 7. remote node-2 dir + first boot for cert ==="
@@ -75,10 +77,10 @@ dat="$(grep -E '^[[:space:]]*default_level_name' "$DIR/node-primary/pumpkin.toml
 dat="${dat:-world}"
 scp "$DIR/node-2/$dat/level.dat" "$REMOTE:~/$RDIR/$dat/level.dat" 2>/dev/null || scp "$DIR/node-primary/$dat/level.dat" "$REMOTE:~/$RDIR/$dat/level.dat"
 tmux kill-session -t pumpkin-primary 2>/dev/null || true
-tmux new-session -d -s pumpkin-primary -c "$DIR/node-primary" "$BIN"
+tmux new-session -d -s pumpkin-primary -c "$DIR/node-primary" "$LOCAL_LAUNCH"
 sleep 3
 tmux kill-session -t pumpkin-node1 2>/dev/null || true
-tmux new-session -d -s pumpkin-node1 -c "$DIR/node-1" "$BIN"
+tmux new-session -d -s pumpkin-node1 -c "$DIR/node-1" "$LOCAL_LAUNCH"
 ssh "$REMOTE" "tmux kill-session -t pumpkin-node2 2>/dev/null; tmux new-session -d -s pumpkin-node2 -c ~/$RDIR $BIN"
 
 echo "=== join ==="

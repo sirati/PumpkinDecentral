@@ -200,12 +200,15 @@ fi
 check_mesh
 [ "$errors" -ne 0 ] && { echo "run-local: refusing to start: fix binds, MC ports, or pins above" >&2; exit 1; }
 if [ "$MODE" = "check" ]; then verify_cluster_seed; [ "$errors" -ne 0 ] && exit 1; echo "ok: binds, MC ports, pins, and seed verified"; exit 0; fi
-(cd "$DIR/node-primary" && nohup cargo run -q -p pumpkin >"$DIR/node-primary/node.log" 2>&1 & echo $! > "$DIR/node-primary/node.pid")
+BIN="$(readlink -f "${PUMPKIN_BIN:-$REPO/result-dev/bin/pumpkin}")"
+[ -x "$BIN" ] || { echo "run-local: missing Pumpkin binary: $BIN" >&2; exit 1; }
+LIMITED="$REPO/tools/cluster/run-pumpkin-limited.sh"
+(cd "$DIR/node-primary" && nohup "$LIMITED" "$BIN" >"$DIR/node-primary/node.log" 2>&1 & echo $! > "$DIR/node-primary/node.pid")
 echo "started node-primary pid $(cat "$DIR/node-primary/node.pid") log $DIR/node-primary/node.log"
 wait_for_primary_seed || exit 1
 sync_cluster_seed || exit 1
 verify_cluster_seed
 [ "$errors" -ne 0 ] && { echo "run-local: refusing to start secondaries: seed sync failed above" >&2; exit 1; }
-(cd "$DIR/node-1" && nohup cargo run -q -p pumpkin >"$DIR/node-1/node.log" 2>&1 & echo $! > "$DIR/node-1/node.pid")
+(cd "$DIR/node-1" && nohup "$LIMITED" "$BIN" >"$DIR/node-1/node.log" 2>&1 & echo $! > "$DIR/node-1/node.pid")
 echo "started node-1 pid $(cat "$DIR/node-1/node.pid") log $DIR/node-1/node.log"
-echo "node-2 is remote: copy $DIR/node-2/<world>/level.dat to the laptop, then run: cd <repo> && cargo run -q -p pumpkin (cwd with node-2 pumpkin.toml)"
+echo "node-2 is remote: copy $DIR/node-2/<world>/level.dat to the laptop before starting it"
