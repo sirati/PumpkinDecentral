@@ -20,6 +20,7 @@ use pumpkin_util::text::TextComponent;
 #[pumpkin_block("minecraft:enchanting_table")]
 pub struct EnchantingTableBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for EnchantingTableBlock {
     fn placed(&self, args: PlacedArgs<'_>) {
         let entity = EnchantingTableBlockEntity::new(*args.position);

@@ -11,6 +11,7 @@ pub(crate) type MovingPistonProps = pumpkin_data::block_properties::MovingPiston
 #[pumpkin_block("minecraft:moving_piston")]
 pub struct PistonExtensionBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for PistonExtensionBlock {
     fn broken(&self, args: BrokenArgs<'_>) {
         {

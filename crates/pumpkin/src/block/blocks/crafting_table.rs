@@ -15,6 +15,7 @@ use std::sync::Mutex;
 #[pumpkin_block("minecraft:crafting_table")]
 pub struct CraftingTableBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for CraftingTableBlock {
     fn normal_use(&self, args: NormalUseArgs<'_>) -> BlockActionResult {
         if let Some(factory) = self.get_screen_handler_factory(GetScreenHandlerFactoryArgs {

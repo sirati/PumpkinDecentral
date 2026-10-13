@@ -21,6 +21,28 @@ struct QueryExecutor(GameRule);
 impl CommandExecutor for QueryExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let key = TextComponent::text(self.0.to_string());
+        if context.server().advanced_config.cluster.enabled {
+            let value = crate::server::cluster_gamerules::query(context.server(), &self.0)
+                .ok_or_else(crate::server::cluster_admin_apply::admin_busy_error)?;
+            let (text, result) = match value {
+                crate::server::cluster_gamerules::RuleValue::Bool(value) => {
+                    (value.to_string(), value as i32)
+                }
+                crate::server::cluster_gamerules::RuleValue::Int(value) => (
+                    value.to_string(),
+                    value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                ),
+            };
+            context.source.send_feedback(
+                TextComponent::translate_cross(
+                    "commands.gamerule.query",
+                    "commands.gamerule.query",
+                    [key, TextComponent::text(text)],
+                ),
+                false,
+            );
+            return Ok(result);
+        }
         let level_info = context.server().level_info.load();
         let game_rule = level_info.game_rules.get(&self.0);
         let game_rule_i32_value = match game_rule {
@@ -49,6 +71,19 @@ impl CommandExecutor for SetIntExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let key = TextComponent::text(self.0.to_string());
         let arg_value = IntegerArgumentType::get(context, "value")? as i64;
+        if context.server().advanced_config.cluster.enabled {
+            if !crate::server::cluster_gamerules::set_rule(
+                context.server(),
+                &self.0,
+                GameRuleValue::Int(arg_value),
+            ) {
+                return Err(crate::server::cluster_admin_apply::admin_busy_error());
+            }
+            context
+                .source
+                .send_feedback(TextComponent::text("Game rule change queued."), false);
+            return Ok(arg_value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32);
+        }
 
         let current_info = context.server().level_info.load();
         let mut new_info = (**current_info).clone();
@@ -79,6 +114,19 @@ impl CommandExecutor for SetBoolExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let key = TextComponent::text(self.0.to_string());
         let arg_value = BoolArgumentType::get(context, "value")?;
+        if context.server().advanced_config.cluster.enabled {
+            if !crate::server::cluster_gamerules::set_rule(
+                context.server(),
+                &self.0,
+                GameRuleValue::Bool(arg_value),
+            ) {
+                return Err(crate::server::cluster_admin_apply::admin_busy_error());
+            }
+            context
+                .source
+                .send_feedback(TextComponent::text("Game rule change queued."), false);
+            return Ok(arg_value as i32);
+        }
 
         let current_info = context.server().level_info.load();
         let mut new_info = (**current_info).clone();

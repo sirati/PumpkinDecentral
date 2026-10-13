@@ -5,7 +5,7 @@
 use pumpkin_data::{Block, BlockDirection, BlockState};
 use pumpkin_util::math::position::BlockPos;
 
-use crate::world::World;
+use crate::block::RedstonePowerWorld;
 
 pub mod bell;
 pub mod buttons;
@@ -37,7 +37,7 @@ pub mod dispenser;
 pub fn is_emitting_redstone_power(
     block: &Block,
     state: &BlockState,
-    world: &World,
+    world: &dyn RedstonePowerWorld,
     pos: &BlockPos,
     facing: BlockDirection,
 ) -> bool {
@@ -47,7 +47,7 @@ pub fn is_emitting_redstone_power(
 pub fn get_redstone_power(
     block: &Block,
     state: &BlockState,
-    world: &World,
+    world: &dyn RedstonePowerWorld,
     pos: &BlockPos,
     facing: BlockDirection,
 ) -> u8 {
@@ -63,7 +63,7 @@ pub fn get_redstone_power(
 pub fn get_redstone_power_no_dust(
     block: &Block,
     state: &BlockState,
-    world: &World,
+    world: &dyn RedstonePowerWorld,
     pos: BlockPos,
     facing: BlockDirection,
 ) -> u8 {
@@ -76,7 +76,11 @@ pub fn get_redstone_power_no_dust(
     get_weak_power(block, state, world, &pos, facing, false)
 }
 
-pub fn get_max_strong_power(world: &World, pos: &BlockPos, dust_power: bool) -> u8 {
+pub fn get_max_strong_power(
+    world: &dyn RedstonePowerWorld,
+    pos: &BlockPos,
+    dust_power: bool,
+) -> u8 {
     let mut max_power = 0;
     for side in BlockDirection::all() {
         let (block, state) = world.get_block_and_state(&pos.offset(side.to_offset()));
@@ -92,7 +96,7 @@ pub fn get_max_strong_power(world: &World, pos: &BlockPos, dust_power: bool) -> 
     max_power
 }
 
-pub fn get_max_weak_power(world: &World, pos: &BlockPos, dust_power: bool) -> u8 {
+pub fn get_max_weak_power(world: &dyn RedstonePowerWorld, pos: &BlockPos, dust_power: bool) -> u8 {
     let mut max_power = 0;
     for side in BlockDirection::all() {
         let (block, state) = world.get_block_and_state(&pos.offset(side.to_offset()));
@@ -111,7 +115,7 @@ pub fn get_max_weak_power(world: &World, pos: &BlockPos, dust_power: bool) -> u8
 fn get_weak_power(
     block: &Block,
     state: &BlockState,
-    world: &World,
+    world: &dyn RedstonePowerWorld,
     pos: &BlockPos,
     side: BlockDirection,
     dust_power: bool,
@@ -120,14 +124,14 @@ fn get_weak_power(
         return 0;
     }
     world
-        .block_registry
+        .power_registry()
         .get_weak_redstone_power(block, world, pos, state, side)
 }
 
 fn get_strong_power(
     block: &Block,
     state: &BlockState,
-    world: &World,
+    world: &dyn RedstonePowerWorld,
     pos: &BlockPos,
     side: BlockDirection,
     dust_power: bool,
@@ -136,11 +140,11 @@ fn get_strong_power(
         return 0;
     }
     world
-        .block_registry
+        .power_registry()
         .get_strong_redstone_power(block, world, pos, state, side)
 }
 
-pub fn block_receives_redstone_power(world: &World, pos: &BlockPos) -> bool {
+pub fn block_receives_redstone_power(world: &dyn RedstonePowerWorld, pos: &BlockPos) -> bool {
     for facing in BlockDirection::all() {
         let neighbor_pos = pos.offset(facing.to_offset());
         let (block, state) = world.get_block_and_state(&neighbor_pos);
@@ -156,7 +160,11 @@ pub fn is_diode(block: &Block) -> bool {
     block == &Block::REPEATER || block == &Block::COMPARATOR
 }
 
-pub fn diode_get_input_strength(world: &World, pos: &BlockPos, facing: BlockDirection) -> u8 {
+pub fn diode_get_input_strength(
+    world: &dyn RedstonePowerWorld,
+    pos: &BlockPos,
+    facing: BlockDirection,
+) -> u8 {
     let input_pos = pos.offset(facing.to_offset());
     let (input_block, input_state) = world.get_block_and_state(&input_pos);
     let power: u8 = get_redstone_power(input_block, input_state, world, &input_pos, facing);

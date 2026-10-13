@@ -65,6 +65,7 @@ pub(crate) fn apply_entity_variant(item: &ItemStack, mob: &dyn EntityBase) {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for SpawnEggItem {
     fn normal_use(&self, item: &Item, player: &Player) {
         if let Some(entity_type) = entity_from_egg(item.id) {

@@ -126,6 +126,16 @@ impl ServerPlayerData {
         Ok(())
     }
 
+    pub(crate) fn read_resume_catalog(&self) -> std::io::Result<std::fs::ReadDir> {
+        if pumpkin_world::level::is_cluster_secondary() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "secondary resume catalog is diskless",
+            ));
+        }
+        std::fs::read_dir(self.storage.get_data_path())
+    }
+
     /// Loads player data and applies it to a player.
     ///
     /// This function loads a player's data and applies it to their Player instance.

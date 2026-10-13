@@ -17,6 +17,7 @@ use super::{HorizontalFacingRailExt, Rail, RailElevation, RailProperties};
 #[pumpkin_block("minecraft:rail")]
 pub struct RailBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for RailBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let world = args.world;

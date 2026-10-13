@@ -51,6 +51,7 @@ const fn get_wool_item_for_color(color: u8) -> &'static Item {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for ShearsItem {
     fn use_on_block(
         &self,

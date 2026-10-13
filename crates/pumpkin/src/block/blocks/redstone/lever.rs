@@ -63,7 +63,90 @@ fn play_lever_sound(world: &Arc<World>, block_pos: &BlockPos, powered: bool) {
 #[pumpkin_block("minecraft:lever")]
 pub struct LeverBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for LeverBlock {
+    fn placement_intent(
+        &self,
+        args: crate::block::PlacementIntentArgs<'_>,
+    ) -> Option<BlockStateId> {
+        let mut properties = LeverLikeProperties::default(args.block);
+        properties.face = match args.direction {
+            BlockDirection::Up => AttachFace::Ceiling,
+            BlockDirection::Down => AttachFace::Floor,
+            _ => AttachFace::Wall,
+        };
+        properties.facing = if matches!(args.direction, BlockDirection::Up | BlockDirection::Down) {
+            args.facing
+        } else {
+            args.direction.opposite().to_cardinal_direction()
+        };
+        let direction = properties.get_direction();
+        let offset = direction.to_offset();
+        let support = BlockPos::new(
+            args.position.0.x.checked_add(offset.x)?,
+            args.position.0.y.checked_add(offset.y)?,
+            args.position.0.z.checked_add(offset.z)?,
+        );
+        args.world
+            .get_block_state(&support)
+            .is_side_solid(direction.opposite())
+            .then(|| properties.to_state_id(args.block))
+    }
+
+    fn normal_use_intent(
+        &self,
+        args: crate::block::NormalUseIntentArgs<'_>,
+    ) -> Option<(
+        BlockActionResult,
+        Vec<crate::block::neighbor::BlockCallbackEffect>,
+    )> {
+        use crate::block::neighbor::BlockCallbackEffect;
+        if !args.can_modify_world {
+            return Some((BlockActionResult::Pass, Vec::new()));
+        }
+        let state = args.world.get_block_state_id(args.position);
+        let mut properties = LeverLikeProperties::from_state_id(state);
+        properties.powered = !properties.powered;
+        let offset = properties.get_direction().opposite().to_offset();
+        let attached = BlockPos::new(
+            args.position.0.x.checked_add(offset.x)?,
+            args.position.0.y.checked_add(offset.y)?,
+            args.position.0.z.checked_add(offset.z)?,
+        );
+        Some((
+            BlockActionResult::Consume,
+            vec![
+                BlockCallbackEffect::SetBlock {
+                    position: *args.position,
+                    state: properties.to_state_id(args.block),
+                    flags: BlockFlags::NOTIFY_ALL,
+                },
+                BlockCallbackEffect::NotifyNeighbors {
+                    position: *args.position,
+                    except: None,
+                },
+                BlockCallbackEffect::NotifyNeighbors {
+                    position: attached,
+                    except: None,
+                },
+                BlockCallbackEffect::Sound {
+                    position: *args.position,
+                    sound: Sound::BlockLeverClick,
+                    volume_milli: 300,
+                    pitch_milli: if properties.powered { 600 } else { 500 },
+                },
+                BlockCallbackEffect::GameEvent {
+                    position: *args.position,
+                    event: if properties.powered {
+                        GameEvent::BlockActivate
+                    } else {
+                        GameEvent::BlockDeactivate
+                    },
+                },
+            ],
+        ))
+    }
+
     fn normal_use(&self, args: NormalUseArgs<'_>) -> BlockActionResult {
         toggle_lever(args.world, args.position);
         BlockActionResult::Consume
@@ -88,13 +171,37 @@ impl BlockBehaviour for LeverBlock {
     }
 
     fn on_state_replaced(&self, args: OnStateReplacedArgs<'_>) {
-        let block_pos = args.position;
+        crate::block::neighbor::apply_legacy_replaced_intent(self, args);
+    }
 
-        let lever_props = LeverLikeProperties::from_state_id(args.old_state_id);
-
-        if lever_props.powered {
-            Self::update_neighbors(args.world, block_pos, lever_props);
+    fn callback_intent(
+        &self,
+        args: crate::block::neighbor::BlockCallbackIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        use crate::block::neighbor::{BlockCallbackEffect, BlockCallbackEvent};
+        let BlockCallbackEvent::StateReplaced { old_state, .. } = args.event else {
+            return Some(Vec::new());
+        };
+        let properties = LeverLikeProperties::from_state_id(old_state);
+        if !properties.powered {
+            return Some(Vec::new());
         }
+        let offset = properties.get_direction().opposite().to_offset();
+        let attached = BlockPos::new(
+            args.position.0.x.checked_add(offset.x)?,
+            args.position.0.y.checked_add(offset.y)?,
+            args.position.0.z.checked_add(offset.z)?,
+        );
+        Some(vec![
+            BlockCallbackEffect::NotifyNeighbors {
+                position: *args.position,
+                except: None,
+            },
+            BlockCallbackEffect::NotifyNeighbors {
+                position: attached,
+                except: None,
+            },
+        ])
     }
 
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {

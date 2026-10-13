@@ -10,6 +10,7 @@ use crate::time::TickStamp;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AcceptedPos {
     pub gid: GlobalPlayerId,
+    pub incarnation: u64,
     pub seq: PlayerSeq,
     pub tick: TickStamp,
     pub world: WorldId,
@@ -25,6 +26,7 @@ impl From<&PosUpdate> for AcceptedPos {
     fn from(update: &PosUpdate) -> Self {
         Self {
             gid: update.gid,
+            incarnation: update.incarnation,
             seq: update.seq,
             tick: update.tick,
             world: update.world,
@@ -40,7 +42,7 @@ impl From<&PosUpdate> for AcceptedPos {
 
 #[derive(Debug, Default)]
 pub struct RemotePlayerTable {
-    pub last_seq: HashMap<GlobalPlayerId, PlayerSeq>,
+    pub last_seq: HashMap<(GlobalPlayerId, u64), PlayerSeq>,
     pub ghosts: HashMap<GlobalPlayerId, AcceptedPos>,
 }
 
@@ -51,7 +53,14 @@ impl RemotePlayerTable {
     }
 
     pub fn apply_update(&mut self, update: &PosUpdate) -> Option<AcceptedPos> {
-        let fresh = match self.last_seq.get(&update.gid) {
+        if self
+            .ghosts
+            .get(&update.gid)
+            .is_some_and(|current| current.incarnation > update.incarnation)
+        {
+            return None;
+        }
+        let fresh = match self.last_seq.get(&(update.gid, update.incarnation)) {
             None => true,
             Some(seen) => update.seq.is_newer_than(*seen),
         };
@@ -59,7 +68,15 @@ impl RemotePlayerTable {
             return None;
         }
         let accepted = AcceptedPos::from(update);
-        self.last_seq.insert(update.gid, update.seq);
+        if self
+            .ghosts
+            .get(&update.gid)
+            .is_some_and(|current| current.incarnation != update.incarnation)
+        {
+            self.last_seq.retain(|(gid, _), _| *gid != update.gid);
+        }
+        self.last_seq
+            .insert((update.gid, update.incarnation), update.seq);
         self.ghosts.insert(update.gid, accepted);
         Some(accepted)
     }
@@ -89,8 +106,21 @@ impl RemotePlayerTable {
     }
 
     pub fn remove(&mut self, gid: &GlobalPlayerId) -> Option<AcceptedPos> {
-        self.last_seq.remove(gid);
+        self.last_seq.retain(|(player, _), _| player != gid);
         self.ghosts.remove(gid)
+    }
+
+    pub fn remove_server(&mut self, server: crate::identity::ServerId) -> Vec<GlobalPlayerId> {
+        let players = self
+            .ghosts
+            .keys()
+            .filter(|gid| gid.server == server)
+            .copied()
+            .collect::<Vec<_>>();
+        for player in &players {
+            self.remove(player);
+        }
+        players
     }
 
     #[must_use]
@@ -122,6 +152,8 @@ where
 
 pub fn sample_local_player(
     gid: GlobalPlayerId,
+    incarnation: u64,
+    spatial_epoch: crate::canonical_action::SpatialEpoch,
     seq: PlayerSeq,
     tick: TickStamp,
     world: WorldId,
@@ -133,7 +165,9 @@ pub fn sample_local_player(
     on_ground: bool,
 ) {
     let update = PosUpdate {
+        spatial_epoch,
         gid,
+        incarnation,
         seq,
         tick,
         world,
@@ -231,6 +265,15 @@ mod tests {
     fn sample(player: u16, seq: u16) -> PosUpdate {
         PosUpdate {
             gid: gid(player),
+            incarnation: 1,
+            spatial_epoch: crate::canonical_action::SpatialEpoch::Admission {
+                lease: crate::canonical_action::LivePlayerLease {
+                    key: crate::canonical_action::PlayerKey(uuid::Uuid::nil()),
+                    gid: gid(player),
+                    incarnation: 1,
+                },
+                admitted_at: TickStamp(0),
+            },
             seq: PlayerSeq(seq),
             tick: TickStamp(seq),
             world: WorldId::new(0, 7),
@@ -260,6 +303,17 @@ mod tests {
         assert!(table.apply_update(&sample(1, 10)).is_none());
         assert!(table.apply_update(&sample(1, 9)).is_none());
         assert!(table.apply_update(&sample(1, 11)).is_some());
+    }
+
+    #[test]
+    fn reused_slot_rejects_late_previous_incarnation() {
+        let mut table = RemotePlayerTable::new();
+        assert!(table.apply_update(&sample(1, u16::MAX)).is_some());
+        let mut replacement = sample(1, 0);
+        replacement.incarnation = 2;
+        assert!(table.apply_update(&replacement).is_some());
+        assert!(table.apply_update(&sample(1, 0)).is_none());
+        assert_eq!(table.ghost(&gid(1)).unwrap().incarnation, 2);
     }
 
     #[test]
@@ -297,6 +351,8 @@ mod tests {
         let _ = drain_local_samples();
         sample_local_player(
             gid(7),
+            1,
+            sample(7, 3).spatial_epoch,
             PlayerSeq(3),
             TickStamp(3),
             WorldId::new(0, 7),

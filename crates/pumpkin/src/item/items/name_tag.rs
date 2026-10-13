@@ -15,6 +15,7 @@ impl ItemMetadata for NameTagItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for NameTagItem {
     fn use_on_entity(&self, item: &mut ItemStack, player: &Player, entity: Arc<dyn EntityBase>) {
         let entity = entity.get_entity();

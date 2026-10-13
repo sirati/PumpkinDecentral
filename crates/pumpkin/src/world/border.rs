@@ -7,6 +7,7 @@ use crate::net::java::JavaClient;
 
 use super::World;
 
+#[derive(Clone)]
 pub struct Worldborder {
     pub center_x: f64,
     pub center_z: f64,
@@ -18,6 +19,82 @@ pub struct Worldborder {
     pub warning_time: i32,
     pub damage_per_block: f32,
     pub buffer: f32,
+}
+
+pub enum BorderAccess<'a> {
+    Local(std::sync::MutexGuard<'a, Worldborder>),
+    Cluster(Worldborder),
+}
+
+impl std::ops::Deref for BorderAccess<'_> {
+    type Target = Worldborder;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Local(value) => value,
+            Self::Cluster(value) => value,
+        }
+    }
+}
+
+impl std::ops::DerefMut for BorderAccess<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Local(value) => value,
+            Self::Cluster(value) => value,
+        }
+    }
+}
+
+impl World {
+    pub fn border_for_command(&self) -> BorderAccess<'_> {
+        if self
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            let view = self.cluster_environment_view.load();
+            let value = &view.border;
+            let slot = crate::server::cluster_world_rules::disciplined_slot()
+                .unwrap_or(value.lerp_start_slot);
+            return BorderAccess::Cluster(Worldborder {
+                center_x: value.center_x,
+                center_z: value.center_z,
+                old_diameter: value.current_diameter(slot),
+                new_diameter: value.new_diameter,
+                speed: value.remaining_millis(slot),
+                portal_teleport_boundary: 29_999_984,
+                warning_blocks: value.warning_blocks,
+                warning_time: value.warning_time,
+                damage_per_block: value.damage_per_block,
+                buffer: value.buffer,
+            });
+        }
+        BorderAccess::Local(
+            self.worldborder
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+}
+
+fn request(world: &World, mutation: pumpkin_cluster::world_time::BorderMutation) -> bool {
+    if let Some(server) = world.server.upgrade()
+        && server.advanced_config.cluster.enabled
+    {
+        if let Some(world) = server
+            .worlds
+            .load()
+            .iter()
+            .find(|value| value.uuid == world.uuid)
+        {
+            server.cluster_environment.time(
+                world,
+                pumpkin_cluster::world_time::EnvironmentMutation::Border(mutation),
+            );
+        }
+        return true;
+    }
+    false
 }
 
 impl Worldborder {
@@ -60,6 +137,12 @@ impl Worldborder {
     }
 
     pub fn set_center(&mut self, world: &World, x: f64, z: f64) {
+        if request(
+            world,
+            pumpkin_cluster::world_time::BorderMutation::Center(x, z),
+        ) {
+            return;
+        }
         self.center_x = x;
         self.center_z = z;
 
@@ -67,8 +150,15 @@ impl Worldborder {
     }
 
     pub fn set_diameter(&mut self, world: &World, diameter: f64, speed: Option<i64>) {
+        if request(
+            world,
+            pumpkin_cluster::world_time::BorderMutation::Diameter(diameter, speed),
+        ) {
+            return;
+        }
         self.old_diameter = self.new_diameter;
         self.new_diameter = diameter;
+        self.speed = speed.unwrap_or(0);
 
         match speed {
             Some(speed) => {
@@ -85,30 +175,63 @@ impl Worldborder {
     }
 
     pub fn add_diameter(&mut self, world: &World, offset: f64, speed: Option<i64>) {
+        if request(
+            world,
+            pumpkin_cluster::world_time::BorderMutation::Add(offset, speed),
+        ) {
+            return;
+        }
         self.set_diameter(world, self.new_diameter + offset, speed);
     }
 
     pub fn set_warning_delay(&mut self, world: &World, delay: i32) {
+        if request(
+            world,
+            pumpkin_cluster::world_time::BorderMutation::WarningTime(delay),
+        ) {
+            return;
+        }
         self.warning_time = delay;
 
         world.broadcast_packet_all(&CSetBorderWarningDelay::new(self.warning_time.into()));
     }
 
     pub fn set_warning_distance(&mut self, world: &World, distance: i32) {
+        if request(
+            world,
+            pumpkin_cluster::world_time::BorderMutation::WarningDistance(distance),
+        ) {
+            return;
+        }
         self.warning_blocks = distance;
 
         world.broadcast_packet_all(&CSetBorderWarningDistance::new(self.warning_blocks.into()));
     }
 
-    pub const fn set_damage_buffer(&mut self, buffer: f32) {
+    pub fn set_damage_buffer(&mut self, world: &World, buffer: f32) {
+        if request(
+            world,
+            pumpkin_cluster::world_time::BorderMutation::Buffer(buffer),
+        ) {
+            return;
+        }
         self.buffer = buffer;
     }
 
-    pub const fn set_damage_per_block(&mut self, damage: f32) {
+    pub fn set_damage_per_block(&mut self, world: &World, damage: f32) {
+        if request(
+            world,
+            pumpkin_cluster::world_time::BorderMutation::Damage(damage),
+        ) {
+            return;
+        }
         self.damage_per_block = damage;
     }
 
     pub fn reset(&mut self, world: &World) {
+        if request(world, pumpkin_cluster::world_time::BorderMutation::Reset) {
+            return;
+        }
         self.center_x = 0.0;
         self.center_z = 0.0;
         self.old_diameter = 29_999_984.0;

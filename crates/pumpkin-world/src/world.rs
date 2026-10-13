@@ -81,7 +81,7 @@ pub trait WorldPortalExt: Send + Sync {
     fn spawn_structure_entities(&self, _entities: Vec<NbtCompound>) {}
 }
 
-pub trait BlockAccessor: Send + Sync {
+pub trait BlockAccessor {
     fn get_block(&self, position: &BlockPos) -> &'static Block;
 
     fn get_block_state(&self, position: &BlockPos) -> &'static BlockState;
@@ -89,4 +89,19 @@ pub trait BlockAccessor: Send + Sync {
     fn get_block_state_id(&self, position: &BlockPos) -> BlockStateId;
 
     fn get_block_and_state(&self, position: &BlockPos) -> (&'static Block, &'static BlockState);
+}
+
+impl<T: BlockAccessor + ?Sized> BlockAccessor for std::sync::Arc<T> {
+    fn get_block(&self, position: &BlockPos) -> &'static Block {
+        (**self).get_block(position)
+    }
+    fn get_block_state(&self, position: &BlockPos) -> &'static BlockState {
+        (**self).get_block_state(position)
+    }
+    fn get_block_state_id(&self, position: &BlockPos) -> BlockStateId {
+        (**self).get_block_state_id(position)
+    }
+    fn get_block_and_state(&self, position: &BlockPos) -> (&'static Block, &'static BlockState) {
+        (**self).get_block_and_state(position)
+    }
 }

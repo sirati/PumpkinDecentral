@@ -67,16 +67,20 @@ pub enum ControllerMovementStatistic {
     Amount(i32),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControllerActorSource {
     Initial,
     Client,
-    AcceptedAdministrative(crate::completion::ActionKey),
+    AcceptedAdministrative(crate::completion::ActionKey, TickStamp),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ControllerActorIntent {
     pub actor: GlobalPlayerId,
+    pub spatial_epoch: Option<crate::canonical_action::SpatialEpoch>,
+    pub player_key: uuid::Uuid,
+    pub owner_install_generation: u64,
+    pub head_yaw: f32,
     pub source: ControllerActorSource,
     pub world: crate::protocol::WorldId,
     pub tick: TickStamp,
@@ -89,6 +93,8 @@ pub struct ControllerActorIntent {
     pub sneaking: Option<bool>,
     pub sprinting: Option<bool>,
     pub crawling: Option<bool>,
+    pub swimming: Option<bool>,
+    pub gliding: Option<bool>,
     pub flying: Option<bool>,
     pub effective_flying: bool,
     pub gamemode: Option<u8>,
@@ -98,6 +104,7 @@ pub struct ControllerActorIntent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ViewIntent {
     pub actor: GlobalPlayerId,
+    pub owner_install_generation: u64,
     pub world: crate::protocol::WorldId,
     pub center: crate::protocol::ChunkAddr,
     pub radius: NonZero<u8>,

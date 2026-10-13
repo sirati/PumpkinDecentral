@@ -11,7 +11,15 @@ use crate::entity::Entity;
 #[pumpkin_block_from_tag("c:cobblestones/infested")]
 pub struct InfestedBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for InfestedBlock {
+    fn player_broken_intent(
+        &self,
+        args: crate::block::neighbor::PlayerBrokenIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        args.context.creative.then(Vec::new)
+    }
+
     fn broken(&self, args: BrokenArgs<'_>) {
         {
             // TODO: ugly fix, use onStacksDropped

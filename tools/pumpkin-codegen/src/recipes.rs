@@ -556,6 +556,7 @@ pub fn build() -> TokenStream {
         recipes_assets.insert(key, recipe);
     }
 
+    let mut crafting_recipe_ids = Vec::new();
     let mut crafting_recipes = Vec::new();
     let mut cooking_recipes = Vec::new();
     let mut stonecutting_recipes = Vec::new();
@@ -585,15 +586,19 @@ pub fn build() -> TokenStream {
                 cooking_recipes.push(campfire_token);
             }
             RecipeTypes::CraftingShaped(recipe) => {
+                crafting_recipe_ids.push(recipe_id);
                 crafting_recipes.push(recipe.to_token_stream());
             }
             RecipeTypes::CraftingShapeless(recipe) => {
+                crafting_recipe_ids.push(recipe_id);
                 crafting_recipes.push(recipe.to_token_stream());
             }
             RecipeTypes::CraftingTransmute(recipe) => {
+                crafting_recipe_ids.push(recipe_id);
                 crafting_recipes.push(recipe.to_token_stream());
             }
             RecipeTypes::CraftingDecoratedPot(recipe) => {
+                crafting_recipe_ids.push(recipe_id);
                 crafting_recipes.push(recipe.to_token_stream());
             }
             RecipeTypes::Smelting(recipe) => {
@@ -784,6 +789,7 @@ pub fn build() -> TokenStream {
             Blocks,
         }
 
+        pub static RECIPES_CRAFTING_IDS: &[&str] = &[#(#crafting_recipe_ids),*];
         pub static RECIPES_CRAFTING: &[CraftingRecipeTypes] = &[
             #(#crafting_recipes),*
         ];

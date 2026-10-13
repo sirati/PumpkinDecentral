@@ -19,6 +19,7 @@ use pumpkin_world::world::{BlockAccessor, BlockFlags};
 #[pumpkin_block("minecraft:pointed_dripstone")]
 pub struct DripstoneBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for DripstoneBlock {
     fn can_place_at(&self, args: CanPlaceAtArgs<'_>) -> bool {
         can_place_at_pos(

@@ -30,9 +30,7 @@ impl ArgumentType<CommandSource> for TeamArgumentType {
     ) -> Suggestions {
         let scoreboard = context
             .world()
-            .scoreboard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .scoreboard.snapshot();
         for team_name in scoreboard.get_teams().keys() {
             builder = builder.filter_and_suggest_one(team_name.as_str());
         }

@@ -7,7 +7,7 @@ use crate::protocol::{PosUpdate, WorldId};
 use crate::time::TickStamp;
 
 const MAGIC: [u8; 4] = *b"PCM2";
-const VERSION: u16 = 2;
+const VERSION: u16 = 4;
 const MOVEMENT_KIND: u8 = 1;
 pub const MAX_WIRE_RECORDS: usize = 1024;
 pub const MAX_WIRE_PAYLOAD: usize = 1024 * 1024;
@@ -29,6 +29,9 @@ struct BatchHeader {
 pub struct MovementRecord {
     server: U16<LE>,
     player: U16<LE>,
+    incarnation: U64<LE>,
+    epoch_length: u8,
+    epoch: [u8; 64],
     sequence: U16<LE>,
     tick: U16<LE>,
     dimension: u8,
@@ -47,10 +50,17 @@ pub struct MovementRecord {
 
 impl MovementRecord {
     #[must_use]
-    pub fn from_update(update: &PosUpdate) -> Self {
-        Self {
+    pub fn from_update(update: &PosUpdate) -> Result<Self, WireError> {
+        let mut epoch = [0; 64];
+        let epoch_length = postcard::to_slice(&update.spatial_epoch, &mut epoch)
+            .map_err(|_| WireError::Epoch)?
+            .len() as u8;
+        Ok(Self {
             server: U16::new(update.gid.server.0),
             player: U16::new(update.gid.player.0),
+            incarnation: U64::new(update.incarnation),
+            epoch_length,
+            epoch,
             sequence: U16::new(update.seq.0),
             tick: U16::new(update.tick.0),
             dimension: update.world.dimension,
@@ -65,13 +75,38 @@ impl MovementRecord {
             head_yaw: U32::new(update.head_yaw.to_bits()),
             pitch: U32::new(update.pitch.to_bits()),
             on_ground: u8::from(update.on_ground),
-        }
+        })
     }
 
     #[must_use]
-    pub fn to_update(self) -> PosUpdate {
-        PosUpdate {
-            gid: GlobalPlayerId::new(ServerId(self.server.get()), PlayerSlot(self.player.get())),
+    pub fn to_update(self) -> Result<PosUpdate, WireError> {
+        let epoch_length = usize::from(self.epoch_length);
+        if epoch_length == 0 || epoch_length > self.epoch.len() {
+            return Err(WireError::Epoch);
+        }
+        let (spatial_epoch, remaining): (crate::canonical_action::SpatialEpoch, _) =
+            postcard::take_from_bytes(&self.epoch[..epoch_length]).map_err(|_| WireError::Epoch)?;
+        if !remaining.is_empty() || self.epoch[epoch_length..].iter().any(|byte| *byte != 0) {
+            return Err(WireError::Epoch);
+        }
+        let gid = GlobalPlayerId::new(ServerId(self.server.get()), PlayerSlot(self.player.get()));
+        let incarnation = self.incarnation.get();
+        let epoch_matches = match spatial_epoch {
+            crate::canonical_action::SpatialEpoch::Admission { lease, .. } => {
+                lease.gid == gid && lease.incarnation == incarnation
+            }
+            crate::canonical_action::SpatialEpoch::Action(reference) => {
+                reference.id.actor == crate::actor::ActorId::Player(gid)
+                    && reference.id.incarnation == incarnation
+            }
+        };
+        if incarnation == 0 || !epoch_matches {
+            return Err(WireError::Epoch);
+        }
+        Ok(PosUpdate {
+            gid,
+            incarnation,
+            spatial_epoch,
             seq: PlayerSeq(self.sequence.get()),
             tick: TickStamp(self.tick.get()),
             world: WorldId::new(self.dimension, self.world.get()),
@@ -89,12 +124,13 @@ impl MovementRecord {
             head_yaw: f32::from_bits(self.head_yaw.get()),
             pitch: f32::from_bits(self.pitch.get()),
             on_ground: self.on_ground != 0,
-        }
+        })
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WireError {
+    Epoch,
     Header,
     Version(u16),
     Kind(u8),
@@ -141,7 +177,7 @@ pub fn encode_movement(updates: &[PosUpdate]) -> Result<Bytes, WireError> {
     let mut out = BytesMut::with_capacity(total);
     out.put_slice(header.as_bytes());
     for update in updates {
-        out.put_slice(MovementRecord::from_update(update).as_bytes());
+        out.put_slice(MovementRecord::from_update(update)?.as_bytes());
     }
     Ok(out.freeze())
 }
@@ -182,7 +218,14 @@ impl MovementBatch {
         if payload_len != expected || bytes.len() != HEADER_BYTES.saturating_add(payload_len) {
             return Err(WireError::Length);
         }
-        Ok(Self { bytes, count })
+        let decoded = Self { bytes, count };
+        for index in 0..count {
+            decoded
+                .record(index)
+                .ok_or(WireError::Length)?
+                .to_update()?;
+        }
+        Ok(decoded)
     }
 
     #[must_use]
@@ -206,7 +249,10 @@ impl MovementBatch {
     }
 
     pub fn updates(&self) -> impl Iterator<Item = PosUpdate> + '_ {
-        (0..self.count).filter_map(|index| self.record(index).map(|record| (*record).to_update()))
+        (0..self.count).filter_map(|index| {
+            self.record(index)
+                .and_then(|record| (*record).to_update().ok())
+        })
     }
 }
 
@@ -217,6 +263,15 @@ mod tests {
     fn update(player: u16) -> PosUpdate {
         PosUpdate {
             gid: GlobalPlayerId::new(ServerId(2), PlayerSlot(player)),
+            incarnation: 1,
+            spatial_epoch: crate::canonical_action::SpatialEpoch::Admission {
+                lease: crate::canonical_action::LivePlayerLease {
+                    key: crate::canonical_action::PlayerKey(uuid::Uuid::nil()),
+                    gid: GlobalPlayerId::new(ServerId(2), PlayerSlot(player)),
+                    incarnation: 1,
+                },
+                admitted_at: TickStamp(0),
+            },
             seq: PlayerSeq(u16::MAX),
             tick: TickStamp(17),
             world: crate::protocol::WorldId::new(2, 0x1234),

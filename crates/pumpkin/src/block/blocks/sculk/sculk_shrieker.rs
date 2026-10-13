@@ -82,6 +82,7 @@ impl SculkShriekerBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for SculkShriekerBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut props = SculkShriekerLikeProperties::default(args.block);

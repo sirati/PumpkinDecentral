@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::actor::ActorId;
 use crate::completion::ActionKey;
@@ -137,6 +138,7 @@ pub struct ItemUseState {
     pub duration_ticks: u32,
     pub cooldown_ticks: u32,
     pub has_remainder: bool,
+    pub blocking_delay_ticks: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,16 +190,35 @@ pub struct ItemCooldownTransition {
     pub after: ItemCooldownState,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActorCombatState {
     pub actor: ActorId,
     pub revision: u64,
     pub health_milli: u32,
     pub absorption_milli: u32,
     pub velocity_micro: [i64; 3],
+    pub timing: CombatTiming,
+    pub effective_attributes: BTreeMap<u16, u64>,
+    pub equipment: crate::combat_action::CombatEquipmentFacts,
+    pub status: crate::combat_action::CombatStatusFacts,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CombatTiming {
+    pub death_inventory_processed: bool,
+    pub last_damage_kind: Option<crate::combat_action::DamageKind>,
+    pub death_cause: Option<crate::canonical_action::ActionRef>,
+    pub hurt_ticks: u16,
+    pub last_damage_milli: u32,
+    pub last_damage_tick: Option<TickStamp>,
+    pub attack_ticks: u16,
+    pub last_attack_tick: Option<TickStamp>,
+    pub fire_ticks: u32,
+    pub death_ticks: u16,
+    pub last_attacker: Option<ActorId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemCombatEffect {
     pub attacker: ActorId,
     pub before: ActorCombatState,
@@ -225,13 +246,13 @@ impl ItemCombatEffect {
         }
         Some(Self {
             attacker,
-            before,
+            before: before.clone(),
             after: ActorCombatState {
                 revision: before.revision.wrapping_add(1),
                 health_milli: before.health_milli.saturating_sub(health_damage),
                 absorption_milli: before.absorption_milli - absorbed,
                 velocity_micro,
-                ..before
+                ..before.clone()
             },
             damage_milli,
             knockback_micro,
@@ -241,10 +262,357 @@ impl ItemCombatEffect {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActorFoodState {
+    pub exhaustion_milli: u32,
+    pub tick_timer: u16,
     pub actor: ActorId,
     pub food: u8,
     pub saturation_milli: u32,
     pub revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActorLivingState {
+    pub permanent_attribute_modifiers: BTreeMap<u16, Vec<crate::combat_action::CombatAttributeModifier>>,
+    pub menu: crate::canonical_menu::MenuSessionState,
+    pub environment: LivingEnvironmentState,
+    pub tags: std::collections::BTreeSet<String>,
+    pub tags_revision: u64,
+    pub advancements: crate::player_advancement::PlayerAdvancementState,
+    pub stand: Option<crate::armor_stand::ArmorStandState>,
+    pub mob: Option<crate::mob_continuation::MobContinuation>,
+    pub merchant: Option<crate::canonical_merchant::MerchantOffersState>,
+    pub simulation_tick: Option<TickStamp>,
+    pub effects: Vec<crate::player_admin::EffectState>,
+    pub hidden_effects: BTreeMap<u16, Vec<crate::player_admin::EffectState>>,
+    pub property_versions: BTreeMap<crate::living_property::LivingProperty, u64>,
+    pub food: ActorFoodState,
+    pub combat: ActorCombatState,
+    pub use_state: Option<ItemUseState>,
+    pub cooldowns: BTreeMap<String, ItemCooldownState>,
+    pub avatar: Option<PlayerAvatarState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LivingEnvironmentState {
+    pub air_ticks: i16,
+    pub frozen_ticks: u16,
+}
+
+impl Default for LivingEnvironmentState {
+    fn default() -> Self {
+        Self { air_ticks: 300, frozen_ticks: 0 }
+    }
+}
+
+impl LivingEnvironmentState {
+    pub fn valid(self) -> bool {
+        (-20..=300).contains(&self.air_ticks) && self.frozen_ticks <= 140
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlayerSleepingState {
+    pub bed: crate::protocol::BlockPos,
+    pub since: TickStamp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlayerRespawnState {
+    pub world: crate::protocol::WorldId,
+    pub position: crate::protocol::BlockPos,
+    pub yaw: u32,
+    pub forced: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlayerPresentationState {
+    pub camera_target: Option<crate::item_contact::ContactObservation>,
+    pub sleeping: Option<PlayerSleepingState>,
+    pub respawn: Option<PlayerRespawnState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlayerPresentationChange {
+    Camera(Option<crate::item_contact::ContactObservation>),
+    Sleeping(Option<PlayerSleepingState>),
+    Respawn(Option<PlayerRespawnState>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlayerAvatarState {
+    pub stance: PlayerStance,
+    pub mount: Option<crate::item_contact::ContactIdentity>,
+    pub relation_versions: BTreeMap<crate::actor_relation::ActorRelation, u64>,
+    pub experience: crate::player_experience::PlayerExperienceState,
+    pub statistics: BTreeMap<(u16, u32), u32>,
+    pub presentation: PlayerPresentationState,
+    pub spatial_epoch: crate::canonical_action::SpatialEpoch,
+    pub world: crate::protocol::WorldId,
+    pub position: [u64; 3],
+    pub yaw: u32,
+    pub head_yaw: u32,
+    pub pitch: u32,
+    pub on_ground: bool,
+    pub movement_tick: TickStamp,
+    pub movement_sequence: crate::identity::PlayerSeq,
+    pub game_mode: u8,
+    pub fall_distance: u32,
+    pub on_fire: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlayerStance {
+    pub sneaking: bool,
+    pub sprinting: bool,
+    pub crawling: bool,
+    pub swimming: bool,
+    pub gliding: bool,
+}
+
+impl PlayerAvatarState {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.relation_versions.iter().all(|(relation, revision)| {
+            *relation == crate::actor_relation::ActorRelation::Mount && *revision > 0
+        }) && self
+            .mount
+            .as_ref()
+            .is_none_or(crate::actor_relation::identity_valid)
+            && self.experience.is_valid()
+            && self.statistics.len() <= 32768
+            && self.statistics.iter().all(|((category, key), value)| {
+                *category <= 8 && *key <= i32::MAX as u32 && *value <= i32::MAX as u32
+            })
+            && (matches!(self.spatial_epoch,
+                crate::canonical_action::SpatialEpoch::Admission { lease, .. } if lease.incarnation != 0
+            ) || matches!(self.spatial_epoch,
+                crate::canonical_action::SpatialEpoch::Action(reference) if reference.id.incarnation != 0
+            ))
+            && self
+                .presentation
+                .camera_target
+                .as_ref()
+                .is_none_or(|target| target.valid())
+            && self
+                .presentation
+                .respawn
+                .is_none_or(|respawn| f32::from_bits(respawn.yaw).is_finite())
+            && self.position.iter().all(|bits| {
+                let coordinate = f64::from_bits(*bits);
+                coordinate.is_finite() && coordinate.abs() <= 30_000_000.0
+            })
+            && f32::from_bits(self.yaw).is_finite()
+            && f32::from_bits(self.head_yaw).is_finite()
+            && f32::from_bits(self.pitch).is_finite()
+            && f32::from_bits(self.fall_distance).is_finite()
+            && f32::from_bits(self.fall_distance) >= 0.0
+            && self.game_mode <= 3
+    }
+}
+
+impl ActorLivingState {
+    pub fn attribute_modifiers(&self, attribute: u16) -> Vec<crate::combat_action::CombatAttributeModifier> {
+        let mut modifiers = self.combat.equipment.modifiers.iter().filter(|modifier| modifier.attribute == attribute)
+            .map(|modifier| (modifier.id.clone(), modifier.clone())).collect::<BTreeMap<_, _>>();
+        if let Some(permanent) = self.permanent_attribute_modifiers.get(&attribute) {
+            for modifier in permanent { modifiers.insert(modifier.id.clone(), modifier.clone()); }
+        }
+        modifiers.into_values().collect()
+    }
+
+    pub fn attribute(&self, attribute: u16, base: f64) -> f64 {
+        self.combat.equipment.attribute_with_permanent(attribute, base,
+            self.permanent_attribute_modifiers.get(&attribute).map_or(&[], Vec::as_slice))
+    }
+
+    #[must_use]
+    pub fn belongs_to(&self, actor: ActorId) -> bool {
+        !matches!(actor, ActorId::Peer(_))
+            && self.environment.valid()
+            && crate::actor_tags::valid(&self.tags)
+            && self.advancements.valid()
+            && (matches!(actor, ActorId::Player(_)) || self.advancements.progress.is_empty())
+            && self.stand.as_ref().is_none_or(|stand| {
+                matches!(actor, ActorId::Entity(_))
+                    && self.mob.is_none()
+                    && self.avatar.is_none()
+                    && stand.valid()
+            })
+            && self
+                .mob
+                .as_ref()
+                .is_none_or(|state| matches!(actor, ActorId::Entity(_)) && state.valid())
+            && self.merchant.as_ref().is_none_or(|state|
+                matches!(actor, ActorId::Entity(_)) && state.valid())
+            && self.menu.belongs_to(actor)
+            && self.property_versions.iter().all(|(property, revision)| {
+                *revision != 0 && property.accepts(&property.read(self), actor)
+            })
+            && self.food.actor == actor
+            && self.food.food <= 20
+            && self.food.exhaustion_milli <= 40_000
+            && self.food.tick_timer < 80
+            && self.food.saturation_milli <= u32::from(self.food.food) * 1000
+            && self.combat.actor == actor
+            && self.permanent_attribute_modifiers.len() <= 256
+            && self.permanent_attribute_modifiers.iter().all(|(attribute, modifiers)|
+                crate::living_property::LivingProperty::PermanentAttributeModifiers(*attribute)
+                    .accepts(&crate::living_property::LivingPropertyValue::PermanentAttributeModifiers(modifiers.clone()), actor))
+            && self.combat.effective_attributes.len() <= 256
+            && self
+                .combat
+                .effective_attributes
+                .values()
+                .all(|bits| f64::from_bits(*bits).is_finite())
+            && self.combat.equipment.is_valid()
+            && self.effects.len() <= 256
+            && self.effects.iter().all(|effect| effect.duration >= -1)
+            && self
+                .effects
+                .iter()
+                .map(|effect| effect.kind)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                == self.effects.len()
+            && (crate::active_effects::ActiveEffectSet {
+                visible: self.effects.clone(),
+                hidden: self.hidden_effects.clone(),
+            })
+            .valid()
+            && self
+                .use_state
+                .as_ref()
+                .is_none_or(|state| state.actor == actor)
+            && self.cooldowns.values().all(|state| state.actor == actor)
+            && self.avatar.as_ref().is_none_or(PlayerAvatarState::is_valid)
+            && (matches!(actor, ActorId::Player(_)) || self.avatar.is_none())
+    }
+
+    #[must_use]
+    pub fn player_administrative_state(
+        &self,
+    ) -> Option<crate::player_admin::PlayerAdministrativeState> {
+        let avatar = self.avatar.as_ref()?;
+        Some(crate::player_admin::PlayerAdministrativeState {
+            world: avatar.world,
+            position: avatar.position.map(f64::from_bits),
+            yaw: f32::from_bits(avatar.yaw),
+            pitch: f32::from_bits(avatar.pitch),
+            velocity: self
+                .combat
+                .velocity_micro
+                .map(|value| value as f64 / 1_000_000.0),
+            health: self.combat.health_milli as f32 / 1_000.0,
+            absorption: self.combat.absorption_milli as f32 / 1_000.0,
+            food: self.food.food,
+            saturation: self.food.saturation_milli as f32 / 1_000.0,
+            gamemode: avatar.game_mode,
+            effects: self.effects.clone(),
+            fall_distance: f32::from_bits(avatar.fall_distance),
+            on_fire: avatar.on_fire,
+        })
+    }
+
+    #[must_use]
+    pub fn with_player_administrative_state(
+        &self,
+        state: &crate::player_admin::PlayerAdministrativeState,
+    ) -> Option<Self> {
+        if !matches!(self.food.actor, ActorId::Player(_))
+            || self.avatar.is_none()
+            || state
+                .position
+                .iter()
+                .any(|value| !value.is_finite() || value.abs() > 30_000_000.0)
+            || state
+                .velocity
+                .iter()
+                .any(|value| !value.is_finite() || value.abs() > 1_000_000.0)
+            || !state.yaw.is_finite()
+            || !state.pitch.is_finite()
+            || !state.health.is_finite()
+            || !state.absorption.is_finite()
+            || !state.saturation.is_finite()
+            || !state.fall_distance.is_finite()
+            || state.health < 0.0
+            || state.absorption < 0.0
+            || state.saturation < 0.0
+            || state.fall_distance < 0.0
+            || state.food > 20
+            || state.saturation > f32::from(state.food)
+            || state.gamemode > 3
+            || state.health > u32::MAX as f32 / 1_000.0
+            || state.absorption > u32::MAX as f32 / 1_000.0
+            || state.saturation > u32::MAX as f32 / 1_000.0
+            || state.effects.len() > 256
+            || state.effects.iter().any(|effect| effect.duration < -1)
+        {
+            return None;
+        }
+        let mut next = self.clone();
+        next.food.food = state.food;
+        next.food.saturation_milli = (state.saturation * 1_000.0).round() as u32;
+        next.combat.health_milli = (state.health * 1_000.0).round() as u32;
+        next.combat.absorption_milli = (state.absorption * 1_000.0).round() as u32;
+        next.combat.velocity_micro = state
+            .velocity
+            .map(|value| (value * 1_000_000.0).round() as i64);
+        if next.food.food != self.food.food
+            || next.food.saturation_milli != self.food.saturation_milli
+        {
+            next.food.revision = self.food.revision.wrapping_add(1);
+        }
+        if next.combat.health_milli != self.combat.health_milli
+            || next.combat.absorption_milli != self.combat.absorption_milli
+            || next.combat.velocity_micro != self.combat.velocity_micro
+        {
+            next.combat.revision = self.combat.revision.wrapping_add(1);
+        }
+        next.effects = state.effects.clone();
+        next.effects.sort_unstable_by_key(|effect| effect.kind);
+        if next
+            .effects
+            .windows(2)
+            .any(|pair| pair[0].kind == pair[1].kind)
+        {
+            return None;
+        }
+        next.avatar = Some(PlayerAvatarState {
+            stance: self.avatar.as_ref()?.stance,
+            mount: self.avatar.as_ref()?.mount.clone(),
+            relation_versions: self.avatar.as_ref()?.relation_versions.clone(),
+            experience: self.avatar.as_ref()?.experience,
+            statistics: self.avatar.as_ref()?.statistics.clone(),
+            presentation: self.avatar.as_ref()?.presentation.clone(),
+            spatial_epoch: self.avatar.as_ref()?.spatial_epoch,
+            world: state.world,
+            position: state.position.map(f64::to_bits),
+            yaw: state.yaw.to_bits(),
+            head_yaw: self.avatar.as_ref().map_or(state.yaw.to_bits(), |avatar| {
+                if avatar.yaw == state.yaw.to_bits() {
+                    avatar.head_yaw
+                } else {
+                    state.yaw.to_bits()
+                }
+            }),
+            pitch: state.pitch.to_bits(),
+            on_ground: self.avatar.as_ref().is_none_or(|avatar| avatar.on_ground),
+            movement_tick: self
+                .avatar
+                .as_ref()
+                .map_or(TickStamp(0), |avatar| avatar.movement_tick),
+            movement_sequence: self
+                .avatar
+                .as_ref()
+                .map_or(crate::identity::PlayerSeq(0), |avatar| {
+                    avatar.movement_sequence
+                }),
+            game_mode: state.gamemode,
+            fall_distance: state.fall_distance.to_bits(),
+            on_fire: state.on_fire,
+        });
+        Some(next)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -607,7 +975,8 @@ impl ItemAction {
     ) -> Result<(), ItemActionRejection> {
         if self
             .combat
-            .is_some_and(|combat| current != Some(combat.before))
+            .as_ref()
+            .is_some_and(|combat| current.as_ref() != Some(&combat.before))
         {
             return Err(ItemActionRejection::StaleActor);
         }
@@ -744,7 +1113,7 @@ impl ItemAction {
                 return Err(ItemActionRejection::StaleActor);
             }
         }
-        if let Some(combat) = self.combat {
+        if let Some(combat) = &self.combat {
             if !matches!(
                 &self.kind,
                 ItemActionKind::UseOnActor {
@@ -757,10 +1126,12 @@ impl ItemAction {
                 })
                 || ItemCombatEffect::new(
                     combat.attacker,
-                    combat.before,
+                    combat.before.clone(),
                     combat.damage_milli,
                     combat.knockback_micro,
-                ) != Some(combat)
+                )
+                .as_ref()
+                    != Some(combat)
             {
                 return Err(ItemActionRejection::StaleActor);
             }
@@ -1122,7 +1493,7 @@ fn action_resources(action: &ItemAction) -> Vec<ItemActionResource> {
             .iter()
             .map(|mutation| ItemActionResource::Actor(mutation.actor)),
     );
-    if let Some(combat) = action.combat {
+    if let Some(combat) = &action.combat {
         resources.push(ItemActionResource::Actor(combat.before.actor));
     }
     resources.extend(action.actor_effects.iter().map(|effect| match effect {
@@ -1439,6 +1810,7 @@ mod tests {
             duration_ticks: 72_000,
             cooldown_ticks: 0,
             has_remainder: false,
+            blocking_delay_ticks: 5,
         };
         fire.use_transition = Some(ItemUseTransition {
             before: Some(state),
@@ -1591,6 +1963,7 @@ mod tests {
                 duration_ticks: 9,
                 cooldown_ticks: 0,
                 has_remainder: false,
+                blocking_delay_ticks: 5,
             }),
             after: None,
         });
@@ -1644,6 +2017,7 @@ mod tests {
                 duration_ticks: 8,
                 cooldown_ticks: 0,
                 has_remainder: true,
+                blocking_delay_ticks: 5,
             }),
             after: None,
         });
@@ -1762,6 +2136,8 @@ mod tests {
     fn competing_food_completions_share_one_actor_revision() {
         let actor = GlobalPlayerId::new(ServerId(1), PlayerSlot(2));
         let before = ActorFoodState {
+            exhaustion_milli: 0,
+            tick_timer: 0,
             actor: actor.into(),
             food: 18,
             saturation_milli: 17_000,
@@ -1798,9 +2174,18 @@ mod tests {
             health_milli: 5_000,
             absorption_milli: 1_500,
             velocity_micro: [250_000, 0, -125_000],
+            timing: Default::default(),
+            effective_attributes: Default::default(),
+            equipment: Default::default(),
+            status: Default::default(),
         };
-        let effect =
-            ItemCombatEffect::new(attacker.into(), before, 2_000, [500_000, 0, 250_000]).unwrap();
+        let effect = ItemCombatEffect::new(
+            attacker.into(),
+            before.clone(),
+            2_000,
+            [500_000, 0, 250_000],
+        )
+        .unwrap();
         assert_eq!(effect.after.absorption_milli, 0);
         assert_eq!(effect.after.health_milli, 4_500);
         assert_eq!(effect.after.velocity_micro, [750_000, 0, 125_000]);
@@ -1818,7 +2203,7 @@ mod tests {
             position: [1.0, 64.0, 0.0],
             revision: 7,
         });
-        action.combat = Some(effect);
+        action.combat = Some(effect.clone());
         assert_eq!(action.validate_combat_state(Some(before)), Ok(()));
         assert_eq!(
             action.validate_combat_state(Some(effect.after)),
@@ -1846,6 +2231,10 @@ mod tests {
             health_milli: 10_000,
             absorption_milli: 0,
             velocity_micro: [0; 3],
+            timing: Default::default(),
+            effective_attributes: Default::default(),
+            equipment: Default::default(),
+            status: Default::default(),
         };
         let attacks: Vec<_> = [1, 2, 3]
             .into_iter()
@@ -1866,7 +2255,7 @@ mod tests {
                 });
                 action.combat = ItemCombatEffect::new(
                     attacker.into(),
-                    before,
+                    before.clone(),
                     1_000 * u32::from(server),
                     [i64::from(server) * 100_000, 0, 0],
                 );
@@ -1887,7 +2276,7 @@ mod tests {
                     99,
                     attacks[0].tick,
                     order.map(|index| attacks[index].clone()),
-                    |action| action.validate_combat_state(Some(before)),
+                    |action| action.validate_combat_state(Some(before.clone())),
                 );
                 assert_eq!(result.accepted.len(), 1);
                 assert_eq!(result.rejected.len(), 2);
@@ -1898,7 +2287,7 @@ mod tests {
                         .all(|(_, reason)| *reason == ItemActionRejection::LostConflict)
                 );
                 let winner = &result.accepted[0];
-                (winner.actor, winner.combat.unwrap().after)
+                (winner.actor, winner.combat.as_ref().unwrap().after.clone())
             })
             .into_iter()
             .collect();

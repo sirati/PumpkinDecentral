@@ -9,6 +9,7 @@ use pumpkin_util::PermissionLvl;
 #[pumpkin_block("minecraft:structure_block")]
 pub struct StructureBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for StructureBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let props = StructureBlockLikeProperties::default(args.block);

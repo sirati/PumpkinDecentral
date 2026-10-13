@@ -28,6 +28,10 @@ const ERROR_DUPLICATE_UUID: CommandErrorType<0> = CommandErrorType::new(
     translation::java::COMMANDS_SUMMON_FAILED_UUID,
     translation::bedrock::COMMANDS_SUMMON_FAILED,
 );
+const ERROR_FAILED: CommandErrorType<0> = CommandErrorType::new(
+    translation::java::COMMANDS_SUMMON_FAILED,
+    translation::bedrock::COMMANDS_SUMMON_FAILED,
+);
 const INVALID_POSITION: CommandErrorType<0> = CommandErrorType::new(
     translation::java::COMMANDS_SUMMON_INVALIDPOSITION,
     translation::bedrock::COMMANDS_SUMMON_OUTOFWORLD,
@@ -40,7 +44,27 @@ struct SummonExecutor {
 
 impl CommandExecutor for SummonExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
+        self.execute_outcome(context).map(|execution| match execution {
+            pumpkin_command::deferred::CommandExecution::Complete(value) => value,
+            pumpkin_command::deferred::CommandExecution::Deferred(_) => 0,
+        })
+    }
+
+    fn execute_outcome(&self, context: &CommandContext) -> Result<pumpkin_command::deferred::CommandExecution, pumpkin_command::errors::command_syntax_error::CommandSyntaxError> {
         let entity_type = ResourceArgument::get_summonable_entity_type(context, "entity")?;
+        if context.source.server.as_ref().is_some_and(|server| server.advanced_config.cluster.enabled)
+            && matches!(context.source.output, crate::command::CommandSender::Lobby(_) | crate::command::CommandSender::PreJoin(_)) {
+            if self.has_pos {
+                let coordinates = Vec3ArgumentType::get_coordinates(context, "pos")?;
+                if [pumpkin_util::math::vector3::Axis::X, pumpkin_util::math::vector3::Axis::Y,
+                    pumpkin_util::math::vector3::Axis::Z].into_iter().enumerate().any(|(index, axis)|
+                        coordinates.is_relative(axis) && !context.source.position_known[index]) {
+                    return Err(INVALID_POSITION.create_without_context());
+                }
+            } else if !context.source.position_known.iter().all(|known| *known) {
+                return Err(INVALID_POSITION.create_without_context());
+            }
+        }
         let pos = if self.has_pos {
             Vec3ArgumentType::get_coordinates(context, "pos")?.resolve(&context.source)
         } else {
@@ -53,8 +77,8 @@ impl CommandExecutor for SummonExecutor {
         }
 
         let world = context.source.world();
-        let difficulty = world.level_info.load().difficulty;
-        if difficulty == Difficulty::Peaceful && !entity_type.category.is_friendly {
+        if !context.source.server.as_ref().is_some_and(|server| server.advanced_config.cluster.enabled)
+            && world.level_info.load().difficulty == Difficulty::Peaceful && !entity_type.category.is_friendly {
             return Err(ERROR_FAILED_PEACEFUL.create_without_context());
         }
 
@@ -63,6 +87,42 @@ impl CommandExecutor for SummonExecutor {
         } else {
             None
         };
+
+        if let Some(server) = context.source.server.as_ref().filter(|server| server.advanced_config.cluster.enabled)
+            && (entity_type.mob || crate::server::cluster_vehicle_birth::vehicle_kind(entity_type).is_some()) {
+            let empty = pumpkin_nbt::compound::NbtCompound::new();
+            let root = nbt.unwrap_or(&empty);
+            if root.has("UUID") {
+                return Err(ERROR_FAILED.create_without_context());
+            }
+            let motion = root.get_list("Motion");
+            let velocity = std::array::from_fn::<_, 3, _>(|axis| motion.and_then(|values| values.get(axis))
+                .and_then(pumpkin_nbt::tag::NbtTag::extract_double).unwrap_or(0.0));
+            if velocity.iter().any(|value| !value.is_finite() || value.abs() > 1_000_000.0) {
+                return Err(ERROR_FAILED.create_without_context());
+            }
+            let rotation = root.get_list("Rotation");
+            let yaw = rotation.and_then(|values| values.first()).and_then(pumpkin_nbt::tag::NbtTag::extract_float).unwrap_or(0.0);
+            let pitch = rotation.and_then(|values| values.get(1)).and_then(pumpkin_nbt::tag::NbtTag::extract_float).unwrap_or(0.0);
+            let spatial = pumpkin_cluster::entity_body::EntitySpatial {
+                world: crate::server::cluster_world_delta::world_id(world), position: [pos.x, pos.y, pos.z].map(f64::to_bits),
+                velocity_micro: velocity.map(|value| (value * 1_000_000.0).round() as i64),
+                yaw: yaw.to_bits(), pitch: pitch.to_bits(), on_ground: root.get_bool("OnGround").unwrap_or(false),
+            };
+            let initial = if entity_type.mob {
+                crate::server::cluster_owned_mob_initial::parse_initialization(entity_type, &spatial, root)
+            } else {
+                crate::server::cluster_vehicle_birth::parse_initialization(entity_type, root)
+            }.map_err(|_| ERROR_FAILED.create_without_context())?;
+            let request = pumpkin_cluster::mob_initialization::EntityAdmissionRequest { kind: entity_type.id, spatial, initial };
+            let token = crate::server::cluster_player_commands::submit_summon_deferred(server, context.source.clone(), request)
+                .map_err(|_| ERROR_FAILED.create_without_context())?;
+            return Ok(pumpkin_command::deferred::CommandExecution::Deferred(token));
+        }
+
+        if context.source.server.as_ref().is_some_and(|server| server.advanced_config.cluster.enabled) {
+            return Err(ERROR_FAILED.create_without_context());
+        }
 
         let uuid = nbt
             .and_then(|nbt| nbt.get_uuid("UUID"))
@@ -95,7 +155,7 @@ impl CommandExecutor for SummonExecutor {
             true,
         );
 
-        Ok(1)
+        Ok(pumpkin_command::deferred::CommandExecution::Complete(1))
     }
 }
 

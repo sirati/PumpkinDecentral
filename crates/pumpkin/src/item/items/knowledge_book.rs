@@ -14,6 +14,7 @@ impl ItemMetadata for KnowledgeBookItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for KnowledgeBookItem {
     fn normal_use(&self, _item: &Item, player: &Player) {
         let mut held = player.inventory().held_item();
@@ -49,6 +50,7 @@ impl ItemMetadata for DiscFragmentItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for DiscFragmentItem {
     fn as_any(&self) -> &dyn Any {
         self

@@ -56,6 +56,7 @@ pub struct SignedInput {
 }
 
 pub(super) enum SecureChatInput {
+    Promote { player: Arc<Player> },
     Remove {
         uuid: Uuid,
         player_ptr: usize,
@@ -63,6 +64,20 @@ pub(super) enum SecureChatInput {
     Install {
         player: Arc<Player>,
         session: SPlayerSession,
+    },
+    LobbyInstall {
+        source: Arc<super::cluster_lobby::LobbyCommandSender>,
+        session: SPlayerSession,
+    },
+    LobbyValidate {
+        source: Arc<super::cluster_lobby::LobbyCommandSender>,
+        input: SignedInput,
+        result: oneshot::Sender<Result<(), ChatError>>,
+    },
+    LobbyAck {
+        source: Arc<super::cluster_lobby::LobbyCommandSender>,
+        offset: i32,
+        result: oneshot::Sender<Result<(), ChatError>>,
     },
     Ack {
         player: Arc<Player>,
@@ -84,6 +99,7 @@ pub(super) enum SecureChatInput {
 
 struct OwnedState {
     player: Weak<Player>,
+    client: Weak<crate::net::ClientPlatform>,
     session: ChatSession,
     cache: MessageCache,
 }
@@ -92,6 +108,7 @@ impl OwnedState {
     fn new(player: &Arc<Player>) -> Self {
         Self {
             player: Arc::downgrade(player),
+            client: Arc::downgrade(&player.client),
             session: ChatSession::default(),
             cache: MessageCache::default(),
         }
@@ -104,11 +121,37 @@ fn state_for<'a>(
 ) -> &'a mut OwnedState {
     let uuid = player.gameprofile.id;
     if !states.get(&uuid).is_some_and(|old| {
-        old.player
+        old.client
             .upgrade()
-            .is_some_and(|current| Arc::ptr_eq(&current, player))
+            .is_some_and(|current| Arc::ptr_eq(&current, &player.client))
     }) {
         states.insert(uuid, OwnedState::new(player));
+    }
+    let state = states.get_mut(&uuid).unwrap();
+    state.player = Arc::downgrade(player);
+    state
+}
+
+fn lobby_state_for<'a>(
+    states: &'a mut HashMap<Uuid, OwnedState>,
+    source: &super::cluster_lobby::LobbyCommandSender,
+) -> &'a mut OwnedState {
+    let uuid = source.profile.id;
+    if !states.get(&uuid).is_some_and(|state| {
+        state
+            .client
+            .upgrade()
+            .is_some_and(|client| Arc::ptr_eq(&client, &source.client))
+    }) {
+        states.insert(
+            uuid,
+            OwnedState {
+                player: Weak::new(),
+                client: Arc::downgrade(&source.client),
+                session: ChatSession::default(),
+                cache: MessageCache::default(),
+            },
+        );
     }
     states.get_mut(&uuid).unwrap()
 }
@@ -204,10 +247,56 @@ impl SecureChatRuntime {
         )
     }
 
+    pub(super) fn reserve_promote(&self) -> Option<mpsc::OwnedPermit<SecureChatInput>> {
+        self.tx.clone().try_reserve_owned().ok()
+    }
+
     pub fn install(&self, player: Arc<Player>, session: SPlayerSession) -> bool {
         self.tx
             .try_send(SecureChatInput::Install { player, session })
             .is_ok()
+    }
+
+    pub fn install_lobby(
+        &self,
+        source: Arc<super::cluster_lobby::LobbyCommandSender>,
+        session: SPlayerSession,
+    ) -> bool {
+        self.tx
+            .try_send(SecureChatInput::LobbyInstall { source, session })
+            .is_ok()
+    }
+
+    pub fn validate_lobby(
+        &self,
+        source: Arc<super::cluster_lobby::LobbyCommandSender>,
+        input: SignedInput,
+    ) -> Option<oneshot::Receiver<Result<(), ChatError>>> {
+        let (result, receiver) = oneshot::channel();
+        self.tx
+            .try_send(SecureChatInput::LobbyValidate {
+                source,
+                input,
+                result,
+            })
+            .ok()?;
+        Some(receiver)
+    }
+
+    pub fn ack_lobby(
+        &self,
+        source: Arc<super::cluster_lobby::LobbyCommandSender>,
+        offset: i32,
+    ) -> Option<oneshot::Receiver<Result<(), ChatError>>> {
+        let (result, receiver) = oneshot::channel();
+        self.tx
+            .try_send(SecureChatInput::LobbyAck {
+                source,
+                offset,
+                result,
+            })
+            .ok()?;
+        Some(receiver)
     }
 
     pub fn remove(&self, player: &Player) -> bool {
@@ -265,8 +354,80 @@ pub fn spawn(server: &Arc<Server>, mut rx: mpsc::Receiver<SecureChatInput>) {
     server.spawn_task(async move {
         let mut states = HashMap::<Uuid, OwnedState>::new();
         let mut views = HashMap::<Uuid, ChatSessionView>::new();
-        while let Some(input) = rx.recv().await {
+        let mut sweep = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            let input = tokio::select! {
+                input = rx.recv() => {
+                    let Some(input) = input else { break };
+                    input
+                }
+                _ = sweep.tick() => {
+                    states.retain(|_, state| state.client.upgrade().is_some());
+                    views.retain(|uuid, view| states.get(uuid).is_some_and(|state| {
+                        state.player.as_ptr() as usize == view.player_ptr
+                    }));
+                    task_server.cluster_secure_chat.views.store(Arc::new(views.clone()));
+                    continue;
+                }
+            };
             match input {
+                SecureChatInput::LobbyInstall { source, session } => {
+                    let state = lobby_state_for(&mut states, &source);
+                    if state.session.session_id != session.session_id {
+                        state.session = ChatSession::new(
+                            session.session_id,
+                            session.expires_at,
+                            session.public_key,
+                            session.key_signature,
+                        );
+                    }
+                }
+                SecureChatInput::LobbyValidate {
+                    source,
+                    input,
+                    result,
+                } => {
+                    let state = lobby_state_for(&mut states, &source);
+                    let outcome = validate(state, &input);
+                    if outcome.is_ok() {
+                        state.session.messages_sent += 1;
+                    }
+                    let _ = result.send(outcome);
+                }
+                SecureChatInput::LobbyAck {
+                    source,
+                    offset,
+                    result,
+                } => {
+                    let outcome = usize::try_from(offset)
+                        .map_err(|_| ChatError::ChatValidationFailed)
+                        .and_then(|offset| {
+                            lobby_state_for(&mut states, &source)
+                                .cache
+                                .last_seen_validator
+                                .apply_offset(offset)
+                                .map_err(|_| ChatError::ChatValidationFailed)
+                        });
+                    let _ = result.send(outcome);
+                }
+                SecureChatInput::Promote { player } => {
+                    let state = state_for(&mut states, &player);
+                    views.insert(player.gameprofile.id, ChatSessionView {
+                        player_ptr: Arc::as_ptr(&player) as usize,
+                        session_id: state.session.session_id,
+                        expires_at: state.session.expires_at,
+                        public_key: state.session.public_key.clone(),
+                        signature: state.session.signature.clone(),
+                    });
+                    task_server.cluster_secure_chat.views.store(Arc::new(views.clone()));
+                    if !super::cluster_hide::is_hidden_player(&task_server, &player) {
+                        let actions = [PlayerAction::InitializeChat(views.get(&player.gameprofile.id).and_then(ChatSessionView::init_chat))];
+                        task_server.broadcast_packet_all(&CPlayerInfoUpdate::new(
+                            PlayerInfoFlags::INITIALIZE_CHAT.bits(),
+                            &[pumpkin_protocol::java::client::play::Player { uuid: player.gameprofile.id, actions: &actions }],
+                        ));
+                    }
+                }
                 SecureChatInput::Remove { uuid, player_ptr } => {
                     if states
                         .get(&uuid)
@@ -282,12 +443,14 @@ pub fn spawn(server: &Arc<Server>, mut rx: mpsc::Receiver<SecureChatInput>) {
                 }
                 SecureChatInput::Install { player, session } => {
                     let state = state_for(&mut states, &player);
-                    state.session = ChatSession::new(
-                        session.session_id,
-                        session.expires_at,
-                        session.public_key.clone(),
-                        session.key_signature.clone(),
-                    );
+                    if state.session.session_id != session.session_id {
+                        state.session = ChatSession::new(
+                            session.session_id,
+                            session.expires_at,
+                            session.public_key.clone(),
+                            session.key_signature.clone(),
+                        );
+                    }
                     views.insert(
                         player.gameprofile.id,
                         ChatSessionView {
@@ -351,7 +514,7 @@ pub fn spawn(server: &Arc<Server>, mut rx: mpsc::Receiver<SecureChatInput>) {
                         SignedMessageLink::new(
                             sender.session.messages_sent,
                             player.gameprofile.id,
-                            Uuid::nil(),
+                            sender.session.session_id,
                         ),
                         input.signature.clone(),
                         SignedMessageBody::new(

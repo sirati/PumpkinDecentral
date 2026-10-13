@@ -156,6 +156,7 @@ impl DebugStickItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for DebugStickItem {
     fn can_mine(&self, player: &Player) -> bool {
         if player.can_use_game_master_blocks() {

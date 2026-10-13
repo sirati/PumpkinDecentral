@@ -22,6 +22,7 @@ use rand::RngExt;
 #[pumpkin_block("minecraft:sweet_berry_bush")]
 pub struct SweetBerryBushBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for SweetBerryBushBlock {
     fn is_valid_bonemeal_target(&self, args: crate::block::BonemealArgs<'_>) -> bool {
         <Self as CropBlockBase>::is_valid_bonemeal_target(self, args.world, args.position)

@@ -22,6 +22,10 @@ impl JavaClient {
             return;
         };
         if server.advanced_config.cluster.enabled {
+            if action == ActionType::Attack {
+                super::attack::stage_cluster_attack(player, server, entity_id.0, false);
+                return;
+            }
             if !crate::server::cluster_controller::submit_patch(
                 server,
                 player,
@@ -29,8 +33,8 @@ impl JavaClient {
             ) {
                 return;
             }
-            let Some((target, target_chunk)) =
-                crate::server::cluster_inventory_protocol::actor_for_entity_id(player, entity_id.0)
+            let Some(observation) =
+                crate::server::cluster_inventory_protocol::actor_observation_for_entity_id(player, entity_id.0)
             else {
                 return;
             };
@@ -61,8 +65,9 @@ impl JavaClient {
                 player,
                 hand,
                 crate::server::cluster_inventory_protocol::StagedItemActionKind::UseOnActor {
-                    target,
-                    target_chunk,
+                    target: observation.actor(),
+                    target_chunk: observation.chunk,
+                    observation,
                     hit,
                     interaction,
                 },

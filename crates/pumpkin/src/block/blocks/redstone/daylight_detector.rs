@@ -17,6 +17,7 @@ type DaylightDetectorProperties = pumpkin_data::block_properties::DaylightDetect
 #[pumpkin_block("minecraft:daylight_detector")]
 pub struct DaylightDetectorBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for DaylightDetectorBlock {
     fn placed(&self, args: PlacedArgs<'_>) {
         args.world

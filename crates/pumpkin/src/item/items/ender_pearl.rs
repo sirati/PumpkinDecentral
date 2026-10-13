@@ -24,6 +24,7 @@ const POWER: f32 = 1.5;
 const DIVERGENCE: f32 = 1.0;
 const THROW_SOUND_VOLUME: f32 = 0.5;
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for EnderPearlItem {
     fn normal_use(&self, _item: &Item, player: &Player) {
         let position = player.position();

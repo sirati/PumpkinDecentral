@@ -34,6 +34,38 @@ impl CommandExecutor for WeatherExecutor {
 
         let world = context.source.world();
         let server = context.server();
+        if server.advanced_config.cluster.enabled {
+            let (clear, rain, raining, thundering) = match self.mode {
+                WeatherMode::Clear => (
+                    duration.unwrap_or_else(|| rand::random_range(12_000..=180_000)),
+                    0,
+                    false,
+                    false,
+                ),
+                WeatherMode::Rain => (
+                    0,
+                    duration.unwrap_or_else(|| rand::random_range(12_000..=24_000)),
+                    true,
+                    false,
+                ),
+                WeatherMode::Thunder => (
+                    0,
+                    duration.unwrap_or_else(|| rand::random_range(3600..=15_600)),
+                    true,
+                    true,
+                ),
+            };
+            if !server
+                .cluster_environment
+                .weather(world, clear, rain, raining, thundering)
+            {
+                return Err(crate::server::cluster_admin_apply::admin_busy_error());
+            }
+            context
+                .source
+                .send_feedback(TextComponent::text("World weather change queued."), false);
+            return Ok(duration.unwrap_or(-1));
+        }
         let (message, return_val) = {
             let mut weather = world
                 .weather

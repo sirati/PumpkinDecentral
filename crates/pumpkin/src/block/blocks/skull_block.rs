@@ -26,6 +26,7 @@ impl BlockMetadata for SkullBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for SkullBlock {
     fn placed(&self, args: PlacedArgs<'_>) {
         {

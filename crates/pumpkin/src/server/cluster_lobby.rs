@@ -1,6 +1,5 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
@@ -9,9 +8,8 @@ use pumpkin_data::entity::EntityType;
 use pumpkin_protocol::codec::var_int::VarInt;
 use pumpkin_protocol::java::client::play::{
     CBlockEntityData, CBlockUpdate, CCenterChunk, CChunkBatchEnd, CChunkBatchStart, CGameEvent,
-    CLogin, CPlayerInfoUpdate, CPlayerPosition, CPlayerSpawnPosition, CRemovePlayerInfo,
-    CSetCamera, CSpawnEntity, CUpdateTime, GameEvent, PlayerAction, PlayerInfoFlags,
-    PlayerSpawnData,
+    CLogin, CPlayerPosition, CPlayerSpawnPosition, CSetCamera, CSpawnEntity, CUpdateTime,
+    GameEvent, PlayerSpawnData,
 };
 use pumpkin_protocol::java::server::play::{
     SChatAck, SChatCommand, SChatCommandSigned, SChatMessage, SChunkBatch, SClientInformationPlay,
@@ -26,10 +24,10 @@ use pumpkin_util::math::vector3::Vector3;
 use pumpkin_util::resource_location::ResourceLocation;
 use pumpkin_util::text::{TextComponent, color::NamedColor};
 use pumpkin_util::version::JavaMinecraftVersion;
+#[cfg(test)]
 use pumpkin_world::chunk::format::LightContainer;
 use pumpkin_world::cylindrical_chunk_iterator::Cylindrical;
 use pumpkin_world::level::is_cluster_secondary;
-use rustc_hash::FxHashMap;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -37,9 +35,11 @@ use crate::block::entities::BlockEntity;
 use crate::block::entities::end_portal::EndPortalBlockEntity;
 use crate::entity::player::Player;
 use crate::entity::{Entity, NBTStorage};
-use crate::net::chunk_sender::{BatchAckResult, EncodedChunk};
+use crate::net::chunk_sender::{BatchAckResult, ClusterChunkEncoder};
 use crate::net::java::JavaClient;
+#[cfg(test)]
 use crate::net::java::chunk_data::CChunkData;
+use crate::net::java::play::session::bounded_view_distance as bounded_lobby_view_distance;
 use crate::net::{ChunkSender, ClientPlatform, GameProfile, PlayerConfig};
 use crate::server::Server;
 use crate::world::World;
@@ -69,23 +69,31 @@ pub struct LobbyDirectory {
 }
 
 #[derive(Clone)]
-struct LobbyDirectoryEntry {
-    gid: pumpkin_cluster::identity::GlobalPlayerId,
+pub(crate) struct LobbyDirectoryEntry {
+    pub(crate) gid: pumpkin_cluster::identity::GlobalPlayerId,
+    pub(crate) uuid: [u8; 16],
+    pub(crate) session: u64,
     release: std::sync::Weak<AtomicBool>,
-    client: std::sync::Weak<ClientPlatform>,
+    pub(crate) client: std::sync::Weak<ClientPlatform>,
 }
 
 pub(crate) enum LobbyDirectoryCommand {
     Register {
         name: String,
         gid: pumpkin_cluster::identity::GlobalPlayerId,
+        uuid: [u8; 16],
+        session: u64,
         release: std::sync::Weak<AtomicBool>,
         client: std::sync::Weak<ClientPlatform>,
     },
-    Unregister(pumpkin_cluster::identity::GlobalPlayerId),
+    Unregister(pumpkin_cluster::identity::GlobalPlayerId, [u8; 16], u64),
 }
 
 impl LobbyDirectory {
+    pub(crate) fn sessions(&self) -> Arc<HashMap<String, LobbyDirectoryEntry>> {
+        self.snapshot.load_full()
+    }
+
     pub(crate) fn new(capacity: usize) -> (Self, mpsc::Receiver<LobbyDirectoryCommand>) {
         let (tx, rx) = mpsc::channel(capacity);
         (
@@ -101,6 +109,8 @@ impl LobbyDirectory {
         self.register_entry(
             source.profile.name.to_ascii_lowercase(),
             source.gid,
+            *source.profile.id.as_bytes(),
+            source.session_generation,
             Arc::downgrade(&source.release),
             Arc::downgrade(&source.client),
         )
@@ -110,6 +120,8 @@ impl LobbyDirectory {
         &self,
         name: String,
         gid: pumpkin_cluster::identity::GlobalPlayerId,
+        uuid: [u8; 16],
+        session: u64,
         release: std::sync::Weak<AtomicBool>,
         client: std::sync::Weak<ClientPlatform>,
     ) -> bool {
@@ -117,15 +129,22 @@ impl LobbyDirectory {
             .try_send(LobbyDirectoryCommand::Register {
                 name,
                 gid,
+                uuid,
+                session,
                 release,
                 client,
             })
             .is_ok()
     }
 
-    fn unregister(&self, gid: pumpkin_cluster::identity::GlobalPlayerId) -> bool {
+    fn unregister(
+        &self,
+        gid: pumpkin_cluster::identity::GlobalPlayerId,
+        uuid: [u8; 16],
+        session: u64,
+    ) -> bool {
         self.tx
-            .try_send(LobbyDirectoryCommand::Unregister(gid))
+            .try_send(LobbyDirectoryCommand::Unregister(gid, uuid, session))
             .is_ok()
     }
 
@@ -154,6 +173,16 @@ impl LobbyDirectory {
         true
     }
 
+    pub fn disconnect_ip(&self, ip: std::net::IpAddr, message: &TextComponent) {
+        for entry in self.snapshot.load().values() {
+            if let Some(client) = entry.client.upgrade() {
+                if client.address().ip() == ip {
+                    client.try_kick(crate::net::DisconnectReason::Kicked, message);
+                }
+            }
+        }
+    }
+
     pub fn disconnect_gid(
         &self,
         gid: pumpkin_cluster::identity::GlobalPlayerId,
@@ -170,6 +199,31 @@ impl LobbyDirectory {
         true
     }
 
+    pub fn route_message_identity(
+        &self,
+        gid: pumpkin_cluster::identity::GlobalPlayerId,
+        uuid: [u8; 16],
+        session: u64,
+        message: &TextComponent,
+    ) -> bool {
+        let snapshot = self.snapshot.load();
+        let Some(entry) = snapshot
+            .values()
+            .find(|entry| (entry.gid, entry.uuid, entry.session) == (gid, uuid, session))
+        else {
+            return false;
+        };
+        let Some(client) = entry.client.upgrade() else {
+            return false;
+        };
+        send_session_message(
+            client.as_ref(),
+            message,
+            pumpkin_util::translation::Locale::EnUs,
+        );
+        true
+    }
+
     pub fn route_message(&self, name: &str, message: &TextComponent) -> bool {
         let snapshot = self.snapshot.load();
         let Some(entry) = snapshot.get(&name.to_ascii_lowercase()) else {
@@ -178,13 +232,12 @@ impl LobbyDirectory {
         let Some(client) = entry.client.upgrade() else {
             return false;
         };
-        if let ClientPlatform::Java(client) = client.as_ref() {
-            client.try_send_packet(
-                &pumpkin_protocol::java::client::play::CSystemChatMessage::new(message, false),
-            );
-            return true;
-        }
-        false
+        send_session_message(
+            client.as_ref(),
+            message,
+            pumpkin_util::translation::Locale::EnUs,
+        );
+        true
     }
 }
 
@@ -200,20 +253,32 @@ pub(crate) fn spawn_lobby_directory(
                 LobbyDirectoryCommand::Register {
                     name,
                     gid,
+                    uuid,
+                    session,
                     release,
                     client,
                 } => {
+                    if entries
+                        .get(&name)
+                        .is_some_and(|entry: &LobbyDirectoryEntry| entry.session > session)
+                    {
+                        continue;
+                    }
                     entries.insert(
                         name,
                         LobbyDirectoryEntry {
                             gid,
+                            uuid,
+                            session,
                             release,
                             client,
                         },
                     );
                 }
-                LobbyDirectoryCommand::Unregister(gid) => {
-                    entries.retain(|_, entry| entry.gid != gid);
+                LobbyDirectoryCommand::Unregister(gid, uuid, session) => {
+                    entries.retain(|_, entry| {
+                        (entry.gid, entry.uuid, entry.session) != (gid, uuid, session)
+                    });
                 }
             }
             entries.retain(|_, entry| {
@@ -225,6 +290,7 @@ pub(crate) fn spawn_lobby_directory(
 }
 
 pub struct LobbyCommandSender {
+    pub session_generation: u64,
     pub gid: pumpkin_cluster::identity::GlobalPlayerId,
     pub client: Arc<ClientPlatform>,
     pub profile: GameProfile,
@@ -236,10 +302,86 @@ pub struct LobbyCommandSender {
 
 impl LobbyCommandSender {
     pub fn send_message(&self, text: &TextComponent) {
-        if let ClientPlatform::Java(client) = self.client.as_ref() {
+        let locale = self
+            .locale
+            .parse()
+            .unwrap_or(pumpkin_util::translation::Locale::EnUs);
+        send_session_message(self.client.as_ref(), text, locale);
+    }
+}
+
+fn send_session_message(
+    client: &ClientPlatform,
+    text: &TextComponent,
+    locale: pumpkin_util::translation::Locale,
+) {
+    match client {
+        ClientPlatform::Java(client) => {
             client.try_send_packet(
                 &pumpkin_protocol::java::client::play::CSystemChatMessage::new(text, false),
             );
+        }
+        ClientPlatform::Bedrock(client) => {
+            use pumpkin_protocol::bedrock::server::text::SText;
+            let packet = match &*text.0.content {
+                pumpkin_util::text::TextContent::Translate {
+                    translate,
+                    bedrock_translate,
+                    with,
+                } => SText::translation(
+                    bedrock_translate
+                        .as_deref()
+                        .unwrap_or(translate.as_ref())
+                        .to_string(),
+                    with.iter()
+                        .map(pumpkin_util::text::TextComponentBase::to_bedrock_string)
+                        .collect(),
+                ),
+                _ => SText::system_message(text.0.to_bedrock_legacy(locale)),
+            };
+            client.try_enqueue_client_packet(&packet);
+        }
+    }
+}
+
+pub(crate) struct PreparedLobbyChunkNeed {
+    actor: pumpkin_cluster::identity::GlobalPlayerId,
+    install_generation: u64,
+    need: Option<super::cluster::ChunkNeedLease>,
+    delivered: Vec<pumpkin_cluster::protocol::ChunkKey>,
+    retirement: Option<tokio::sync::mpsc::OwnedPermit<super::cluster_chunk_watch::WatchCommand>>,
+}
+
+impl PreparedLobbyChunkNeed {
+    fn into_activation(
+        mut self,
+    ) -> (
+        super::cluster::ChunkNeedLease,
+        tokio::sync::mpsc::OwnedPermit<super::cluster_chunk_watch::WatchCommand>,
+    ) {
+        (
+            self.need.take().expect("prepared chunk claim"),
+            self.retirement
+                .take()
+                .expect("prepared retirement capacity"),
+        )
+    }
+}
+
+impl Drop for PreparedLobbyChunkNeed {
+    fn drop(&mut self) {
+        if let Some(need) = self.need.take() {
+            self.retirement
+                .take()
+                .expect("prepared retirement capacity")
+                .send(super::cluster_chunk_watch::WatchCommand::RetainPrepared {
+                    actor: self.actor,
+                    install_generation: self.install_generation,
+                    need,
+                    delivered: std::mem::take(&mut self.delivered),
+                    retained_until: super::cluster_chunk_watch::retirement_now_millis()
+                        .saturating_add(30_000),
+                });
         }
     }
 }
@@ -252,23 +394,24 @@ pub struct LobbyPromotion {
     pub data: Option<pumpkin_nbt::compound::NbtCompound>,
     pub hint: pumpkin_cluster::handoff::PlayerResumeHint,
     pub inventory_install_token: u64,
-    pub(crate) chunk_need: super::cluster::ChunkNeedLease,
+    pub(crate) chunk_need: PreparedLobbyChunkNeed,
     pub chunk_sender: ChunkSender,
+    pub(crate) sent_presentations: rustc_hash::FxHashMap<
+        Vector2<i32>,
+        Arc<super::cluster_chunk_presentation::ChunkPresentation>,
+    >,
     pub chat_session: Option<SPlayerSession>,
-    pub plugin_payloads: VecDeque<(String, Bytes)>,
-    pub resource_pack_results: Vec<(Uuid, VarInt)>,
-    pub dialog_actions: VecDeque<(String, Option<Bytes>)>,
     pub reentered: bool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct LocalLobbySnapshot {
     pub hint: pumpkin_cluster::handoff::PlayerResumeHint,
-    pub data: pumpkin_nbt::compound::NbtCompound,
+    pub data: Arc<[u8]>,
     pub commit_token: Option<u64>,
 }
 
 pub(crate) struct DeferredDeparture {
-    pub retained: Option<super::cluster_presence::RetainedDeparture>,
     pub ready: tokio::sync::oneshot::Receiver<super::cluster_controller::DepartureStatus>,
 }
 
@@ -291,35 +434,30 @@ pub(crate) fn begin_player_departure(
     let expected_close_token = server
         .cluster_inventory_close_token
         .fetch_add(1, Ordering::Relaxed);
-    match super::cluster_inventory_protocol::stage_departure_screen_close_any(
-        player,
-        expected_close_token,
-    ) {
-        Ok(()) => {}
-        Err(error) => {
-            player.world().suspend_player_visibility(player);
-            let _ = super::cluster_presence::freeze_player_handoff(player);
-            if logout {
-                super::cluster_presence::publish_logout_gid(server, gid);
-            }
-            tracing::error!(
-                ?gid,
-                ?error,
-                "cluster player screen close could not be staged"
-            );
-            return None;
-        }
-    }
-    player.world().suspend_player_visibility(player);
-    let retained = super::cluster_presence::freeze_player_handoff(player);
+    let retained = super::cluster_presence::freeze_player_handoff(server, player);
     if logout {
-        super::cluster_presence::publish_logout_gid(server, gid);
+        super::cluster_presence::publish_logout_gid(
+            server,
+            gid,
+            *player.gameprofile.id.as_bytes(),
+            player
+                .cluster_owner_install_generation
+                .load(Ordering::Acquire),
+        );
     }
-    match server
-        .cluster_controller
-        .request_player_departure(gid, expected_close_token, logout)
-    {
-        Ok(ready) => Some(DeferredDeparture { retained, ready }),
+    let lease = super::cluster_world_owner::player_action_lease(server, player);
+    let install_generation = player
+        .cluster_owner_install_generation
+        .load(std::sync::atomic::Ordering::Acquire);
+    match server.cluster_controller.request_player_departure(
+        player.clone(),
+        lease,
+        install_generation,
+        expected_close_token,
+        logout,
+        retained,
+    ) {
+        Ok(ready) => Some(DeferredDeparture { ready }),
         Err(error) => {
             tracing::error!(?gid, ?error, "cluster player departure ticket failed");
             None
@@ -327,75 +465,97 @@ pub(crate) fn begin_player_departure(
     }
 }
 
-pub(crate) async fn await_player_departure(
-    mut ready: tokio::sync::oneshot::Receiver<super::cluster_controller::DepartureStatus>,
-    uuid: Uuid,
-) -> bool {
-    let outcome = match tokio::time::timeout(std::time::Duration::from_secs(60), &mut ready).await {
-        Ok(outcome) => outcome,
-        Err(_) => {
-            tracing::error!(%uuid, "cluster player departure exceeded 60 seconds");
-            ready.await
-        }
-    };
-    match outcome {
-        Ok(super::cluster_controller::DepartureStatus::Ready) => true,
-        result => {
-            tracing::error!(%uuid, ?result, "cluster player departure did not settle");
-            false
-        }
-    }
-}
-
 pub(crate) fn local_snapshot_from_player(
     player: &Player,
     server: &Server,
+    frozen: &super::cluster_controller::FrozenPlayerDeparture,
+    retained: Option<&super::cluster_presence::RetainedDeparture>,
 ) -> Option<LocalLobbySnapshot> {
-    let gid = player.cluster_gid()?;
-    let statistics = server.cluster_actor_statistics.load();
-    let statistics = statistics.get(&gid)?;
-    if statistics.leave_game_recorded {
-        tracing::error!(
-            ?gid,
-            revision = statistics.revision,
-            "cluster lobby snapshot has logout statistics"
-        );
+    if player.cluster_gid() != Some(frozen.lease.gid) || frozen.lease.key.0 != player.gameprofile.id
+    {
         return None;
     }
-    let world = player.world();
-    let position = player.position();
-    let rotation = player.rotation();
+    let worlds = server.worlds.load();
+    let Some(world) = worlds
+        .iter()
+        .find(|world| super::cluster_world_delta::world_id(world) == frozen.spatial.world)
+    else {
+        return None;
+    };
+    let effective = frozen.spatial.frame.effective;
     let revision = server
         .cluster_handoff
         .load()
         .hints
         .get(&player.gameprofile.id)
         .map_or(0, |hint| hint.playerdata_revision);
-    let world_id = super::cluster_world_delta::world_id(&world);
-    let hint = pumpkin_cluster::handoff::PlayerResumeHint {
-        uuid: *player.gameprofile.id.as_bytes(),
-        dimension: world.dimension.minecraft_name.to_string(),
-        position: [position.x, position.y, position.z],
-        rotation: [rotation.0, rotation.1],
-        view_radius: player.config.load().view_distance.get(),
-        playerdata_revision: revision,
-        last_owner: Some(server.advanced_config.cluster.server_id),
-        retained_chunks: player
-            .watched_section
-            .load()
-            .all_chunks_within()
-            .map(|chunk| pumpkin_cluster::protocol::ChunkKey::new(world_id, chunk.x, chunk.y))
-            .collect(),
-        retained_until_millis: 0,
-    };
-    let mut data = pumpkin_nbt::compound::NbtCompound::new();
-    player.write_nbt(&mut data);
-    statistics.write_nbt(&mut data);
+    let mut data = player.cluster_handoff_base_nbt.clone();
+    if super::cluster_player_projection::write_owned_player_nbt(
+        server,
+        &frozen.living,
+        frozen.spatial,
+        &mut data,
+    )
+    .is_err()
+    {
+        return None;
+    }
+    if super::cluster_invsee::write_frozen_player_inventory_nbt(
+        &mut data,
+        frozen.lease,
+        &frozen.player_inventory,
+        &frozen.ender_inventory,
+    )
+    .is_err()
+    {
+        return None;
+    }
     Some(LocalLobbySnapshot {
-        hint,
-        data,
+        hint: pumpkin_cluster::handoff::PlayerResumeHint {
+            uuid: *player.gameprofile.id.as_bytes(),
+            dimension: world.dimension.minecraft_name.to_string(),
+            position: effective.position,
+            rotation: [effective.yaw, effective.pitch],
+            view_radius: player.config.load().view_distance.get(),
+            playerdata_revision: revision,
+            last_owner: Some(server.advanced_config.cluster.server_id),
+            retained_chunks: retained.map_or_else(Vec::new, |retained| {
+                retained
+                    .chunks
+                    .iter()
+                    .filter(|chunk| chunk.world == frozen.spatial.world)
+                    .copied()
+                    .collect()
+            }),
+            retained_until_millis: retained.map_or(0, |retained| retained.retained_until),
+        },
+        data: super::cluster_handoff::serialize_nbt(data).into(),
         commit_token: None,
     })
+}
+
+fn previous_session_world(server: &Server, uuid: Uuid) -> Option<Arc<World>> {
+    let player = server
+        .get_all_players()
+        .into_iter()
+        .find(|player| player.gameprofile.id == uuid)?;
+    let world = player.cluster_gid().and_then(|gid| {
+        server
+            .cluster_actor_spatial
+            .load()
+            .get(&gid)
+            .map(|spatial| spatial.truth.local.world)
+    });
+    world
+        .and_then(|world_id| {
+            server
+                .worlds
+                .load()
+                .iter()
+                .find(|world| super::cluster_world_delta::world_id(world) == world_id)
+                .cloned()
+        })
+        .or_else(|| Some(player.world()))
 }
 
 pub struct LobbySession {
@@ -409,31 +569,42 @@ pub struct LobbySession {
     source: Arc<LobbyCommandSender>,
     handoff: pumpkin_cluster::handoff::PinnedHandoff,
     sender: ChunkSender,
-    encoded: FxHashMap<Vector2<i32>, EncodedChunk>,
+    encoded: ClusterChunkEncoder,
     required: Vec<Vector2<i32>>,
-    chunk_need: Option<super::cluster::ChunkNeedLease>,
+    chunk_need: Option<PreparedLobbyChunkNeed>,
     requested_hint: bool,
     requested_playerdata: bool,
     inventory_install_revision: Option<u64>,
     handoff_outbox: VecDeque<super::cluster_handoff::HandoffCommand>,
     playerdata_token: u64,
     image_sent: bool,
+    bedrock_pack_ready: bool,
+    bedrock_initialized: bool,
+    bedrock_chunk_receipts: VecDeque<(Vector2<i32>, tokio::sync::oneshot::Receiver<()>)>,
+    pending_skin_seed: Option<super::cluster_profile_skins::SkinSeed>,
     real_center_sent: bool,
-    tab_seen: HashMap<Uuid, (String, Vec<pumpkin_cluster::presence::PresenceProperty>)>,
+    roster_registered_ready: Option<bool>,
     presence_revision: u64,
     invariant_failed: bool,
+    #[cfg(feature = "cluster-e2e")]
+    revision_mismatch_detected: bool,
+    #[cfg(feature = "cluster-e2e")]
+    originally_pinned: Option<pumpkin_cluster::handoff::PlayerResumeHint>,
+    #[cfg(feature = "cluster-e2e")]
+    retirement_barrier: Option<super::cluster_test_handoff::RetirementBarrierEvidence>,
+    #[cfg(feature = "cluster-e2e")]
+    retirement_barrier_observed: bool,
     held: bool,
     directory_registered: bool,
     chat_rx: tokio::sync::broadcast::Receiver<(Option<String>, TextComponent)>,
     chat_session: Option<SPlayerSession>,
     chat_session_checks: VecDeque<tokio::sync::oneshot::Receiver<Option<SPlayerSession>>>,
-    plugin_channels: HashSet<String>,
-    plugin_payloads: VecDeque<(String, Bytes)>,
-    resource_pack_results: Vec<(Uuid, VarInt)>,
-    dialog_actions: VecDeque<(String, Option<Bytes>)>,
+    session_work:
+        VecDeque<tokio::sync::oneshot::Receiver<super::cluster_session_ingress::SessionOutcome>>,
     local_hint: Option<pumpkin_cluster::handoff::PlayerResumeHint>,
-    local_playerdata: Option<pumpkin_nbt::compound::NbtCompound>,
-    local_snapshot_rx: Option<tokio::sync::oneshot::Receiver<LocalLobbySnapshot>>,
+    retired_playerdata_bytes: Option<Arc<[u8]>>,
+    local_snapshot_rx:
+        Option<tokio::sync::oneshot::Receiver<super::cluster_controller::DepartureStatus>>,
     local_commit_token: Option<u64>,
     #[cfg(feature = "cluster-e2e")]
     created_at: std::time::Instant,
@@ -446,6 +617,14 @@ pub struct LobbySession {
 }
 
 impl LobbySession {
+    pub const fn uuid(&self) -> Uuid {
+        self.profile.id
+    }
+
+    pub const fn session_generation(&self) -> u64 {
+        self.playerdata_token
+    }
+
     #[must_use]
     pub const fn gid(&self) -> pumpkin_cluster::identity::GlobalPlayerId {
         self.gid
@@ -458,7 +637,7 @@ impl LobbySession {
         server: &Arc<Server>,
     ) -> Option<Self> {
         Self::create(
-            client, profile, config, server, false, true, None, None, None, None,
+            client, profile, config, server, false, true, None, None, None, None, None,
         )
         .await
     }
@@ -467,7 +646,7 @@ impl LobbySession {
         player: &Player,
         server: &Arc<Server>,
         forced: bool,
-        snapshot_rx: tokio::sync::oneshot::Receiver<LocalLobbySnapshot>,
+        snapshot_rx: tokio::sync::oneshot::Receiver<super::cluster_controller::DepartureStatus>,
     ) -> Option<Self> {
         Self::create(
             player.client.clone(),
@@ -480,6 +659,7 @@ impl LobbySession {
             None,
             None,
             Some(snapshot_rx),
+            Some(player.world()),
         )
         .await
     }
@@ -493,18 +673,95 @@ impl LobbySession {
         send_login: bool,
         existing_gid: Option<pumpkin_cluster::identity::GlobalPlayerId>,
         local_hint: Option<pumpkin_cluster::handoff::PlayerResumeHint>,
-        local_playerdata: Option<pumpkin_nbt::compound::NbtCompound>,
-        local_snapshot_rx: Option<tokio::sync::oneshot::Receiver<LocalLobbySnapshot>>,
+        retired_playerdata_bytes: Option<Arc<[u8]>>,
+        local_snapshot_rx: Option<
+            tokio::sync::oneshot::Receiver<super::cluster_controller::DepartureStatus>,
+        >,
+        lobby_world_override: Option<Arc<World>>,
     ) -> Option<Self> {
-        let lobby_world = server.worlds.load().first().cloned()?;
+        let mut config = config;
+        config.view_distance = match client.as_ref() {
+            ClientPlatform::Java(_) => bounded_lobby_view_distance(config.view_distance, server),
+            ClientPlatform::Bedrock(_) => std::num::NonZeroU8::new(
+                config
+                    .view_distance
+                    .get()
+                    .max(2)
+                    .min(
+                        server
+                            .advanced_config
+                            .networking
+                            .bedrock
+                            .view_distance
+                            .get()
+                            .max(2),
+                    )
+                    .min(pumpkin_data::chunk_view_lut::MAX_VIEW_DISTANCE),
+            )
+            .expect("bounded Bedrock view radius"),
+        };
+        let previous_world = previous_session_world(server, profile.id);
+        let pending_commit = super::cluster_handoff::pending_commit(server, profile.id);
+        let retirement_pending = previous_world.is_some() || pending_commit.is_some();
+        let local_hint = local_hint.or_else(|| {
+            (send_login && !retirement_pending)
+                .then(|| {
+                    server
+                        .cluster_handoff
+                        .load()
+                        .hints
+                        .get(&profile.id)
+                        .cloned()
+                })
+                .flatten()
+        });
+        let worlds = server.worlds.load();
+        let lobby_world = lobby_world_override
+            .or_else(|| {
+                pending_commit.as_ref().and_then(|(_, dimension)| {
+                    worlds
+                        .iter()
+                        .find(|world| world.dimension.minecraft_name == dimension)
+                        .cloned()
+                })
+            })
+            .or(previous_world)
+            .or_else(|| {
+                local_hint.as_ref().and_then(|hint| {
+                    worlds
+                        .iter()
+                        .find(|world| world.dimension.minecraft_name == hint.dimension)
+                        .cloned()
+                })
+            })
+            .or_else(|| worlds.first().cloned())?;
         let entity_id = Entity::reserve_ids(1);
         let playerdata_token = server
             .cluster_lobby_session_generation
             .fetch_add(1, Ordering::Relaxed);
         let gid =
             existing_gid.unwrap_or_else(|| super::cluster_presence::reserve_login_gid(server));
+        let pending_skin_seed = if let ClientPlatform::Bedrock(bedrock) = client.as_ref() {
+            let data = bedrock.client_data.load_full();
+            let Some(skin) = data
+                .as_ref()
+                .as_ref()
+                .and_then(|data| super::cluster_profile_skins::native_skin(data))
+            else {
+                client.try_kick(
+                    crate::net::DisconnectReason::BadPacket,
+                    &TextComponent::text("Invalid Bedrock skin"),
+                );
+                return None;
+            };
+            super::cluster_profile_skins::seed(server, gid, profile.id, skin, playerdata_token)
+                .err()
+        } else {
+            None
+        };
         let permission = super::cluster_presence::permission_for_uuid(server, profile.id);
         let source = Arc::new(LobbyCommandSender {
+            session_generation: playerdata_token,
             gid,
             client: client.clone(),
             profile: profile.clone(),
@@ -519,20 +776,32 @@ impl LobbySession {
             gid,
             &profile,
             config.server_listing,
+            matches!(client.as_ref(), ClientPlatform::Bedrock(_)),
+            playerdata_token,
         );
-        let ClientPlatform::Java(java) = client.as_ref() else {
-            return None;
-        };
-        if send_login {
-            send_lobby_login(java, entity_id, &lobby_world, server);
-        }
         let command_source =
             crate::command::CommandSender::PreJoin(source.clone()).into_source(server);
-        crate::command::client_suggestions::send_java_commands_packet(
-            java,
-            &command_source,
-            &server.command_dispatcher.load(),
-        );
+        match client.as_ref() {
+            ClientPlatform::Java(java) => {
+                if send_login {
+                    send_lobby_login(java, entity_id, &lobby_world, server);
+                }
+                crate::command::client_suggestions::send_java_commands_packet(
+                    java,
+                    &command_source,
+                    &server.command_dispatcher.load(),
+                );
+            }
+            ClientPlatform::Bedrock(bedrock) => {
+                if !send_login {
+                    crate::command::client_suggestions::send_bedrock_commands_for_source(
+                        bedrock,
+                        &command_source,
+                        &server.command_dispatcher.load(),
+                    );
+                }
+            }
+        }
         let mut sender = ChunkSender::new();
         sender.max_in_flight = u16::MAX;
         let mut session = Self {
@@ -546,7 +815,7 @@ impl LobbySession {
             source,
             handoff: pumpkin_cluster::handoff::PinnedHandoff::new(),
             sender,
-            encoded: FxHashMap::default(),
+            encoded: ClusterChunkEncoder::new(),
             required: Vec::new(),
             chunk_need: None,
             requested_hint: false,
@@ -555,21 +824,30 @@ impl LobbySession {
             handoff_outbox: VecDeque::new(),
             playerdata_token,
             image_sent: false,
+            bedrock_pack_ready: !send_login,
+            bedrock_initialized: !send_login,
+            bedrock_chunk_receipts: VecDeque::new(),
+            pending_skin_seed,
             real_center_sent: false,
-            tab_seen: HashMap::new(),
+            roster_registered_ready: None,
             presence_revision: u64::MAX,
             invariant_failed: false,
+            #[cfg(feature = "cluster-e2e")]
+            revision_mismatch_detected: false,
+            #[cfg(feature = "cluster-e2e")]
+            originally_pinned: None,
+            #[cfg(feature = "cluster-e2e")]
+            retirement_barrier: None,
+            #[cfg(feature = "cluster-e2e")]
+            retirement_barrier_observed: false,
             held: !send_login,
             directory_registered,
             chat_rx: server.cluster_lobby_chat_tx.subscribe(),
             chat_session: None,
             chat_session_checks: VecDeque::new(),
-            plugin_channels: HashSet::new(),
-            plugin_payloads: VecDeque::new(),
-            resource_pack_results: Vec::new(),
-            dialog_actions: VecDeque::new(),
+            session_work: VecDeque::new(),
             local_hint,
-            local_playerdata,
+            retired_playerdata_bytes,
             local_snapshot_rx,
             local_commit_token: None,
             #[cfg(feature = "cluster-e2e")]
@@ -583,7 +861,10 @@ impl LobbySession {
         };
         session.send_image(server);
         session.sync_roster(server);
-        if session.local_hint.is_none() && session.local_snapshot_rx.is_none() {
+        if session.local_hint.is_none()
+            && session.local_snapshot_rx.is_none()
+            && !retirement_pending
+        {
             session.request_hint();
         }
         Some(session)
@@ -596,8 +877,73 @@ impl LobbySession {
         client
     }
 
-    fn send_image(&mut self, _server: &Server) {
+    fn kick(&self, message: &TextComponent) {
+        self.client
+            .try_kick(crate::net::DisconnectReason::Kicked, message);
+    }
+
+    fn send_image(&mut self, server: &Server) {
         if self.image_sent {
+            return;
+        }
+        if let ClientPlatform::Bedrock(client) = self.client.as_ref() {
+            if !self.bedrock_pack_ready {
+                return;
+            }
+            client.try_enqueue_client_packet(
+                &pumpkin_protocol::bedrock::client::CSetPlayerGameType {
+                    player_game_type: pumpkin_protocol::bedrock::client::GameType::Spectator,
+                },
+            );
+            client.try_enqueue_client_packet(&pumpkin_protocol::bedrock::client::CMovePlayer::new(
+                (self.entity_id as u64).into(),
+                Vector3::new(
+                    LOBBY_BLOCK_X as f32,
+                    LOBBY_CAMERA_Y as f32,
+                    LOBBY_BLOCK_Z as f32,
+                ),
+                90.0,
+                0.0,
+                0.0,
+                pumpkin_protocol::bedrock::client::CMovePlayer::MODE_TELEPORT,
+                false,
+                0u64.into(),
+                0,
+                0,
+                0u64.into(),
+            ));
+            let Some(image) = server
+                .cluster_lobby_images
+                .bedrock
+                .get(self.lobby_world.dimension.minecraft_name)
+            else {
+                self.fail_invariant("Bedrock lobby image unavailable");
+                return;
+            };
+            client.try_enqueue_client_packet(
+                &pumpkin_protocol::bedrock::client::CNetworkChunkPublisherUpdate::new(
+                    BlockPos::new(LOBBY_BLOCK_X, LOBBY_PLATFORM_Y, LOBBY_BLOCK_Z),
+                    64,
+                ),
+            );
+            for chunk in image.chunks.iter() {
+                client.try_enqueue_packet(chunk.clone());
+                if client.is_closed() {
+                    self.fail_invariant("Bedrock lobby packet queue is full");
+                    return;
+                }
+            }
+            client.try_enqueue_client_packet(
+                &pumpkin_protocol::bedrock::client::CPlayStatus::PlayerSpawn,
+            );
+            client.try_enqueue_client_packet(&pumpkin_protocol::bedrock::client::CSetTitle::new(
+                pumpkin_protocol::bedrock::client::TitleType::Title,
+                "Loading".into(),
+                0,
+                i32::MAX,
+                0,
+            ));
+            self.image_sent = true;
             return;
         }
         #[cfg(feature = "cluster-e2e")]
@@ -607,14 +953,17 @@ impl LobbySession {
         #[cfg(feature = "cluster-e2e")]
         let real_chunk_fetches_before = super::cluster::cluster_inflight_fetch();
         #[cfg(feature = "cluster-e2e")]
-        let real_chunk_holders_before = _server.cluster_owned_chunk_blocks.load().len();
+        let real_chunk_holders_before = server.cluster_owned_chunk_blocks.load().len();
         let version = self.java().version.load();
         if version >= JavaMinecraftVersion::V_1_20_2 {
             self.sender
                 .register_batch_for_acknowledgement(self.playerdata_token as u32, Vec::new());
         }
         let java = self.java();
-        let Some(image) = lobby_static_image(version) else {
+        let Some(image) = server
+            .cluster_lobby_images
+            .get(version, self.lobby_world.dimension.minecraft_name)
+        else {
             java.try_kick(&TextComponent::text("Unsupported Java lobby version"));
             self.invariant_failed = true;
             return;
@@ -635,17 +984,24 @@ impl LobbySession {
         #[cfg(feature = "cluster-e2e")]
         tracing::debug!(
             uuid = %self.profile.id,
-            real_players = _server.worlds.load().iter().map(|world| world.players.load().len()).sum::<usize>(),
+            real_players = server.worlds.load().iter().map(|world| world.players.load().len()).sum::<usize>(),
             real_chunk_wants_before,
             real_chunk_wants_after = super::cluster::cluster_wanted_chunks(),
             real_chunk_fetches_before,
             real_chunk_fetches_after = super::cluster::cluster_inflight_fetch(),
             real_chunk_holders_before,
-            real_chunk_holders_after = _server.cluster_owned_chunk_blocks.load().len(),
+            real_chunk_holders_after = server.cluster_owned_chunk_blocks.load().len(),
             "cluster e2e virtual lobby world footprint"
         );
+        java.try_send_packet(&pumpkin_protocol::java::client::play::CTitleAnimation::new(
+            0,
+            i32::MAX,
+            0,
+        ));
+        java.try_send_packet(&pumpkin_protocol::java::client::play::CTitleText::new(
+            &TextComponent::text("Loading"),
+        ));
         self.image_sent = true;
-        self.show_progress(0, 0);
     }
 
     fn request_hint(&mut self) {
@@ -673,10 +1029,44 @@ impl LobbySession {
                 self.handoff_outbox.push_front(command);
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                self.java()
-                    .try_kick(&TextComponent::text("Cluster handoff unavailable"));
+                self.kick(&TextComponent::text("Cluster handoff unavailable"));
             }
         }
+    }
+
+    #[cfg(feature = "cluster-e2e")]
+    fn observe_retirement_barrier(&mut self, server: &Server) {
+        if self.retirement_barrier_observed {
+            return;
+        }
+        let old_install = server
+            .get_all_players()
+            .into_iter()
+            .find(|player| player.gameprofile.id == self.profile.id)
+            .map(|player| {
+                player
+                    .cluster_owner_install_generation
+                    .load(Ordering::Acquire)
+            });
+        let pending_commit =
+            super::cluster_handoff::pending_commit(server, self.profile.id).map(|(token, _)| token);
+        if old_install.is_none() && pending_commit.is_none() {
+            return;
+        }
+        self.retirement_barrier_observed = true;
+        let expected_revision = server
+            .cluster_handoff
+            .load()
+            .hints
+            .get(&self.profile.id)
+            .map(|hint| hint.playerdata_revision);
+        self.retirement_barrier = super::cluster_test_handoff::RetirementBarrierEvidence::entered(
+            self.profile.id,
+            self.playerdata_token,
+            old_install,
+            pending_commit,
+            expected_revision,
+        );
     }
 
     fn pin_target(&mut self, server: &Server) {
@@ -686,11 +1076,31 @@ impl LobbySession {
         {
             return;
         }
+        if previous_session_world(server, self.profile.id).is_some() {
+            #[cfg(feature = "cluster-e2e")]
+            self.observe_retirement_barrier(server);
+            return;
+        }
+        if let Some((token, _)) = super::cluster_handoff::pending_commit(server, self.profile.id) {
+            #[cfg(feature = "cluster-e2e")]
+            self.observe_retirement_barrier(server);
+            if server
+                .cluster_handoff
+                .load()
+                .commit_outcomes
+                .get(&(self.profile.id, token))
+                .is_some_and(|outcome| !outcome.accepted)
+            {
+                tracing::error!(uuid = %self.profile.id, session = self.playerdata_token, token, "cluster lobby prior retirement commit rejected");
+                self.invariant_failed = true;
+                self.kick(&TextComponent::text("Previous playerdata commit rejected"));
+            }
+            return;
+        }
         let snapshot = server.cluster_handoff.load();
         if snapshot.failed_hints.contains(&self.profile.id) {
             self.invariant_failed = true;
-            self.java()
-                .try_kick(&TextComponent::text("Resume target identity mismatch"));
+            self.kick(&TextComponent::text("Resume target identity mismatch"));
             return;
         }
         let hint = self
@@ -720,11 +1130,20 @@ impl LobbySession {
         let Some(hint) = hint else {
             return;
         };
+        if !(2..=pumpkin_data::chunk_view_lut::MAX_VIEW_DISTANCE).contains(&hint.view_radius) {
+            self.fail_invariant("Invalid resume view radius");
+            return;
+        }
+        if hint.position.iter().any(|value| !value.is_finite())
+            || hint.rotation.iter().any(|value| !value.is_finite())
+        {
+            self.fail_invariant("Invalid resume position");
+            return;
+        }
         let Some(dimension) = pumpkin_data::dimension::Dimension::from_name(&hint.dimension) else {
             if !self.invariant_failed {
                 self.invariant_failed = true;
-                self.java()
-                    .try_kick(&TextComponent::text("Resume dimension unavailable"));
+                self.kick(&TextComponent::text("Resume dimension unavailable"));
             }
             return;
         };
@@ -737,13 +1156,24 @@ impl LobbySession {
         let Some(target_world) = target_world else {
             if !self.invariant_failed {
                 self.invariant_failed = true;
-                self.java()
-                    .try_kick(&TextComponent::text("Resume world unavailable"));
+                self.kick(&TextComponent::text("Resume world unavailable"));
             }
             return;
         };
         self.target_world = Some(target_world);
         if self.handoff.pin(hint.clone()).is_err() {
+            return;
+        }
+        #[cfg(feature = "cluster-e2e")]
+        if let Some(evidence) = self.retirement_barrier.take() {
+            evidence.released(hint.playerdata_revision, &hint.dimension, hint.position);
+        }
+        #[cfg(feature = "cluster-e2e")]
+        if self.originally_pinned.is_none() {
+            self.originally_pinned = Some(hint.clone());
+        }
+        if hint.dimension != self.lobby_world.dimension.minecraft_name {
+            tracing::error!(uuid = %self.profile.id, session = self.playerdata_token, revision = hint.playerdata_revision, login_dimension = self.lobby_world.dimension.minecraft_name, target_dimension = %hint.dimension, "cluster lobby target requires forbidden dimension transition");
             return;
         }
         let center = Vector2::new(
@@ -754,16 +1184,16 @@ impl LobbySession {
         self.required = Cylindrical::new(center, radius)
             .all_chunks_within()
             .collect();
-        self.chunk_need = Some(super::cluster::require_lobby_chunks(
-            self.target_world.as_ref().unwrap_or(&self.lobby_world),
-            &self.required,
-        ));
         for position in &self.required {
             self.sender.enqueue_chunk(*position);
         }
     }
 
     pub fn handle_packet(&mut self, packet: &RawPacket, server: &Arc<Server>) {
+        if matches!(self.client.as_ref(), ClientPlatform::Bedrock(_)) {
+            self.handle_bedrock_packet(packet, server);
+            return;
+        }
         let version = self.java().version.load();
         match self.java().dispatch_common_session_packet(None, packet) {
             Ok(true) => return,
@@ -773,6 +1203,14 @@ impl LobbySession {
                 return;
             }
         }
+        use crate::net::java::play::session::PlaySessionPacket;
+        let session_packet = match crate::net::java::play::session::decode(packet, version) {
+            Ok(packet) => packet,
+            Err(_) => {
+                self.fail_invariant("Malformed lobby session packet");
+                return;
+            }
+        };
         let mut payload = &packet.payload[..];
         if packet.id == SChunkBatch::to_id(version) {
             match SChunkBatch::read(&mut payload, &version) {
@@ -795,184 +1233,319 @@ impl LobbySession {
                 }
             }
         } else if packet.id == SChatCommand::to_id(version) {
-            if let Ok(packet) = SChatCommand::read(&mut payload, &version) {
+            if let Some(PlaySessionPacket::Command(packet)) = session_packet {
                 self.submit_command(
                     server,
                     packet.command.strip_prefix('/').unwrap_or(packet.command),
                 );
             }
         } else if packet.id == SChatCommandSigned::to_id(version) {
-            if let Ok(packet) = SChatCommandSigned::read(&mut payload, &version) {
-                self.submit_command(
-                    server,
-                    packet.command.strip_prefix('/').unwrap_or(packet.command),
-                );
+            if let Some(PlaySessionPacket::SignedCommand(packet)) = session_packet {
+                self.submit_command(server, packet.strip_prefix('/').unwrap_or(packet));
             }
         } else if packet.id == SChatMessage::to_id(version) {
-            if let Ok(packet) = SChatMessage::read(&mut payload, &version)
-                && let Some(command) = packet.message.strip_prefix('/')
-            {
-                self.submit_command(server, command);
-            } else if let Ok(packet) = SChatMessage::read(&mut &packet.payload[..], &version) {
-                let decorated = TextComponent::chat_decorated(
-                    &server.advanced_config.chat.format,
-                    &self.profile.name,
-                    packet.message,
-                );
-                if super::cluster_chat_out::broadcast_public_chat(
-                    server,
-                    self.gid,
-                    &self.profile.name,
-                    packet.message,
-                ) {
-                    let _ = server.cluster_lobby_chat_tx.send((None, decorated));
+            if let Some(PlaySessionPacket::Chat(packet)) = session_packet {
+                if let Some(command) = packet.message.strip_prefix('/') {
+                    self.submit_command(server, command);
                 } else {
-                    self.source
-                        .send_message(&TextComponent::text("Cluster chat queue is full"));
+                    let received_at = std::time::Instant::now();
+                    let staged = if server.basic_config.allow_chat_reports {
+                        super::cluster_session_ingress::StagedSessionInput::SecureJava {
+                            input: super::cluster_secure_chat::SignedInput {
+                                body: packet.message.to_owned(),
+                                timestamp: packet.timestamp,
+                                salt: packet.salt,
+                                signature: packet.signature.map(Into::into),
+                                message_count: packet.message_count.0,
+                                acknowledged: packet.acknowledged.into(),
+                                checksum: packet.checksum,
+                            },
+                            received_at,
+                        }
+                    } else {
+                        super::cluster_session_ingress::StagedSessionInput::Java {
+                            body: packet.message.to_owned(),
+                            received_at,
+                        }
+                    };
+                    self.submit_session_work(server, staged);
                 }
             }
         } else if packet.id == SCommandSuggestion::to_id(version) {
-            if let Ok(packet) = SCommandSuggestion::read(&mut payload, &version) {
+            if let Some(PlaySessionPacket::Suggestions(packet)) = session_packet {
                 self.suggest(&packet, server);
             }
         } else if packet.id == SClientInformationPlay::to_id(version)
-            && let Ok(packet) = SClientInformationPlay::read(&mut payload, &version)
+            && let Some(PlaySessionPacket::Settings(packet)) = session_packet
         {
             self.update_config(&packet, server);
         } else if packet.id == SPlayerSession::to_id(version) {
-            if let Ok(packet) = SPlayerSession::read(&mut payload, &version) {
+            if let Some(PlaySessionPacket::Session(packet)) = session_packet {
                 if self.chat_session_checks.len() >= 4 {
                     self.fail_invariant("Too many pending chat sessions");
                     return;
                 }
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                self.chat_session_checks.push_back(rx);
-                let client = self.client.clone();
-                let server = server.clone();
-                let uuid = self.profile.id;
-                server.clone().spawn_task(async move {
-                    let ClientPlatform::Java(java) = client.as_ref() else {
-                        let _ = tx.send(None);
-                        return;
-                    };
-                    let result = java
-                        .validate_chat_session_uuid(uuid, &server, &packet)
-                        .await
-                        .ok()
-                        .map(|()| packet);
-                    let _ = tx.send(result);
-                });
+                if let Some(result) = super::cluster_session_ingress::submit_lobby_session(
+                    server,
+                    self.source.clone(),
+                    packet,
+                ) {
+                    self.chat_session_checks.push_back(result);
+                } else {
+                    self.fail_invariant("Chat session queue is full");
+                }
             }
         } else if packet.id == SCustomPayload::to_id(version) {
-            if let Ok(packet) = SCustomPayload::read(&mut payload, &version) {
-                if self.plugin_payloads.len() >= 64 {
-                    self.fail_invariant("Too many pending lobby plugin messages");
-                    return;
-                }
-                let mut event = crate::plugin::api::events::player::LobbyCustomPayloadEvent {
-                    source: self.source.clone(),
+            if let Some(PlaySessionPacket::Payload(packet)) = session_packet {
+                let staged = super::cluster_session_ingress::StagedSessionInput::Payload {
                     channel: packet.channel.to_string(),
                     data: Bytes::copy_from_slice(packet.data),
+                    received_at: std::time::Instant::now(),
                 };
-                let plugin_server = server.clone();
-                server.spawn_task(async move {
-                    plugin_server
-                        .plugin_manager
-                        .fire(&plugin_server, &mut event)
-                        .await;
-                });
-                self.plugin_payloads.push_back((
-                    packet.channel.to_string(),
-                    Bytes::copy_from_slice(packet.data),
-                ));
-                if let Ok(channels) = std::str::from_utf8(packet.data) {
-                    if packet.channel == "minecraft:register" {
-                        self.plugin_channels.extend(
-                            channels
-                                .split('\0')
-                                .filter(|channel| !channel.is_empty())
-                                .map(str::to_owned),
-                        );
-                    } else if packet.channel == "minecraft:unregister" {
-                        for channel in channels.split('\0') {
-                            self.plugin_channels.remove(channel);
-                        }
-                    }
+                if !self.submit_session_work(server, staged) {
+                    return;
                 }
             }
         } else if packet.id == SPlayResourcePack::to_id(version) {
-            if let Ok(packet) = SPlayResourcePack::read(&mut payload, &version) {
-                if self.resource_pack_results.len() >= 32 {
-                    self.fail_invariant("Too many pending lobby resource pack results");
-                    return;
-                }
-                let mut event = crate::plugin::api::events::player::LobbyResourcePackStatusEvent {
-                    source: self.source.clone(),
-                    pack_id: packet.uuid,
-                    status: format!("{:?}", packet.response_result()),
+            if let Some(PlaySessionPacket::ResourcePack(packet)) = session_packet {
+                let staged = super::cluster_session_ingress::StagedSessionInput::ResourcePack {
+                    uuid: packet.uuid,
+                    result: packet.result,
+                    received_at: std::time::Instant::now(),
                 };
-                let plugin_server = server.clone();
-                server.spawn_task(async move {
-                    plugin_server
-                        .plugin_manager
-                        .fire(&plugin_server, &mut event)
-                        .await;
-                });
-                self.resource_pack_results
-                    .push((packet.uuid, packet.result));
-                if server.advanced_config.resource_pack.java.force
-                    && matches!(
-                    packet.response_result(),
-                    pumpkin_protocol::java::server::play::PlayResourcePackResult::Declined
-                        | pumpkin_protocol::java::server::play::PlayResourcePackResult::DownloadFail
-                ) {
-                    self.java().try_kick(&TextComponent::text(
-                        "You must accept the resource pack to play on this server.",
-                    ));
-                }
+                self.submit_session_work(server, staged);
             }
         } else if packet.id == SPlayPong::to_id(version) {
-            let _ = SPlayPong::read(&mut payload, &version);
+            let _ = session_packet;
         } else if packet.id == SChatAck::to_id(version) {
-            let _ = SChatAck::read(&mut payload, &version);
+            if server.basic_config.allow_chat_reports {
+                if let Some(PlaySessionPacket::ChatAck(packet)) = session_packet {
+                    let staged = super::cluster_session_ingress::StagedSessionInput::SecureAck {
+                        offset: packet.offset.0,
+                        received_at: std::time::Instant::now(),
+                    };
+                    self.submit_session_work(server, staged);
+                }
+            }
         } else if packet.id
             == pumpkin_protocol::java::server::play::SCustomClickAction::to_id(version)
-            && let Ok(packet) = pumpkin_protocol::java::server::play::SCustomClickAction::read(
-                &mut payload,
-                &version,
-            )
+            && let Some(PlaySessionPacket::Dialog(packet)) = session_packet
         {
-            if self.dialog_actions.len() >= 64 {
-                self.fail_invariant("Too many pending lobby dialog actions");
-                return;
-            }
-            let action_id = packet.action_id.to_string();
-            let action_payload = packet.payload.map(Bytes::copy_from_slice);
-            let mut event = crate::plugin::api::events::player::LobbyDialogActionEvent {
-                source: self.source.clone(),
-                action_id: action_id.clone(),
-                payload: action_payload.clone(),
+            let staged = super::cluster_session_ingress::StagedSessionInput::Dialog {
+                action_id: packet.action_id.to_string(),
+                payload: packet.payload.map(Bytes::copy_from_slice),
+                received_at: std::time::Instant::now(),
             };
-            let plugin_server = server.clone();
-            server.spawn_task(async move {
-                plugin_server
-                    .plugin_manager
-                    .fire(&plugin_server, &mut event)
-                    .await;
-            });
-            self.dialog_actions.push_back((action_id, action_payload));
+            self.submit_session_work(server, staged);
         }
     }
 
-    fn submit_command(&self, server: &Arc<Server>, command: &str) {
-        if !super::cluster_session_ingress::submit_lobby_command(
-            server,
-            self.source.clone(),
-            command.to_string(),
-        ) {
-            self.source
-                .send_message(&TextComponent::text("Cluster command queue is full"));
+    fn handle_bedrock_packet(&mut self, packet: &RawPacket, server: &Arc<Server>) {
+        use pumpkin_protocol::bedrock::server::{
+            command_request::SCommandRequest, request_chunk_radius::SRequestChunkRadius,
+            resource_pack_client_response::SResourcePackClientResponse, text::SText,
+        };
+        use pumpkin_protocol::packet::Packet;
+        use pumpkin_protocol::serial::PacketRead;
+        let mut payload = &packet.payload[..];
+        let input = match packet.id {
+            pumpkin_protocol::bedrock::server::SSetLocalPlayerAsInitialized::PACKET_ID => {
+                let Ok(initialized) =
+                    pumpkin_protocol::bedrock::server::SSetLocalPlayerAsInitialized::read(
+                        &mut payload,
+                    )
+                else {
+                    self.fail_invariant("Malformed lobby initialized packet");
+                    return;
+                };
+                if initialized.player_id.0 != self.entity_id as u64 {
+                    self.fail_invariant("Lobby initialized identity mismatch");
+                    return;
+                }
+                self.bedrock_initialized = true;
+                None
+            }
+            pumpkin_protocol::bedrock::server::SPlayerAuthInput::PACKET_ID => {
+                if !self.directory_registered {
+                    return;
+                }
+                if let ClientPlatform::Bedrock(client) = self.client.as_ref() {
+                    client.try_enqueue_client_packet(
+                        &pumpkin_protocol::bedrock::client::CMovePlayer::new(
+                            (self.entity_id as u64).into(),
+                            Vector3::new(
+                                LOBBY_BLOCK_X as f32,
+                                LOBBY_CAMERA_Y as f32,
+                                LOBBY_BLOCK_Z as f32,
+                            ),
+                            90.0,
+                            0.0,
+                            0.0,
+                            pumpkin_protocol::bedrock::client::CMovePlayer::MODE_RESET,
+                            false,
+                            0u64.into(),
+                            0,
+                            0,
+                            0u64.into(),
+                        ),
+                    );
+                }
+                None
+            }
+            SResourcePackClientResponse::PACKET_ID => {
+                let Ok(response) = SResourcePackClientResponse::read(&mut payload) else {
+                    self.fail_invariant("Malformed resource pack response");
+                    return;
+                };
+                let ClientPlatform::Bedrock(client) = self.client.as_ref() else {
+                    return;
+                };
+                match response.response {
+                    SResourcePackClientResponse::STATUS_HAVE_ALL_PACKS => {
+                        use pumpkin_protocol::bedrock::client::{
+                            CResourcePackStackPacket, PackInstanceId,
+                        };
+                        let config = &server.advanced_config.resource_pack.bedrock;
+                        client.try_enqueue_client_packet(&CResourcePackStackPacket {
+                            texture_pack_required: config.force,
+                            texture_pack_list: if config.enabled {
+                                config
+                                    .packs
+                                    .iter()
+                                    .map(|pack| PackInstanceId {
+                                        pack_id: pack.uuid.to_string(),
+                                        version: pack.version.clone(),
+                                        sub_pack_name: String::new(),
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            },
+                            base_game_version: pumpkin_world::CURRENT_BEDROCK_MC_VERSION
+                                .to_string(),
+                            experiments:
+                                pumpkin_protocol::bedrock::client::start_game::Experiments {
+                                    toggles: Vec::new(),
+                                    experiments_ever_toggled: false,
+                                },
+                            include_editor_packs: false,
+                        });
+                    }
+                    SResourcePackClientResponse::STATUS_COMPLETED if !self.bedrock_pack_ready => {
+                        super::cluster_bedrock_lobby::start(
+                            client,
+                            self.entity_id,
+                            server,
+                            &self.lobby_world.dimension,
+                        );
+                        let source = crate::command::CommandSender::PreJoin(self.source.clone())
+                            .into_source(server);
+                        crate::command::client_suggestions::send_bedrock_commands_for_source(
+                            client,
+                            &source,
+                            &server.command_dispatcher.load(),
+                        );
+                        self.bedrock_pack_ready = true;
+                        self.send_image(server);
+                    }
+                    SResourcePackClientResponse::STATUS_COMPLETED => {}
+                    _ => self.fail_invariant("Resource pack negotiation failed"),
+                }
+                None
+            }
+            SCommandRequest::PACKET_ID => match SCommandRequest::read(&mut payload) {
+                Ok(command) => Some(
+                    super::cluster_session_ingress::StagedSessionInput::Command {
+                        command: command
+                            .command
+                            .strip_prefix('/')
+                            .unwrap_or(&command.command)
+                            .to_string(),
+                        received_at: std::time::Instant::now(),
+                    },
+                ),
+                Err(_) => {
+                    self.fail_invariant("Malformed lobby command");
+                    return;
+                }
+            },
+            SText::PACKET_ID => match SText::read(&mut payload) {
+                Ok(text) => Some(
+                    super::cluster_session_ingress::StagedSessionInput::Bedrock {
+                        body: text.message.into_owned(),
+                        xuid: text.xuid.into_owned(),
+                        filtered: text.filtered_message.map(std::borrow::Cow::into_owned),
+                        received_at: std::time::Instant::now(),
+                    },
+                ),
+                Err(_) => {
+                    self.fail_invariant("Malformed lobby chat");
+                    return;
+                }
+            },
+            SRequestChunkRadius::PACKET_ID => {
+                let Ok(radius) = SRequestChunkRadius::read(&mut payload) else {
+                    self.fail_invariant("Malformed lobby view radius");
+                    return;
+                };
+                if radius.chunk_radius.0 < 1 {
+                    self.fail_invariant("Invalid view radius");
+                    return;
+                }
+                let maximum = server
+                    .advanced_config
+                    .networking
+                    .bedrock
+                    .view_distance
+                    .get()
+                    .max(2)
+                    .min(pumpkin_data::chunk_view_lut::MAX_VIEW_DISTANCE);
+                let radius = radius.chunk_radius.0.clamp(2, i32::from(maximum)) as u8;
+                self.config.view_distance =
+                    std::num::NonZeroU8::new(radius).expect("validated lobby radius");
+                if let ClientPlatform::Bedrock(client) = self.client.as_ref() {
+                    client.try_enqueue_client_packet(
+                        &pumpkin_protocol::bedrock::client::CChunkRadiusUpdated {
+                            chunk_radius: VarInt(i32::from(radius)),
+                        },
+                    );
+                }
+                None
+            }
+            _ => None,
+        };
+        if let Some(input) = input {
+            self.submit_session_work(server, input);
         }
+    }
+
+    fn submit_command(&mut self, server: &Arc<Server>, command: &str) {
+        self.submit_session_work(
+            server,
+            super::cluster_session_ingress::StagedSessionInput::Command {
+                command: command.to_string(),
+                received_at: std::time::Instant::now(),
+            },
+        );
+    }
+
+    fn submit_session_work(
+        &mut self,
+        server: &Server,
+        staged: super::cluster_session_ingress::StagedSessionInput,
+    ) -> bool {
+        if self.session_work.len() >= 128 {
+            self.fail_invariant("Too many pending lobby session callbacks");
+            return false;
+        }
+        let Some(receipt) =
+            super::cluster_session_ingress::submit_lobby_work(server, self.source.clone(), staged)
+        else {
+            self.fail_invariant("Lobby session callback queue is full");
+            return false;
+        };
+        self.session_work.push_back(receipt);
+        true
     }
 
     fn suggest(&self, packet: &SCommandSuggestion<'_>, server: &Arc<Server>) {
@@ -988,24 +1561,13 @@ impl LobbySession {
     }
 
     fn update_config(&mut self, packet: &SClientInformationPlay<'_>, server: &Arc<Server>) {
-        let (Ok(main_hand), Ok(chat_mode), Some(view_distance)) = (
-            pumpkin_util::Hand::try_from(packet.main_hand.0),
-            crate::entity::player::ChatMode::try_from(packet.chat_mode.0),
-            std::num::NonZeroU8::new(packet.view_distance as u8),
-        ) else {
+        let Ok(config) = crate::net::java::play::session::player_config(packet, server) else {
+            self.fail_invariant("Invalid client settings");
             return;
         };
-        self.config = PlayerConfig {
-            locale: packet.locale.to_string(),
-            view_distance,
-            chat_mode,
-            chat_colors: packet.chat_colors,
-            skin_parts: packet.skin_parts,
-            main_hand,
-            text_filtering: packet.text_filtering,
-            server_listing: packet.server_listing,
-        };
+        self.config = config;
         self.source = Arc::new(LobbyCommandSender {
+            session_generation: self.playerdata_token,
             gid: self.source.gid,
             client: self.source.client.clone(),
             profile: self.source.profile.clone(),
@@ -1019,25 +1581,21 @@ impl LobbySession {
             self.gid,
             &self.profile,
             self.config.server_listing,
+            matches!(self.client.as_ref(), ClientPlatform::Bedrock(_)),
+            self.playerdata_token,
         );
     }
 
     pub fn tick(&mut self, server: &Arc<Server>) -> Option<LobbyPromotion> {
+        self.poll_virtual_events(server);
         if self.invariant_failed {
             return None;
         }
-        while let Some(check) = self.chat_session_checks.front_mut() {
-            match check.try_recv() {
-                Ok(Some(session)) => {
-                    self.chat_session = Some(session);
-                    self.chat_session_checks.pop_front();
-                }
-                Ok(None) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                    self.fail_invariant("Invalid chat session");
-                    return None;
-                }
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => break,
-            }
+        if !self.image_sent {
+            return None;
+        }
+        if matches!(self.client.as_ref(), ClientPlatform::Bedrock(_)) && !self.bedrock_initialized {
+            return None;
         }
         #[cfg(feature = "cluster-e2e")]
         if !self.stall_reported && self.created_at.elapsed() >= std::time::Duration::from_secs(30) {
@@ -1046,7 +1604,17 @@ impl LobbySession {
             let held = self.target_world.as_ref().map_or(0, |world| {
                 self.required
                     .iter()
-                    .filter(|position| world.level.is_cluster_held(position))
+                    .filter(|position| {
+                        server
+                            .cluster_chunk_presentations
+                            .load()
+                            .get(&pumpkin_cluster::protocol::ChunkKey::new(
+                                super::cluster_world_delta::world_id(world),
+                                position.x,
+                                position.y,
+                            ))
+                            .is_some()
+                    })
                     .count()
             });
             let ready = self
@@ -1072,22 +1640,27 @@ impl LobbySession {
                 playerdata_response = ?handoff_snapshot.playerdata.get(&self.profile.id).map(|data| (data.token, data.revision)),
                 playerdata_unavailable = ?handoff_snapshot.missing_playerdata.get(&self.profile.id).copied(),
                 playerdata_failed = ?handoff_snapshot.failed_playerdata.get(&self.profile.id).copied(),
-                local_playerdata = self.local_playerdata.is_some(),
+                retired_playerdata_bytes = self.retired_playerdata_bytes.is_some(),
                 held = self.held,
                 released = self.source.release.load(Ordering::Acquire),
                 directory_registered = self.directory_registered,
-                inventory_route_ready = server.cluster_inventory_install_route_tx.borrow().as_ref().is_some_and(|route| !route.is_closed()),
+                inventory_install_seen = server.cluster_inventory_handoff_installed.load().contains_key(&(self.gid, self.playerdata_token)),
                 join_allowed = super::cluster::cluster_player_join_allowed(),
                 "cluster e2e lobby handoff exceeded 30 seconds"
             );
         }
         if let Some(receiver) = self.local_snapshot_rx.as_mut() {
             match receiver.try_recv() {
-                Ok(snapshot) => {
+                Ok(super::cluster_controller::DepartureStatus::Retired(snapshot)) => {
                     self.local_hint = Some(snapshot.hint);
-                    self.local_playerdata = Some(snapshot.data);
+                    self.retired_playerdata_bytes = Some(snapshot.data);
                     self.local_commit_token = snapshot.commit_token;
                     self.local_snapshot_rx = None;
+                }
+                Ok(_) => {
+                    tracing::error!(uuid = %self.profile.id, session = self.playerdata_token, "cluster local departure did not retire");
+                    self.fail_invariant("Local lobby handoff failed");
+                    return None;
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
                 Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
@@ -1107,14 +1680,44 @@ impl LobbySession {
                     hint.playerdata_revision = outcome.revision;
                 }
                 self.local_commit_token = None;
+                self.handoff_outbox.push_back(
+                    super::cluster_handoff::HandoffCommand::ReleaseCommitOutcome {
+                        uuid: self.profile.id,
+                        token,
+                    },
+                );
             }
         }
         if !self.directory_registered {
             self.directory_registered = server.cluster_lobby_directory.register(&self.source);
         }
         self.flush_handoff_outbox(server);
-        self.poll_virtual_events(server);
         self.pin_target(server);
+        if self
+            .handoff
+            .hint()
+            .is_some_and(|hint| hint.dimension != self.lobby_world.dimension.minecraft_name)
+        {
+            self.show_progress(0, 0);
+            return None;
+        }
+        if self.chunk_need.is_none() && self.handoff.hint().is_some() {
+            let route = server.cluster_chunk_watch_route.load_full()?;
+            let retirement = route.as_ref().clone().try_reserve_owned().ok()?;
+            let need = super::cluster::try_require_lobby_chunks(
+                server,
+                self.target_world.as_ref()?,
+                &self.required,
+                self.playerdata_token,
+            )?;
+            self.chunk_need = Some(PreparedLobbyChunkNeed {
+                actor: self.gid,
+                install_generation: self.playerdata_token,
+                need: Some(need),
+                delivered: Vec::new(),
+                retirement: Some(retirement),
+            });
+        }
         let hint = self.handoff.hint()?.clone();
         let world = self.target_world.as_ref()?;
         let center = Vector2::new(
@@ -1124,8 +1727,31 @@ impl LobbySession {
         let peer = self
             .required
             .iter()
-            .filter(|position| world.level.is_cluster_held(position))
+            .filter(|position| {
+                server
+                    .cluster_chunk_presentations
+                    .load()
+                    .get(&pumpkin_cluster::protocol::ChunkKey::new(
+                        super::cluster_world_delta::world_id(world),
+                        position.x,
+                        position.y,
+                    ))
+                    .is_some()
+            })
             .count();
+        while let Some((position, mut receipt)) = self.bedrock_chunk_receipts.pop_front() {
+            match receipt.try_recv() {
+                Ok(()) => self.sender.mark_delivered(&[position]),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    self.bedrock_chunk_receipts.push_front((position, receipt));
+                    break;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    self.fail_invariant("Bedrock real chunk transport failed");
+                    return None;
+                }
+            }
+        }
         let received = self
             .required
             .iter()
@@ -1137,23 +1763,58 @@ impl LobbySession {
             self.peer_complete_reported = true;
             tracing::debug!(uuid = %self.profile.id, peer, required = self.required.len(), "cluster e2e lobby peer chunks complete");
         }
-        while let Some(batch) = self.sender.prepare_batch(
-            &world.level,
+        let target_version = match self.client.as_ref() {
+            ClientPlatform::Java(java) => java.version.load(),
+            ClientPlatform::Bedrock(_) => JavaMinecraftVersion::Unknown,
+        };
+        let presentations = server.cluster_chunk_presentations.load_full();
+        let encoding = if matches!(self.client.as_ref(), ClientPlatform::Bedrock(_)) {
+            let dimension = match world.dimension.minecraft_name {
+                "minecraft:the_nether" => 1,
+                "minecraft:the_end" => 2,
+                _ => 0,
+            };
+            self.encoded.advance_bedrock(
+                &presentations,
+                super::cluster_world_delta::world_id(world),
+                &self.sender.pending_chunks,
+                dimension,
+            )
+        } else {
+            self.encoded.advance(
+                &presentations,
+                super::cluster_world_delta::world_id(world),
+                &self.sender.pending_chunks,
+                target_version,
+            )
+        };
+        if let Err(error) = encoding {
+            self.fail_invariant(&error);
+            return None;
+        }
+        while let Some((batch, encoded)) = self.sender.prepare_encoded_batch(
+            &mut self.encoded,
             center,
-            self.config.view_distance,
             self.playerdata_token as u32,
-            self.java().version.load(),
+            target_version,
         ) {
-            let encoded = ChunkSender::encode_batch(&batch, &mut self.encoded);
-            if encoded.is_empty() {
-                self.fail_invariant("Real chunk encoding failed");
-                return None;
-            }
             if !self.real_center_sent {
-                self.java().try_send_packet(&CCenterChunk {
-                    chunk_x: VarInt(center.x),
-                    chunk_z: VarInt(center.y),
-                });
+                match self.client.as_ref() {
+                    ClientPlatform::Java(java) => java.try_send_packet(&CCenterChunk {
+                        chunk_x: VarInt(center.x),
+                        chunk_z: VarInt(center.y),
+                    }),
+                    ClientPlatform::Bedrock(bedrock) => bedrock.try_enqueue_client_packet(
+                        &pumpkin_protocol::bedrock::client::CNetworkChunkPublisherUpdate::new(
+                            BlockPos::new(
+                                hint.position[0].floor() as i32,
+                                hint.position[1].floor() as i32,
+                                hint.position[2].floor() as i32,
+                            ),
+                            u32::from(hint.view_radius) * 16,
+                        ),
+                    ),
+                }
                 self.real_center_sent = true;
             }
             #[cfg(feature = "cluster-e2e")]
@@ -1161,13 +1822,37 @@ impl LobbySession {
                 self.first_real_batch_reported = true;
                 tracing::debug!(uuid = %self.profile.id, peer, required = self.required.len(), batch_chunks = encoded.len(), "cluster e2e lobby first real batch enqueued");
             }
-            self.sender
-                .commit_batch(&batch, &encoded, &self.client, self.playerdata_token as u32);
+            if let ClientPlatform::Bedrock(client) = self.client.as_ref() {
+                let mut receipts = Vec::with_capacity(encoded.len());
+                for chunk in &encoded {
+                    match client.try_enqueue_owned_chunk(&chunk.payload) {
+                        Ok(receipt) => receipts.push(receipt),
+                        Err(error) => {
+                            self.fail_invariant(&error);
+                            return None;
+                        }
+                    }
+                }
+                let dispatched = self.sender.commit_encoded_bedrock_batch(
+                    &batch,
+                    &encoded,
+                    self.playerdata_token as u32,
+                );
+                self.bedrock_chunk_receipts
+                    .extend(dispatched.into_iter().zip(receipts));
+            } else {
+                self.sender.commit_batch(
+                    &batch,
+                    &encoded,
+                    &self.client,
+                    self.playerdata_token as u32,
+                );
+            }
         }
         if peer != self.required.len() || !super::cluster::cluster_player_join_allowed() {
             return None;
         }
-        if self.local_playerdata.is_none() && !self.requested_playerdata {
+        if self.retired_playerdata_bytes.is_none() && !self.requested_playerdata {
             self.handoff_outbox.push_back(
                 super::cluster_handoff::HandoffCommand::RequestPlayerdata {
                     uuid: self.profile.id,
@@ -1185,12 +1870,16 @@ impl LobbySession {
             .is_some_and(|token| *token == self.playerdata_token)
         {
             self.invariant_failed = true;
-            self.java()
-                .try_kick(&TextComponent::text("Playerdata identity mismatch"));
+            self.kick(&TextComponent::text("Playerdata identity mismatch"));
             return None;
         }
-        let data = if let Some(data) = self.local_playerdata.as_ref() {
-            Some(data.clone())
+        let data = if let Some(data) = self.retired_playerdata_bytes.as_ref() {
+            let Some(data) = super::cluster_handoff::deserialize_retired_playerdata(data, &hint)
+            else {
+                self.fail_invariant("Retired playerdata decode failed");
+                return None;
+            };
+            Some(data)
         } else if let Some(data) = snapshot.playerdata.get(&self.profile.id) {
             if data.token != self.playerdata_token {
                 return None;
@@ -1201,9 +1890,12 @@ impl LobbySession {
             }) = self.handoff.validate_playerdata_revision(data.revision)
             {
                 self.invariant_failed = true;
-                tracing::warn!(uuid = %self.profile.id, expected, received, "playerdata handoff revision mismatch");
-                self.java()
-                    .try_kick(&TextComponent::text("Playerdata revision mismatch"));
+                #[cfg(feature = "cluster-e2e")]
+                {
+                    self.revision_mismatch_detected = true;
+                }
+                tracing::warn!(uuid = %self.profile.id, session = self.playerdata_token, expected, received, target_dimension = %hint.dimension, target_position = ?hint.position, "playerdata handoff revision mismatch");
+                self.kick(&TextComponent::text("Playerdata revision mismatch"));
                 return None;
             }
             super::cluster_handoff::deserialize_nbt(&data.data)
@@ -1213,14 +1905,20 @@ impl LobbySession {
             }
             if *revision != hint.playerdata_revision {
                 self.invariant_failed = true;
+                #[cfg(feature = "cluster-e2e")]
+                {
+                    self.revision_mismatch_detected = true;
+                }
                 tracing::warn!(
                     uuid = %self.profile.id,
                     expected = hint.playerdata_revision,
                     received = *revision,
+                    session = self.playerdata_token,
+                    target_dimension = %hint.dimension,
+                    target_position = ?hint.position,
                     "unavailable playerdata revision mismatch"
                 );
-                self.java()
-                    .try_kick(&TextComponent::text("Playerdata revision mismatch"));
+                self.kick(&TextComponent::text("Playerdata revision mismatch"));
                 return None;
             }
             None
@@ -1236,6 +1934,7 @@ impl LobbySession {
             match super::cluster_invsee::submit_handoff_inventory(
                 server,
                 self.gid,
+                self.profile.id,
                 self.playerdata_token,
                 chunk,
                 data.as_ref(),
@@ -1264,7 +1963,7 @@ impl LobbySession {
             return None;
         };
         let installed = server.cluster_inventory_handoff_installed.load();
-        let Some(status) = installed.get(&self.gid) else {
+        let Some(status) = installed.get(&(self.gid, self.playerdata_token)) else {
             return None;
         };
         if status.token != self.playerdata_token {
@@ -1275,14 +1974,9 @@ impl LobbySession {
             self.fail_invariant("Inventory handoff unavailable");
             return None;
         }
-        if !self.chat_session_checks.is_empty() {
-            return None;
-        }
-        if server
-            .cluster_inventory_install_route_tx
-            .borrow()
-            .as_ref()
-            .is_none_or(tokio::sync::mpsc::Sender::is_closed)
+        if !self.chat_session_checks.is_empty()
+            || !self.session_work.is_empty()
+            || !self.handoff_outbox.is_empty()
         {
             return None;
         }
@@ -1308,15 +2002,52 @@ impl LobbySession {
             inventory_install_token: self.playerdata_token,
             chunk_need: self.chunk_need.take()?,
             chunk_sender: std::mem::take(&mut self.sender),
+            sent_presentations: self.encoded.take_sent_presentations(),
             chat_session: self.chat_session.take(),
-            plugin_payloads: std::mem::take(&mut self.plugin_payloads),
-            resource_pack_results: std::mem::take(&mut self.resource_pack_results),
-            dialog_actions: std::mem::take(&mut self.dialog_actions),
             reentered: self.held,
         })
     }
 
     pub fn poll_virtual_events(&mut self, server: &Arc<Server>) {
+        if let Some(seed) = self.pending_skin_seed.take() {
+            self.pending_skin_seed = super::cluster_profile_skins::seed(
+                server,
+                seed.gid,
+                seed.uuid,
+                seed.skin,
+                seed.session,
+            )
+            .err();
+        }
+        while let Some(check) = self.chat_session_checks.front_mut() {
+            match check.try_recv() {
+                Ok(Some(session)) => {
+                    self.chat_session = Some(session);
+                    self.chat_session_checks.pop_front();
+                }
+                Ok(None) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    self.fail_invariant("Invalid chat session");
+                    return;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => break,
+            }
+        }
+        while let Some(receipt) = self.session_work.front_mut() {
+            match receipt.try_recv() {
+                Ok(
+                    super::cluster_session_ingress::SessionOutcome::Completed
+                    | super::cluster_session_ingress::SessionOutcome::Rejected,
+                ) => {
+                    self.session_work.pop_front();
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => break,
+                Ok(super::cluster_session_ingress::SessionOutcome::Failed)
+                | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    self.fail_invariant("Lobby session callback did not complete");
+                    return;
+                }
+            }
+        }
         while let Ok((target, message)) = self.chat_rx.try_recv() {
             if target
                 .as_ref()
@@ -1328,8 +2059,20 @@ impl LobbySession {
         self.sync_roster(server);
     }
 
+    pub(crate) fn session_work_complete(&self) -> bool {
+        !self.invariant_failed
+            && self.session_work.is_empty()
+            && self.chat_session_checks.is_empty()
+    }
+
     pub fn finish_promotion(&mut self, server: &Server) -> bool {
-        if !self.directory_registered || !server.cluster_lobby_directory.unregister(self.gid) {
+        if !self.directory_registered
+            || !server.cluster_lobby_directory.unregister(
+                self.gid,
+                *self.profile.id.as_bytes(),
+                self.playerdata_token,
+            )
+        {
             return false;
         }
         self.directory_registered = false;
@@ -1337,6 +2080,48 @@ impl LobbySession {
     }
 
     pub fn close(&self, server: &Server) {
+        #[cfg(feature = "cluster-e2e")]
+        if self.revision_mismatch_detected {
+            let worlds = server.worlds.load();
+            let player_registered = worlds.iter().any(|world| {
+                world
+                    .players
+                    .load()
+                    .iter()
+                    .any(|player| player.gameprofile.id == self.profile.id)
+            });
+            let replica_registered = worlds.iter().any(|world| {
+                world
+                    .entities
+                    .load()
+                    .iter()
+                    .any(|entity| entity.get_entity().entity_uuid == self.profile.id)
+            });
+            let inventory_installed =
+                server
+                    .cluster_inventory_snapshots
+                    .load()
+                    .keys()
+                    .any(|target| match target {
+                        pumpkin_cluster::inventory::InventoryTarget::Player(gid) => {
+                            *gid == self.gid
+                        }
+                        pumpkin_cluster::inventory::InventoryTarget::LeasedPlayer {
+                            key,
+                            player,
+                            ..
+                        }
+                        | pumpkin_cluster::inventory::InventoryTarget::LeasedVirtual {
+                            key,
+                            player,
+                            ..
+                        } => *key == self.profile.id && *player == self.gid,
+                        _ => false,
+                    });
+            let target_rechosen = self.originally_pinned.as_ref() != self.handoff.hint();
+            tracing::debug!(uuid = %self.profile.id, player_registered, inventory_installed,
+                replica_registered, target_rechosen, "cluster e2e revision mismatch cleanup");
+        }
         if self.inventory_install_revision.is_some() {
             super::cluster_invsee::cancel_handoff_inventory_install(
                 server,
@@ -1345,7 +2130,11 @@ impl LobbySession {
             );
         }
         if self.directory_registered {
-            let _ = server.cluster_lobby_directory.unregister(self.gid);
+            let _ = server.cluster_lobby_directory.unregister(
+                self.gid,
+                *self.profile.id.as_bytes(),
+                self.playerdata_token,
+            );
         }
     }
 
@@ -1355,19 +2144,21 @@ impl LobbySession {
         }
         self.invariant_failed = true;
         tracing::warn!(uuid = %self.profile.id, reason = message, "cluster lobby handoff invariant failed");
-        self.java()
-            .try_kick(&TextComponent::text(message.to_string()));
+        self.kick(&TextComponent::text(message.to_string()));
     }
 
     fn sync_roster(&mut self, server: &Arc<Server>) {
         let snapshot = server.cluster_presence.snapshot();
-        if snapshot.revision == self.presence_revision {
+        if snapshot.revision == self.presence_revision
+            && matches!(self.client.as_ref(), ClientPlatform::Java(_))
+        {
             return;
         }
         self.presence_revision = snapshot.revision;
         let permission = snapshot.permission_for_uuid(self.profile.id.as_bytes());
         if permission != self.source.permission {
             self.source = Arc::new(LobbyCommandSender {
+                session_generation: self.playerdata_token,
                 gid: self.source.gid,
                 client: self.source.client.clone(),
                 profile: self.source.profile.clone(),
@@ -1378,92 +2169,63 @@ impl LobbySession {
             });
             let command_source =
                 crate::command::CommandSender::PreJoin(self.source.clone()).into_source(server);
-            crate::command::client_suggestions::send_java_commands_packet(
-                self.java(),
-                &command_source,
-                &server.command_dispatcher.load(),
-            );
-        }
-        let mut desired = HashMap::new();
-        for (gid, entry) in &snapshot.entries {
-            if snapshot.is_visible_to(gid, &entry.uuid, Some(self.profile.id.as_bytes())) {
-                desired.insert(
-                    Uuid::from_bytes(entry.uuid),
-                    (entry.name.clone(), entry.properties.clone()),
-                );
+            match self.client.as_ref() {
+                ClientPlatform::Java(java) => {
+                    crate::command::client_suggestions::send_java_commands_packet(
+                        java,
+                        &command_source,
+                        &server.command_dispatcher.load(),
+                    )
+                }
+                ClientPlatform::Bedrock(bedrock) => {
+                    crate::command::client_suggestions::send_bedrock_commands_for_source(
+                        bedrock,
+                        &command_source,
+                        &server.command_dispatcher.load(),
+                    )
+                }
             }
         }
-        if snapshot.is_visible_to(
-            &self.gid,
-            self.profile.id.as_bytes(),
-            Some(self.profile.id.as_bytes()),
-        ) {
-            desired.entry(self.profile.id).or_insert_with(|| {
-                let properties = self
-                    .profile
-                    .properties
-                    .load()
-                    .iter()
-                    .map(|property| {
-                        pumpkin_cluster::presence::PresenceProperty::new(
-                            property.name.to_string(),
-                            property.value.to_string(),
-                            property.signature.as_ref().map(ToString::to_string),
-                        )
-                    })
-                    .collect();
-                (self.profile.name.clone(), properties)
-            });
-        }
-        let removed = self
-            .tab_seen
-            .keys()
-            .filter(|uuid| !desired.contains_key(uuid))
-            .copied()
-            .collect::<Vec<_>>();
-        if !removed.is_empty() {
-            self.java()
-                .try_send_packet(&CRemovePlayerInfo::new(&removed));
-        }
-        for (uuid, (name, properties)) in &desired {
-            if self.tab_seen.get(uuid) == Some(&(name.clone(), properties.clone())) {
-                continue;
+        let ready =
+            matches!(self.client.as_ref(), ClientPlatform::Java(_)) || self.bedrock_pack_ready;
+        if self.roster_registered_ready != Some(ready) {
+            if super::cluster_roster::register(
+                server,
+                self.client.clone(),
+                self.gid,
+                *self.profile.id.as_bytes(),
+                self.playerdata_token,
+                ready,
+            ) {
+                self.roster_registered_ready = Some(ready);
+            } else {
+                self.presence_revision = u64::MAX;
             }
-            if self.tab_seen.contains_key(uuid) {
-                self.java()
-                    .try_send_packet(&CRemovePlayerInfo::new(&[*uuid]));
-            }
-            let properties = super::cluster_chat_pm::protocol_properties(properties);
-            self.send_roster_entry(*uuid, name, &properties);
         }
-        self.tab_seen = desired;
-    }
-
-    fn send_roster_entry(&self, uuid: Uuid, name: &str, properties: &[pumpkin_protocol::Property]) {
-        let actions = [
-            PlayerAction::AddPlayer { name, properties },
-            PlayerAction::UpdateGameMode(VarInt(GameMode::Spectator as i32)),
-            PlayerAction::UpdateListed(true),
-            PlayerAction::UpdateLatency(VarInt(0)),
-        ];
-        let players = [pumpkin_protocol::java::client::play::Player {
-            uuid,
-            actions: &actions,
-        }];
-        self.java().try_send_packet(&CPlayerInfoUpdate::new(
-            (PlayerInfoFlags::ADD_PLAYER
-                | PlayerInfoFlags::UPDATE_GAME_MODE
-                | PlayerInfoFlags::UPDATE_LISTED
-                | PlayerInfoFlags::UPDATE_LATENCY)
-                .bits(),
-            &players,
-        ));
     }
 
     fn show_progress(&self, peer: usize, received: usize) {
         let total = self.required.len().max(1);
         let peer = peer.saturating_mul(100).saturating_div(total);
         let received = received.saturating_mul(100).saturating_div(total);
+        if let ClientPlatform::Bedrock(client) = self.client.as_ref() {
+            use pumpkin_protocol::bedrock::client::{CSetTitle, TitleType};
+            client.try_enqueue_client_packet(&CSetTitle::new(
+                TitleType::Title,
+                "Loading".into(),
+                0,
+                LOBBY_TITLE_STAY_TICKS,
+                5,
+            ));
+            client.try_enqueue_client_packet(&CSetTitle::new(
+                TitleType::Subtitle,
+                format!("§8{peer}% §f{received}%"),
+                0,
+                LOBBY_TITLE_STAY_TICKS,
+                5,
+            ));
+            return;
+        }
         self.java()
             .try_send_packet(&pumpkin_protocol::java::client::play::CTitleAnimation::new(
                 0,
@@ -1543,7 +2305,6 @@ const LOBBY_PLATFORM_Y: i32 = 100;
 /// eye `1.62` higher at `102.0` while looking straight down.
 const LOBBY_ANCHOR_Y: f64 = 100.38;
 const LOBBY_CAMERA_Y: f64 = LOBBY_PLATFORM_Y as f64 + 2.0;
-const LOBBY_SPAWN_DIMENSION: &str = "minecraft:overworld";
 const LOBBY_CHUNK_BLOCKS: i32 = 16;
 /// Fake chunk radius around the portal chunk (9x9, 4 out each side).
 const LOBBY_CHUNK_RADIUS: i32 = 4;
@@ -1552,7 +2313,7 @@ const LOBBY_FROZEN_DAYTIME: i64 = 6000;
 /// Title stays `20` ticks so it auto-hides one second after updates stop.
 const LOBBY_TITLE_STAY_TICKS: i32 = 20;
 
-fn lobby_center_chunk() -> Vector2<i32> {
+pub(crate) fn lobby_center_chunk() -> Vector2<i32> {
     Vector2::new(LOBBY_BLOCK_X >> 4, LOBBY_BLOCK_Z >> 4)
 }
 
@@ -1574,8 +2335,10 @@ struct LobbyFrames {
     tail: Box<[Bytes]>,
 }
 const LOBBY_IMAGE_SLOTS: usize = JavaMinecraftVersion::Unknown as usize + 1;
-static LOBBY_IMAGES: [OnceLock<LobbyStatic>; LOBBY_IMAGE_SLOTS] =
-    [const { OnceLock::new() }; LOBBY_IMAGE_SLOTS];
+pub(crate) struct LobbyImages {
+    images: HashMap<&'static str, Box<[Option<LobbyStatic>]>>,
+    pub(crate) bedrock: HashMap<&'static str, super::cluster_bedrock_lobby::BedrockLobbyImage>,
+}
 const LOBBY_IMAGE_VERSIONS: [JavaMinecraftVersion; 51] = [
     JavaMinecraftVersion::V_1_7_2,
     JavaMinecraftVersion::V_1_7_6,
@@ -1630,13 +2393,41 @@ const LOBBY_IMAGE_VERSIONS: [JavaMinecraftVersion; 51] = [
     JavaMinecraftVersion::V_26_2,
 ];
 
-pub(crate) fn initialize_lobby_images(server: &Server) {
-    let config = &server.advanced_config.networking.java.compression;
-    let compression = config
-        .enabled
-        .then_some((config.info.threshold as usize, config.info.level));
-    for version in LOBBY_IMAGE_VERSIONS {
-        let _ = LOBBY_IMAGES[version as usize].set(lobby_build_image(version, compression));
+impl LobbyImages {
+    pub(crate) fn new(
+        enabled: bool,
+        compression: Option<(usize, u32)>,
+        bedrock_compression: (usize, u32),
+    ) -> Self {
+        let mut images = HashMap::new();
+        let mut bedrock = HashMap::new();
+        if enabled {
+            for dimension in [
+                &pumpkin_data::dimension::Dimension::OVERWORLD,
+                &pumpkin_data::dimension::Dimension::OVERWORLD_CAVES,
+                &pumpkin_data::dimension::Dimension::THE_NETHER,
+                &pumpkin_data::dimension::Dimension::THE_END,
+            ] {
+                let mut versions = vec![None; LOBBY_IMAGE_SLOTS].into_boxed_slice();
+                for version in LOBBY_IMAGE_VERSIONS {
+                    versions[version as usize] =
+                        Some(lobby_build_dimension_image(version, compression, dimension));
+                }
+                images.insert(dimension.minecraft_name, versions);
+                bedrock.insert(
+                    dimension.minecraft_name,
+                    super::cluster_bedrock_lobby::BedrockLobbyImage::for_dimension(
+                        bedrock_compression,
+                        dimension,
+                    ),
+                );
+            }
+        }
+        Self { images, bedrock }
+    }
+
+    fn get(&self, version: JavaMinecraftVersion, dimension: &str) -> Option<&LobbyStatic> {
+        self.images.get(dimension)?.get(version as usize)?.as_ref()
     }
 }
 fn lobby_serialize<P: pumpkin_protocol::ClientPacket + Sync>(
@@ -1648,9 +2439,10 @@ fn lobby_serialize<P: pumpkin_protocol::ClientPacket + Sync>(
         out.push(data);
     }
 }
-fn lobby_build_image(
+fn lobby_build_dimension_image(
     version: JavaMinecraftVersion,
     compression: Option<(usize, u32)>,
+    dimension: &pumpkin_data::dimension::Dimension,
 ) -> LobbyStatic {
     let mut head = Vec::new();
     let mut tail = Vec::new();
@@ -1699,7 +2491,7 @@ fn lobby_build_image(
             BlockPos::new(LOBBY_BLOCK_X, LOBBY_PLATFORM_Y, LOBBY_BLOCK_Z),
             0.0,
             0.0,
-            LOBBY_SPAWN_DIMENSION.to_owned(),
+            dimension.minecraft_name.to_owned(),
         ),
         &version,
         &mut head,
@@ -1718,8 +2510,12 @@ fn lobby_build_image(
     let mut batch_size: u16 = 0;
     for dz in -LOBBY_CHUNK_RADIUS..=LOBBY_CHUNK_RADIUS {
         for dx in -LOBBY_CHUNK_RADIUS..=LOBBY_CHUNK_RADIUS {
-            let chunk = lobby_fake_chunk(center.x + dx, center.y + dz);
-            lobby_serialize(&CChunkData(&chunk), &version, &mut tail);
+            let (payload, light) =
+                lobby_fake_chunk_packet(center.x + dx, center.y + dz, version, dimension);
+            tail.push(payload);
+            if let Some(light) = light {
+                tail.push(light);
+            }
             batch_size = batch_size.saturating_add(1);
         }
     }
@@ -1818,9 +2614,72 @@ fn lobby_build_image(
         compressed,
     }
 }
-fn lobby_static_image(version: JavaMinecraftVersion) -> Option<&'static LobbyStatic> {
-    LOBBY_IMAGES.get(version as usize)?.get()
+fn lobby_fake_chunk_packet(
+    x: i32,
+    z: i32,
+    version: JavaMinecraftVersion,
+    dimension: &pumpkin_data::dimension::Dimension,
+) -> (Bytes, Option<Bytes>) {
+    use pumpkin_world::chunk::palette::{BiomePalette, BlockPalette};
+    let center = lobby_center_chunk();
+    let portal = x == center.x && z == center.y;
+    let section_count = (dimension.height / 16) as usize;
+    let mut sections = vec![BlockPalette::default(); section_count];
+    let mut entities = Vec::new();
+    if portal {
+        let y = (LOBBY_PLATFORM_Y - dimension.min_y) as usize;
+        for dz in 0..16 {
+            for dx in 0..16 {
+                sections[y / 16].set(dx, y % 16, dz, Block::END_PORTAL.default_state.id);
+                let position =
+                    BlockPos::new((x << 4) + dx as i32, LOBBY_PLATFORM_Y, (z << 4) + dz as i32);
+                let bytes = pumpkin_nbt::Nbt::from(EndPortalBlockEntity::create_nbt(position))
+                    .write_unnamed()
+                    .to_vec();
+                entities.push((
+                    pumpkin_cluster::protocol::BlockPos {
+                        x: position.0.x,
+                        y: position.0.y,
+                        z: position.0.z,
+                    },
+                    pumpkin_cluster::canonical_action::Cell {
+                        revision: 0,
+                        value: pumpkin_cluster::canonical_action::Value::BlockEntity(bytes),
+                    },
+                ));
+            }
+        }
+    }
+    let blocks = super::cluster_chunk_state::OwnedChunkBlocks::from_palettes(
+        dimension.min_y,
+        sections.into_boxed_slice(),
+        vec![BiomePalette::default(); section_count].into_boxed_slice(),
+    );
+    let sky = if portal && dimension.has_skylight {
+        255
+    } else {
+        0
+    };
+    let lighting = pumpkin_world::lighting::owned::OwnedChunkLighting {
+        block: (0..section_count).map(|_| Box::new([0; 2048])).collect(),
+        sky: (0..section_count).map(|_| Box::new([sky; 2048])).collect(),
+    };
+    crate::net::java::chunk_data::owned::encode(
+        pumpkin_cluster::protocol::ChunkKey::new(
+            pumpkin_cluster::protocol::WorldId::new(0, 0),
+            x,
+            z,
+        ),
+        &pumpkin_nbt::compound::NbtCompound::new(),
+        &blocks,
+        &entities,
+        Some(&lighting),
+        version,
+    )
+    .expect("virtual lobby packet image")
 }
+
+#[cfg(test)]
 fn lobby_fake_chunk(x: i32, z: i32) -> pumpkin_world::chunk::ChunkData {
     let chunk = pumpkin_world::chunk::ChunkData::empty(x, z);
     let portal = Block::END_PORTAL.default_state.id;
@@ -1870,10 +2729,10 @@ pub fn lobby_enter_manual(player: &Player, forced: bool) -> bool {
     if !is_cluster_secondary() {
         return false;
     }
-    let ClientPlatform::Java(client) = player.client.as_ref() else {
-        return false;
-    };
-    client.request_cluster_lobby(forced)
+    match player.client.as_ref() {
+        ClientPlatform::Java(client) => client.request_cluster_lobby(forced),
+        ClientPlatform::Bedrock(client) => client.request_cluster_lobby(forced),
+    }
 }
 
 #[cfg(test)]
@@ -1882,49 +2741,116 @@ mod tests {
 
     #[tokio::test]
     async fn cached_lobby_frames_decode_with_and_without_compression() {
-        for (version, compression) in [
-            (JavaMinecraftVersion::V_1_21_11, None),
-            (JavaMinecraftVersion::V_1_21_11, Some((256, 4))),
-            (JavaMinecraftVersion::V_26_2, None),
-            (JavaMinecraftVersion::V_26_2, Some((256, 4))),
+        for dimension in [
+            &pumpkin_data::dimension::Dimension::OVERWORLD,
+            &pumpkin_data::dimension::Dimension::THE_NETHER,
+            &pumpkin_data::dimension::Dimension::THE_END,
         ] {
-            let image = lobby_build_image(version, compression);
-            let (head, tail) = if compression.is_some() {
-                let frames = image.compressed.as_ref().unwrap();
-                (&frames.head, &frames.tail)
-            } else {
-                (&image.uncompressed.head, &image.uncompressed.tail)
-            };
-            let frames = head.iter().chain(tail.iter());
-            let mut stream = Vec::new();
-            let mut frame_count = 0;
-            for frame in frames {
-                stream.extend_from_slice(frame);
-                frame_count += 1;
+            for (version, compression) in [
+                (JavaMinecraftVersion::V_1_21_11, None),
+                (JavaMinecraftVersion::V_1_21_11, Some((256, 4))),
+                (JavaMinecraftVersion::V_26_2, None),
+                (JavaMinecraftVersion::V_26_2, Some((256, 4))),
+            ] {
+                let image = lobby_build_dimension_image(version, compression, dimension);
+                let (head, tail) = if compression.is_some() {
+                    let frames = image.compressed.as_ref().unwrap();
+                    (&frames.head, &frames.tail)
+                } else {
+                    (&image.uncompressed.head, &image.uncompressed.tail)
+                };
+                let frames = head.iter().chain(tail.iter());
+                let mut stream = Vec::new();
+                let mut frame_count = 0;
+                for frame in frames {
+                    stream.extend_from_slice(frame);
+                    frame_count += 1;
+                }
+                let mut decoder = pumpkin_protocol::java::packet_decoder::TCPNetworkDecoder::new(
+                    stream.as_slice(),
+                );
+                if let Some((threshold, _)) = compression {
+                    decoder.set_compression(threshold);
+                }
+                let mut packet_ids = Vec::with_capacity(frame_count);
+                for _ in 0..frame_count {
+                    let packet = decoder.get_raw_packet().await.unwrap();
+                    if packet.id == CPlayerSpawnPosition::to_id(version) {
+                        let spawn =
+                            CPlayerSpawnPosition::read(&mut packet.payload.as_ref(), &version)
+                                .unwrap();
+                        assert_eq!(spawn.dimension_name, dimension.minecraft_name);
+                        assert_eq!(spawn.location.0.y, 100);
+                    }
+                    packet_ids.push(packet.id);
+                }
+                assert_eq!(packet_ids[0], CGameEvent::to_id(version));
+                assert_eq!(packet_ids[1], CPlayerPosition::to_id(version));
+                assert_eq!(packet_ids[2], CPlayerSpawnPosition::to_id(version));
+                assert_eq!(packet_ids[3], CCenterChunk::to_id(version));
+                assert_eq!(packet_ids[4], CChunkBatchStart::to_id(version));
+                assert_eq!(
+                    packet_ids
+                        .iter()
+                        .filter(|id| **id == CChunkData::to_id(version))
+                        .count(),
+                    81
+                );
+                assert_eq!(packet_ids[86], CChunkBatchEnd::to_id(version));
             }
-            let mut decoder =
-                pumpkin_protocol::java::packet_decoder::TCPNetworkDecoder::new(stream.as_slice());
-            if let Some((threshold, _)) = compression {
-                decoder.set_compression(threshold);
-            }
-            let mut packet_ids = Vec::with_capacity(frame_count);
-            for _ in 0..frame_count {
-                packet_ids.push(decoder.get_raw_packet().await.unwrap().id);
-            }
-            assert_eq!(packet_ids[0], CGameEvent::to_id(version));
-            assert_eq!(packet_ids[1], CPlayerPosition::to_id(version));
-            assert_eq!(packet_ids[2], CPlayerSpawnPosition::to_id(version));
-            assert_eq!(packet_ids[3], CCenterChunk::to_id(version));
-            assert_eq!(packet_ids[4], CChunkBatchStart::to_id(version));
-            assert_eq!(
-                packet_ids
-                    .iter()
-                    .filter(|id| **id == CChunkData::to_id(version))
-                    .count(),
-                81
-            );
-            assert_eq!(packet_ids[86], CChunkBatchEnd::to_id(version));
         }
+    }
+
+    #[test]
+    fn unactivated_lobby_claim_moves_through_reserved_retirement_capacity_without_avatar() {
+        let actor = pumpkin_cluster::identity::GlobalPlayerId::new(
+            pumpkin_cluster::identity::ServerId(1),
+            pumpkin_cluster::identity::PlayerSlot(3),
+        );
+        let chunk = pumpkin_cluster::protocol::ChunkKey::new(
+            pumpkin_cluster::protocol::WorldId::new(0, 0),
+            4,
+            5,
+        );
+        let (need_tx, mut need_rx) = tokio::sync::mpsc::channel(1);
+        let (watch_tx, mut watch_rx) = tokio::sync::mpsc::channel(1);
+        let guard = PreparedLobbyChunkNeed {
+            actor,
+            install_generation: 42,
+            need: Some(super::super::cluster::ChunkNeedLease::test_owned(
+                need_tx.try_reserve_owned().unwrap(),
+                50,
+                vec![chunk],
+            )),
+            delivered: vec![chunk],
+            retirement: Some(watch_tx.try_reserve_owned().unwrap()),
+        };
+        let cut = super::super::cluster_chunk_watch::retirement_now_millis();
+        drop(guard);
+        assert!(matches!(
+            need_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        match watch_rx.try_recv().unwrap() {
+            super::super::cluster_chunk_watch::WatchCommand::RetainPrepared {
+                actor: received,
+                install_generation,
+                need,
+                delivered,
+                retained_until,
+            } => {
+                assert_eq!(received, actor);
+                assert_eq!(install_generation, 42);
+                assert_eq!(delivered, vec![chunk]);
+                assert_eq!(need.chunks(), &[chunk]);
+                assert!(retained_until >= cut.saturating_add(30_000));
+                drop(need);
+            }
+            _ => panic!("expected owned prepared retirement"),
+        }
+        assert!(
+            matches!(need_rx.try_recv(), Ok(super::super::cluster::ChunkNeed::ReleaseSet { lease: 50, chunks }) if chunks == vec![chunk])
+        );
     }
 
     #[test]
@@ -1944,12 +2870,16 @@ mod tests {
         assert!(directory.register_entry(
             "first".to_string(),
             first_gid,
+            [1; 16],
+            1,
             Arc::downgrade(&first),
             std::sync::Weak::new(),
         ));
         assert!(!directory.register_entry(
             "second".to_string(),
             second_gid,
+            [2; 16],
+            2,
             Arc::downgrade(&second),
             std::sync::Weak::new(),
         ));
@@ -1959,6 +2889,8 @@ mod tests {
         assert!(directory.register_entry(
             "second".to_string(),
             second_gid,
+            [2; 16],
+            2,
             Arc::downgrade(&second),
             std::sync::Weak::new(),
         ));
@@ -1975,6 +2907,8 @@ mod tests {
                     pumpkin_cluster::identity::ServerId(1),
                     pumpkin_cluster::identity::PlayerSlot(1),
                 ),
+                uuid: [3; 16],
+                session: 3,
                 release: Arc::downgrade(&release),
                 client: std::sync::Weak::new(),
             },
@@ -2088,5 +3022,176 @@ mod tests {
         assert!(west.pending_block_entities.lock().unwrap().is_empty());
         let far = lobby_fake_chunk(center.x + 5, center.y + 5);
         assert!(far.pending_block_entities.lock().unwrap().is_empty());
+    }
+}
+
+pub(crate) struct ActivatedLobbyWatch {
+    install_generation: u64,
+    actor: pumpkin_cluster::identity::GlobalPlayerId,
+    session: u64,
+    release: Option<tokio::sync::mpsc::OwnedPermit<super::cluster_chunk_watch::WatchCommand>>,
+}
+
+impl ActivatedLobbyWatch {
+    pub(crate) fn transfer_to_controller(mut self, player: &Player) -> Result<(), Self> {
+        if let Some(release) = self.release.take() {
+            if let Err(release) = player.cluster_initial_watch_release.push(release) {
+                self.release = Some(release);
+                return Err(self);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ActivatedLobbyWatch {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release.send(super::cluster_chunk_watch::WatchCommand::Retire {
+                actor: self.actor,
+                session: self.session,
+                install_generation: self.install_generation,
+                retained: None,
+            });
+        }
+    }
+}
+
+pub(crate) fn activate_lobby_watch(
+    server: Arc<Server>,
+    player: Arc<Player>,
+    hint: pumpkin_cluster::handoff::PlayerResumeHint,
+    sent: rustc_hash::FxHashMap<
+        pumpkin_util::math::vector2::Vector2<i32>,
+        Arc<super::cluster_chunk_presentation::ChunkPresentation>,
+    >,
+    mut need: PreparedLobbyChunkNeed,
+) -> impl std::future::Future<Output = Option<ActivatedLobbyWatch>> {
+    #[cfg(feature = "cluster-e2e")]
+    let mut early_confirm_gate = super::cluster_test_handoff::begin(&server, &player);
+    let world = need
+        .need
+        .as_ref()
+        .and_then(|need| need.chunks().first())
+        .map(|chunk| chunk.world);
+    if let Some(world) = world {
+        need.delivered = sent
+            .keys()
+            .map(|position| pumpkin_cluster::protocol::ChunkKey::new(world, position.x, position.y))
+            .collect();
+    }
+    let mut payload = Some((sent, need));
+    let mut receipt: Option<
+        tokio::sync::oneshot::Receiver<
+            Result<
+                super::cluster_chunk_watch::WatchActivated,
+                super::cluster_chunk_watch::WatchActivationError,
+            >,
+        >,
+    > = None;
+    let mut guard = None;
+    std::future::poll_fn(move |_| {
+        use std::task::Poll;
+        if player.client.closed() {
+            return Poll::Ready(None);
+        }
+        #[cfg(feature = "cluster-e2e")]
+        if let Some(gate) = early_confirm_gate.as_mut() {
+            match gate.started() {
+                Ok(true) => {}
+                Ok(false) => return Poll::Pending,
+                Err(()) => return Poll::Ready(None),
+            }
+        }
+        if let Some(receipt) = receipt.as_mut() {
+            return match receipt.try_recv() {
+                Ok(Ok(activated))
+                    if guard.as_ref().is_some_and(|guard: &ActivatedLobbyWatch| {
+                        guard.actor == activated.actor && guard.session == activated.session
+                    }) =>
+                {
+                    Poll::Ready(guard.take())
+                }
+                Ok(Err(error)) => {
+                    tracing::error!(uuid = %player.gameprofile.id, install_generation = player.cluster_owner_install_generation.load(Ordering::Acquire), ?error, "cluster lobby watch activation rejected");
+                    Poll::Ready(None)
+                }
+                Ok(_) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Poll::Ready(None),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => Poll::Pending,
+            };
+        }
+        let Some(lease) = super::cluster_world_owner::player_action_lease(&server, &player) else {
+            return Poll::Pending;
+        };
+        let publications = server.cluster_actor_spatial.load();
+        let Some(spatial) = publications.get(&lease.gid) else {
+            return Poll::Pending;
+        };
+        let Some(route) = server.cluster_chunk_watch_route.load_full() else {
+            return Poll::Pending;
+        };
+        let Ok(activate) = route.as_ref().clone().try_reserve_owned() else {
+            return Poll::Pending;
+        };
+        let (sent, prepared_need) = payload.take().unwrap();
+        let install_generation = prepared_need.install_generation;
+        let (need, release) = prepared_need.into_activation();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let world = spatial.truth.local.world;
+        let effective = spatial.truth.local.frame.effective;
+        activate.send(super::cluster_chunk_watch::WatchCommand::Activate(
+            super::cluster_chunk_watch::WatchActivationRequest {
+                actor: lease.gid,
+                session: lease.incarnation,
+                player: player.clone(),
+                view: pumpkin_cluster::controller::ViewIntent {
+                    actor: lease.gid,
+                    owner_install_generation: player
+                        .cluster_owner_install_generation
+                        .load(Ordering::Acquire),
+                    world,
+                    center: pumpkin_cluster::protocol::ChunkAddr {
+                        x: (hint.position[0].floor() as i32).div_euclid(16),
+                        z: (hint.position[2].floor() as i32).div_euclid(16),
+                    },
+                    radius: std::num::NonZeroU8::new(hint.view_radius).unwrap(),
+                    spectator_generates: player.cluster_initial_gamemode
+                        != pumpkin_util::GameMode::Spectator as u8,
+                    simulation_distance: server
+                        .advanced_config
+                        .networking
+                        .java
+                        .simulation_distance
+                        .get(),
+                    chunk_send_epoch: player.chunk_send_epoch.load(Ordering::Relaxed),
+                    tick: effective.tick,
+                },
+                sent: sent
+                    .into_iter()
+                    .map(|(position, image)| {
+                        (
+                            pumpkin_cluster::protocol::ChunkKey::new(world, position.x, position.y),
+                            image,
+                        )
+                    })
+                    .collect(),
+                need,
+                respond: tx,
+            },
+        ));
+        guard = Some(ActivatedLobbyWatch {
+            install_generation,
+            actor: lease.gid,
+            session: lease.incarnation,
+            release: Some(release),
+        });
+        receipt = Some(rx);
+        Poll::Pending
+    })
+}
+
+pub(crate) fn retire_failed_handoff(server: Arc<Server>, player: Arc<Player>) {
+    if begin_player_departure(&server, &player, true).is_none() {
+        tracing::error!(uuid = %player.gameprofile.id, "cluster failed handoff departure unavailable");
     }
 }

@@ -97,6 +97,7 @@ impl JigsawBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for JigsawBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut props = JigsawLikeProperties::default(args.block);

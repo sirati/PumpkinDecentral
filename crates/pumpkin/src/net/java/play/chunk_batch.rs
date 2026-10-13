@@ -6,6 +6,23 @@ impl JavaClient {
         let epoch = player
             .chunk_send_epoch
             .load(std::sync::atomic::Ordering::Relaxed);
+        if player
+            .world()
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            if player
+                .cluster_chunk_acknowledgements
+                .push((packet.chunks_per_tick, epoch))
+                .is_err()
+            {
+                self.try_kick(&TextComponent::text(
+                    "Chunk acknowledgement input queue exhausted",
+                ));
+            }
+            return;
+        }
         let result = player
             .chunk_sender
             .lock()

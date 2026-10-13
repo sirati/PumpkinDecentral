@@ -188,9 +188,7 @@ impl PortalType {
 
                 let teleportation_scale = scale_factor_current / scale_factor_new;
                 let worldborder = dest_world
-                    .worldborder
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    .border_for_command();
                 let (clamped_x, clamped_z) = worldborder.clamp_block(
                     (pos.x * teleportation_scale).floor() as i32,
                     (pos.z * teleportation_scale).floor() as i32,

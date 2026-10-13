@@ -21,6 +21,7 @@ impl BlockMetadata for FlowerbedBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for FlowerbedBlock {
     fn can_place_at(&self, args: CanPlaceAtArgs<'_>) -> bool {
         let block_below = args.block_accessor.get_block(&args.position.down());

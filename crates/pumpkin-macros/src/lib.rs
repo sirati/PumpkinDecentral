@@ -1,5 +1,38 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod callback_defaults;
+
+#[proc_macro_attribute]
+pub fn canonical_item_defaults(args: TokenStream, item: TokenStream) -> TokenStream {
+    if !args.is_empty() {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "canonical_item_defaults takes no arguments",
+        )
+        .into_compile_error()
+        .into();
+    }
+    callback_defaults::expand_item(parse_macro_input!(item as syn::ItemImpl))
+        .unwrap_or_else(|error| error.into_compile_error())
+        .into()
+}
+
+#[proc_macro_attribute]
+pub fn canonical_callback_defaults(args: TokenStream, item: TokenStream) -> TokenStream {
+    if !args.is_empty() {
+        return syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "canonical_callback_defaults takes no arguments",
+        )
+        .into_compile_error()
+        .into();
+    }
+    let item = parse_macro_input!(item as syn::ItemImpl);
+    callback_defaults::expand(item)
+        .unwrap_or_else(|error| error.into_compile_error())
+        .into()
+}
+
 use heck::ToShoutySnakeCase;
 use proc_macro::TokenStream;
 use proc_macro_error2::{abort, abort_call_site};

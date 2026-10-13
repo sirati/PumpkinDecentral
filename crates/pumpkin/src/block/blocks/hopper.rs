@@ -54,6 +54,7 @@ pub struct HopperBlock;
 
 type HopperLikeProperties = pumpkin_data::block_properties::HopperLikeProperties;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for HopperBlock {
     fn normal_use(&self, args: NormalUseArgs<'_>) -> BlockActionResult {
         if let Some(factory) = self.get_screen_handler_factory(GetScreenHandlerFactoryArgs {

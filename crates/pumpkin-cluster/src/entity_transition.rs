@@ -3,8 +3,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use serde::{Deserialize, Serialize};
 
 use crate::actor::ActorId;
+use crate::canonical_action::{
+    Action, ActionClass, ActionId, ActionKind, ApplyFailure, ChunkPart, ClientOrigin, Effect,
+    EntityMoveAuthority, Stakeholder, Target, UndoProcedure,
+};
 use crate::completion::ActionKey;
 use crate::entities::EntitySpawn;
+use crate::entity_body::{EntityBody, EntityPayload, EntitySpatial};
 use crate::identity::ServerId;
 use crate::protocol::{ChunkKey, GlobalEntityId, StreamKind};
 use crate::time::TickStamp;
@@ -168,9 +173,7 @@ impl EntityDepartureIndex {
             return Err(TransitionError::ConflictingTransition);
         }
         for pair in track.pending.windows(2) {
-            if pair[1].sequence.wrapping_sub(pair[0].sequence) == 1
-                && pair[1].from != pair[0].to
-            {
+            if pair[1].sequence.wrapping_sub(pair[0].sequence) == 1 && pair[1].from != pair[0].to {
                 track.pending.retain(|pending| *pending != transition);
                 return Err(TransitionError::ConflictingTransition);
             }
@@ -366,6 +369,7 @@ mod tests {
         IndexedEntityAction {
             action: ActionKey {
                 actor: GlobalPlayerId::new(ServerId(3), PlayerSlot(9)).into(),
+                incarnation: 1,
                 sequence,
                 family: 3,
             },
@@ -393,6 +397,7 @@ mod tests {
                     TickStamp(12),
                     ActionKey {
                         actor: GlobalPlayerId::new(ServerId(3), PlayerSlot(9)).into(),
+                incarnation: 1,
                         sequence: 1,
                         family: 3,
                     }
@@ -414,11 +419,7 @@ mod tests {
         index.install(entity(), ServerId(2), chunk(0), 4);
         index.transition(ServerId(2), transition(u16::MAX)).unwrap();
 
-        let chunks = index.index(action(
-            4,
-            0,
-            &[(target, chunk(9)), (actor, chunk(0))],
-        ));
+        let chunks = index.index(action(4, 0, &[(target, chunk(9)), (actor, chunk(0))]));
 
         assert_eq!(chunks, BTreeSet::from([chunk(1), chunk(9)]));
     }
@@ -510,16 +511,10 @@ mod tests {
         let mut index = EntityDepartureIndex::default();
         index.install(entity(), ServerId(2), chunk(0), 4);
         index
-            .transition(
-                ServerId(2),
-                transition_with(5, 12, chunk(0), chunk(1)),
-            )
+            .transition(ServerId(2), transition_with(5, 12, chunk(0), chunk(1)))
             .unwrap();
         index
-            .transition(
-                ServerId(2),
-                transition_with(6, 13, chunk(1), chunk(2)),
-            )
+            .transition(ServerId(2), transition_with(6, 13, chunk(1), chunk(2)))
             .unwrap();
 
         let chunks = index.index(action(9, 14, &[(actor, chunk(0))]));
@@ -584,6 +579,7 @@ mod tests {
                     TickStamp(20),
                     ActionKey {
                         actor: GlobalPlayerId::new(ServerId(3), PlayerSlot(9)).into(),
+                incarnation: 1,
                         sequence: 64,
                         family: 3,
                     }
@@ -693,4 +689,78 @@ mod tests {
             EntityBoundaryDisposition::Snapshot(_)
         ));
     }
+}
+pub fn capture(
+    body: &EntityBody,
+    source: ChunkKey,
+    spatial: EntitySpatial,
+    tick: TickStamp,
+    id: ActionId,
+) -> Result<Action, ApplyFailure> {
+    if !body.belongs_to(body.id, source)
+        || body.owner.generation == 0
+        || id.actor != ActorId::Entity(body.id)
+        || id.incarnation != u64::from(body.id.generation)
+        || id.family != 8
+        || matches!(
+            body.payload,
+            EntityPayload::Item(_) | EntityPayload::Experience(_)
+        )
+    {
+        return Err(ApplyFailure::InvalidAction);
+    }
+    let destination = ChunkKey::new(
+        spatial.world,
+        (f64::from_bits(spatial.position[0]).floor() as i32).div_euclid(16),
+        (f64::from_bits(spatial.position[2]).floor() as i32).div_euclid(16),
+    );
+    if source == destination
+        || !spatial.belongs_to(destination)
+        || source.world != destination.world
+    {
+        return Err(ApplyFailure::InvalidAction);
+    }
+    let mut stakeholders = vec![Stakeholder::Chunk(source), Stakeholder::Chunk(destination)];
+    stakeholders.sort_unstable();
+    let action = Action {
+        edit_authority: None,
+        id,
+        tick,
+        class: ActionClass::Infallible,
+        chunk_transition: true,
+        actor_chunk: Some(source),
+        player_leases: Vec::new(),
+        player_chunks: Vec::new(),
+        stakeholders,
+        dependencies: Vec::new(),
+        conditions: Vec::new(),
+        effects: vec![Effect::MoveEntityBody {
+            source: Target::Chunk {
+                key: source,
+                part: ChunkPart::Entity(body.id),
+                inventory: None,
+            },
+            destination: Target::Chunk {
+                key: destination,
+                part: ChunkPart::Entity(body.id),
+                inventory: None,
+            },
+            spatial,
+            authority: Some(EntityMoveAuthority {
+                birth: body.birth.clone(),
+                body_owner: body.owner,
+                issuer: body.owner,
+            }),
+        }],
+        counterfactual_conditions: Vec::new(),
+        counterfactual_effects: Vec::new(),
+        semantic_intent: None,
+        factual_result: None,
+        undo: vec![UndoProcedure::RestoreWrittenTargets],
+        kind: ActionKind::Actor,
+        presentation: Vec::new(),
+        client_origin: ClientOrigin::None,
+    };
+    action.validate()?;
+    Ok(action)
 }

@@ -18,6 +18,7 @@ impl SoulFireBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for SoulFireBlock {
     fn on_entity_collision(&self, args: OnEntityCollisionArgs<'_>) {
         FireBlockBase::apply_fire_collision(&args, true);

@@ -51,6 +51,7 @@ impl ItemMetadata for MinecartItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for MinecartItem {
     fn use_on_block(
         &self,

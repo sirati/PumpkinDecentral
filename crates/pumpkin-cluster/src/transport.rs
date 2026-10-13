@@ -153,24 +153,26 @@ impl std::error::Error for TransportError {}
 pub struct TransportChannels {
     pub inbound_tx: mpsc::Sender<InboundParcel>,
     pub outbound_rx: mpsc::Receiver<OutboundParcel>,
-    pub datagram_in_tx: mpsc::Sender<(ServerId, Vec<u8>)>,
+    pub datagram_in_tx: mpsc::Sender<(ServerId, u64, Vec<u8>)>,
     pub datagram_out_rx: mpsc::Receiver<(ServerId, Vec<u8>)>,
     pub peer_state_tx: watch::Sender<Arc<PeerStateSnapshot>>,
     pub replacement_ready_rx: mpsc::Receiver<ServerId>,
     pub peer_admitted_rx: watch::Receiver<Arc<HashSet<ServerId>>>,
     pub drop_request_rx: mpsc::Receiver<ServerId>,
+    pub generation_drop_request_rx: mpsc::Receiver<(ServerId, u64)>,
 }
 
 #[derive(Debug)]
 pub struct MeshChannels {
     pub inbound_rx: mpsc::Receiver<InboundParcel>,
     pub outbound_tx: mpsc::Sender<OutboundParcel>,
-    pub datagram_in_rx: mpsc::Receiver<(ServerId, Vec<u8>)>,
+    pub datagram_in_rx: mpsc::Receiver<(ServerId, u64, Vec<u8>)>,
     pub datagram_out_tx: mpsc::Sender<(ServerId, Vec<u8>)>,
     pub peer_state_rx: watch::Receiver<Arc<PeerStateSnapshot>>,
     pub replacement_ready_tx: mpsc::Sender<ServerId>,
     pub peer_admitted_tx: watch::Sender<Arc<HashSet<ServerId>>>,
     pub drop_request_tx: mpsc::Sender<ServerId>,
+    pub generation_drop_request_tx: mpsc::Sender<(ServerId, u64)>,
 }
 
 #[must_use]
@@ -183,6 +185,7 @@ pub fn channel_pair(buffer: usize) -> (TransportChannels, MeshChannels) {
     let (replacement_ready_tx, replacement_ready_rx) = mpsc::channel(buffer);
     let (peer_admitted_tx, peer_admitted_rx) = watch::channel(Arc::new(HashSet::new()));
     let (drop_request_tx, drop_request_rx) = mpsc::channel(buffer);
+    let (generation_drop_request_tx, generation_drop_request_rx) = mpsc::channel(buffer);
     (
         TransportChannels {
             inbound_tx,
@@ -193,6 +196,7 @@ pub fn channel_pair(buffer: usize) -> (TransportChannels, MeshChannels) {
             replacement_ready_rx,
             peer_admitted_rx,
             drop_request_rx,
+            generation_drop_request_rx,
         },
         MeshChannels {
             inbound_rx,
@@ -203,6 +207,7 @@ pub fn channel_pair(buffer: usize) -> (TransportChannels, MeshChannels) {
             replacement_ready_tx,
             peer_admitted_tx,
             drop_request_tx,
+            generation_drop_request_tx,
         },
     )
 }
@@ -279,6 +284,7 @@ impl Transport {
             mut replacement_ready_rx,
             mut peer_admitted_rx,
             mut drop_request_rx,
+            mut generation_drop_request_rx,
         } = channels;
         let forward_tx = router_tx.clone();
         tokio::spawn(async move {
@@ -306,7 +312,23 @@ impl Transport {
         let drop_tx = router_tx.clone();
         tokio::spawn(async move {
             while let Some(peer) = drop_request_rx.recv().await {
-                if drop_tx.send(RouterMsg::ForceDrop(peer)).await.is_err() {
+                if drop_tx
+                    .send(RouterMsg::ForceDrop(peer, None))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        let generation_drop_tx = router_tx.clone();
+        tokio::spawn(async move {
+            while let Some((peer, generation)) = generation_drop_request_rx.recv().await {
+                if generation_drop_tx
+                    .send(RouterMsg::ForceDrop(peer, Some(generation)))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -601,7 +623,13 @@ impl Transport {
                         }
                     }
                 }
-                RouterMsg::ForceDrop(peer) => {
+                RouterMsg::ForceDrop(peer, generation) => {
+                    if !drop_generation_matches(
+                        peer_state.drop_epoch.get(&peer).copied(),
+                        generation,
+                    ) {
+                        continue;
+                    }
                     deferred_admission.remove(&peer);
                     deferred_admission_bytes.remove(&peer);
                     deferred_adverts.remove(&peer);
@@ -731,7 +759,7 @@ impl Transport {
 enum RouterMsg {
     Connection(quinn::Connection),
     Disconnected(ServerId, usize, String),
-    ForceDrop(ServerId),
+    ForceDrop(ServerId, Option<u64>),
     StreamFailed(ServerId, usize),
     Parcel(OutboundParcel),
     OutboundClosed,
@@ -768,6 +796,10 @@ struct PeerAvailability {
 
 fn publish_peer_state(sender: &watch::Sender<Arc<PeerStateSnapshot>>, state: &PeerStateSnapshot) {
     sender.send_replace(Arc::new(state.clone()));
+}
+
+fn drop_generation_matches(current: Option<u64>, requested: Option<u64>) -> bool {
+    requested.is_none_or(|generation| current == Some(generation))
 }
 
 fn note_peer_connected(
@@ -1197,7 +1229,7 @@ fn register_connection(
     conn: quinn::Connection,
     generation: u64,
     inbound_tx: &mpsc::Sender<InboundParcel>,
-    datagram_in_tx: &mpsc::Sender<(ServerId, Vec<u8>)>,
+    datagram_in_tx: &mpsc::Sender<(ServerId, u64, Vec<u8>)>,
 ) -> Option<(ServerId, watch::Sender<ConnectionPhase>)> {
     let Some(peer) = connection_peer(&conn, pins) else {
         tracing::warn!("closing connection from an unknown peer");
@@ -1231,7 +1263,7 @@ fn start_connection_readers(
     peer: ServerId,
     generation: u64,
     inbound_tx: mpsc::Sender<InboundParcel>,
-    datagram_in_tx: mpsc::Sender<(ServerId, Vec<u8>)>,
+    datagram_in_tx: mpsc::Sender<(ServerId, u64, Vec<u8>)>,
     active: watch::Receiver<ConnectionPhase>,
 ) {
     tokio::spawn(serve_uni_streams(
@@ -1241,7 +1273,13 @@ fn start_connection_readers(
         inbound_tx,
         active.clone(),
     ));
-    tokio::spawn(serve_datagrams(conn, peer, datagram_in_tx, active));
+    tokio::spawn(serve_datagrams(
+        conn,
+        peer,
+        generation,
+        datagram_in_tx,
+        active,
+    ));
 }
 
 async fn serve_uni_streams(
@@ -1336,7 +1374,8 @@ async fn serve_stream(
 async fn serve_datagrams(
     conn: quinn::Connection,
     peer: ServerId,
-    datagram_in_tx: mpsc::Sender<(ServerId, Vec<u8>)>,
+    generation: u64,
+    datagram_in_tx: mpsc::Sender<(ServerId, u64, Vec<u8>)>,
     active: watch::Receiver<ConnectionPhase>,
 ) {
     loop {
@@ -1345,7 +1384,11 @@ async fn serve_datagrams(
                 if *active.borrow() != ConnectionPhase::Active {
                     continue;
                 }
-                if datagram_in_tx.send((peer, data.to_vec())).await.is_err() {
+                if datagram_in_tx
+                    .send((peer, generation, data.to_vec()))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -1594,6 +1637,14 @@ mod tests {
     use crate::protocol::{StreamKind, WorldId};
 
     static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn delayed_overflow_drop_cannot_close_replacement_generation() {
+        assert!(drop_generation_matches(Some(4), Some(4)));
+        assert!(!drop_generation_matches(Some(5), Some(4)));
+        assert!(!drop_generation_matches(None, Some(4)));
+        assert!(drop_generation_matches(Some(5), None));
+    }
 
     #[test]
     fn admission_buffers_large_holder_view_without_losing_latest_drop() {
@@ -1930,7 +1981,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(second.bytes, vec![4, 5]);
-        let (peer, datagram) =
+        let (peer, _, datagram) =
             tokio::time::timeout(Duration::from_secs(10), mesh_b.datagram_in_rx.recv())
                 .await
                 .unwrap()

@@ -6,6 +6,7 @@ use pumpkin_cluster::identity::{GlobalPlayerId, ServerId};
 use pumpkin_cluster::inventory::{
     INV_CURSOR, INV_MAIN, INV_SELECTED, InventoryApplyError, InventoryIntentPayload,
     InventoryMutationIntent, InventoryResolution, InventoryStateSnapshot, InventoryTarget,
+    SemanticInventoryOp,
 };
 use pumpkin_cluster::invsee::{
     INVSEE_MAX_SLOT_NBT_BYTES, INVSEE_REQUEST_TIMEOUT_MS, InventorySnapshot, InvseeControl,
@@ -27,7 +28,17 @@ use pumpkin_protocol::java::client::play::{CSetCursorItem, CSetPlayerInventory};
 use pumpkin_util::text::TextComponent;
 
 use super::Server;
+pub(crate) struct InventoryOpenSource {
+    pub lease: pumpkin_cluster::canonical_action::LivePlayerLease,
+    pub screen: pumpkin_cluster::inventory::InventoryScreenSnapshot,
+    pub source: pumpkin_cluster::canonical_menu::MenuSource,
+    pub menu: Option<pumpkin_cluster::inventory::InventoryMenuMetadata>,
+    pub presentation: Option<ClusterScreenPresentation>,
+}
+
 pub(crate) struct LocalInventoryAction {
+    pub open: Option<Arc<InventoryOpenSource>>,
+    pub lease: Option<pumpkin_cluster::canonical_action::LivePlayerLease>,
     pub intent: InventoryMutationIntent,
     pub origin: Option<u64>,
     pub input_sequence: Option<pumpkin_cluster::identity::PlayerSeq>,
@@ -37,6 +48,7 @@ pub(crate) struct LocalInventoryAction {
 pub(crate) struct InventoryPublication {
     pub resolution: InventoryResolution,
     pub origin: Option<u64>,
+    pub session: Option<u64>,
 }
 
 pub(crate) type InventoryActionRoute = Option<mpsc::Sender<LocalInventoryAction>>;
@@ -54,11 +66,19 @@ pub(crate) type InventoryScreenRoute = Option<mpsc::Sender<LocalInventoryScreenC
 
 pub(crate) struct LocalInventorySnapshotRequest {
     pub target: InventoryTarget,
-    pub reply: oneshot::Sender<Option<InventoryStateSnapshot>>,
+    pub reply: oneshot::Sender<Option<LocalInventorySnapshotResponse>>,
+}
+
+pub(crate) struct LocalInventorySnapshotResponse {
+    pub state: InventoryStateSnapshot,
+    pub lease: pumpkin_cluster::canonical_action::LivePlayerLease,
+    pub chunks: Vec<pumpkin_cluster::protocol::ChunkKey>,
+    pub authority: pumpkin_cluster::invsee::InventoryPreviewAuthority,
 }
 
 pub(crate) type InventorySnapshotRoute = Option<mpsc::Sender<LocalInventorySnapshotRequest>>;
 
+#[derive(Clone)]
 pub(crate) struct ClusterScreenPresentation {
     pub title: TextComponent,
     pub window_type: pumpkin_data::screen::WindowType,
@@ -109,10 +129,12 @@ pub(crate) fn block_menu_screen(
             && leg.inventory.target == leg.target
     };
     if !valid_leg(&descriptor.first)
-        || descriptor.second.as_ref().is_some_and(|second| {
-            !valid_leg(second) || second.target == descriptor.first.target
-        })
-        || viewer.target != InventoryTarget::Player(session.actor)
+        || descriptor
+            .second
+            .as_ref()
+            .is_some_and(|second| !valid_leg(second) || second.target == descriptor.first.target)
+        || !matches!(viewer.target, InventoryTarget::Player(player) | InventoryTarget::LeasedPlayer { player, .. }
+            if player == session.actor)
     {
         return Err(InventoryApplyError::Rejected);
     }
@@ -151,9 +173,7 @@ pub(crate) fn block_menu_screen(
             container_slots
         };
         if leg.inventory.cells.iter().any(|cell| {
-            cell.loc.inv != INV_MAIN
-                || cell.loc.slot >= size as u16
-                || !occupied.insert(cell.loc)
+            cell.loc.inv != INV_MAIN || cell.loc.slot >= size as u16 || !occupied.insert(cell.loc)
         }) {
             return Err(InventoryApplyError::Rejected);
         }
@@ -196,7 +216,7 @@ pub(crate) fn block_menu_screen(
             screen_slot: screen_slot as u16,
             slot: InventorySlotRef::new(target, loc),
             cell,
-            limit: 64,
+            limit: 99,
         });
     }
     let cursor_loc = InvLoc::new(INV_CURSOR, 0);
@@ -214,12 +234,16 @@ pub(crate) fn block_menu_screen(
         InventoryScreenSnapshot {
             session,
             sync_id,
+            state_id: 0,
             window_kind: window_type as u16,
             container_slots: container_slots as u16,
             slots,
             cursor,
             affected,
             preview: None,
+            preview_incarnation: None,
+            preview_lease: None,
+            preview_authority: None,
         },
         ClusterScreenPresentation {
             title: descriptor.title,
@@ -298,12 +322,8 @@ pub(crate) fn open_cluster_block_menu(
         );
         return Err(InventoryApplyError::TargetUnavailable);
     }
-    let submitted = open_inventory_screen_with_presentation(
-        &server,
-        screen,
-        None,
-        Some(presentation),
-    );
+    let submitted =
+        open_inventory_screen_with_presentation(&server, screen, None, Some(presentation));
     if submitted.is_err() {
         player.cluster_inventory_screen_target.store(None);
         let _ = player.cluster_current_inventory_session.compare_exchange(
@@ -317,10 +337,32 @@ pub(crate) fn open_cluster_block_menu(
     Ok(sync_id)
 }
 
+pub(crate) struct CanonicalInventoryOpenPresentation {
+    pub reference: pumpkin_cluster::canonical_action::ActionRef,
+    pub lease: pumpkin_cluster::canonical_action::LivePlayerLease,
+    pub screen: pumpkin_cluster::inventory::InventoryScreenSnapshot,
+    pub source: pumpkin_cluster::canonical_menu::MenuSource,
+    pub menu: Option<pumpkin_cluster::inventory::InventoryMenuMetadata>,
+    pub merchant: Option<pumpkin_cluster::inventory::InventoryMerchantPresentation>,
+    pub presentation: Option<ClusterScreenPresentation>,
+}
+
+pub(crate) fn reserve_canonical_open_presentation(
+    server: &Server,
+) -> Result<mpsc::OwnedPermit<LocalInventoryLifecycle>, InventoryApplyError> {
+    server.cluster_inventory_install_route_tx.load_full()
+        .ok_or(InventoryApplyError::TargetUnavailable)?
+        .as_ref().clone().try_reserve_owned().map_err(|_| InventoryApplyError::QueueFull)
+}
+
 pub(crate) enum LocalInventoryLifecycle {
+    CanonicalOpenPresentation(CanonicalInventoryOpenPresentation),
     InstallPlayer {
         gid: GlobalPlayerId,
+        key: uuid::Uuid,
+        generation: u64,
         token: Option<u64>,
+        new_player: bool,
         player: InventoryStateSnapshot,
         crafting: InventoryStateSnapshot,
         ender: InventoryStateSnapshot,
@@ -341,7 +383,9 @@ pub(crate) enum LocalInventoryLifecycle {
         target: InventoryTarget,
     },
     OpenScreen {
+        lease: pumpkin_cluster::canonical_action::LivePlayerLease,
         screen: pumpkin_cluster::inventory::InventoryScreenSnapshot,
+        source: Option<pumpkin_cluster::canonical_menu::MenuSource>,
         menu: Option<pumpkin_cluster::inventory::InventoryMenuMetadata>,
         presentation: Option<ClusterScreenPresentation>,
     },
@@ -369,6 +413,12 @@ pub(crate) enum LocalInventoryLifecycle {
 pub(crate) type InventoryInstallRoute = Option<mpsc::Sender<LocalInventoryLifecycle>>;
 
 pub(crate) enum InvseeCommand {
+    AcceptedClose {
+        player: Arc<crate::entity::player::Player>,
+        lease: pumpkin_cluster::canonical_action::LivePlayerLease,
+        session: pumpkin_cluster::inventory::InventoryScreenSession,
+        window_kind: u16,
+    },
     Configure {
         local: ServerId,
         outbound: mpsc::Sender<OutboundParcel>,
@@ -479,6 +529,14 @@ impl InvseeOwner {
             }
         }
         None
+    }
+
+    fn is_current_player_arc(&self, player: &Arc<crate::entity::player::Player>) -> bool {
+        let Some(gid) = player.cluster_gid() else {
+            return false;
+        };
+        self.find_player(gid)
+            .is_some_and(|current| Arc::ptr_eq(&current, player))
     }
 
     fn find_local_target(
@@ -745,11 +803,7 @@ impl InvseeOwner {
             return;
         }
         let (reply, response) = oneshot::channel();
-        let snapshot_route = self
-            .server
-            .cluster_inventory_snapshot_route_tx
-            .borrow()
-            .clone();
+        let snapshot_route = self.server.cluster_inventory_snapshot_route_tx.load_full();
         if snapshot_route
             .and_then(|route| {
                 route
@@ -765,19 +819,20 @@ impl InvseeOwner {
             return;
         }
         let commands = self.server.cluster_invsee_tx.clone();
+        let server = self.server.clone();
         let owner_name = target.gameprofile.name.clone();
-        let position = target.position();
-        let target_chunk = chunk_of_block(
-            super::cluster_world_delta::world_id(&target.world()),
-            position.x.floor() as i32,
-            position.z.floor() as i32,
-        );
         self.server.spawn_task(async move {
             let outcome =
                 tokio::time::timeout(Duration::from_millis(INVSEE_REQUEST_TIMEOUT_MS), response)
                     .await;
             let response = match outcome {
-                Ok(Ok(Some(state))) => {
+                Ok(Ok(Some(bundle)))
+                    if InvseeOwner::new(server.clone()).is_current_player_arc(&target)
+                        && bundle.lease.key.0 == target.gameprofile.id
+                        && bundle.lease.gid == request.target
+                        && bundle.chunks.len() == 1 =>
+                {
+                    let state = bundle.state;
                     let selected = state
                         .cells
                         .iter()
@@ -789,7 +844,9 @@ impl InvseeOwner {
                     InvseeResponse::found(
                         &request,
                         inventory_snapshot_from_state(state, owner_name, selected)
-                            .with_affected(vec![target_chunk]),
+                            .with_lease(bundle.lease)
+                            .with_authority(bundle.authority)
+                            .with_affected(bundle.chunks),
                     )
                 }
                 _ => InvseeResponse::offline(&request),
@@ -954,11 +1011,7 @@ impl InvseeOwner {
                 );
             }
         }
-        let route = self
-            .server
-            .cluster_inventory_install_route_tx
-            .borrow()
-            .clone();
+        let route = self.server.cluster_inventory_install_route_tx.load_full();
         let sessions: Vec<_> = self.deferred_refresh.keys().copied().collect();
         for session in sessions {
             let Some((target, expected_revision, snapshot, queued_at)) =
@@ -1011,7 +1064,22 @@ impl InvseeOwner {
             InvseeControl::Request(request) if request.target.server == self.local => {
                 self.answer(request);
             }
-            InvseeControl::Response(response) if response.viewer.server == self.local => {
+            InvseeControl::Response(response)
+                if response.viewer.server == self.local
+                    && response.target.server == parcel.peer
+                    && response.snapshot().is_none_or(|snapshot| {
+                        snapshot.authority.as_ref().is_some_and(|authority| {
+                            authority.provider.server == parcel.peer
+                                && self
+                                    .server
+                                    .cluster_peer_incarnations
+                                    .load()
+                                    .get(&parcel.peer)
+                                    .copied()
+                                    == Some(authority.provider.generation)
+                        })
+                    }) =>
+            {
                 self.resolve(response);
             }
             InvseeControl::Write(write) if write.target.server == self.local => {
@@ -1198,17 +1266,30 @@ pub(crate) fn submit_selected_slot_mutation_with_sequence(
     origin: Option<u64>,
     input_sequence: Option<pumpkin_cluster::identity::PlayerSeq>,
 ) -> Result<(), InventoryApplyError> {
-    let snapshot = inventory_snapshot(server, InventoryTarget::Player(actor))
-        .ok_or(InventoryApplyError::TargetUnavailable)?;
-    let mutation =
-        pumpkin_cluster::inventory::InventoryMutation::select_hotbar(&snapshot, selected_slot)
-            .map_err(|_| InventoryApplyError::Rejected)?;
-    submit_inventory_mutation_with_sequence(
+    if selected_slot >= 9 || affected.len() != 1 {
+        return Err(InventoryApplyError::Rejected);
+    }
+    submit_inventory_intent_with_sequence(
         server,
-        actor,
-        tick,
-        mutation,
-        affected,
+        InventoryMutationIntent {
+            actor: pumpkin_cluster::actor::ActorId::Player(actor),
+            tick,
+            actor_chunk: affected[0],
+            affected,
+            screen_session: None,
+            payload: pumpkin_cluster::inventory::InventoryIntentPayload::Gestures(vec![
+                pumpkin_cluster::inventory::InventoryGesture::SelectHotbar {
+                    slot: pumpkin_cluster::inventory::InventorySlotRef::new(
+                        InventoryTarget::Player(actor),
+                        pumpkin_cluster::inventory::InvLoc::new(
+                            pumpkin_cluster::inventory::INV_SELECTED,
+                            0,
+                        ),
+                    ),
+                    selected: selected_slot,
+                },
+            ]),
+        },
         origin,
         input_sequence,
     )
@@ -1228,12 +1309,17 @@ pub(crate) fn submit_inventory_intent_with_sequence(
     origin: Option<u64>,
     input_sequence: Option<pumpkin_cluster::identity::PlayerSeq>,
 ) -> Result<(), InventoryApplyError> {
+    let lease = match intent.actor {
+        pumpkin_cluster::actor::ActorId::Player(gid) => Some(find_inventory_player(server, gid).and_then(|player| super::cluster_world_owner::player_action_lease(server, &player)).ok_or(InventoryApplyError::TargetUnavailable)?),
+        _ => None,
+    };
     server
         .cluster_inventory_action_route_tx
-        .borrow()
-        .clone()
+        .load_full()
         .ok_or(InventoryApplyError::TargetUnavailable)?
         .try_send(LocalInventoryAction {
+            open: None,
+            lease,
             intent,
             origin,
             input_sequence,
@@ -1248,6 +1334,36 @@ pub(crate) fn subscribe_inventory_publications(
     server.cluster_inventory_publication_tx.subscribe()
 }
 
+#[derive(Clone)]
+pub(crate) struct PublishedInventorySnapshot {
+    pub publication_generation: u64,
+    snapshot: Arc<InventoryStateSnapshot>,
+}
+
+impl std::ops::Deref for PublishedInventorySnapshot {
+    type Target = InventoryStateSnapshot;
+    fn deref(&self) -> &Self::Target { &self.snapshot }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct InventoryPublicationSnapshot {
+    generation: u64,
+    roots: pumpkin_cluster::structural_map::StructuralMap<InventoryTarget, PublishedInventorySnapshot>,
+}
+
+impl std::ops::Deref for InventoryPublicationSnapshot {
+    type Target = pumpkin_cluster::structural_map::StructuralMap<InventoryTarget, PublishedInventorySnapshot>;
+    fn deref(&self) -> &Self::Target { &self.roots }
+}
+
+impl InventoryPublicationSnapshot {
+    fn insert(&mut self, target: InventoryTarget, snapshot: InventoryStateSnapshot) {
+        self.generation = self.generation.checked_add(1).expect("inventory publication generation exhausted");
+        self.roots.insert(target, PublishedInventorySnapshot { publication_generation: self.generation, snapshot: Arc::new(snapshot) });
+    }
+    fn remove(&mut self, target: &InventoryTarget) { self.roots.remove(target); }
+}
+
 pub(crate) fn inventory_snapshot(
     server: &Server,
     target: InventoryTarget,
@@ -1256,7 +1372,65 @@ pub(crate) fn inventory_snapshot(
         .cluster_inventory_snapshots
         .load()
         .get(&target)
-        .cloned()
+        .map(|root| root.snapshot.as_ref().clone())
+}
+
+#[derive(Clone)]
+pub(crate) struct CanonicalEnderInventory {
+    pub publication_generation: u64,
+    pub lease: pumpkin_cluster::canonical_action::LivePlayerLease,
+    pub revision: u64,
+    pub cells: [pumpkin_cluster::inventory::InventoryCell; 27],
+}
+
+pub(crate) fn published_ender_inventory(
+    server: &Server,
+    lease: pumpkin_cluster::canonical_action::LivePlayerLease,
+) -> Option<CanonicalEnderInventory> {
+    let player = find_inventory_player(server, lease.gid)?;
+    published_ender_inventory_for_player(server, &player, lease)
+}
+
+pub(crate) fn published_ender_inventory_revision_for_player(
+    server: &Server,
+    player: &crate::entity::player::Player,
+    lease: pumpkin_cluster::canonical_action::LivePlayerLease,
+) -> Option<(u64, u64)> {
+    if super::cluster_world_owner::player_action_lease(server, player) != Some(lease) { return None; }
+    let target = InventoryTarget::LeasedVirtual { host: lease.gid.server, key: lease.key.0, player: lease.gid, incarnation: lease.incarnation, session: 0, kind: 0x100 };
+    server.cluster_inventory_snapshots.load().get(&target).map(|snapshot| (snapshot.publication_generation, snapshot.revision))
+}
+
+pub(crate) fn published_canonical_ender_root(
+    server: &Server,
+    lease: pumpkin_cluster::canonical_action::LivePlayerLease,
+) -> Option<(u64, Arc<InventoryStateSnapshot>)> {
+    if lease.incarnation == 0 || lease.key.0.is_nil() { return None; }
+    let target = InventoryTarget::LeasedVirtual { host: lease.gid.server, key: lease.key.0, player: lease.gid, incarnation: lease.incarnation, session: 0, kind: 0x100 };
+    let publications = server.cluster_inventory_snapshots.load();
+    let root = publications.get(&target)?;
+    if root.target != target || !root.has_complete_persistent_cells() { return None; }
+    Some((root.publication_generation, root.snapshot.clone()))
+}
+
+pub(crate) fn published_ender_inventory_for_player(
+    server: &Server,
+    player: &crate::entity::player::Player,
+    lease: pumpkin_cluster::canonical_action::LivePlayerLease,
+) -> Option<CanonicalEnderInventory> {
+    if super::cluster_world_owner::player_action_lease(server, player) != Some(lease) { return None; }
+    let target = InventoryTarget::LeasedVirtual { host: lease.gid.server, key: lease.key.0, player: lease.gid, incarnation: lease.incarnation, session: 0, kind: 0x100 };
+    let snapshots = server.cluster_inventory_snapshots.load();
+    let snapshot = snapshots.get(&target)?;
+    let mut cells = std::array::from_fn(|slot| pumpkin_cluster::inventory::InventoryCell::empty(pumpkin_cluster::inventory::InvLoc::new(INV_MAIN, slot as u16)));
+    let mut seen = [false; 27];
+    for cell in &snapshot.cells {
+        let slot = usize::from(cell.loc.slot);
+        if cell.loc.inv != INV_MAIN || slot >= 27 || seen[slot] { return None; }
+        seen[slot] = true;
+        cells[slot] = cell.clone();
+    }
+    Some(CanonicalEnderInventory { publication_generation: snapshot.publication_generation, lease, revision: snapshot.revision, cells })
 }
 
 pub(crate) fn inventory_screen_snapshot(
@@ -1283,6 +1457,24 @@ pub(crate) fn request_inventory_screen_refresh(
             target,
             expected_revision,
         })
+        .map_err(|_| InventoryApplyError::QueueFull)
+}
+
+pub(crate) fn reserve_inventory_close_notification(
+    server: &Server,
+    lease: pumpkin_cluster::canonical_action::LivePlayerLease,
+    session: pumpkin_cluster::inventory::InventoryScreenSession,
+    _window_kind: u16,
+) -> Result<mpsc::OwnedPermit<InvseeCommand>, InventoryApplyError> {
+    if session.actor != lease.gid {
+        return Err(InventoryApplyError::Rejected);
+    }
+    let player = find_inventory_player(server, lease.gid)
+        .ok_or(InventoryApplyError::TargetUnavailable)?;
+    if super::cluster_world_owner::player_action_lease(server, &player) != Some(lease) {
+        return Err(InventoryApplyError::Rejected);
+    }
+    server.cluster_inventory_close_notification_tx.clone().try_reserve_owned()
         .map_err(|_| InventoryApplyError::QueueFull)
 }
 
@@ -1419,6 +1611,12 @@ pub(super) fn refreshed_invsee_screen(
         return Err(InventoryApplyError::Rejected);
     }
     let mut next = screen.clone();
+    if snapshot.incarnation == 0
+        || screen.preview_incarnation != Some(snapshot.incarnation)
+        || screen.preview_lease != snapshot.lease
+    {
+        return Err(InventoryApplyError::Rejected);
+    }
     for slot in &mut next.slots {
         if slot.slot.target == preview.target {
             slot.cell = preview
@@ -1430,6 +1628,9 @@ pub(super) fn refreshed_invsee_screen(
         }
     }
     next.preview = Some(preview);
+    next.preview_incarnation = Some(snapshot.incarnation);
+    next.preview_lease = snapshot.lease;
+    next.preview_authority = snapshot.authority.clone();
     next.affected = vec![viewer_chunk, snapshot.affected[0]];
     next.affected.sort_unstable();
     next.affected.dedup();
@@ -1447,6 +1648,31 @@ mod invsee_refresh_tests {
     use pumpkin_cluster::protocol::{ChunkKey, WorldId};
 
     #[test]
+    fn publication_identity_changes_for_equal_revision_replay_and_root_rebirth() {
+        let gid = GlobalPlayerId::new(ServerId(2), PlayerSlot(1));
+        let target = InventoryTarget::LeasedVirtual { host: gid.server, key: uuid::Uuid::from_u128(7), player: gid, incarnation: 3, session: 0, kind: 0x100 };
+        let loc = InvLoc::new(INV_MAIN, 0);
+        let initial = InventoryStateSnapshot { target, revision: 16, cells: vec![pumpkin_cluster::inventory::InventoryCell { loc, item: 1, count: 2, nbt: Vec::new() }] };
+        let mut publications = InventoryPublicationSnapshot::default();
+        publications.insert(target, initial.clone());
+        let frozen = publications.clone();
+        let first = frozen.get(&target).unwrap().publication_generation;
+        let mut replayed = initial.clone();
+        replayed.cells[0].count = 3;
+        publications.insert(target, replayed);
+        let replay = publications.get(&target).unwrap();
+        assert_eq!(replay.revision, 16);
+        assert_eq!(replay.cells[0].count, 3);
+        assert!(replay.publication_generation > first);
+        assert_eq!(frozen.get(&target).unwrap().cells[0].count, 2);
+        let replay_generation = replay.publication_generation;
+        publications.remove(&target);
+        publications.insert(target, initial);
+        assert!(publications.get(&target).unwrap().publication_generation > replay_generation);
+        assert_eq!(frozen.get(&target).unwrap().publication_generation, first);
+    }
+
+    #[test]
     fn remote_change_refreshes_editable_slots_without_reopening_window() {
         let viewer = GlobalPlayerId::new(ServerId(2), PlayerSlot(1));
         let target = GlobalPlayerId::new(ServerId(3), PlayerSlot(1));
@@ -1462,7 +1688,7 @@ mod invsee_refresh_tests {
             screen_slot,
             slot: InventorySlotRef::new(InventoryTarget::Player(target), loc),
             cell: empty(loc),
-            limit: 64,
+            limit: 99,
         };
         let screen = pumpkin_cluster::inventory::InventoryScreenSnapshot {
             session: InventoryScreenSession {
@@ -1470,6 +1696,7 @@ mod invsee_refresh_tests {
                 session: 17,
             },
             sync_id: 17,
+            state_id: 0,
             window_kind: 0,
             container_slots: 45,
             slots: vec![
@@ -1484,6 +1711,9 @@ mod invsee_refresh_tests {
                 revision: 5,
                 cells: Vec::new(),
             }),
+            preview_incarnation: Some(1),
+            preview_lease: None,
+            preview_authority: None,
         };
         let filled = |loc, item| {
             inventory_cell_from_item_stack(loc, &ItemStack::new(1, item))
@@ -1512,7 +1742,13 @@ mod invsee_refresh_tests {
                 })
                 .collect(),
         )
+        .with_incarnation(1)
         .with_affected(vec![new_chunk]);
+        let replacement_player = remote.clone().with_incarnation(2);
+        assert!(matches!(
+            refreshed_invsee_screen(&screen, target, 5, viewer_chunk, &replacement_player),
+            Err(InventoryApplyError::Rejected)
+        ));
         let refreshed = refreshed_invsee_screen(&screen, target, 5, viewer_chunk, &remote)
             .expect("fresh matching remote snapshot");
         assert_eq!(refreshed.session, screen.session);
@@ -1636,6 +1872,12 @@ mod invsee_refresh_tests {
         );
         assert_eq!(at(InvLoc::new(INV_SELECTED, 0)).item, 5);
 
+        let mut replica_nbt = pumpkin_nbt::compound::NbtCompound::new();
+        write_player_inventory_cells_nbt(&mut replica_nbt, &snapshot.cells).unwrap();
+        let replica_snapshot = player_inventory_snapshot_from_nbt(gid, Some(&replica_nbt)).unwrap();
+        assert_eq!(replica_snapshot.cells, snapshot.cells);
+        assert_eq!(replica_snapshot.revision, snapshot.revision);
+
         let chunk = ChunkKey::new(WorldId::new(0, 1), 2, 3);
         let (crafting, screen) = player_screen_snapshot(gid, &snapshot, vec![chunk]).unwrap();
         assert!(crafting.cells.is_empty());
@@ -1681,9 +1923,16 @@ mod invsee_refresh_tests {
 
 pub(crate) fn publish_inventory_screen(
     server: &Server,
-    screen: pumpkin_cluster::inventory::InventoryScreenSnapshot,
+    mut screen: pumpkin_cluster::inventory::InventoryScreenSnapshot,
 ) {
     let mut next = (**server.cluster_inventory_screens.load()).clone();
+    if let Some(previous) = next.get(&screen.session) {
+        screen.state_id = if previous.slots != screen.slots {
+            previous.state_id.wrapping_add(1)
+        } else {
+            previous.state_id
+        };
+    }
     next.insert(screen.session, screen);
     server.cluster_inventory_screens.store(Arc::new(next));
 }
@@ -1716,9 +1965,14 @@ pub(crate) fn inventory_screens_for_target(
         .collect()
 }
 
-fn refresh_inventory_screens(server: &Server, snapshots: &[InventoryStateSnapshot]) {
+fn refresh_inventory_screens(
+    server: &Server,
+    snapshots: &[InventoryStateSnapshot],
+    current_player_target: impl Fn(InventoryTarget) -> bool,
+) {
     let mut next = (**server.cluster_inventory_screens.load()).clone();
     for screen in next.values_mut() {
+        let prior_slots = screen.slots.clone();
         for slot in &mut screen.slots {
             let Some(snapshot) = snapshots
                 .iter()
@@ -1733,10 +1987,12 @@ fn refresh_inventory_screens(server: &Server, snapshots: &[InventoryStateSnapsho
                 .cloned()
                 .unwrap_or_else(|| pumpkin_cluster::inventory::InventoryCell::empty(slot.slot.loc));
         }
-        if let Some(snapshot) = snapshots
-            .iter()
-            .find(|snapshot| snapshot.target == InventoryTarget::Player(screen.session.actor))
-        {
+        if let Some(snapshot) = snapshots.iter().find(|snapshot| {
+            matches!(snapshot.target,
+                    InventoryTarget::Player(gid) | InventoryTarget::LeasedPlayer { player: gid, .. }
+                    if gid == screen.session.actor)
+                && current_player_target(snapshot.target)
+        }) {
             let cursor =
                 pumpkin_cluster::inventory::InvLoc::new(pumpkin_cluster::inventory::INV_CURSOR, 0);
             screen.cursor = snapshot
@@ -1745,6 +2001,11 @@ fn refresh_inventory_screens(server: &Server, snapshots: &[InventoryStateSnapsho
                 .find(|cell| cell.loc == cursor)
                 .cloned()
                 .unwrap_or_else(|| pumpkin_cluster::inventory::InventoryCell::empty(cursor));
+        }
+        super::cluster_inventory_menu::refresh_crafting_preview(server, screen);
+        super::cluster_inventory_menu::refresh_menu_transform_preview(server, screen);
+        if screen.slots != prior_slots {
+            screen.state_id = screen.state_id.wrapping_add(1);
         }
     }
     server.cluster_inventory_screens.store(Arc::new(next));
@@ -1772,9 +2033,203 @@ pub(crate) fn publish_imported_inventory_snapshots(
     validate_imported_inventory_snapshots(&snapshots)?;
     let before = server.cluster_inventory_screens.load_full();
     publish_inventory_snapshots(server, snapshots.iter().cloned());
-    refresh_inventory_screens(server, &snapshots);
+    refresh_inventory_screens(server, &snapshots, |target| {
+        matches!(target, InventoryTarget::Player(_))
+    });
     let after = server.cluster_inventory_screens.load_full();
     super::cluster_inventory_protocol::publish_inventory_screen_deltas(server, &before, &after)
+}
+
+fn complete_canonical_ender_snapshot(snapshot: &InventoryStateSnapshot) -> Result<InventoryStateSnapshot, InventoryApplyError> {
+    if !matches!(snapshot.target, InventoryTarget::LeasedVirtual { session: 0, kind: 0x100, .. }) {
+        return Err(InventoryApplyError::Rejected);
+    }
+    let mut cells = std::collections::BTreeMap::new();
+    for cell in &snapshot.cells {
+        if cell.loc.inv != INV_MAIN || cell.loc.slot >= 27 || cells.insert(cell.loc.slot, cell.clone()).is_some() {
+            return Err(InventoryApplyError::Rejected);
+        }
+    }
+    Ok(InventoryStateSnapshot { target: snapshot.target, revision: snapshot.revision,
+        cells: (0..27).map(|slot| cells.remove(&slot).unwrap_or_else(|| pumpkin_cluster::inventory::InventoryCell::empty(pumpkin_cluster::inventory::InvLoc::new(INV_MAIN, slot)))).collect() })
+}
+
+pub(crate) fn publish_committed_canonical_inventory(
+    server: &Server,
+    snapshots: &[InventoryStateSnapshot],
+    operations: &[SemanticInventoryOp],
+    current_player_target: impl Fn(InventoryTarget) -> bool,
+) -> Result<(), InventoryApplyError> {
+    let local = ServerId(server.advanced_config.cluster.server_id);
+    let ender_roots = snapshots.iter().filter(|snapshot| matches!(snapshot.target, InventoryTarget::LeasedVirtual { session: 0, kind: 0x100, .. }))
+        .map(complete_canonical_ender_snapshot).collect::<Result<Vec<_>, _>>()?;
+    let mut players = HashMap::new();
+    let mut player_projections = Vec::new();
+    let mut ender_projections = Vec::new();
+    for snapshot in snapshots {
+        match snapshot.target {
+            InventoryTarget::Player(gid) | InventoryTarget::LeasedPlayer { player: gid, .. }
+                if gid.server == local && current_player_target(snapshot.target) =>
+            {
+                let player = find_inventory_player(server, gid)
+                    .ok_or(InventoryApplyError::TargetUnavailable)?;
+                let projection = cluster_player_inventory_snapshot_from_state(snapshot)?;
+                if projection.stacks.len()
+                    != pumpkin_inventory::player::player_inventory::PlayerInventory::OFF_HAND_SLOT
+                        + 1
+                    || projection.selected_slot >= 9
+                {
+                    return Err(InventoryApplyError::Rejected);
+                }
+                players.insert(gid, player.clone());
+                player_projections.push((player, projection));
+            }
+            InventoryTarget::Virtual {
+                owner: pumpkin_cluster::actor::ActorId::Player(gid),
+                session: 0,
+                kind: 0x100,
+                ..
+            } if gid.server == local => {
+                let player = find_inventory_player(server, gid)
+                    .ok_or(InventoryApplyError::TargetUnavailable)?;
+                ender_projections.push((player, ender_chest_stacks_from_state(snapshot)?));
+            }
+            InventoryTarget::LeasedVirtual {
+                player: gid,
+                session: 0,
+                kind: 0x100,
+                ..
+            } if gid.server == local && current_player_target(snapshot.target) => {
+                let player = find_inventory_player(server, gid)
+                    .ok_or(InventoryApplyError::TargetUnavailable)?;
+                ender_projections.push((player, ender_chest_stacks_from_state(snapshot)?));
+            }
+            _ => {}
+        }
+    }
+    for (player, projection) in player_projections {
+        if !player.inventory.publish_cluster_snapshot(projection) {
+            return Err(InventoryApplyError::Rejected);
+        }
+    }
+    for (player, projection) in ender_projections {
+        player
+            .ender_chest_inventory
+            .publish_cluster_snapshot(projection);
+    }
+    publish_inventory_snapshots(server, snapshots.iter().filter(|snapshot| !matches!(snapshot.target, InventoryTarget::LeasedVirtual { session: 0, kind: 0x100, .. })).cloned().chain(ender_roots));
+    let before = server.cluster_inventory_screens.load_full();
+    refresh_inventory_screens(server, snapshots, &current_player_target);
+    let after = server.cluster_inventory_screens.load_full();
+    let mut equipment = HashMap::<
+        GlobalPlayerId,
+        Vec<(pumpkin_data::data_component_impl::EquipmentSlot, ItemStack)>,
+    >::new();
+    for operation in operations {
+        let gid = match operation.target {
+            InventoryTarget::Player(gid) | InventoryTarget::LeasedPlayer { player: gid, .. }
+                if current_player_target(operation.target) =>
+            {
+                gid
+            }
+            _ => continue,
+        };
+        let Some(player) = players.get(&gid) else {
+            continue;
+        };
+        let cell = &operation.after;
+        if cell.loc.inv == INV_CURSOR && cell.loc.slot == 0 {
+            let stack = item_stack_from_inventory_cell(cell)?;
+            if !player
+                .try_send_cursor_packet(&CSetCursorItem::new(&ItemStackSerializer::from(stack)))
+            {
+                return Err(InventoryApplyError::TargetUnavailable);
+            }
+        } else if cell.loc.inv == INV_SELECTED && cell.loc.slot == 0 {
+            let selected = u8::try_from(
+                cell.item
+                    .checked_sub(1)
+                    .ok_or(InventoryApplyError::Rejected)?,
+            )
+            .map_err(|_| InventoryApplyError::Rejected)?;
+            if !player.try_send_selected_slot(selected) {
+                return Err(InventoryApplyError::TargetUnavailable);
+            }
+        } else {
+            let slot = player_inventory_slot(cell.loc).ok_or(InventoryApplyError::Rejected)?;
+            let stack = item_stack_from_inventory_cell(cell)?;
+            if !player.try_send_slot_set_packet(&CSetPlayerInventory::new(
+                (slot as i32).into(),
+                &ItemStackSerializer::from(stack.clone()),
+            )) {
+                return Err(InventoryApplyError::TargetUnavailable);
+            }
+            if let Some(equipment_slot) = equipment_slot(player, slot) {
+                equipment
+                    .entry(gid)
+                    .or_default()
+                    .push((equipment_slot, stack));
+            }
+        }
+    }
+    for (gid, slots) in equipment {
+        if let Some(player) = players.get(&gid) {
+            player.living_entity.send_equipment_changes(&slots);
+        }
+    }
+    super::cluster_inventory_protocol::publish_inventory_screen_deltas(server, &before, &after)?;
+    Ok(())
+}
+
+pub(crate) fn close_canonical_inventory_viewers(
+    server: &Server,
+    snapshots: &[InventoryStateSnapshot],
+    current_player_target: impl Fn(InventoryTarget) -> bool,
+) {
+    let targets = snapshots
+        .iter()
+        .map(|snapshot| snapshot.target)
+        .collect::<std::collections::HashSet<_>>();
+    let mut viewers = std::collections::HashSet::new();
+    for target in &targets {
+        match target {
+            InventoryTarget::Player(gid) => {
+                viewers.insert(*gid);
+            }
+            InventoryTarget::LeasedPlayer { player: gid, .. } if current_player_target(*target) => {
+                viewers.insert(*gid);
+            }
+            InventoryTarget::Virtual {
+                owner: pumpkin_cluster::actor::ActorId::Player(gid),
+                ..
+            } => {
+                viewers.insert(*gid);
+            }
+            InventoryTarget::LeasedVirtual { player: gid, .. }
+                if current_player_target(*target) =>
+            {
+                viewers.insert(*gid);
+            }
+            _ => {}
+        }
+    }
+    for (session, screen) in server.cluster_inventory_screens.load().iter() {
+        if screen
+            .slots
+            .iter()
+            .any(|slot| targets.contains(&slot.slot.target))
+        {
+            viewers.insert(session.actor);
+        }
+    }
+    for gid in viewers {
+        if let Some(player) = find_inventory_player(server, gid) {
+            player.client.try_kick(
+                crate::net::DisconnectReason::Unknown,
+                &TextComponent::text("Inventory update could not be delivered"),
+            );
+        }
+    }
 }
 
 pub(crate) fn validate_imported_inventory_snapshots(
@@ -1816,7 +2271,9 @@ pub(crate) fn publish_inventory_resolution(
     super::cluster_inventory_protocol::apply_inventory_effects(server, &resolution)?;
     publish_inventory_snapshots(server, resolution.authoritative.iter().cloned());
     let screens_before = server.cluster_inventory_screens.load_full();
-    refresh_inventory_screens(server, &resolution.authoritative);
+    refresh_inventory_screens(server, &resolution.authoritative, |target| {
+        matches!(target, InventoryTarget::Player(_))
+    });
     let screens_after = server.cluster_inventory_screens.load_full();
     super::cluster_inventory_protocol::publish_inventory_screen_deltas(
         server,
@@ -1826,7 +2283,11 @@ pub(crate) fn publish_inventory_resolution(
     super::cluster_inventory_protocol::publish_inventory_menu_effects(server, &resolution)?;
     let _ = server
         .cluster_inventory_publication_tx
-        .send(InventoryPublication { resolution, origin });
+        .send(InventoryPublication {
+            resolution,
+            origin,
+            session: None,
+        });
     Ok(())
 }
 
@@ -1979,9 +2440,15 @@ fn publish_player_inventory_snapshot(
 pub(crate) fn cluster_player_inventory_snapshot_from_state(
     snapshot: &InventoryStateSnapshot,
 ) -> Result<ClusterPlayerInventorySnapshot, InventoryApplyError> {
+    cluster_player_inventory_snapshot_from_cells(&snapshot.cells)
+}
+
+fn cluster_player_inventory_snapshot_from_cells(
+    cells: &[pumpkin_cluster::inventory::InventoryCell],
+) -> Result<ClusterPlayerInventorySnapshot, InventoryApplyError> {
     let mut stacks = vec![ItemStack::EMPTY.clone(); 41];
     let mut selected_slot = None;
-    for cell in &snapshot.cells {
+    for cell in cells {
         if cell.loc.inv == INV_SELECTED && cell.loc.slot == 0 {
             let selected = cell
                 .item
@@ -2123,26 +2590,46 @@ pub(crate) fn install_player_inventory(
         position.z.floor() as i32,
     )];
     let (crafting, screen) = player_screen_snapshot(target, &snapshot, chunks.clone())?;
-    server
+    let generation = server
+        .cluster_lobby_session_generation
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let route = server
         .cluster_inventory_install_route_tx
-        .borrow()
-        .clone()
-        .ok_or(InventoryApplyError::TargetUnavailable)?
+        .load_full()
+        .ok_or(InventoryApplyError::TargetUnavailable)?;
+    let previous = player
+        .cluster_owner_install_generation
+        .swap(generation, std::sync::atomic::Ordering::AcqRel);
+    if route
         .try_send(LocalInventoryLifecycle::InstallPlayer {
             gid: target,
+            key: player.gameprofile.id,
+            generation,
             token: None,
+            new_player: false,
             player: snapshot,
             crafting,
             ender,
             screen,
             chunks,
         })
-        .map_err(|_| InventoryApplyError::QueueFull)
+        .is_err()
+    {
+        let _ = player.cluster_owner_install_generation.compare_exchange(
+            generation,
+            previous,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+        return Err(InventoryApplyError::QueueFull);
+    }
+    Ok(())
 }
 
 pub(crate) fn submit_handoff_inventory(
     server: &Server,
     gid: GlobalPlayerId,
+    key: uuid::Uuid,
     token: u64,
     chunk: pumpkin_cluster::protocol::ChunkKey,
     data: Option<&pumpkin_nbt::compound::NbtCompound>,
@@ -2154,12 +2641,14 @@ pub(crate) fn submit_handoff_inventory(
     let (crafting, screen) = player_screen_snapshot(gid, &player, chunks.clone())?;
     server
         .cluster_inventory_install_route_tx
-        .borrow()
-        .clone()
+        .load_full()
         .ok_or(InventoryApplyError::TargetUnavailable)?
         .try_send(LocalInventoryLifecycle::InstallPlayer {
             gid,
+            key,
+            generation: token,
             token: Some(token),
+            new_player: data.is_none(),
             player,
             crafting,
             ender,
@@ -2173,9 +2662,7 @@ pub(crate) fn submit_handoff_inventory(
 pub(crate) fn retire_handoff_inventory_install(server: &Server, gid: GlobalPlayerId, token: u64) {
     server.cluster_inventory_handoff_installed.rcu(|published| {
         let mut next = (**published).clone();
-        if next.get(&gid).is_some_and(|status| status.token == token) {
-            next.remove(&gid);
-        }
+        next.remove(&(gid, token));
         Arc::new(next)
     });
 }
@@ -2284,12 +2771,16 @@ fn player_screen_snapshot(
                 session: 0,
             },
             sync_id: 0,
+            state_id: 0,
             window_kind: 0,
             container_slots: 5,
             slots,
             cursor,
             affected: chunks,
             preview: None,
+            preview_incarnation: None,
+            preview_lease: None,
+            preview_authority: None,
         },
     ))
 }
@@ -2301,8 +2792,7 @@ pub(crate) fn install_inventory(
 ) -> Result<(), InventoryApplyError> {
     server
         .cluster_inventory_install_route_tx
-        .borrow()
-        .clone()
+        .load_full()
         .ok_or(InventoryApplyError::TargetUnavailable)?
         .try_send(LocalInventoryLifecycle::Install {
             snapshot: snapshot.clone(),
@@ -2332,8 +2822,7 @@ pub(crate) fn install_screen_inventory_with_menu(
 ) -> Result<(), InventoryApplyError> {
     server
         .cluster_inventory_install_route_tx
-        .borrow()
-        .clone()
+        .load_full()
         .ok_or(InventoryApplyError::TargetUnavailable)?
         .try_send(LocalInventoryLifecycle::Install {
             snapshot,
@@ -2365,6 +2854,19 @@ pub(crate) fn open_inventory_screen_with_presentation(
     menu: Option<pumpkin_cluster::inventory::InventoryMenuMetadata>,
     presentation: Option<ClusterScreenPresentation>,
 ) -> Result<(), InventoryApplyError> {
+    let player = find_inventory_player(server, screen.session.actor).ok_or(InventoryApplyError::TargetUnavailable)?;
+    let lease = super::cluster_world_owner::player_action_lease(server, &player).ok_or(InventoryApplyError::TargetUnavailable)?;
+    open_inventory_screen_for_lease(server, lease, screen, menu, presentation)
+}
+
+pub(crate) fn open_inventory_screen_for_lease(
+    server: &Server,
+    lease: pumpkin_cluster::canonical_action::LivePlayerLease,
+    screen: pumpkin_cluster::inventory::InventoryScreenSnapshot,
+    menu: Option<pumpkin_cluster::inventory::InventoryMenuMetadata>,
+    presentation: Option<ClusterScreenPresentation>,
+) -> Result<(), InventoryApplyError> {
+    if lease.gid != screen.session.actor { return Err(InventoryApplyError::Rejected); }
     if presentation.as_ref().is_some_and(|presentation| {
         item_stack_from_inventory_cell(&screen.cursor).is_err()
             || presentation.window_type as u16 != screen.window_kind
@@ -2381,10 +2883,11 @@ pub(crate) fn open_inventory_screen_with_presentation(
     }
     server
         .cluster_inventory_install_route_tx
-        .borrow()
-        .clone()
+        .load_full()
         .ok_or(InventoryApplyError::TargetUnavailable)?
         .try_send(LocalInventoryLifecycle::OpenScreen {
+            lease,
+            source: None,
             screen,
             menu,
             presentation,
@@ -2455,7 +2958,7 @@ pub(crate) fn open_cluster_ender_chest_screen(
             screen_slot: screen_slot as u16,
             slot: InventorySlotRef::new(target, loc),
             cell,
-            limit: 64,
+            limit: 99,
         });
     }
     let cursor_loc = InvLoc::new(INV_CURSOR, 0);
@@ -2474,12 +2977,16 @@ pub(crate) fn open_cluster_ender_chest_screen(
     let screen = InventoryScreenSnapshot {
         session,
         sync_id,
+        state_id: 0,
         window_kind: pumpkin_data::screen::WindowType::Generic9x3 as u16,
         container_slots: 27,
         slots,
         cursor,
         affected,
         preview: None,
+        preview_incarnation: None,
+        preview_lease: None,
+        preview_authority: None,
     };
     player
         .cluster_current_inventory_session
@@ -2519,8 +3026,7 @@ pub(crate) fn close_inventory_screen(
 ) -> Result<(), InventoryApplyError> {
     server
         .cluster_inventory_install_route_tx
-        .borrow()
-        .clone()
+        .load_full()
         .ok_or(InventoryApplyError::TargetUnavailable)?
         .try_send(LocalInventoryLifecycle::CloseScreen { session })
         .map_err(|_| InventoryApplyError::QueueFull)
@@ -2534,8 +3040,7 @@ pub(crate) fn begin_departure_inventory_close(
 ) -> Result<(), InventoryApplyError> {
     server
         .cluster_inventory_install_route_tx
-        .borrow()
-        .clone()
+        .load_full()
         .ok_or(InventoryApplyError::TargetUnavailable)?
         .try_send(LocalInventoryLifecycle::BeginDeparture {
             actor,
@@ -2553,8 +3058,7 @@ pub(crate) fn install_beacon_state(
 ) -> Result<(), InventoryApplyError> {
     server
         .cluster_inventory_install_route_tx
-        .borrow()
-        .clone()
+        .load_full()
         .ok_or(InventoryApplyError::TargetUnavailable)?
         .try_send(LocalInventoryLifecycle::BeaconSnapshot {
             target,
@@ -2616,10 +3120,12 @@ pub(crate) fn remove_inventory(
     server: &Server,
     target: InventoryTarget,
 ) -> Result<(), InventoryApplyError> {
+    if matches!(target, InventoryTarget::Player(_)) {
+        return Err(InventoryApplyError::Rejected);
+    }
     server
         .cluster_inventory_install_route_tx
-        .borrow()
-        .clone()
+        .load_full()
         .ok_or(InventoryApplyError::TargetUnavailable)?
         .try_send(LocalInventoryLifecycle::Remove { target })
         .map_err(|_| InventoryApplyError::QueueFull)?;
@@ -2722,6 +3228,89 @@ pub(crate) fn player_inventory_snapshot_from_nbt(
     })
 }
 
+pub(crate) fn write_player_inventory_cells_nbt(
+    nbt: &mut pumpkin_nbt::compound::NbtCompound,
+    cells: &[pumpkin_cluster::inventory::InventoryCell],
+) -> Result<(), InventoryApplyError> {
+    use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
+    let projection = cluster_player_inventory_snapshot_from_cells(cells)?;
+    let mut items = Vec::new();
+    let mut equipment = NbtCompound::new();
+    for (slot, stack) in projection
+        .stacks
+        .iter()
+        .enumerate()
+        .filter(|(_, stack)| !stack.is_empty())
+    {
+        let (slot_id, name) = match slot {
+            0..=35 => (slot as i8, None),
+            36 => (100, Some("feet")),
+            37 => (101, Some("legs")),
+            38 => (102, Some("chest")),
+            39 => (103, Some("head")),
+            40 => (-106, Some("offhand")),
+            _ => return Err(InventoryApplyError::Rejected),
+        };
+        let mut item = NbtCompound::new();
+        stack.write_item_stack(&mut item);
+        if let Some(name) = name {
+            equipment.put_compound(name, item.clone());
+        }
+        item.put_byte("Slot", slot_id);
+        items.push(NbtTag::Compound(item));
+    }
+    nbt.put_int("SelectedItemSlot", i32::from(projection.selected_slot));
+    nbt.put("Inventory", NbtTag::List(items));
+    nbt.put_compound("equipment", equipment);
+    Ok(())
+}
+
+pub(crate) fn write_frozen_player_inventory_nbt(
+    nbt: &mut pumpkin_nbt::compound::NbtCompound,
+    lease: pumpkin_cluster::canonical_action::LivePlayerLease,
+    player: &InventoryStateSnapshot,
+    ender: &InventoryStateSnapshot,
+) -> Result<(), InventoryApplyError> {
+    use pumpkin_nbt::{compound::NbtCompound, tag::NbtTag};
+    let expected_player = InventoryTarget::LeasedPlayer {
+        key: lease.key.0,
+        player: lease.gid,
+        incarnation: lease.incarnation,
+    };
+    let expected_ender = InventoryTarget::LeasedVirtual {
+        host: lease.gid.server,
+        key: lease.key.0,
+        player: lease.gid,
+        incarnation: lease.incarnation,
+        session: 0,
+        kind: 0x100,
+    };
+    if player.target != expected_player
+        || ender.target != expected_ender
+        || player
+            .cells
+            .iter()
+            .any(|cell| cell.loc.inv == INV_CURSOR && !cell.is_empty())
+    {
+        return Err(InventoryApplyError::Rejected);
+    }
+    validate_imported_inventory_snapshots(&[player.clone(), ender.clone()])?;
+    let mut ender_items = Vec::new();
+    for (slot, stack) in ender_chest_stacks_from_state(ender)?
+        .iter()
+        .enumerate()
+        .filter(|(_, stack)| !stack.is_empty())
+    {
+        let mut item = NbtCompound::new();
+        stack.write_item_stack(&mut item);
+        item.put_byte("Slot", slot as i8);
+        ender_items.push(NbtTag::Compound(item));
+    }
+    write_player_inventory_cells_nbt(nbt, &player.cells)?;
+    nbt.put("EnderItems", NbtTag::List(ender_items));
+    Ok(())
+}
+
 pub(crate) fn ender_chest_stacks_from_nbt(
     data: Option<&pumpkin_nbt::compound::NbtCompound>,
 ) -> [ItemStack;
@@ -2812,6 +3401,7 @@ async fn owner_task(server: Arc<Server>, mut commands: mpsc::Receiver<InvseeComm
             break;
         };
         match command {
+            InvseeCommand::AcceptedClose { .. } => unreachable!(),
             InvseeCommand::Configure { local, outbound } => owner.configure(local, outbound),
             InvseeCommand::Snapshot {
                 viewer,
@@ -2863,13 +3453,32 @@ pub(crate) fn spawn_invsee_owner(server: &Arc<Server>, commands: mpsc::Receiver<
     server.spawn_task(owner_task(server.clone(), commands));
 }
 
+pub(crate) fn spawn_inventory_close_notifications(server: &Arc<Server>, mut commands: mpsc::Receiver<InvseeCommand>) {
+    let server_task = server.clone();
+    server.spawn_task(async move {
+        while let Some(command) = commands.recv().await {
+            let InvseeCommand::AcceptedClose { player, lease, session, window_kind } = command else { continue; };
+            if session.actor != lease.gid || player.cluster_gid() != Some(lease.gid) { continue; }
+            use pumpkin_data::screen::WindowType as W;
+            let windows = [W::Generic9x1, W::Generic9x2, W::Generic9x3, W::Generic9x4,
+                W::Generic9x5, W::Generic9x6, W::Generic3x3, W::Crafter3x3, W::Anvil,
+                W::Beacon, W::BlastFurnace, W::BrewingStand, W::Crafting, W::Enchantment,
+                W::Furnace, W::Grindstone, W::Hopper, W::Lectern, W::Loom, W::Merchant,
+                W::ShulkerBox, W::Smithing, W::Smoker, W::CartographyTable, W::Stonecutter];
+            let window = (session.session != 0).then(|| windows.get(usize::from(window_kind)).copied()).flatten();
+            let mut event = crate::plugin::api::events::player::inventory_close::InventoryCloseEvent::new(&player, window);
+            server_task.plugin_manager.fire(&server_task, &mut event).await;
+        }
+    });
+}
+
 pub(crate) fn attach_inventory_action_owner(
     server: &Server,
 ) -> mpsc::Receiver<LocalInventoryAction> {
     let (tx, rx) = mpsc::channel(256);
     server
         .cluster_inventory_action_route_tx
-        .send_replace(Some(tx));
+        .store(Some(Arc::new(tx)));
     rx
 }
 
@@ -2879,7 +3488,7 @@ pub(crate) fn attach_inventory_screen_owner(
     let (tx, rx) = mpsc::channel(256);
     server
         .cluster_inventory_screen_route_tx
-        .send_replace(Some(tx));
+        .store(Some(Arc::new(tx)));
     rx
 }
 
@@ -2923,8 +3532,7 @@ pub(crate) fn submit_inventory_screen_command_with_sequence_and_close_token(
 ) -> Result<(), InventoryApplyError> {
     server
         .cluster_inventory_screen_route_tx
-        .borrow()
-        .clone()
+        .load_full()
         .ok_or(InventoryApplyError::TargetUnavailable)?
         .try_send(LocalInventoryScreenCommand {
             command,
@@ -2943,7 +3551,7 @@ pub(crate) fn attach_inventory_snapshot_owner(
     let (tx, rx) = mpsc::channel(256);
     server
         .cluster_inventory_snapshot_route_tx
-        .send_replace(Some(tx));
+        .store(Some(Arc::new(tx)));
     rx
 }
 
@@ -2953,7 +3561,7 @@ pub(crate) fn attach_inventory_install_owner(
     let (tx, rx) = mpsc::channel(256);
     server
         .cluster_inventory_install_route_tx
-        .send_replace(Some(tx));
+        .store(Some(Arc::new(tx)));
     rx
 }
 
@@ -3018,30 +3626,41 @@ pub(crate) async fn request_inventory_snapshot(
             return None;
         }
         let owner_name = player.gameprofile.name.clone();
-        let selected = player.inventory.get_selected_slot();
         let (reply, response) = oneshot::channel();
         server
             .cluster_inventory_snapshot_route_tx
-            .borrow()
-            .clone()?
+            .load_full()?
             .try_send(LocalInventorySnapshotRequest {
                 target: InventoryTarget::Player(target),
                 reply,
             })
             .ok()?;
-        let state =
+        let bundle =
             tokio::time::timeout(Duration::from_millis(INVSEE_REQUEST_TIMEOUT_MS), response)
                 .await
                 .ok()?
                 .ok()??;
-        let position = player.position();
-        let chunk = chunk_of_block(
-            super::cluster_world_delta::world_id(&player.world()),
-            position.x.floor() as i32,
-            position.z.floor() as i32,
-        );
+        if bundle.lease.key.0 != player.gameprofile.id
+            || bundle.lease.gid != target
+            || bundle.chunks.len() != 1
+            || !owner.is_current_player_arc(&player)
+        {
+            return None;
+        }
+        let selected = bundle
+            .state
+            .cells
+            .iter()
+            .find(|cell| cell.loc.inv == INV_SELECTED && cell.loc.slot == 0)
+            .and_then(|cell| cell.item.checked_sub(1))
+            .and_then(|slot| u8::try_from(slot).ok())
+            .filter(|slot| *slot < 9)
+            .unwrap_or_default();
         return Some(
-            inventory_snapshot_from_state(state, owner_name, selected).with_affected(vec![chunk]),
+            inventory_snapshot_from_state(bundle.state, owner_name, selected)
+                .with_lease(bundle.lease)
+                .with_authority(bundle.authority)
+                .with_affected(bundle.chunks),
         );
     }
     let (reply, pending) = oneshot::channel();

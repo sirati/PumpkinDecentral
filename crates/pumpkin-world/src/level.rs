@@ -17,8 +17,8 @@ use crate::{
     tick::{OrderedTick, ScheduledTick, TickPriority},
     world::WorldPortalExt,
 };
-use arc_swap::ArcSwap;
-use crossbeam::queue::SegQueue;
+use arc_swap::{ArcSwap, ArcSwapOption};
+use crossbeam::queue::{ArrayQueue, SegQueue};
 use dashmap::{DashMap, Entry};
 use pumpkin_config::{chunk::ChunkConfig, lighting::LightingEngineConfig, world::LevelConfig};
 use pumpkin_data::biome::Biome;
@@ -26,12 +26,12 @@ use pumpkin_data::dimension::Dimension;
 use pumpkin_data::{Block, BlockStateId, block_properties::has_random_ticks, fluid::Fluid};
 use pumpkin_util::math::{position::BlockPos, vector2::Vector2};
 use pumpkin_util::world_seed::Seed;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 use std::{
     path::PathBuf,
-    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
     thread,
 };
 use tokio::time::timeout;
@@ -50,6 +50,138 @@ use tokio_util::task::TaskTracker;
 
 pub type SyncChunk = Arc<ChunkData>;
 pub type SyncEntityChunk = Arc<ChunkEntityData>;
+
+pub fn cluster_checkpoint_path(
+    folder: &std::path::Path,
+    dimension: u8,
+    world_key: u64,
+    position: Vector2<i32>,
+) -> std::path::PathBuf {
+    folder.join("cluster-checkpoints").join(format!(
+        "{}_{}_{}_{}.cpk",
+        dimension, world_key, position.x, position.y
+    ))
+}
+
+pub enum FreshChunkAdmission {
+    Prepare {
+        world_key: u64,
+        dimension: u8,
+        position: Vector2<i32>,
+        generation: u64,
+        image: std::sync::Arc<[u8]>,
+        palettes: crate::chunk_system::chunk_state::InitialChunkPalettes,
+        respond: oneshot::Sender<bool>,
+        wake: crossbeam::channel::Sender<()>,
+    },
+    Published {
+        world_key: u64,
+        dimension: u8,
+        position: Vector2<i32>,
+        generation: u64,
+    },
+    Aborted {
+        world_key: u64,
+        dimension: u8,
+        position: Vector2<i32>,
+        generation: u64,
+    },
+}
+
+pub enum PersistedChunkAdmission {
+    Prepare {
+        world_key: u64,
+        dimension: u8,
+        position: Vector2<i32>,
+        generation: u64,
+        original: SyncChunk,
+        respond: oneshot::Sender<Option<SyncChunk>>,
+        wake: crossbeam::channel::Sender<()>,
+    },
+    Published {
+        world_key: u64,
+        dimension: u8,
+        position: Vector2<i32>,
+        generation: u64,
+    },
+}
+
+pub struct ClusterSnapshotPublication {
+    pub position: Vector2<i32>,
+    pub snapshot: SyncChunk,
+    pub reservation_generation: Option<u64>,
+    pub respond: oneshot::Sender<bool>,
+}
+
+pub struct PersistedChunkDecision {
+    pub world_key: u64,
+    pub dimension: u8,
+    pub position: Vector2<i32>,
+    pub generation: u64,
+    pub recovery: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PersistedChunkReservationState {
+    Pending,
+    Recovery,
+    Approved,
+    Lost,
+}
+
+#[derive(Clone, Copy)]
+pub struct PersistedChunkReservation {
+    pub generation: u64,
+    pub state: PersistedChunkReservationState,
+}
+
+#[derive(Clone)]
+pub enum OwnerChunkDemand {
+    RetainPeerRequest {
+        position: Vector2<i32>,
+    },
+    ReleasePeerRequest {
+        position: Vector2<i32>,
+    },
+    Acquire {
+        position: Vector2<i32>,
+        lease: u64,
+        ready: Option<tokio::sync::mpsc::Sender<OwnerChunkReady>>,
+    },
+    Release {
+        position: Vector2<i32>,
+        lease: u64,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnerChunkReady {
+    pub world_key: u64,
+    pub dimension: u8,
+    pub position: Vector2<i32>,
+    pub lease: u64,
+    pub publication_generation: u64,
+}
+
+pub enum PeerChunkInstallClaim {
+    Claim {
+        position: Vector2<i32>,
+        generation: u64,
+        respond: tokio::sync::mpsc::Sender<PeerChunkInstallClaimResult>,
+    },
+    Release {
+        position: Vector2<i32>,
+        generation: u64,
+    },
+}
+
+pub struct PeerChunkInstallClaimResult {
+    pub world_key: u64,
+    pub dimension: u8,
+    pub position: Vector2<i32>,
+    pub generation: u64,
+    pub allowed: bool,
+}
 
 struct ClusterLobbyNeedCounts {
     counts: ArcSwap<rustc_hash::FxHashMap<Vector2<i32>, u32>>,
@@ -123,6 +255,11 @@ pub struct Level {
     pub level_folder: Arc<LevelFolder>,
     pub cluster_dimension: u8,
     pub cluster_world_key: u64,
+    pub cluster_genesis_required: bool,
+    pub fresh_chunk_admission: ArcSwapOption<tokio::sync::mpsc::Sender<FreshChunkAdmission>>,
+    pub persisted_chunk_admission:
+        ArcSwapOption<tokio::sync::mpsc::Sender<PersistedChunkAdmission>>,
+    pub fresh_chunk_wake: ArcSwapOption<crossbeam::channel::Sender<()>>,
     pub lighting_config: LightingEngineConfig,
 
     /// Counts the number of ticks that have been scheduled for this world
@@ -132,6 +269,22 @@ pub struct Level {
     // from the loaded chunks map and sent to the underlying ChunkIO
     pub loaded_chunks: Arc<DashMap<Vector2<i32>, SyncChunk>>,
     pub cluster_snapshots: Arc<DashMap<Vector2<i32>, SyncChunk>>,
+    pub cluster_snapshot_publication:
+        ArcSwapOption<crossbeam::channel::Sender<ClusterSnapshotPublication>>,
+    pub cluster_publication_reservations:
+        Arc<ArcSwap<rustc_hash::FxHashMap<Vector2<i32>, PersistedChunkReservation>>>,
+    pub cluster_persisted_decision:
+        ArcSwapOption<tokio::sync::mpsc::Sender<PersistedChunkDecision>>,
+    pub cluster_peer_install_claim:
+        ArcSwapOption<crossbeam::channel::Sender<PeerChunkInstallClaim>>,
+    pub cluster_owner_chunk_demand: ArcSwapOption<crossbeam::channel::Sender<OwnerChunkDemand>>,
+    /// Owner-published primary chunks whose unresolved action history forbids unload.
+    pub cluster_unsettled_primary_chunks: ArcSwap<FxHashSet<Vector2<i32>>>,
+    /// Scheduler-issued generation tokens. Owner claims a token before an action
+    /// can use its chunk; unload atomically claims the opposite state.
+    pub cluster_primary_chunk_fences: ArcSwap<FxHashMap<Vector2<i32>, Arc<AtomicU8>>>,
+    pub cluster_peer_install_releases: Arc<ArrayQueue<(Vector2<i32>, u64)>>,
+    pub cluster_peer_claim_capacity: ArcSwapOption<tokio::sync::mpsc::Sender<()>>,
     pub cluster_pinned: Arc<dashmap::DashSet<Vector2<i32>>>,
     cluster_lobby_pins: ClusterLobbyNeedCounts,
     pub cluster_fetch_wanted: Arc<dashmap::DashSet<Vector2<i32>>>,
@@ -196,12 +349,28 @@ pub struct LevelFolder {
 
 impl Level {
     #[must_use]
-    #[expect(clippy::too_many_lines)]
     pub fn from_root_folder(
         level_config: &LevelConfig,
         root_folder: PathBuf,
         seed: i64,
         dimension: Dimension,
+    ) -> Arc<Self> {
+        Self::from_root_folder_with_cluster_genesis(
+            level_config,
+            root_folder,
+            seed,
+            dimension,
+            false,
+        )
+    }
+
+    #[expect(clippy::too_many_lines)]
+    pub fn from_root_folder_with_cluster_genesis(
+        level_config: &LevelConfig,
+        root_folder: PathBuf,
+        seed: i64,
+        dimension: Dimension,
+        cluster_genesis_required: bool,
     ) -> Arc<Self> {
         let cluster_world_key = root_folder
             .file_name()
@@ -331,6 +500,10 @@ impl Level {
             level_folder,
             cluster_dimension,
             cluster_world_key,
+            cluster_genesis_required,
+            fresh_chunk_admission: ArcSwapOption::empty(),
+            persisted_chunk_admission: ArcSwapOption::empty(),
+            fresh_chunk_wake: ArcSwapOption::empty(),
             lighting_config: level_config.lighting,
             light_engine: DynamicLightEngine::new(dim_min_y, dim_min_y + dim_height),
             chunk_saver,
@@ -338,6 +511,17 @@ impl Level {
             schedule_tick_counts: AtomicU64::new(0),
             loaded_chunks: Arc::new(DashMap::new()),
             cluster_snapshots: Arc::new(DashMap::new()),
+            cluster_snapshot_publication: ArcSwapOption::empty(),
+            cluster_publication_reservations: Arc::new(ArcSwap::from_pointee(
+                rustc_hash::FxHashMap::default(),
+            )),
+            cluster_persisted_decision: ArcSwapOption::empty(),
+            cluster_peer_install_claim: ArcSwapOption::empty(),
+            cluster_owner_chunk_demand: ArcSwapOption::empty(),
+            cluster_unsettled_primary_chunks: ArcSwap::from_pointee(FxHashSet::default()),
+            cluster_primary_chunk_fences: ArcSwap::from_pointee(FxHashMap::default()),
+            cluster_peer_install_releases: Arc::new(ArrayQueue::new(1_024)),
+            cluster_peer_claim_capacity: ArcSwapOption::empty(),
             cluster_pinned: Arc::new(dashmap::DashSet::new()),
             cluster_lobby_pins: ClusterLobbyNeedCounts::new(),
             cluster_fetch_wanted: Arc::new(dashmap::DashSet::new()),
@@ -588,6 +772,26 @@ impl Level {
         active_chunks: &FxHashSet<Vector2<i32>>,
         random_tick_speed: i64,
     ) -> TickData {
+        self.collect_tick_data(active_chunks, random_tick_speed, true)
+    }
+
+    /// Samples random ticks without stepping the legacy scheduled queues.
+    /// This is a transition seam only: it still reads `Level` chunk locks, so
+    /// owner-lane simulation must move random sampling into owned state too.
+    pub fn get_random_tick_data(
+        &self,
+        active_chunks: &FxHashSet<Vector2<i32>>,
+        random_tick_speed: i64,
+    ) -> TickData {
+        self.collect_tick_data(active_chunks, random_tick_speed, false)
+    }
+
+    fn collect_tick_data(
+        &self,
+        active_chunks: &FxHashSet<Vector2<i32>>,
+        random_tick_speed: i64,
+        include_scheduled: bool,
+    ) -> TickData {
         let samples_per_section = random_tick_speed.max(0);
 
         let mut ticks = TickData {
@@ -647,11 +851,14 @@ impl Level {
 
         // 2. Process chunks with scheduled ticks
         // We collect keys first to avoid holding DashSet shard lock while accessing loaded_chunks (deadlock risk)
-        let scheduled_chunk_pos: Vec<_> = self
-            .chunks_with_scheduled_ticks
-            .iter()
-            .map(|p| *p)
-            .collect();
+        let scheduled_chunk_pos: Vec<_> = if include_scheduled {
+            self.chunks_with_scheduled_ticks
+                .iter()
+                .map(|p| *p)
+                .collect()
+        } else {
+            Vec::new()
+        };
         for pos in scheduled_chunk_pos {
             if let Some(chunk) = self.loaded_chunks.get(&pos) {
                 let chunk = chunk.value();
@@ -958,6 +1165,62 @@ fn cluster_fetch_sender_for(pos: Vector2<i32>) -> Option<mpsc::Sender<ClusterFet
 }
 
 impl Level {
+    pub fn install_primary_chunk_fence(&self, pos: Vector2<i32>) {
+        self.cluster_primary_chunk_fences.rcu(|current| {
+            let mut next = (**current).clone();
+            next.entry(pos)
+                .or_insert_with(|| Arc::new(AtomicU8::new(0)));
+            Arc::new(next)
+        });
+    }
+
+    pub fn retire_primary_chunk_fence(&self, pos: Vector2<i32>) {
+        let retiring = self.cluster_primary_chunk_fences.load().get(&pos).cloned();
+        if let Some(fence) = &retiring {
+            // A reader may hold an older ArcSwap map after this method returns.
+            fence.store(2, Ordering::Release);
+        }
+        self.cluster_primary_chunk_fences.rcu(|current| {
+            let mut next = (**current).clone();
+            if current
+                .get(&pos)
+                .zip(retiring.as_ref())
+                .is_some_and(|(existing, retiring)| Arc::ptr_eq(existing, retiring))
+            {
+                next.remove(&pos);
+            }
+            Arc::new(next)
+        });
+    }
+
+    pub fn claim_primary_chunk_for_actions(&self, pos: Vector2<i32>) -> bool {
+        let fences = self.cluster_primary_chunk_fences.load();
+        let Some(fence) = fences.get(&pos) else {
+            return false;
+        };
+        fence.load(Ordering::Acquire) == 1
+            || fence
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    }
+
+    pub fn release_primary_chunk_action_claim(&self, pos: Vector2<i32>) {
+        if let Some(fence) = self.cluster_primary_chunk_fences.load().get(&pos) {
+            let _ = fence.compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire);
+        }
+    }
+
+    pub fn try_begin_primary_chunk_unload(&self, pos: Vector2<i32>) -> bool {
+        self.cluster_primary_chunk_fences
+            .load()
+            .get(&pos)
+            .is_some_and(|fence| {
+                fence
+                    .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            })
+    }
+
     pub fn pin_cluster_chunk(&self, pos: Vector2<i32>) {
         self.cluster_pinned.insert(pos);
     }
@@ -1174,6 +1437,738 @@ pub fn cluster_encode_snapshot(chunk: &SyncChunk) -> Vec<u8> {
     out
 }
 
+/// Checks an immutable admission image without constructing a lock-backed chunk.
+/// The owner uses this before binding the image to its separately supplied palettes.
+#[must_use]
+pub fn cluster_snapshot_layout_matches(
+    image: &[u8],
+    x: i32,
+    z: i32,
+    min_y: i32,
+    section_count: usize,
+) -> bool {
+    let Some((version, body)) = image.split_first() else {
+        return false;
+    };
+    if *version != CLUSTER_SNAPSHOT_VERSION || section_count == 0 {
+        return false;
+    }
+    let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new(std::io::Cursor::new(body));
+    let Ok(nbt) = pumpkin_nbt::Nbt::read(&mut reader) else {
+        return false;
+    };
+    if nbt.root_tag.get_int("xPos") != Some(x)
+        || nbt.root_tag.get_int("zPos") != Some(z)
+        || nbt.root_tag.get_int("yPos") != Some(min_y.div_euclid(16))
+    {
+        return false;
+    }
+    let Some(pumpkin_nbt::tag::NbtTag::List(sections)) = nbt.root_tag.child_tags.get("sections")
+    else {
+        return false;
+    };
+    if sections.len() != section_count {
+        return false;
+    }
+    let mut seen = vec![false; section_count];
+    for section in sections {
+        let pumpkin_nbt::tag::NbtTag::Compound(section) = section else {
+            return false;
+        };
+        let Some(y) = section.get_byte("Y") else {
+            return false;
+        };
+        let Ok(index) = usize::try_from(i32::from(y) - min_y.div_euclid(16)) else {
+            return false;
+        };
+        let Some(slot) = seen.get_mut(index) else {
+            return false;
+        };
+        if *slot {
+            return false;
+        }
+        *slot = true;
+    }
+    seen.into_iter().all(|present| present)
+}
+
+/// Advances the owner-held inhabited counter in a private immutable image.
+/// The caller must serialize this with every other accepted image mutation.
+#[must_use]
+pub fn cluster_advance_snapshot_inhabited(image: &[u8], ticks: u64) -> Option<Vec<u8>> {
+    let (version, body) = image.split_first()?;
+    if *version != CLUSTER_SNAPSHOT_VERSION {
+        return None;
+    }
+    let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new(std::io::Cursor::new(body));
+    let mut nbt = pumpkin_nbt::Nbt::read(&mut reader).ok()?;
+    let current = nbt.root_tag.get_long("InhabitedTime").unwrap_or(0);
+    let advance = i64::try_from(ticks).ok()?;
+    nbt.root_tag
+        .put_long("InhabitedTime", current.checked_add(advance)?);
+    let encoded = nbt.write();
+    let mut out = Vec::with_capacity(encoded.len() + 1);
+    out.push(CLUSTER_SNAPSHOT_VERSION);
+    out.extend_from_slice(&encoded);
+    Some(out)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterScheduledKind {
+    Block,
+    Fluid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClusterScheduledTick {
+    pub kind: ClusterScheduledKind,
+    pub id: u16,
+    pub position: BlockPos,
+    pub delay: u8,
+    pub priority: TickPriority,
+}
+
+/// Decodes the exact legacy queue in a private admission image. Invalid entries
+/// fail admission instead of silently changing which callbacks will run.
+#[must_use]
+pub fn cluster_snapshot_scheduled_ticks(image: &[u8]) -> Option<Vec<ClusterScheduledTick>> {
+    use pumpkin_util::resource_location::{FromResourceLocation, ResourceLocation};
+    use std::str::FromStr;
+    let (version, body) = image.split_first()?;
+    if *version != CLUSTER_SNAPSHOT_VERSION {
+        return None;
+    }
+    let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new(std::io::Cursor::new(body));
+    let nbt = pumpkin_nbt::Nbt::read(&mut reader).ok()?;
+    let mut out = Vec::new();
+    for (name, kind) in [
+        ("block_ticks", ClusterScheduledKind::Block),
+        ("fluid_ticks", ClusterScheduledKind::Fluid),
+    ] {
+        let Some(tag) = nbt.root_tag.child_tags.get(name) else {
+            continue;
+        };
+        let pumpkin_nbt::tag::NbtTag::List(list) = tag else {
+            return None;
+        };
+        for entry in list {
+            let pumpkin_nbt::tag::NbtTag::Compound(entry) = entry else {
+                return None;
+            };
+            let position = BlockPos::new(
+                entry.get_int("x")?,
+                entry.get_int("y")?,
+                entry.get_int("z")?,
+            );
+            let delay = u8::try_from(entry.get_int("t")?).ok()?;
+            let priority = TickPriority::try_from(entry.get_int("p")?).ok()?;
+            let location = ResourceLocation::from_str(entry.get_string("i")?).ok()?;
+            let id = match kind {
+                ClusterScheduledKind::Block => <&'static Block>::from_resource_location(&location)?
+                    .id
+                    .as_u16(),
+                ClusterScheduledKind::Fluid => {
+                    <&'static Fluid>::from_resource_location(&location)?.id
+                }
+            };
+            out.push(ClusterScheduledTick {
+                kind,
+                id,
+                position,
+                delay,
+                priority,
+            });
+        }
+    }
+    Some(out)
+}
+
+/// Writes the owner queue into an immutable image; every unrelated chunk field
+/// remains byte-equivalent after NBT decoding.
+#[must_use]
+pub fn cluster_replace_snapshot_scheduled_ticks(
+    image: &[u8],
+    ticks: &[ClusterScheduledTick],
+) -> Option<Vec<u8>> {
+    let (version, body) = image.split_first()?;
+    if *version != CLUSTER_SNAPSHOT_VERSION {
+        return None;
+    }
+    let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new(std::io::Cursor::new(body));
+    let mut nbt = pumpkin_nbt::Nbt::read(&mut reader).ok()?;
+    replace_scheduled_ticks_nbt(&mut nbt.root_tag, ticks)?;
+    let encoded = nbt.write();
+    let mut out = Vec::with_capacity(encoded.len() + 1);
+    out.push(CLUSTER_SNAPSHOT_VERSION);
+    out.extend_from_slice(&encoded);
+    Some(out)
+}
+
+fn replace_scheduled_ticks_nbt(
+    root: &mut pumpkin_nbt::NbtCompound,
+    ticks: &[ClusterScheduledTick],
+) -> Option<()> {
+    use pumpkin_util::resource_location::ToResourceLocation;
+    for (name, kind) in [
+        ("block_ticks", ClusterScheduledKind::Block),
+        ("fluid_ticks", ClusterScheduledKind::Fluid),
+    ] {
+        let mut list = Vec::new();
+        for tick in ticks.iter().filter(|tick| tick.kind == kind) {
+            let name = match kind {
+                ClusterScheduledKind::Block => {
+                    let block = Block::from_id(pumpkin_data::BlockId::new(tick.id)?);
+                    block.to_resource_location()
+                }
+                ClusterScheduledKind::Fluid => Fluid::from_id(tick.id)?.to_resource_location(),
+            };
+            let mut entry = pumpkin_nbt::compound::NbtCompound::new();
+            entry.put_int("x", tick.position.0.x);
+            entry.put_int("y", tick.position.0.y);
+            entry.put_int("z", tick.position.0.z);
+            entry.put_int("t", i32::from(tick.delay));
+            entry.put_int("p", tick.priority as i32);
+            entry.put_string("i", name);
+            list.push(pumpkin_nbt::tag::NbtTag::Compound(entry));
+        }
+        root.put_list(name, list);
+    }
+    Some(())
+}
+
+/// Extracts exact block-entity compounds from a private immutable image.
+/// Each value is a standalone NBT document suitable for a canonical cell.
+#[must_use]
+pub fn cluster_snapshot_block_entities(image: &[u8]) -> Option<Vec<(BlockPos, Vec<u8>)>> {
+    use pumpkin_nbt::tag::NbtTag;
+    let (version, body) = image.split_first()?;
+    if *version != CLUSTER_SNAPSHOT_VERSION {
+        return None;
+    }
+    let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new(std::io::Cursor::new(body));
+    let nbt = pumpkin_nbt::Nbt::read(&mut reader).ok()?;
+    let chunk_x = nbt.root_tag.get_int("xPos")?;
+    let chunk_z = nbt.root_tag.get_int("zPos")?;
+    let Some(tag) = nbt.root_tag.child_tags.get("block_entities") else {
+        return Some(Vec::new());
+    };
+    let NbtTag::List(list) = tag else {
+        return None;
+    };
+    if list.len() > 4096 {
+        return None;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::with_capacity(list.len());
+    let mut total_bytes = 0usize;
+    for tag in list {
+        let NbtTag::Compound(compound) = tag else {
+            return None;
+        };
+        let position = BlockPos::new(
+            compound.get_int("x")?,
+            compound.get_int("y")?,
+            compound.get_int("z")?,
+        );
+        if position.0.x.div_euclid(16) != chunk_x
+            || position.0.z.div_euclid(16) != chunk_z
+            || !seen.insert((position.0.x, position.0.y, position.0.z))
+        {
+            return None;
+        }
+        let bytes = pumpkin_nbt::Nbt::new(String::new(), compound.clone())
+            .write_unnamed_canonical()
+            .ok()?;
+        if bytes.is_empty() || bytes.len() > 65_536 {
+            return None;
+        }
+        total_bytes = total_bytes.checked_add(bytes.len())?;
+        if total_bytes > 8 * 1024 * 1024 {
+            return None;
+        }
+        out.push((position, bytes.to_vec()));
+    }
+    Some(out)
+}
+
+#[must_use]
+pub fn cluster_block_entity_document_matches(position: BlockPos, bytes: &[u8]) -> bool {
+    if bytes.is_empty() || bytes.len() > 65_536 {
+        return false;
+    }
+    let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new(std::io::Cursor::new(bytes));
+    let Ok(entity) = pumpkin_nbt::Nbt::read_unnamed(&mut reader) else {
+        return false;
+    };
+    entity.root_tag.get_int("x") == Some(position.0.x)
+        && entity.root_tag.get_int("y") == Some(position.0.y)
+        && entity.root_tag.get_int("z") == Some(position.0.z)
+        && entity
+            .write_unnamed_canonical()
+            .is_ok_and(|canonical| canonical.as_ref() == bytes)
+}
+
+/// Checks that a canonical block-entity document belongs to the block-state
+/// entity type. Only the exact Minecraft resource ID and known legacy aliases
+/// are accepted; another namespace cannot impersonate a vanilla entity.
+#[must_use]
+pub fn cluster_block_entity_document_type_matches(
+    state: pumpkin_data::BlockStateId,
+    bytes: &[u8],
+) -> bool {
+    let type_id = pumpkin_data::BlockState::from_id(state).block_entity_type;
+    let Some(expected) =
+        pumpkin_data::block_properties::BLOCK_ENTITY_TYPES.get(usize::from(type_id))
+    else {
+        return false;
+    };
+    let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new(std::io::Cursor::new(bytes));
+    let Ok(entity) = pumpkin_nbt::Nbt::read_unnamed(&mut reader) else {
+        return false;
+    };
+    let Some(actual) = entity.root_tag.get_string("id") else {
+        return false;
+    };
+    actual == *expected
+        || actual.strip_prefix("minecraft:") == Some(*expected)
+        || matches!((*expected, actual), ("bed", "Bed"))
+}
+
+#[must_use]
+pub fn cluster_default_block_entity_document(
+    state: pumpkin_data::BlockStateId,
+    position: BlockPos,
+) -> Option<Vec<u8>> {
+    let type_id = pumpkin_data::BlockState::from_id(state).block_entity_type;
+    let name = pumpkin_data::block_properties::BLOCK_ENTITY_TYPES.get(usize::from(type_id))?;
+    let mut root = pumpkin_nbt::compound::NbtCompound::new();
+    root.put_string("id", format!("minecraft:{name}"));
+    root.put_int("x", position.0.x);
+    root.put_int("y", position.0.y);
+    root.put_int("z", position.0.z);
+    pumpkin_nbt::Nbt::new(String::new(), root)
+        .write_unnamed_canonical()
+        .ok()
+        .map(|bytes| bytes.to_vec())
+}
+
+/// Replaces block-entity compounds in an immutable image without touching
+/// palettes, ticks, lighting, or any unrelated chunk field.
+#[must_use]
+pub fn cluster_replace_snapshot_block_entities(
+    image: &[u8],
+    entities: &[(BlockPos, Vec<u8>)],
+) -> Option<Vec<u8>> {
+    let (version, body) = image.split_first()?;
+    if *version != CLUSTER_SNAPSHOT_VERSION || entities.len() > 4096 {
+        return None;
+    }
+    let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new(std::io::Cursor::new(body));
+    let mut nbt = pumpkin_nbt::Nbt::read(&mut reader).ok()?;
+    replace_block_entities_nbt(&mut nbt.root_tag, entities)?;
+    let encoded = nbt.write();
+    let mut out = Vec::with_capacity(encoded.len() + 1);
+    out.push(CLUSTER_SNAPSHOT_VERSION);
+    out.extend_from_slice(&encoded);
+    Some(out)
+}
+
+fn replace_block_entities_nbt(
+    root: &mut pumpkin_nbt::NbtCompound,
+    entities: &[(BlockPos, Vec<u8>)],
+) -> Option<()> {
+    use pumpkin_nbt::tag::NbtTag;
+    if entities.len() > 4096 {
+        return None;
+    }
+    let chunk_x = root.get_int("xPos")?;
+    let chunk_z = root.get_int("zPos")?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut list = Vec::with_capacity(entities.len());
+    let mut total_bytes = 0usize;
+    for (position, bytes) in entities {
+        if position.0.x.div_euclid(16) != chunk_x
+            || position.0.z.div_euclid(16) != chunk_z
+            || bytes.is_empty()
+            || bytes.len() > 65_536
+            || !seen.insert((position.0.x, position.0.y, position.0.z))
+        {
+            return None;
+        }
+        total_bytes = total_bytes.checked_add(bytes.len())?;
+        if total_bytes > 8 * 1024 * 1024 {
+            return None;
+        }
+        let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new(std::io::Cursor::new(
+            bytes.as_slice(),
+        ));
+        if !cluster_block_entity_document_matches(*position, bytes) {
+            return None;
+        }
+        let entity = pumpkin_nbt::Nbt::read_unnamed(&mut reader).ok()?;
+        if entity.root_tag.get_int("x")? != position.0.x
+            || entity.root_tag.get_int("y")? != position.0.y
+            || entity.root_tag.get_int("z")? != position.0.z
+        {
+            return None;
+        }
+        list.push(NbtTag::Compound(entity.root_tag));
+    }
+    root.put_list("block_entities", list);
+    Some(())
+}
+
+#[must_use]
+pub fn cluster_reencode_snapshot_with_blocks(
+    snapshot: &[u8],
+    min_y: i32,
+    blocks: &[crate::chunk::palette::BlockPalette],
+    biomes: &[crate::chunk::palette::BiomePalette],
+) -> Option<Vec<u8>> {
+    let (version, body) = snapshot.split_first()?;
+    if *version != CLUSTER_SNAPSHOT_VERSION || blocks.is_empty() || blocks.len() != biomes.len() {
+        return None;
+    }
+    let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new(std::io::Cursor::new(body));
+    let mut nbt = pumpkin_nbt::Nbt::read(&mut reader).ok()?;
+    replace_palettes_nbt(&mut nbt.root_tag, min_y, blocks, biomes)?;
+    let bytes = nbt.write();
+    let mut output = Vec::with_capacity(bytes.len() + 1);
+    output.push(CLUSTER_SNAPSHOT_VERSION);
+    output.extend_from_slice(&bytes);
+    Some(output)
+}
+
+fn replace_palettes_nbt(
+    root: &mut pumpkin_nbt::NbtCompound,
+    min_y: i32,
+    blocks: &[crate::chunk::palette::BlockPalette],
+    biomes: &[crate::chunk::palette::BiomePalette],
+) -> Option<()> {
+    use crate::chunk::{ChunkHeightmapType, ChunkHeightmaps};
+    use pumpkin_nbt::tag::NbtTag;
+    if blocks.is_empty() || blocks.len() != biomes.len() {
+        return None;
+    }
+    min_y.checked_sub(1)?;
+    min_y.checked_add(i32::try_from(blocks.len().checked_mul(16)?).ok()?)?;
+    if root.get_int("yPos")? != min_y.div_euclid(16) {
+        return None;
+    }
+    let NbtTag::List(sections) = root.child_tags.get_mut("sections")? else {
+        return None;
+    };
+    if sections.len() != blocks.len() {
+        return None;
+    }
+    let mut seen = vec![false; blocks.len()];
+    for section in sections {
+        let NbtTag::Compound(section) = section else {
+            return None;
+        };
+        let y = i32::from(section.get_byte("Y")?);
+        let index = usize::try_from(y - min_y.div_euclid(16)).ok()?;
+        if *seen.get(index)? {
+            return None;
+        }
+        seen[index] = true;
+        let palette = blocks.get(index)?.to_disk_nbt();
+        let mut state = pumpkin_nbt::NbtCompound::new();
+        if let Some(data) = palette.data {
+            state.put("data", NbtTag::LongArray(data.to_vec()));
+        }
+        let names = palette
+            .palette
+            .iter()
+            .map(|&id| {
+                let block = Block::from_state_id(id);
+                let mut value = pumpkin_nbt::NbtCompound::new();
+                let name = if block.name.starts_with("minecraft:") {
+                    block.name.to_string()
+                } else {
+                    format!("minecraft:{}", block.name)
+                };
+                value.put_string("Name", name);
+                if let Some(properties) = block.properties(id) {
+                    let properties = properties.to_props();
+                    if !properties.is_empty() {
+                        let mut tags = pumpkin_nbt::NbtCompound::new();
+                        for (key, value) in properties {
+                            tags.put_string(key, value.to_string());
+                        }
+                        value.put_compound("Properties", tags);
+                    }
+                }
+                NbtTag::Compound(value)
+            })
+            .collect();
+        state.put_list("palette", names);
+        section.put_compound("block_states", state);
+        let palette = biomes.get(index)?.to_disk_nbt();
+        let mut state = pumpkin_nbt::NbtCompound::new();
+        if let Some(data) = palette.data {
+            state.put("data", NbtTag::LongArray(data.to_vec()));
+        }
+        let names = palette
+            .palette
+            .iter()
+            .map(|&id| {
+                let name = pumpkin_data::biome::Biome::from_id(id)
+                    .map_or("plains", |biome| biome.registry_id);
+                NbtTag::String(
+                    if name.starts_with("minecraft:") {
+                        name.to_string()
+                    } else {
+                        format!("minecraft:{name}")
+                    }
+                    .into(),
+                )
+            })
+            .collect();
+        state.put_list("palette", names);
+        section.put_compound("biomes", state);
+    }
+    if seen.iter().any(|value| !value) {
+        return None;
+    }
+    let chunk_x = root.get_int("xPos")?;
+    let chunk_z = root.get_int("zPos")?;
+    if let Some(NbtTag::List(entities)) = root.child_tags.get_mut("block_entities") {
+        let mut kept = Vec::with_capacity(entities.len());
+        for entity in std::mem::take(entities) {
+            let NbtTag::Compound(ref data) = entity else {
+                return None;
+            };
+            let x = data.get_int("x")?;
+            let y = data.get_int("y")?;
+            let z = data.get_int("z")?;
+            if x.div_euclid(16) != chunk_x || z.div_euclid(16) != chunk_z {
+                return None;
+            }
+            let relative_y = y.checked_sub(min_y)?;
+            let section = usize::try_from(relative_y.div_euclid(16)).ok()?;
+            let local_y = usize::try_from(relative_y.rem_euclid(16)).ok()?;
+            let state = blocks.get(section)?.get(
+                x.rem_euclid(16) as usize,
+                local_y,
+                z.rem_euclid(16) as usize,
+            );
+            if pumpkin_data::BlockState::from_id(state).block_entity_type != u16::MAX {
+                kept.push(entity);
+            }
+        }
+        *entities = kept;
+    }
+    let mut heightmaps = ChunkHeightmaps::default();
+    for x in 0..16 {
+        for z in 0..16 {
+            let mut found = [false; 3];
+            for section in (0..blocks.len()).rev() {
+                for y in (0..16).rev() {
+                    let id = blocks[section].get(x, y, z);
+                    let state = pumpkin_data::BlockState::from_id(id);
+                    let absolute_y = min_y + (section * 16 + y) as i32;
+                    for (index, kind) in [
+                        ChunkHeightmapType::WorldSurface,
+                        ChunkHeightmapType::MotionBlocking,
+                        ChunkHeightmapType::MotionBlockingNoLeaves,
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        if !found[index] && kind.is_opaque(state) {
+                            heightmaps.set(kind, x as i32, z as i32, absolute_y, min_y);
+                            found[index] = true;
+                        }
+                    }
+                    if found.iter().all(|found| *found) {
+                        break;
+                    }
+                }
+                if found.iter().all(|found| *found) {
+                    break;
+                }
+            }
+            for (index, kind) in [
+                ChunkHeightmapType::WorldSurface,
+                ChunkHeightmapType::MotionBlocking,
+                ChunkHeightmapType::MotionBlockingNoLeaves,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if !found[index] {
+                    heightmaps.set(kind, x as i32, z as i32, min_y - 1, min_y);
+                }
+            }
+        }
+    }
+    let mut tags = pumpkin_nbt::NbtCompound::new();
+    if let Some(values) = heightmaps.world_surface {
+        tags.put("WORLD_SURFACE", NbtTag::LongArray(values.to_vec()));
+    }
+    if let Some(values) = heightmaps.motion_blocking {
+        tags.put("MOTION_BLOCKING", NbtTag::LongArray(values.to_vec()));
+    }
+    if let Some(values) = heightmaps.motion_blocking_no_leaves {
+        tags.put(
+            "MOTION_BLOCKING_NO_LEAVES",
+            NbtTag::LongArray(values.to_vec()),
+        );
+    }
+    root.put_compound("Heightmaps", tags);
+    Some(())
+}
+
+/// Complete immutable admission image owned by the world lane. Rendering a cut
+/// clones only this private document and never reads a mutable SyncChunk.
+#[derive(Clone)]
+pub struct OwnedChunkImage {
+    nbt: pumpkin_nbt::Nbt,
+}
+
+impl OwnedChunkImage {
+    pub fn document(&self) -> &pumpkin_nbt::Nbt {
+        &self.nbt
+    }
+
+    pub fn light_sections(&self) -> Option<Vec<(i32, Vec<u8>, Vec<u8>)>> {
+        let mut result = Vec::new();
+        for section in self.nbt.root_tag.get_list("sections")? {
+            let pumpkin_nbt::tag::NbtTag::Compound(section) = section else {
+                return None;
+            };
+            let y = i32::from(section.get_byte("Y")?);
+            let array = |name| -> Option<Vec<u8>> {
+                match section.get_byte_array(name) {
+                    Some(data) if data.len() == 2048 => {
+                        Some(data.iter().map(|value| *value as u8).collect())
+                    }
+                    Some(_) => None,
+                    None => Some(vec![0; 2048]),
+                }
+            };
+            result.push((y, array("SkyLight")?, array("BlockLight")?));
+        }
+        result.sort_by_key(|(y, _, _)| *y);
+        if result.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return None;
+        }
+        Some(result)
+    }
+
+    pub fn with_palettes(
+        &self,
+        min_y: i32,
+        blocks: &[crate::chunk::palette::BlockPalette],
+        biomes: &[crate::chunk::palette::BiomePalette],
+    ) -> Option<Self> {
+        let mut next = self.clone();
+        replace_palettes_nbt(&mut next.nbt.root_tag, min_y, blocks, biomes)?;
+        Some(next)
+    }
+
+    #[must_use]
+    pub fn decode(image: &[u8]) -> Option<Self> {
+        let (version, body) = image.split_first()?;
+        if *version != CLUSTER_SNAPSHOT_VERSION {
+            return None;
+        }
+        let mut reader =
+            pumpkin_nbt::deserializer::NbtReadHelperJava::new(std::io::Cursor::new(body));
+        Some(Self {
+            nbt: pumpkin_nbt::Nbt::read(&mut reader).ok()?,
+        })
+    }
+
+    /// Composes every currently owned field at the same caller-selected phase.
+    /// Unknown admission fields remain intact until their own mutation route
+    /// replaces them; this method does not sample any legacy world state.
+    #[must_use]
+    pub fn render_ground(
+        &self,
+        min_y: i32,
+        blocks: &[crate::chunk::palette::BlockPalette],
+        biomes: &[crate::chunk::palette::BiomePalette],
+        inhabited_delta: u64,
+        scheduled: &[ClusterScheduledTick],
+        entities: &[(BlockPos, Vec<u8>)],
+        lighting: Option<&crate::lighting::owned::OwnedChunkLighting>,
+    ) -> Option<Vec<u8>> {
+        let chunk_x = self.nbt.root_tag.get_int("xPos")?;
+        let chunk_z = self.nbt.root_tag.get_int("zPos")?;
+        for (position, bytes) in entities {
+            if position.0.x.div_euclid(16) != chunk_x || position.0.z.div_euclid(16) != chunk_z {
+                return None;
+            }
+            let relative_y = position.0.y.checked_sub(min_y)?;
+            let section = usize::try_from(relative_y.div_euclid(16)).ok()?;
+            let state = blocks.get(section)?.get(
+                position.0.x.rem_euclid(16) as usize,
+                relative_y.rem_euclid(16) as usize,
+                position.0.z.rem_euclid(16) as usize,
+            );
+            if !cluster_block_entity_document_type_matches(state, bytes) {
+                return None;
+            }
+        }
+        let mut nbt = self.nbt.clone();
+        let current = nbt.root_tag.get_long("InhabitedTime").unwrap_or(0);
+        let advance = i64::try_from(inhabited_delta).ok()?;
+        nbt.root_tag
+            .put_long("InhabitedTime", current.checked_add(advance)?);
+        replace_palettes_nbt(&mut nbt.root_tag, min_y, blocks, biomes)?;
+        replace_scheduled_ticks_nbt(&mut nbt.root_tag, scheduled)?;
+        replace_block_entities_nbt(&mut nbt.root_tag, entities)?;
+        if let Some(lighting) = lighting {
+            if lighting.block.len() != blocks.len() || lighting.sky.len() != blocks.len() {
+                return None;
+            }
+            let pumpkin_nbt::tag::NbtTag::List(sections) =
+                nbt.root_tag.child_tags.get_mut("sections")?
+            else {
+                return None;
+            };
+            for section in sections {
+                let pumpkin_nbt::tag::NbtTag::Compound(section) = section else {
+                    return None;
+                };
+                let index =
+                    usize::try_from(i32::from(section.get_byte("Y")?) - min_y.div_euclid(16))
+                        .ok()?;
+                section.put(
+                    "BlockLight",
+                    pumpkin_nbt::tag::NbtTag::ByteArray(
+                        lighting
+                            .block
+                            .get(index)?
+                            .iter()
+                            .map(|byte| *byte as i8)
+                            .collect(),
+                    ),
+                );
+                section.put(
+                    "SkyLight",
+                    pumpkin_nbt::tag::NbtTag::ByteArray(
+                        lighting
+                            .sky
+                            .get(index)?
+                            .iter()
+                            .map(|byte| *byte as i8)
+                            .collect(),
+                    ),
+                );
+            }
+            nbt.root_tag.put_bool("isLightOn", true);
+        }
+        let bytes = nbt.write();
+        let mut out = Vec::with_capacity(bytes.len() + 1);
+        out.push(CLUSTER_SNAPSHOT_VERSION);
+        out.extend_from_slice(&bytes);
+        Some(out)
+    }
+}
+
 #[must_use]
 pub fn cluster_decode_snapshot(x: i32, z: i32, bytes: &[u8]) -> Option<SyncChunk> {
     let (version, body) = bytes.split_first()?;
@@ -1225,7 +2220,10 @@ pub fn cluster_decode_snapshot_with_blocks(
         return None;
     }
     match ChunkData::internal_from_bytes_with_palettes(body, Vector2::new(x, z)) {
-        Ok((chunk, min_y, blocks, biomes)) => Some((Arc::new(chunk), min_y, blocks, biomes)),
+        Ok((mut chunk, min_y, blocks, biomes)) => {
+            chunk.origin = crate::chunk::ChunkOrigin::PeerSnapshot;
+            Some((Arc::new(chunk), min_y, blocks, biomes))
+        }
         Err(error) => {
             warn!(
                 chunk_x = x,
@@ -1314,6 +2312,7 @@ impl ClusterDual {
 
     fn fork_chunk(source: &SyncChunk) -> SyncChunk {
         let fork = Arc::new(ChunkData {
+            origin: crate::chunk::ChunkOrigin::Unknown,
             section: crate::chunk::ChunkSections::new(source.section.count, source.section.min_y),
             heightmap: std::sync::Mutex::new(crate::chunk::ChunkHeightmaps::default()),
             x: source.x,
@@ -1497,6 +2496,79 @@ impl Level {
         self.cluster_fetch_wanted.remove(&pos);
         self.cluster_snapshots.insert(pos, snapshot.clone());
         self.level_channel.notify();
+    }
+
+    pub fn try_publish_cluster_snapshot(
+        &self,
+        position: Vector2<i32>,
+        snapshot: SyncChunk,
+        reservation_generation: Option<u64>,
+        respond: oneshot::Sender<bool>,
+    ) -> bool {
+        let queued = self
+            .cluster_snapshot_publication
+            .load_full()
+            .is_some_and(|route| {
+                route
+                    .try_send(ClusterSnapshotPublication {
+                        position,
+                        snapshot,
+                        reservation_generation,
+                        respond,
+                    })
+                    .is_ok()
+            });
+        if queued {
+            self.level_channel.notify();
+        }
+        queued
+    }
+
+    pub fn try_claim_peer_chunk_install(
+        &self,
+        position: Vector2<i32>,
+        generation: u64,
+        respond: tokio::sync::mpsc::Sender<PeerChunkInstallClaimResult>,
+    ) -> bool {
+        let queued = self
+            .cluster_peer_install_claim
+            .load_full()
+            .is_some_and(|route| {
+                route
+                    .try_send(PeerChunkInstallClaim::Claim {
+                        position,
+                        generation,
+                        respond,
+                    })
+                    .is_ok()
+            });
+        if queued {
+            self.level_channel.notify();
+        }
+        queued
+    }
+
+    pub fn try_release_peer_chunk_install(&self, position: Vector2<i32>, generation: u64) -> bool {
+        let queued = self
+            .cluster_peer_install_claim
+            .load_full()
+            .is_some_and(|route| {
+                match route.try_send(PeerChunkInstallClaim::Release {
+                    position,
+                    generation,
+                }) {
+                    Ok(()) => true,
+                    Err(crossbeam::channel::TrySendError::Full(_)) => self
+                        .cluster_peer_install_releases
+                        .push((position, generation))
+                        .is_ok(),
+                    Err(crossbeam::channel::TrySendError::Disconnected(_)) => false,
+                }
+            });
+        if queued {
+            self.level_channel.notify();
+        }
+        queued
     }
 
     pub fn cluster_ingest_snapshot(&self, pos: Vector2<i32>, snapshot: &SyncChunk) -> bool {
@@ -1794,6 +2866,7 @@ mod tests {
         let mut chunk = ChunkData::empty(3, -7);
         let stone = Block::STONE.default_state.id;
         chunk.set_block_absolute_y(1, 0, 2, stone);
+        chunk.set_block_absolute_y(1, 1, 2, Block::CHEST.default_state.id);
         {
             let mut biomes = chunk.section.biome_sections.write().unwrap();
             let desert = pumpkin_data::biome::Biome::from_name("desert").unwrap().id;
@@ -1817,20 +2890,27 @@ mod tests {
         {
             let mut entities = chunk.pending_block_entities.lock().unwrap();
             let mut entity = pumpkin_nbt::compound::NbtCompound::new();
-            entity.put_int("x", 17);
+            entity.put_int("x", 49);
             entity.put_int("y", 1);
             entity.put_int("z", -110);
             entity.put_string("id", "minecraft:chest".to_string());
-            entities.insert(BlockPos::new(17, 1, -110), entity);
+            entities.insert(BlockPos::new(49, 1, -110), entity);
         }
         {
             let tick = ScheduledTick {
                 delay: 4,
                 priority: TickPriority::Normal,
-                position: BlockPos::new(17, 0, -110),
+                position: BlockPos::new(49, 0, -110),
                 value: &Block::STONE,
             };
             chunk.block_ticks = crate::tick::scheduler::ChunkTickScheduler::from_iter([tick]);
+            let fluid_tick = ScheduledTick {
+                delay: 6,
+                priority: TickPriority::High,
+                position: BlockPos::new(50, 0, -110),
+                value: &Fluid::WATER,
+            };
+            chunk.fluid_ticks = crate::tick::scheduler::ChunkTickScheduler::from_iter([fluid_tick]);
         }
         chunk.inhabited_time.store(12345, Ordering::Relaxed);
         {
@@ -1841,9 +2921,148 @@ mod tests {
         let chunk = Arc::new(chunk);
         let bytes = cluster_encode_snapshot(&chunk);
         assert_eq!(bytes[0], 1);
+        let advanced = cluster_advance_snapshot_inhabited(&bytes, 3).unwrap();
+        let mut scheduled = cluster_snapshot_scheduled_ticks(&advanced).unwrap();
+        assert_eq!(scheduled.len(), 2);
+        assert!(
+            scheduled
+                .iter()
+                .any(|tick| tick.kind == ClusterScheduledKind::Block && tick.delay == 4)
+        );
+        assert!(
+            scheduled
+                .iter()
+                .any(|tick| tick.kind == ClusterScheduledKind::Fluid && tick.delay == 6)
+        );
+        scheduled[0].delay = 2;
+        let scheduled_image =
+            cluster_replace_snapshot_scheduled_ticks(&advanced, &scheduled).unwrap();
+        assert_eq!(
+            cluster_snapshot_scheduled_ticks(&scheduled_image).unwrap(),
+            scheduled
+        );
+        let block_entities = cluster_snapshot_block_entities(&scheduled_image).unwrap();
+        assert_eq!(block_entities.len(), 1);
+        assert_eq!(block_entities[0].0, BlockPos::new(49, 1, -110));
+        assert!(cluster_block_entity_document_matches(
+            block_entities[0].0,
+            &block_entities[0].1
+        ));
+        assert!(cluster_block_entity_document_type_matches(
+            Block::CHEST.default_state.id,
+            &block_entities[0].1
+        ));
+        assert!(!cluster_block_entity_document_type_matches(
+            Block::FURNACE.default_state.id,
+            &block_entities[0].1
+        ));
+        let default_chest = cluster_default_block_entity_document(
+            Block::CHEST.default_state.id,
+            block_entities[0].0,
+        )
+        .unwrap();
+        assert!(cluster_block_entity_document_matches(
+            block_entities[0].0,
+            &default_chest
+        ));
+        assert!(cluster_block_entity_document_type_matches(
+            Block::CHEST.default_state.id,
+            &default_chest
+        ));
+        assert!(
+            cluster_default_block_entity_document(
+                Block::STONE.default_state.id,
+                block_entities[0].0,
+            )
+            .is_none()
+        );
+        for spoofed in ["othermod:chest", "minecraft:ch-est"] {
+            let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new(
+                std::io::Cursor::new(block_entities[0].1.as_slice()),
+            );
+            let mut entity = pumpkin_nbt::Nbt::read_unnamed(&mut reader).unwrap();
+            entity.root_tag.put_string("id", spoofed.to_string());
+            let bytes = entity.write_unnamed_canonical().unwrap();
+            assert!(!cluster_block_entity_document_type_matches(
+                Block::CHEST.default_state.id,
+                &bytes
+            ));
+        }
+        assert!(!cluster_block_entity_document_matches(
+            BlockPos::new(50, 1, -110),
+            &block_entities[0].1
+        ));
+        assert!(
+            cluster_replace_snapshot_block_entities(
+                &scheduled_image,
+                &[block_entities[0].clone(), block_entities[0].clone()]
+            )
+            .is_none()
+        );
+        let rewritten =
+            cluster_replace_snapshot_block_entities(&scheduled_image, &block_entities).unwrap();
+        assert_eq!(
+            cluster_snapshot_block_entities(&rewritten).unwrap(),
+            block_entities
+        );
+        assert_eq!(
+            cluster_snapshot_scheduled_ticks(&rewritten).unwrap(),
+            scheduled
+        );
+        let without_entity = cluster_replace_snapshot_block_entities(&rewritten, &[]).unwrap();
+        assert!(
+            cluster_snapshot_block_entities(&without_entity)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            cluster_snapshot_scheduled_ticks(&without_entity).unwrap(),
+            scheduled
+        );
+        let (scheduled_chunk, _, _, _) =
+            cluster_decode_snapshot_with_blocks(3, -7, &scheduled_image).unwrap();
+        assert_eq!(
+            scheduled_chunk.pending_block_entities.lock().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            scheduled_chunk.inhabited_time.load(Ordering::Relaxed),
+            12348
+        );
+        let (advanced_chunk, _, _, _) =
+            cluster_decode_snapshot_with_blocks(3, -7, &advanced).unwrap();
+        assert_eq!(advanced_chunk.inhabited_time.load(Ordering::Relaxed), 12348);
+        assert_eq!(advanced_chunk.block_ticks.to_vec().len(), 1);
+        assert_eq!(advanced_chunk.fluid_ticks.to_vec().len(), 1);
+        assert_eq!(
+            advanced_chunk.pending_block_entities.lock().unwrap().len(),
+            1
+        );
+        assert!(cluster_snapshot_layout_matches(
+            &bytes,
+            3,
+            -7,
+            chunk.section.min_y,
+            chunk.section.count,
+        ));
+        assert!(!cluster_snapshot_layout_matches(
+            &bytes,
+            4,
+            -7,
+            chunk.section.min_y,
+            chunk.section.count,
+        ));
+        assert!(!cluster_snapshot_layout_matches(
+            &bytes,
+            3,
+            -7,
+            chunk.section.min_y,
+            chunk.section.count - 1,
+        ));
         let (back, block_min_y, owned_blocks, owned_biomes) =
             cluster_decode_snapshot_with_blocks(3, -7, &bytes).expect("snapshot decodes");
 
+        assert_eq!(back.origin, crate::chunk::ChunkOrigin::PeerSnapshot);
         assert_eq!(back.x, 3);
         assert_eq!(back.z, -7);
         assert_eq!(back.section.min_y, chunk.section.min_y);
@@ -1853,6 +3072,120 @@ mod tests {
         assert_eq!(owned_blocks[4].get(1, 0, 2), stone);
         let desert = pumpkin_data::biome::Biome::from_name("desert").unwrap().id;
         assert_eq!(owned_biomes[4].get(0, 0, 0), desert);
+        let owner_image = OwnedChunkImage::decode(&bytes).unwrap();
+        // Mutating the old Level image cannot affect the owner's private cut.
+        chunk
+            .custom_data
+            .lock()
+            .unwrap()
+            .put_int("cluster_probe", 99);
+        let composed = owner_image
+            .render_ground(
+                block_min_y,
+                &owned_blocks,
+                &owned_biomes,
+                3,
+                &scheduled,
+                &block_entities,
+                None,
+            )
+            .unwrap();
+        let expected = cluster_reencode_snapshot_with_blocks(
+            &rewritten,
+            block_min_y,
+            &owned_blocks,
+            &owned_biomes,
+        )
+        .unwrap();
+        let read = |image: &[u8]| {
+            let mut reader = pumpkin_nbt::deserializer::NbtReadHelperJava::new(
+                std::io::Cursor::new(&image[1..]),
+            );
+            pumpkin_nbt::Nbt::read(&mut reader).unwrap()
+        };
+        assert_eq!(read(&composed), read(&expected));
+        assert_eq!(
+            read(&composed).root_tag.get_long("InhabitedTime"),
+            Some(12348)
+        );
+        assert_eq!(
+            read(&composed)
+                .root_tag
+                .get_compound("PumpkinCustomData")
+                .unwrap()
+                .get_int("cluster_probe"),
+            Some(7)
+        );
+        assert!(
+            owner_image
+                .render_ground(
+                    block_min_y,
+                    &owned_blocks,
+                    &owned_biomes,
+                    u64::MAX,
+                    &scheduled,
+                    &block_entities,
+                    None,
+                )
+                .is_none()
+        );
+        // A failed or repeated render never advances the admission baseline.
+        let repeated = owner_image
+            .render_ground(
+                block_min_y,
+                &owned_blocks,
+                &owned_biomes,
+                3,
+                &scheduled,
+                &block_entities,
+                None,
+            )
+            .unwrap();
+        assert_eq!(read(&repeated), read(&composed));
+        let lighting = crate::lighting::owned::OwnedChunkLighting {
+            block: (0..owned_blocks.len())
+                .map(|_| Box::new([0x11; 2048]))
+                .collect(),
+            sky: (0..owned_blocks.len())
+                .map(|_| Box::new([0x22; 2048]))
+                .collect(),
+        };
+        let relit = owner_image
+            .render_ground(
+                block_min_y,
+                &owned_blocks,
+                &owned_biomes,
+                3,
+                &scheduled,
+                &block_entities,
+                Some(&lighting),
+            )
+            .unwrap();
+        let (relit_chunk, _, _, _) = cluster_decode_snapshot_with_blocks(3, -7, &relit).unwrap();
+        let light = relit_chunk.light_engine.lock().unwrap();
+        assert!(
+            matches!(&light.block_light[4], crate::chunk::format::LightContainer::Full(bytes)
+            if bytes.iter().all(|byte| *byte == 0x11))
+        );
+        assert!(
+            matches!(&light.sky_light[4], crate::chunk::format::LightContainer::Full(bytes)
+            if bytes.iter().all(|byte| *byte == 0x22))
+        );
+        let mut incompatible = owned_blocks.clone();
+        incompatible[4].set(1, 1, 2, BlockStateId::AIR);
+        assert!(
+            owner_image
+                .render_ground(
+                    block_min_y,
+                    &incompatible,
+                    &owned_biomes,
+                    3,
+                    &scheduled,
+                    &block_entities,
+                    None,
+                )
+                .is_none()
+        );
         {
             let biomes = back.section.biome_sections.read().unwrap();
             let desert = pumpkin_data::biome::Biome::from_name("desert").unwrap().id;
@@ -1884,7 +3217,7 @@ mod tests {
         {
             let entities = back.pending_block_entities.lock().unwrap();
             let entity = entities
-                .get(&BlockPos::new(17, 1, -110))
+                .get(&BlockPos::new(49, 1, -110))
                 .expect("entity kept");
             assert_eq!(entity.get_string("id"), Some("minecraft:chest"));
         }
@@ -1892,7 +3225,11 @@ mod tests {
             let ticks = back.block_ticks.to_vec();
             assert_eq!(ticks.len(), 1);
             assert_eq!(ticks[0].delay, 4);
-            assert_eq!(ticks[0].position, BlockPos::new(17, 0, -110));
+            assert_eq!(ticks[0].position, BlockPos::new(49, 0, -110));
+            let fluid_ticks = back.fluid_ticks.to_vec();
+            assert_eq!(fluid_ticks.len(), 1);
+            assert_eq!(fluid_ticks[0].delay, 6);
+            assert_eq!(fluid_ticks[0].position, BlockPos::new(50, 0, -110));
         }
         assert_eq!(back.inhabited_time.load(Ordering::Relaxed), 12345);
         assert_eq!(back.status, pumpkin_data::chunk::ChunkStatus::Full);
@@ -1900,6 +3237,63 @@ mod tests {
             let custom = back.custom_data.lock().unwrap();
             assert_eq!(custom.get_int("cluster_probe"), Some(7));
         }
+    }
+
+    #[test]
+    fn canonical_reencode_replaces_stale_ground_state() {
+        let chunk = ChunkData::empty_sync(0, 0);
+        let stone = Block::STONE.default_state.id;
+        chunk.set_block_absolute_y(1, 0, 1, stone);
+        let chest = Block::CHEST.default_state.id;
+        chunk.set_block_absolute_y(2, 0, 2, chest);
+        chunk.set_block_absolute_y(3, 0, 3, chest);
+        {
+            let mut entities = chunk.pending_block_entities.lock().unwrap();
+            for coordinate in [2, 3] {
+                let mut entity = pumpkin_nbt::compound::NbtCompound::new();
+                entity.put_int("x", coordinate);
+                entity.put_int("y", 0);
+                entity.put_int("z", coordinate);
+                entity.put_string("id", "minecraft:chest".to_string());
+                entities.insert(BlockPos::new(coordinate, 0, coordinate), entity);
+            }
+        }
+        chunk.custom_data.lock().unwrap().put_int("probe", 17);
+        let stale = cluster_encode_snapshot(&chunk);
+        let (_, min_y, mut blocks, mut biomes) =
+            cluster_decode_snapshot_with_blocks(0, 0, &stale).unwrap();
+        let section = usize::try_from((0 - min_y).div_euclid(16)).unwrap();
+        blocks[section].set(1, 0, 1, Block::AIR.default_state.id);
+        blocks[section].set(1, 1, 1, stone);
+        blocks[section].set(2, 0, 2, Block::AIR.default_state.id);
+        let desert = pumpkin_data::biome::Biome::from_name("desert").unwrap().id;
+        biomes[section].set(0, 0, 0, desert);
+        let corrected =
+            cluster_reencode_snapshot_with_blocks(&stale, min_y, &blocks, &biomes).unwrap();
+        let (received, _, _, received_biomes) =
+            cluster_decode_snapshot_with_blocks(0, 0, &corrected).unwrap();
+        assert_eq!(
+            received.section.get_block_absolute_y(1, 0, 1),
+            Some(Block::AIR.default_state.id)
+        );
+        assert_eq!(received.section.get_block_absolute_y(1, 1, 1), Some(stone));
+        let entities = received.pending_block_entities.lock().unwrap();
+        assert!(!entities.contains_key(&BlockPos::new(2, 0, 2)));
+        assert!(entities.contains_key(&BlockPos::new(3, 0, 3)));
+        assert_eq!(
+            received.heightmap.lock().unwrap().get(
+                crate::chunk::ChunkHeightmapType::WorldSurface,
+                1,
+                1,
+                min_y,
+            ),
+            1
+        );
+        assert_eq!(
+            received.custom_data.lock().unwrap().get_int("probe"),
+            Some(17)
+        );
+        assert_eq!(received_biomes[section].get(0, 0, 0), desert);
     }
 
     #[test]

@@ -386,6 +386,27 @@ impl<S: CommandSource> CommandDispatcher<S> {
 
     /// Executes a given result that has already been parsed from an input.
     pub fn execute(&self, parsed: ParsingResult<'_, S>) -> Result<i32, CommandSyntaxError> {
+        self.execute_outcome(parsed)
+            .map(|outcome| outcome.completed_result)
+    }
+
+    pub fn execute_input_outcome(
+        &self,
+        input: &str,
+        source: &S,
+    ) -> Result<crate::deferred::CommandExecutionSummary, CommandSyntaxError> {
+        let mut reader = StringReader::new(input);
+        if self.is_disabled(Self::command_name(input)) {
+            return Err(Self::unknown_command_error(&reader));
+        }
+        let parsed = self.parse(&mut reader, source);
+        self.execute_outcome(parsed)
+    }
+
+    pub fn execute_outcome(
+        &self,
+        parsed: ParsingResult<'_, S>,
+    ) -> Result<crate::deferred::CommandExecutionSummary, CommandSyntaxError> {
         if parsed.reader.peek().is_some() {
             return if let Some(err) = parsed.errors.values().next() {
                 Err(err.clone())
@@ -405,9 +426,11 @@ impl<S: CommandSource> CommandDispatcher<S> {
                     .on_command_completion(&original_context, ReturnValue::Failure);
                 Err(Self::unknown_command_error(&parsed.reader))
             }
-            Some(flat_context) => {
-                flat_context.execute_all(&original_context.source, self.consumer.as_ref())
-            }
+            Some(flat_context) => flat_context.execute_all_outcome(
+                &original_context.source,
+                self.consumer.as_ref(),
+                false,
+            ),
         }
     }
 
@@ -523,7 +546,15 @@ impl<S: CommandSource> CommandDispatcher<S> {
     ///
     /// If the input starts with one slash (`/`), it is removed
     /// inside the call itself.
-    pub fn handle_command<'a>(&'a self, source: &S, mut input: &'a str) {
+    pub fn handle_command<'a>(&'a self, source: &S, input: &'a str) {
+        let _ = self.handle_command_outcome(source, input);
+    }
+
+    pub fn handle_command_outcome<'a>(
+        &'a self,
+        source: &S,
+        mut input: &'a str,
+    ) -> Option<crate::deferred::CommandExecutionSummary> {
         // If input starts with '/', but the command with that leading slash is NOT
         // registered, while the stripped command IS registered (or if it's an unknown command
         // starting with a single slash, e.g. from console input), strip one leading slash.
@@ -545,13 +576,17 @@ impl<S: CommandSource> CommandDispatcher<S> {
         if self.is_disabled(Self::command_name(input)) {
             let reader = StringReader::new(input);
             Self::send_error_to_source(source, Self::unknown_command_error(&reader), input);
-            return;
+            return None;
         }
 
-        let output = self.execute_input(input, source);
+        let output = self.execute_input_outcome(input, source);
 
-        if let Err(error) = output {
-            Self::send_error_to_source(source, error, input);
+        match output {
+            Ok(summary) => Some(summary),
+            Err(error) => {
+                Self::send_error_to_source(source, error, input);
+                None
+            }
         }
     }
 

@@ -14,6 +14,7 @@ use std::sync::Arc;
 #[pumpkin_block("minecraft:pumpkin")]
 pub struct PumpkinBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl crate::block::BlockBehaviour for PumpkinBlock {
     fn use_with_item(&self, args: UseWithItemArgs<'_>) -> BlockActionResult {
         if args.item_stack.item != &Item::SHEARS {

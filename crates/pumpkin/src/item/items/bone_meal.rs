@@ -19,6 +19,7 @@ impl ItemMetadata for BoneMealItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for BoneMealItem {
     #[allow(clippy::too_many_lines)]
     fn use_on_block(

@@ -31,21 +31,23 @@ struct Route {
 pub(super) struct IceRouter {
     internal_addr: SocketAddr,
     public_addr: SocketAddr,
-    commands: mpsc::UnboundedSender<Command>,
+    commands: mpsc::Sender<Command>,
 }
 
 pub(super) struct Registration {
     ufrag: String,
     internal: SocketAddr,
-    commands: mpsc::UnboundedSender<Command>,
+    remove: Option<mpsc::OwnedPermit<Command>>,
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        let _ = self.commands.send(Command::Remove {
-            ufrag: self.ufrag.clone(),
-            internal: self.internal,
-        });
+        if let Some(remove) = self.remove.take() {
+            remove.send(Command::Remove {
+                ufrag: self.ufrag.clone(),
+                internal: self.internal,
+            });
+        }
     }
 }
 
@@ -54,7 +56,7 @@ impl IceRouter {
         let public_addr = public.local_addr()?;
         let internal = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let internal_addr = internal.local_addr()?;
-        let (commands, receiver) = mpsc::unbounded_channel();
+        let (commands, receiver) = mpsc::channel(8192);
         tokio::spawn(run(public, internal, receiver));
         Ok(Self {
             internal_addr,
@@ -76,25 +78,31 @@ impl IceRouter {
         ufrag: String,
         internal: SocketAddr,
         candidates: Vec<SocketAddr>,
-    ) -> Registration {
-        let _ = self.commands.send(Command::Register {
+    ) -> Result<Registration, String> {
+        let remove = self
+            .commands
+            .clone()
+            .try_reserve_owned()
+            .map_err(|_| "NetherNet ICE removal queue exhausted".to_string())?;
+        let register = self
+            .commands
+            .clone()
+            .try_reserve_owned()
+            .map_err(|_| "NetherNet ICE registration queue exhausted".to_string())?;
+        register.send(Command::Register {
             ufrag: ufrag.clone(),
             internal,
             candidates,
         });
-        Registration {
+        Ok(Registration {
             ufrag,
             internal,
-            commands: self.commands.clone(),
-        }
+            remove: Some(remove),
+        })
     }
 }
 
-async fn run(
-    public: IceSocket,
-    internal_socket: UdpSocket,
-    mut commands: mpsc::UnboundedReceiver<Command>,
-) {
+async fn run(public: IceSocket, internal_socket: UdpSocket, mut commands: mpsc::Receiver<Command>) {
     let mut routes = HashMap::<SocketAddr, Route>::new();
     let mut by_ufrag = HashMap::<String, SocketAddr>::new();
     let mut by_remote = HashMap::<SocketAddr, SocketAddr>::new();
@@ -277,6 +285,45 @@ fn candidate_address(fields: &[String]) -> Option<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saturated_route_queue_preserves_reserved_removal() {
+        let (commands, mut receiver) = mpsc::channel(2);
+        let address = "127.0.0.1:1".parse().unwrap();
+        let router = IceRouter {
+            internal_addr: address,
+            public_addr: address,
+            commands: commands.clone(),
+        };
+        let registration = router
+            .register("first".into(), address, Vec::new())
+            .unwrap();
+        assert!(
+            matches!(receiver.try_recv(), Ok(Command::Register { ufrag, .. }) if ufrag == "first")
+        );
+        assert!(
+            commands
+                .try_send(Command::Register {
+                    ufrag: "occupied".into(),
+                    internal: address,
+                    candidates: Vec::new()
+                })
+                .is_ok()
+        );
+        assert!(
+            router
+                .register("rejected".into(), address, Vec::new())
+                .is_err()
+        );
+        drop(registration);
+        assert!(
+            matches!(receiver.try_recv(), Ok(Command::Register { ufrag, .. }) if ufrag == "occupied")
+        );
+        assert!(
+            matches!(receiver.try_recv(), Ok(Command::Remove { ufrag, .. }) if ufrag == "first")
+        );
+        assert!(receiver.try_recv().is_err());
+    }
 
     #[test]
     fn reads_stun_username() {

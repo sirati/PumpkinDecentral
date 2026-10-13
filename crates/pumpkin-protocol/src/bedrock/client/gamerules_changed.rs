@@ -15,13 +15,20 @@ pub struct GameRule {
     pub rule_value: RuleValue,
 }
 
-// TODO: flesh out RuleValue
 pub enum RuleValue {
     Null,
+    Bool(bool),
+    Int(u32),
+    Float(f32),
 }
 
 impl PacketWrite for RuleValue {
     fn write<W: std::io::prelude::Write>(&self, writer: &mut W) -> Result<(), std::io::Error> {
-        VarUInt(0).write(writer)
+        match self {
+            Self::Null => VarUInt(0).write(writer),
+            Self::Bool(value) => { VarUInt(1).write(&mut *writer)?; value.write(writer) }
+            Self::Int(value) => { VarUInt(2).write(&mut *writer)?; VarUInt(*value).write(writer) }
+            Self::Float(value) => { VarUInt(3).write(&mut *writer)?; value.write(writer) }
+        }
     }
 }

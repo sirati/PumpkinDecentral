@@ -21,71 +21,85 @@ struct TeamMsgCommandExecutor;
 
 impl CommandExecutor for TeamMsgCommandExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
-        let player = context.source.player_or_err()?;
-        let sender_name = player.gameprofile.name.clone();
-        let world = context.world().clone();
-        let message_text = StringArgumentType::get(context, ARG_MESSAGE)?.to_string();
-        let sender_display_name = context.source.display_name.clone();
-
-        let scoreboard = world
-            .scoreboard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let mut sender_team = None;
-        for team in scoreboard.get_teams().values() {
-            if team.players.contains(&sender_name) {
-                sender_team = Some(team.clone());
-                break;
+        let server = context.source.server();
+        let sender = match &context.source.output {
+            crate::command::CommandSender::Player(player)
+            | crate::command::CommandSender::Lobby(player) => player.cluster_gid(),
+            crate::command::CommandSender::PreJoin(session) => Some(session.gid),
+            _ => {
+                context.source.player_or_err()?;
+                None
             }
-        }
-
-        let Some(team) = sender_team else {
-            return Err(NO_TEAM_ERROR.create_without_context());
         };
-
-        let team_display_name = team.display_name.clone().color_named(team.color);
-        let message_component = TextComponent::text(message_text.clone());
-
-        let online_players = world.players.load();
-        let mut recipients = 0;
-
-        for player in online_players.iter() {
-            if team.players.contains(&player.gameprofile.name) {
-                let msg = if player.gameprofile.name == sender_name {
-                    TextComponent::translate_cross(
-                        translation::java::CHAT_TYPE_TEAM_SENT,
-                        translation::java::CHAT_TYPE_TEAM_SENT,
-                        [
-                            team_display_name.clone(),
-                            sender_display_name.clone(),
-                            message_component.clone(),
-                        ],
-                    )
-                } else {
-                    TextComponent::translate_cross(
-                        translation::java::CHAT_TYPE_TEAM_TEXT,
-                        translation::java::CHAT_TYPE_TEAM_TEXT,
-                        [
-                            team_display_name.clone(),
-                            sender_display_name.clone(),
-                            message_component.clone(),
-                        ],
-                    )
-                };
-
-                player.send_system_message(&msg);
-                recipients += 1;
+        let sender_name = context.source.name.clone();
+        let world = context.world();
+        let message_text = StringArgumentType::get(context, ARG_MESSAGE)?;
+        let teams = world.team_chat_snapshot.load();
+        let team = teams
+            .values()
+            .find(|team| team.players.contains(&sender_name))
+            .ok_or_else(|| NO_TEAM_ERROR.create_without_context())?;
+        if server.advanced_config.cluster.enabled {
+            let sender = sender.ok_or_else(|| {
+                pumpkin_command::errors::error_types::DISPATCHER_PARSE_EXCEPTION
+                    .create_without_context(TextComponent::text("Team chat sender is unavailable"))
+            })?;
+            let (uuid, session) = match &context.source.output {
+                crate::command::CommandSender::Player(player)
+                | crate::command::CommandSender::Lobby(player) => (
+                    *player.gameprofile.id.as_bytes(),
+                    player
+                        .cluster_owner_install_generation
+                        .load(std::sync::atomic::Ordering::Acquire),
+                ),
+                crate::command::CommandSender::PreJoin(session) => {
+                    (*session.profile.id.as_bytes(), session.session_generation)
+                }
+                _ => {
+                    return Err(
+                        pumpkin_command::errors::error_types::DISPATCHER_PARSE_EXCEPTION
+                            .create_without_context(TextComponent::text(
+                                "Team chat sender is unavailable",
+                            )),
+                    );
+                }
+            };
+            let broadcast = crate::server::cluster_chat_pm::capture_team_message(
+                server,
+                world,
+                team,
+                sender,
+                uuid,
+                session,
+                sender_name.clone(),
+                context.source.display_name.clone(),
+                message_text,
+            )
+            .ok_or_else(|| {
+                pumpkin_command::errors::error_types::DISPATCHER_PARSE_EXCEPTION
+                    .create_without_context(TextComponent::text(
+                        "Team chat sender or recipient capacity is unavailable",
+                    ))
+            })?;
+            if !crate::server::cluster_chat_pm::broadcast_team(server, &broadcast) {
+                return Err(
+                    pumpkin_command::errors::error_types::DISPATCHER_PARSE_EXCEPTION
+                        .create_without_context(TextComponent::text(
+                            "Team chat capacity exhausted",
+                        )),
+                );
             }
+            return Ok(crate::server::cluster_chat_pm::deliver_team_frozen(
+                server, &broadcast,
+            ));
         }
-
-        // Fan the team message out to the rest of the cluster; remote hosts deliver it
-        // to their own same-named team members through cluster chat sync.
-        let _cluster_sent = crate::server::cluster_chat_pm::broadcast_team_from_player(
-            context.source.server(),
-            player,
-            &team.name,
-            &message_text,
+        let recipients = crate::server::cluster_chat_pm::deliver_team_local(
+            server,
+            world,
+            team,
+            &sender_name,
+            context.source.display_name.clone(),
+            message_text,
         );
 
         Ok(recipients)

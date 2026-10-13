@@ -47,6 +47,7 @@ impl ScreenHandlerFactory for BarrelScreenFactory {
 #[pumpkin_block("minecraft:barrel")]
 pub struct BarrelBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for BarrelBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut props = BarrelLikeProperties::default(args.block);

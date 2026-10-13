@@ -1,68 +1,192 @@
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-
-use pumpkin_cluster::identity::GlobalPlayerId;
 use pumpkin_data::damage::DamageType;
 use pumpkin_data::entity::EntityType;
-use pumpkin_protocol::bedrock::client::add_player::CAddPlayer;
-use pumpkin_protocol::bedrock::client::common::{
-    BuildPlatform, SerializedAbilitiesData, SerializedAbilitiesDataSerializedLayer,
-};
-use pumpkin_protocol::bedrock::client::set_actor_data::PropertySyncData;
-use pumpkin_protocol::bedrock::network_item::NetworkItemStackDescriptor;
-use pumpkin_protocol::codec::var_ulong::VarULong;
-use pumpkin_protocol::java::client::play::CSpawnEntity;
-use pumpkin_util::GameMode;
-use pumpkin_util::math::vector2::Vector2;
 use pumpkin_util::math::vector3::Vector3;
+use std::sync::Arc;
 
 use crate::entity::{Entity, EntityBase, living::LivingEntity};
-use crate::net::{bedrock::BedrockClient, java::JavaClient};
 use crate::server::Server;
 use crate::world::World;
 
-pub struct RemotePlayerReplica {
-    pub living_entity: LivingEntity,
-    pub gid: GlobalPlayerId,
-    pub name: String,
-    pub game_mode: GameMode,
+pub(crate) struct RemotePlayerReplica {
+    entity: Arc<Entity>,
+    pub frame: crate::server::cluster_remote_player_presentation::RemotePlayerFrame,
 }
 
 impl RemotePlayerReplica {
-    pub fn new(
+    pub(crate) fn new(
         world: Arc<World>,
-        gid: GlobalPlayerId,
-        uuid: uuid::Uuid,
-        name: String,
-        position: Vector3<f64>,
-        game_mode: GameMode,
+        frame: crate::server::cluster_remote_player_presentation::RemotePlayerFrame,
+        previous: Option<&Self>,
     ) -> Arc<Self> {
-        let entity = Entity::from_uuid(uuid, world, position, &EntityType::PLAYER);
-        entity.no_physics.store(true, Ordering::Relaxed);
+        if let Some(previous) = previous.filter(|previous| {
+            previous.frame.same_session(&frame)
+                && previous.frame.spatial.world == frame.spatial.world
+                && previous.frame.spatial.frame.effective.position
+                    == frame.spatial.frame.effective.position
+                && previous.frame.spatial.frame.effective.velocity
+                    == frame.spatial.frame.effective.velocity
+                && previous.frame.spatial.frame.effective.yaw == frame.spatial.frame.effective.yaw
+                && previous.frame.spatial.frame.effective.pitch
+                    == frame.spatial.frame.effective.pitch
+                && previous.frame.spatial.head_yaw == frame.spatial.head_yaw
+                && previous.frame.spatial.sneaking == frame.spatial.sneaking
+                && previous.frame.spatial.sprinting == frame.spatial.sprinting
+                && previous.frame.spatial.swimming == frame.spatial.swimming
+                && previous.frame.spatial.gliding == frame.spatial.gliding
+                && previous.frame.pose() == frame.pose()
+                && crate::server::cluster_living_metadata::player_scale(&previous.frame.living)
+                    == crate::server::cluster_living_metadata::player_scale(&frame.living)
+                && previous.frame.living.combat.timing.fire_ticks
+                    == frame.living.combat.timing.fire_ticks
+                && previous.frame.living.environment.frozen_ticks
+                    == frame.living.environment.frozen_ticks
+                && previous.frame.living.combat.status.invulnerable
+                    == frame.living.combat.status.invulnerable
+                && crate::server::cluster_living_metadata::java_flags(&previous.frame.living)
+                    == crate::server::cluster_living_metadata::java_flags(&frame.living)
+                && previous.frame.spatial.frame.effective.on_ground
+                    == frame.spatial.frame.effective.on_ground
+        }) {
+            return Arc::new(Self {
+                entity: previous.entity.clone(),
+                frame,
+            });
+        }
+        let effective = frame.spatial.frame.effective;
+        let position = Vector3::new(
+            effective.position[0],
+            effective.position[1],
+            effective.position[2],
+        );
+        let biome = frame
+            .spatial
+            .biome_id
+            .and_then(pumpkin_data::biome::Biome::from_id)
+            .unwrap_or(&pumpkin_data::biome::Biome::THE_VOID);
+        let mut entity = Entity::from_uuid_with_id_in_biome(
+            frame.client_entity_id,
+            frame.lease.key.0,
+            world,
+            position,
+            &EntityType::PLAYER,
+            biome,
+        );
+        entity.yaw = crossbeam::atomic::AtomicCell::new(effective.yaw);
+        entity.body_yaw = crossbeam::atomic::AtomicCell::new(effective.yaw);
+        entity.head_yaw = crossbeam::atomic::AtomicCell::new(frame.spatial.head_yaw);
+        entity.pitch = crossbeam::atomic::AtomicCell::new(effective.pitch);
+        entity.velocity = crossbeam::atomic::AtomicCell::new(Vector3::new(
+            effective.velocity[0],
+            effective.velocity[1],
+            effective.velocity[2],
+        ));
+        entity.on_ground = std::sync::atomic::AtomicBool::new(effective.on_ground);
+        entity.sneaking = std::sync::atomic::AtomicBool::new(frame.spatial.sneaking);
+        entity.sprinting = std::sync::atomic::AtomicBool::new(frame.spatial.sprinting);
+        entity.swimming = std::sync::atomic::AtomicBool::new(frame.spatial.swimming);
+        entity.fall_flying = std::sync::atomic::AtomicBool::new(frame.spatial.gliding);
+        entity.no_physics = std::sync::atomic::AtomicBool::new(true);
+        entity.fire_ticks = std::sync::atomic::AtomicI32::new(
+            frame.living.combat.timing.fire_ticks.min(i32::MAX as u32) as i32,
+        );
+        entity.has_visual_fire =
+            std::sync::atomic::AtomicBool::new(frame.living.combat.timing.fire_ticks != 0);
+        entity.frozen_ticks =
+            std::sync::atomic::AtomicI32::new(i32::from(frame.living.environment.frozen_ticks));
+        entity.invulnerable =
+            std::sync::atomic::AtomicBool::new(frame.living.combat.status.invulnerable);
+        let flags = crate::server::cluster_living_metadata::java_flags(&frame.living);
+        entity.invisible = std::sync::atomic::AtomicBool::new(flags & 0x20 != 0);
+        entity.glowing = std::sync::atomic::AtomicBool::new(flags & 0x40 != 0);
+        let pose = frame.pose();
+        let dimensions =
+            crate::server::cluster_living_metadata::player_dimensions(&frame.living, pose);
+        entity.pose = crossbeam::atomic::AtomicCell::new(pose);
+        entity.entity_dimension = crossbeam::atomic::AtomicCell::new(dimensions);
+        entity.bounding_box = crossbeam::atomic::AtomicCell::new(
+            pumpkin_util::math::boundingbox::BoundingBox::new_from_pos(
+                position.x,
+                position.y,
+                position.z,
+                &dimensions,
+            ),
+        );
         Arc::new(Self {
-            living_entity: LivingEntity::new(entity),
-            gid,
-            name,
-            game_mode,
+            entity: Arc::new(entity),
+            frame,
         })
     }
 }
 
 impl EntityBase for RemotePlayerReplica {
+    fn write_nbt(&self, nbt: &mut pumpkin_nbt::compound::NbtCompound) {
+        nbt.child_tags.remove("EnderItems");
+        nbt.put_string("id", "minecraft:player".to_owned());
+        nbt.put_uuid("UUID", self.frame.lease.key.0);
+        let world = self.entity.world.load();
+        let Some(server) = world.server.upgrade() else {
+            return;
+        };
+        if crate::server::cluster_player_projection::write_owned_player_nbt(
+            &server,
+            &self.frame.living,
+            self.frame.spatial,
+            nbt,
+        )
+        .is_err()
+        {
+            return;
+        }
+        if let Some(cells) = self.frame.inventory_cells() {
+            let _ = crate::server::cluster_invsee::write_player_inventory_cells_nbt(nbt, cells);
+        }
+        if let Some(cells) = self.frame.canonical_ender_cells(&server) {
+            let _ = crate::server::cluster_player_ender::write_cells_nbt(nbt, cells);
+        }
+    }
+
     fn tick(&self, _caller: &dyn EntityBase, _server: &Server) {}
 
     fn init_data_tracker(&self) {}
 
     fn get_entity(&self) -> &Entity {
-        &self.living_entity.entity
+        &self.entity
     }
 
     fn get_living_entity(&self) -> Option<&LivingEntity> {
-        Some(&self.living_entity)
+        None
+    }
+
+    fn get_name(&self) -> pumpkin_util::text::TextComponent {
+        pumpkin_util::text::TextComponent::text(self.frame.profile.name.clone())
+    }
+
+    fn get_display_name(&self) -> pumpkin_util::text::TextComponent {
+        self.get_name()
+    }
+
+    fn is_passenger(&self) -> bool {
+        self.frame
+            .living
+            .avatar
+            .as_ref()
+            .is_some_and(|avatar| avatar.mount.is_some())
+    }
+
+    fn is_vehicle(&self) -> bool {
+        false
+    }
+
+    fn has_passenger(&self, _other: &dyn EntityBase) -> bool {
+        false
     }
 
     fn cast_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn can_hit(&self) -> bool {
+        self.frame.living.combat.health_milli != 0 && self.frame.spatial.game_mode != 3
     }
 
     fn is_pushable(&self) -> bool {
@@ -70,14 +194,6 @@ impl EntityBase for RemotePlayerReplica {
     }
 
     fn is_pushed_by_fluids(&self) -> bool {
-        false
-    }
-
-    fn can_hit(&self) -> bool {
-        true
-    }
-
-    fn is_immune_to_explosion(&self) -> bool {
         false
     }
 
@@ -90,70 +206,6 @@ impl EntityBase for RemotePlayerReplica {
         _source: Option<&dyn EntityBase>,
         _cause: Option<&dyn EntityBase>,
     ) -> bool {
-        self.living_entity.damage_with_context(
-            self,
-            _amount,
-            _damage_type,
-            _position,
-            _source,
-            _cause,
-        )
-    }
-
-    fn send_java_spawn_packet(&self, client: &JavaClient) {
-        let entity = &self.living_entity.entity;
-        let packet = CSpawnEntity::new(
-            entity.entity_id.into(),
-            entity.entity_uuid,
-            i32::from(EntityType::PLAYER.id).into(),
-            entity.pos.load(),
-            entity.pitch.load(),
-            entity.yaw.load(),
-            entity.head_yaw.load(),
-            0.into(),
-            entity.velocity.load(),
-        );
-        if let Ok(data) = client.serialize_packet(&packet) {
-            client.try_enqueue_packet(data);
-        }
-    }
-
-    fn send_bedrock_spawn_packet(&self, client: &BedrockClient) {
-        let entity = &self.living_entity.entity;
-        let entity_id = entity.entity_id;
-        let packet = CAddPlayer {
-            uuid: entity.entity_uuid,
-            player_name: self.name.clone(),
-            target_runtime_id: VarULong(entity_id as u64),
-            platform_chat_id: String::new(),
-            position: entity.pos.load().to_f32_lossy(),
-            velocity: entity.velocity.load().to_f32_lossy(),
-            rotation: Vector2::new(entity.pitch.load(), entity.yaw.load()),
-            y_head_rotation: entity.head_yaw.load(),
-            carried_item: NetworkItemStackDescriptor::default(),
-            player_game_type: self.game_mode.into(),
-            entity_data: entity.bedrock_metadata(),
-            synced_properties: PropertySyncData::default(),
-            abilities_data: SerializedAbilitiesData {
-                target_player_raw_id: i64::from(entity_id),
-                player_permissions:
-                    pumpkin_protocol::bedrock::client::PlayerPermissionLevel::Visitor,
-                command_permissions: pumpkin_protocol::bedrock::client::CommandPermissionLevel::Any,
-                layers: vec![SerializedAbilitiesDataSerializedLayer {
-                    serialized_layer: 0,
-                    abilities_set: 0,
-                    ability_value: 0,
-                    fly_speed: 0.05,
-                    vertical_fly_speed: 0.05,
-                    walk_speed: 0.1,
-                }],
-            },
-            actor_links: Vec::new(),
-            device_id: String::new(),
-            build_platform: BuildPlatform::Unknown,
-        };
-        if let Ok(data) = client.serialize_packet(&packet) {
-            client.try_enqueue_packet(data);
-        }
+        false
     }
 }

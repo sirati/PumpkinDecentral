@@ -24,6 +24,7 @@ impl ItemMetadata for ArmorStandItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for ArmorStandItem {
     fn use_on_block(
         &self,

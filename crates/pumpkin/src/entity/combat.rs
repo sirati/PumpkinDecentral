@@ -3,7 +3,11 @@ use std::sync::atomic::Ordering;
 use crate::entity::EntityBase;
 use pumpkin_data::tag::Taggable;
 use pumpkin_data::{
+    Enchantment,
     attributes::Attributes,
+    damage::DamageType,
+    data_component_impl::{AttributeModifiersImpl, EnchantmentsImpl},
+    item_stack::ItemStack,
     particle::Particle,
     sound::{Sound, SoundCategory},
 };
@@ -26,6 +30,141 @@ pub enum AttackType {
     MaceSmash,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct AttackState {
+    pub sprinting: bool,
+    pub on_ground: bool,
+    pub fall_distance: f32,
+    pub mace: bool,
+    pub sword: bool,
+    pub bedrock: bool,
+    pub cooldown: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HurtOutcome {
+    pub damage: f32,
+    pub cooldown: i32,
+    pub play_sound: bool,
+}
+
+pub fn resolve_hurt_cooldown(
+    effective_damage: f32,
+    last_damage: f32,
+    cooldown: i32,
+    health: f32,
+    bypass: bool,
+) -> Option<HurtOutcome> {
+    if cooldown > 10 && !bypass {
+        if effective_damage <= last_damage {
+            return None;
+        }
+        Some(HurtOutcome {
+            damage: (effective_damage - last_damage).max(0.0),
+            cooldown,
+            play_sound: false,
+        })
+    } else {
+        Some(HurtOutcome {
+            damage: effective_damage.max(0.0),
+            cooldown: 20,
+            play_sound: health > effective_damage,
+        })
+    }
+}
+
+pub fn armor_attributes<'a>(stacks: impl Iterator<Item = &'a ItemStack>) -> (f32, f32) {
+    let mut armor = 0.0;
+    let mut toughness = 0.0;
+    for stack in stacks.filter(|stack| !stack.is_empty()) {
+        if let Some(modifiers) = stack.get_data_component::<AttributeModifiersImpl>() {
+            for modifier in modifiers.attribute_modifiers.iter() {
+                if modifier.r#type == &Attributes::ARMOR {
+                    armor += modifier.amount as f32;
+                } else if modifier.r#type == &Attributes::ARMOR_TOUGHNESS {
+                    toughness += modifier.amount as f32;
+                }
+            }
+        }
+    }
+    (armor, toughness)
+}
+
+pub fn protection_factor<'a>(
+    stacks: impl Iterator<Item = &'a ItemStack>,
+    damage_type: &DamageType,
+) -> f32 {
+    use pumpkin_data::tag;
+    let mut protection = 0.0;
+    for stack in stacks.filter(|stack| !stack.is_empty()) {
+        if let Some(enchantments) = stack.get_data_component::<EnchantmentsImpl>() {
+            for (enchantment, level) in enchantments.enchantment.iter() {
+                let multiplier = if **enchantment == Enchantment::PROTECTION {
+                    if !damage_type.has_tag(&tag::DamageType::MINECRAFT_BYPASSES_INVULNERABILITY)
+                        && damage_type != &DamageType::STARVE
+                        && damage_type != &DamageType::GENERIC_KILL
+                        && damage_type != &DamageType::OUT_OF_WORLD
+                    {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                } else if (**enchantment == Enchantment::FIRE_PROTECTION
+                    && damage_type.has_tag(&tag::DamageType::MINECRAFT_IS_FIRE))
+                    || (**enchantment == Enchantment::BLAST_PROTECTION
+                        && damage_type.has_tag(&tag::DamageType::MINECRAFT_IS_EXPLOSION))
+                    || (**enchantment == Enchantment::PROJECTILE_PROTECTION
+                        && damage_type.has_tag(&tag::DamageType::MINECRAFT_IS_PROJECTILE))
+                {
+                    2.0
+                } else if **enchantment == Enchantment::FEATHER_FALLING
+                    && damage_type.has_tag(&tag::DamageType::MINECRAFT_IS_FALL)
+                {
+                    3.0
+                } else {
+                    0.0
+                };
+                protection += *level as f32 * multiplier;
+            }
+        }
+    }
+    protection
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AttackDamageState {
+    pub base_damage: f64,
+    pub enchantment_damage: f64,
+    pub cooldown: f64,
+    pub strength: Option<u8>,
+    pub weakness: Option<u8>,
+    pub attack_type: AttackType,
+    pub fall_distance: f32,
+}
+
+pub fn attack_damage(state: AttackDamageState) -> f64 {
+    let scale = if state.cooldown < 1.0 {
+        state.cooldown.powi(2).mul_add(0.8, 0.2)
+    } else {
+        1.0
+    };
+    let mut damage = state.base_damage * scale + state.enchantment_damage * state.cooldown;
+    if let Some(level) = state.strength {
+        damage += 3.0 * (f64::from(level) + 1.0);
+    }
+    if let Some(level) = state.weakness {
+        damage -= 4.0 * (f64::from(level) + 1.0);
+    }
+    damage = damage.max(0.0);
+    if state.attack_type == AttackType::Critical {
+        damage *= 1.5;
+    }
+    if state.attack_type == AttackType::MaceSmash {
+        damage += 1.5 * f64::from(state.fall_distance);
+    }
+    damage
+}
+
 impl AttackType {
     pub fn new(player: &Player, attack_cooldown_progress: f32) -> Self {
         let entity = &player.get_entity();
@@ -36,23 +175,32 @@ impl AttackType {
         let held_item = player.inventory().held_item();
         let is_mace = held_item.item.id == pumpkin_data::item::Item::MACE.id;
 
-        if is_mace && !on_ground && fall_distance > 1.5 {
+        Self::from_state(AttackState {
+            sprinting,
+            on_ground,
+            fall_distance,
+            mace: is_mace,
+            sword: held_item.is_sword(),
+            bedrock: matches!(player.client.as_ref(), ClientPlatform::Bedrock(_)),
+            cooldown: attack_cooldown_progress,
+        })
+    }
+
+    pub fn from_state(state: AttackState) -> Self {
+        if state.mace && !state.on_ground && state.fall_distance > 1.5 {
             return Self::MaceSmash;
         }
 
-        let sword = held_item.is_sword();
-        let is_bedrock = matches!(player.client.as_ref(), ClientPlatform::Bedrock(_));
-
-        let is_strong = attack_cooldown_progress > 0.9;
-        if sprinting && is_strong {
+        let is_strong = state.cooldown > 0.9;
+        if state.sprinting && is_strong {
             return Self::Knockback;
         }
 
-        if is_strong && !on_ground && fall_distance > 0.0 {
+        if is_strong && !state.on_ground && state.fall_distance > 0.0 {
             return Self::Critical;
         }
 
-        if sword && is_strong && !is_bedrock {
+        if state.sword && is_strong && !state.bedrock {
             return Self::Sweeping;
         }
 
@@ -147,25 +295,18 @@ impl CombatRules {
         armor_toughness: f32,
         breach_level: u32,
     ) -> f32 {
-        let toughness = Self::BASE_ARMOR_TOUGHNESS + armor_toughness / 4.0;
-        let real_armor = (total_armor - damage / toughness)
-            .clamp(total_armor * Self::MIN_ARMOR_RATIO, Self::MAX_ARMOR);
-        let mut armor_fraction = real_armor / Self::ARMOR_PROTECTION_DIVIDER;
-
-        if breach_level > 0 {
-            let reduction = (breach_level as f32 * 0.15).min(1.0);
-            armor_fraction = (armor_fraction * (1.0 - reduction)).clamp(0.0, 1.0);
-        }
-
-        let damage_multiplier = 1.0 - armor_fraction;
-        damage * damage_multiplier
+        pumpkin_cluster::combat_action::damage_after_armor(
+            damage,
+            total_armor,
+            armor_toughness,
+            breach_level,
+        )
     }
 
     /// Calculates damage after magic/enchantment armor reduction, mirroring vanilla `CombatRules.getDamageAfterMagicAbsorb`.
     #[must_use]
     pub fn get_damage_after_magic_absorb(damage: f32, total_magic_armor: f32) -> f32 {
-        let real_armor = total_magic_armor.clamp(0.0, Self::MAX_ARMOR);
-        damage * (1.0 - real_armor / Self::ARMOR_PROTECTION_DIVIDER)
+        pumpkin_cluster::combat_action::damage_after_protection(damage, total_magic_armor)
     }
 }
 
@@ -651,4 +792,123 @@ mod tests {
         // negative and callers guard on `strength > 0.0`.
         assert!(knockback_after_resistance(0.4, 1.2) < 0.0);
     }
+}
+
+pub fn normalized_equipment<'a>(
+    stacks: impl Iterator<
+        Item = (
+            &'a pumpkin_data::data_component_impl::EquipmentSlot,
+            &'a ItemStack,
+        ),
+    >,
+) -> Option<pumpkin_cluster::combat_action::CombatEquipmentFacts> {
+    use pumpkin_cluster::combat_action::{
+        CombatAttributeModifier, CombatEquipmentFacts, CombatModifierOperation,
+    };
+    use pumpkin_data::data_component_impl::{EquipmentSlot, Operation};
+    let mut facts = CombatEquipmentFacts::default();
+    facts.unarmed = true;
+    for (slot, stack) in stacks.filter(|(_, stack)| !stack.is_empty()) {
+        if let Some(modifiers) = stack.get_data_component::<AttributeModifiersImpl>() {
+            for modifier in modifiers.attribute_modifiers.iter().filter(|modifier| {
+                crate::entity::living::attribute_modifier_slot_matches(&modifier.slot, slot)
+            }) {
+                facts.modifiers.push(CombatAttributeModifier {
+                    attribute: u16::from(modifier.r#type.id),
+                    slot: u8::try_from(slot.get_slot_index()).ok()?,
+                    id: modifier.id.to_owned(),
+                    amount: modifier.amount.to_bits(),
+                    operation: match modifier.operation {
+                        Operation::AddValue => CombatModifierOperation::Add,
+                        Operation::AddMultipliedBase => CombatModifierOperation::MultiplyBase,
+                        Operation::AddMultipliedTotal => CombatModifierOperation::MultiplyTotal,
+                    },
+                });
+            }
+        }
+        let level =
+            |enchantment| u16::try_from(stack.get_enchantment_level(enchantment).max(0)).ok();
+        if matches!(slot, EquipmentSlot::MainHand(_)) {
+            let efficiency = u32::from(level(&Enchantment::EFFICIENCY)?);
+            if efficiency > 0 {
+                facts.modifiers.push(CombatAttributeModifier {
+                    attribute: u16::from(
+                        pumpkin_data::attributes::Attributes::MINING_EFFICIENCY.id,
+                    ),
+                    slot: u8::try_from(slot.get_slot_index()).ok()?,
+                    id: "minecraft:enchantment.efficiency".to_owned(),
+                    amount: f64::from(efficiency.checked_mul(efficiency)?.checked_add(1)?)
+                        .to_bits(),
+                    operation: CombatModifierOperation::Add,
+                });
+            }
+            facts.unarmed = false;
+            facts.sharpness = level(&Enchantment::SHARPNESS)?;
+            facts.smite = level(&Enchantment::SMITE)?;
+            facts.bane_of_arthropods = level(&Enchantment::BANE_OF_ARTHROPODS)?;
+            facts.knockback = level(&Enchantment::KNOCKBACK)?;
+            facts.fire_aspect = level(&Enchantment::FIRE_ASPECT)?;
+            facts.breach = level(&Enchantment::BREACH)?;
+            facts.sweeping_edge = level(&Enchantment::SWEEPING_EDGE)?;
+            facts.sword = stack.is_sword();
+            facts.axe = stack.is_axe();
+            facts.mace = stack.item.id == pumpkin_data::item::Item::MACE.id;
+        }
+        if matches!(slot, EquipmentSlot::MainHand(_) | EquipmentSlot::OffHand(_)) {
+            facts.shield |= stack.item.id == pumpkin_data::item::Item::SHIELD.id;
+        }
+        if matches!(
+            slot,
+            EquipmentSlot::Head(_)
+                | EquipmentSlot::Chest(_)
+                | EquipmentSlot::Legs(_)
+                | EquipmentSlot::Feet(_)
+        ) {
+            facts.protection += u32::from(level(&Enchantment::PROTECTION)?);
+            facts.fire_protection += u32::from(level(&Enchantment::FIRE_PROTECTION)?);
+            facts.blast_protection += u32::from(level(&Enchantment::BLAST_PROTECTION)?);
+            facts.projectile_protection += u32::from(level(&Enchantment::PROJECTILE_PROTECTION)?);
+            facts.feather_falling += u32::from(level(&Enchantment::FEATHER_FALLING)?);
+            facts.respiration = facts.respiration.max(level(&Enchantment::RESPIRATION)?);
+            facts.freeze_immune |= stack.get_item().has_tag(&pumpkin_data::tag::Item::MINECRAFT_FREEZE_IMMUNE_WEARABLES);
+        }
+    }
+    facts.modifiers = facts
+        .modifiers
+        .into_iter()
+        .map(|modifier| {
+            (
+                (modifier.attribute, modifier.id.clone(), modifier.slot),
+                modifier,
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>()
+        .into_values()
+        .collect();
+    facts.is_valid().then_some(facts)
+}
+
+pub fn normalized_status<'a>(
+    effects: impl Iterator<Item = &'a pumpkin_cluster::player_admin::EffectState>,
+    invulnerable: bool,
+) -> pumpkin_cluster::combat_action::CombatStatusFacts {
+    use pumpkin_data::effect::StatusEffect;
+    let mut facts = pumpkin_cluster::combat_action::CombatStatusFacts {
+        invulnerable,
+        ..Default::default()
+    };
+    for effect in effects.filter(|effect| effect.duration != 0) {
+        if effect.kind == u16::from(StatusEffect::STRENGTH.id) {
+            facts.strength = Some(effect.amplifier);
+        } else if effect.kind == u16::from(StatusEffect::WEAKNESS.id) {
+            facts.weakness = Some(effect.amplifier);
+        } else if effect.kind == u16::from(StatusEffect::RESISTANCE.id) {
+            facts.resistance = Some(effect.amplifier);
+        } else if effect.kind == u16::from(StatusEffect::FIRE_RESISTANCE.id) {
+            facts.fire_resistance = true;
+        } else if effect.kind == u16::from(StatusEffect::BLINDNESS.id) {
+            facts.blindness = true;
+        }
+    }
+    facts
 }

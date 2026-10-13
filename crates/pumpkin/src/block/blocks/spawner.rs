@@ -10,6 +10,7 @@ use crate::block::{BlockBehaviour, BrokenArgs, OnSyncedBlockEventArgs, PlacedArg
 #[pumpkin_block("minecraft:spawner")]
 pub struct SpawnerBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for SpawnerBlock {
     fn on_synced_block_event(&self, _args: OnSyncedBlockEventArgs<'_>) -> bool {
         true

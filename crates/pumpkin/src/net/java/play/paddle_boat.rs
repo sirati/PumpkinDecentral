@@ -3,15 +3,19 @@ use super::*;
 
 impl JavaClient {
     pub fn handle_paddle_boat(&self, player: &Arc<Player>, packet: &SPaddleBoat) {
-        if player
+        if let Some(server) = player
             .world()
             .server
             .upgrade()
-            .is_some_and(|server| server.advanced_config.cluster.enabled)
+            .filter(|server| server.advanced_config.cluster.enabled)
         {
-            player.client.try_kick(
-                crate::net::DisconnectReason::Unknown,
-                &TextComponent::text("Vehicle input could not be verified"),
+            crate::server::cluster_controller::submit_patch(
+                &server,
+                player,
+                crate::server::cluster_controller::ControllerPatch::Paddles {
+                    left: packet.left_paddle,
+                    right: packet.right_paddle,
+                },
             );
             return;
         }

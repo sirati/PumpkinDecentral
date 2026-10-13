@@ -78,7 +78,7 @@ pub fn encode(message: HealthPolicyMessage) -> Result<Vec<u8>, postcard::Error> 
 
 #[must_use]
 pub fn is_health_policy_message(bytes: &[u8]) -> bool {
-    bytes.starts_with(&MAGIC)
+    bytes.starts_with(&MAGIC) || bytes.starts_with(b"HMS2")
 }
 
 pub fn decode(bytes: &[u8]) -> Result<HealthPolicyMessage, postcard::Error> {
@@ -87,6 +87,46 @@ pub fn decode(bytes: &[u8]) -> Result<HealthPolicyMessage, postcard::Error> {
         return Err(postcard::Error::DeserializeBadEncoding);
     }
     Ok(envelope.message)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthPolicyState {
+    pub source: crate::realm_completion::PeerGeneration,
+    pub snapshot: HealthPolicySnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HealthPolicyControlMessage {
+    Change(HealthMaskMode),
+    State(HealthPolicyState),
+    Seed(HealthPolicyState),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthPolicyControl {
+    pub sender: crate::realm_completion::PeerGeneration,
+    pub message: HealthPolicyControlMessage,
+}
+
+pub fn encode_control(control: HealthPolicyControl) -> Result<Vec<u8>, postcard::Error> {
+    let mut bytes = b"HMS2".to_vec();
+    bytes.extend(postcard::to_allocvec(&control)?);
+    Ok(bytes)
+}
+
+pub fn decode_control(bytes: &[u8]) -> Result<HealthPolicyControl, postcard::Error> {
+    if bytes.len() > 256 || !bytes.starts_with(b"HMS2") {
+        return Err(postcard::Error::DeserializeBadEncoding);
+    }
+    let (control, trailing): (HealthPolicyControl, &[u8]) = postcard::take_from_bytes(&bytes[4..])?;
+    if !trailing.is_empty() || control.sender.generation == 0 {
+        return Err(postcard::Error::DeserializeBadEncoding);
+    }
+    if matches!(control.message, HealthPolicyControlMessage::State(state) | HealthPolicyControlMessage::Seed(state) if state.source.generation == 0)
+    {
+        return Err(postcard::Error::DeserializeBadEncoding);
+    }
+    Ok(control)
 }
 
 #[cfg(test)]
@@ -149,5 +189,59 @@ mod tests {
             required_health(HealthMaskMode::All, false, false, true, actual),
             actual
         );
+    }
+}
+
+#[cfg(test)]
+mod qualified_control_tests {
+    use super::*;
+    use crate::identity::ServerId;
+    use crate::realm_completion::PeerGeneration;
+
+    #[test]
+    fn survivor_carrier_does_not_restamp_original_policy_source() {
+        let source = PeerGeneration {
+            server: ServerId(0),
+            generation: 21,
+        };
+        let sender = PeerGeneration {
+            server: ServerId(7),
+            generation: 82,
+        };
+        let state = HealthPolicyState {
+            source,
+            snapshot: HealthPolicySnapshot::new(41, HealthMaskMode::All),
+        };
+        let seed = HealthPolicyControl {
+            sender,
+            message: HealthPolicyControlMessage::Seed(state),
+        };
+        let encoded = encode_control(seed).unwrap();
+        assert!(is_health_policy_message(&encoded));
+        assert_eq!(decode_control(&encoded).unwrap(), seed);
+        assert!(encoded.len() < 256);
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(decode_control(&trailing).is_err());
+        assert!(decode_control(&vec![0; 257]).is_err());
+        let invalid = HealthPolicyControl {
+            sender: PeerGeneration {
+                generation: 0,
+                ..sender
+            },
+            ..seed
+        };
+        assert!(decode_control(&encode_control(invalid).unwrap()).is_err());
+        let invalid = HealthPolicyControl {
+            sender,
+            message: HealthPolicyControlMessage::State(HealthPolicyState {
+                source: PeerGeneration {
+                    generation: 0,
+                    ..source
+                },
+                ..state
+            }),
+        };
+        assert!(decode_control(&encode_control(invalid).unwrap()).is_err());
     }
 }

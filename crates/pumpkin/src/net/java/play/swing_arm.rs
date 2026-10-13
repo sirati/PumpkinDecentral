@@ -13,6 +13,18 @@ impl JavaClient {
             self.try_kick(&TextComponent::text("Invalid hand"));
             return;
         };
+        if player.cluster_gid().is_some() {
+            let arm = match hand {
+                Hand::Right => pumpkin_cluster::replica_visual::SwingArm::Main,
+                Hand::Left => pumpkin_cluster::replica_visual::SwingArm::Offhand,
+            };
+            crate::server::cluster_remote_player_presentation::submit_cosmetic(
+                server,
+                player,
+                crate::server::cluster_remote_player_presentation::CosmeticChange::Swing(arm),
+            );
+            return;
+        }
 
         let mut anim_event = crate::plugin::api::events::player::player_animation::PlayerAnimationEvent::new(
             player.clone(),

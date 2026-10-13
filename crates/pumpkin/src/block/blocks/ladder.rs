@@ -2,7 +2,6 @@ use crate::block::{
     BlockBehaviour, CanPlaceAtArgs, GetStateForNeighborUpdateArgs, OnPlaceArgs, OnScheduledTickArgs,
 };
 use crate::entity::EntityBase;
-use crate::world::World;
 use pumpkin_data::BlockStateId;
 use pumpkin_data::block_properties::{Facing, LadderLikeProperties};
 use pumpkin_data::{Block, BlockDirection, FacingExt, HorizontalFacingExt};
@@ -14,6 +13,7 @@ use pumpkin_world::tick::TickPriority;
 #[pumpkin_block("minecraft:ladder")]
 pub struct LadderBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for LadderBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let clicked_pos = args.use_item_on.position;
@@ -77,9 +77,16 @@ impl BlockBehaviour for LadderBlock {
     }
 
     fn on_scheduled_tick(&self, args: OnScheduledTickArgs<'_>) {
+        crate::block::neighbor::apply_legacy_scheduled_intent(self, args);
+    }
+
+    fn scheduled_tick_intent(
+        &self,
+        args: crate::block::ScheduledTickIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
         let state_id = args.world.get_block_state_id(args.position);
         if Block::from_state_id(state_id) != &Block::LADDER {
-            return;
+            return Some(Vec::new());
         }
         let props = LadderLikeProperties::from_state_id(state_id);
         if !can_place_ladder_at(
@@ -87,9 +94,23 @@ impl BlockBehaviour for LadderBlock {
             args.position,
             props.facing.to_block_direction().opposite(),
         ) {
-            args.world
-                .schedule_block_tick(args.block, *args.position, 1, TickPriority::Normal);
+            return Some(vec![
+                crate::block::neighbor::BlockCallbackEffect::ScheduleBlock {
+                    position: *args.position,
+                    block: args.block.id,
+                    delay: 1,
+                    priority: TickPriority::Normal,
+                },
+            ]);
         }
+        Some(Vec::new())
+    }
+
+    fn callback_intent(
+        &self,
+        args: crate::block::neighbor::BlockCallbackIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        crate::block::neighbor::support_callback_intent(self, args)
     }
 }
 #[must_use]
@@ -102,7 +123,11 @@ pub const fn horizontal_facing_from_offset(offset: Vector3<i32>) -> Option<Block
         _ => None,
     }
 }
-fn can_place_ladder_at(world: &World, block_pos: &BlockPos, facing: BlockDirection) -> bool {
+fn can_place_ladder_at(
+    world: &dyn pumpkin_world::world::BlockAccessor,
+    block_pos: &BlockPos,
+    facing: BlockDirection,
+) -> bool {
     world
         .get_block_state(&block_pos.offset(facing.to_offset()))
         .is_side_solid(facing.opposite())

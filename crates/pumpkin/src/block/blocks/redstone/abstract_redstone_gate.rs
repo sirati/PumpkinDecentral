@@ -65,7 +65,7 @@ pub trait RedstoneGateBlock<T: Send + Sync + BlockProperties + RedstoneGateBlock
         self.get_weak_redstone_power(args)
     }
 
-    fn get_output_level(&self, world: &World, pos: BlockPos) -> u8;
+    fn get_output_level(&self, world: &dyn crate::block::RedstonePowerWorld, pos: BlockPos) -> u8;
 
     fn on_neighbor_update(&self, args: OnNeighborUpdateArgs<'_>)
     where
@@ -105,7 +105,7 @@ pub trait RedstoneGateBlock<T: Send + Sync + BlockProperties + RedstoneGateBlock
 
     fn get_max_input_level_sides(
         &self,
-        world: &World,
+        world: &dyn crate::block::NeighborUpdateWorld,
         pos: BlockPos,
         state_id: BlockStateId,
         block: &Block,
@@ -114,9 +114,9 @@ pub trait RedstoneGateBlock<T: Send + Sync + BlockProperties + RedstoneGateBlock
         let props = T::from_state_id(state_id, block);
         let facing = props.get_facing();
 
-        let power_left = get_power_on_side(world, &pos, facing.rotate_clockwise(), only_gate);
+        let power_left = world.get_power_on_side(&pos, facing.rotate_clockwise(), only_gate);
         let power_right =
-            get_power_on_side(world, &pos, facing.rotate_counter_clockwise(), only_gate);
+            world.get_power_on_side(&pos, facing.rotate_counter_clockwise(), only_gate);
 
         std::cmp::max(power_left, power_right)
     }
@@ -205,7 +205,7 @@ pub trait RedstoneGateBlock<T: Send + Sync + BlockProperties + RedstoneGateBlock
 }
 
 pub fn get_power<T: BlockProperties + RedstoneGateBlockProperties + Send>(
-    world: &World,
+    world: &dyn crate::block::RedstonePowerWorld,
     pos: BlockPos,
     state_id: BlockStateId,
     block: &Block,
@@ -234,7 +234,7 @@ pub fn get_power<T: BlockProperties + RedstoneGateBlockProperties + Send>(
 }
 
 pub fn get_power_on_side(
-    world: &World,
+    world: &dyn crate::block::RedstonePowerWorld,
     pos: &BlockPos,
     side: HorizontalFacing,
     only_gate: bool,
@@ -245,7 +245,7 @@ pub fn get_power_on_side(
 
     if only_gate {
         if is_diode(side_block) {
-            world.block_registry.get_strong_redstone_power(
+            world.power_registry().get_strong_redstone_power(
                 side_block,
                 world,
                 &side_pos,
@@ -261,10 +261,10 @@ pub fn get_power_on_side(
         let props = RedstoneWireLikeProperties::from_state_id(side_state.id);
         props.power
     } else if world
-        .block_registry
+        .power_registry()
         .emits_redstone_power(side_block, side_state, side_direction)
     {
-        world.block_registry.get_strong_redstone_power(
+        world.power_registry().get_strong_redstone_power(
             side_block,
             world,
             &side_pos,

@@ -77,7 +77,7 @@ trait CropBlockBase: PlantBlockBase {
         let (block, state) = world.get_block_and_state_id(pos);
         let age = self.get_age(state, block);
         if age < self.max_age() {
-            let f = get_available_moisture(world, pos, block);
+            let f = get_available_moisture(world.as_ref(), pos, block);
             if rand::rng().random_range(0..=(25.0 / f).floor() as i64) == 0 {
                 let new_state_id = self.state_with_age(block, state, age + 1);
                 if let Some(server) = world.server.upgrade() {
@@ -103,7 +103,7 @@ trait CropBlockBase: PlantBlockBase {
     }
 }
 
-pub fn get_available_moisture(world: &World, pos: &BlockPos, block: &Block) -> f32 {
+pub fn get_available_moisture(world: &dyn BlockAccessor, pos: &BlockPos, block: &Block) -> f32 {
     let mut moisture = 1.0;
     let down_pos = pos.down();
 
@@ -111,8 +111,9 @@ pub fn get_available_moisture(world: &World, pos: &BlockPos, block: &Block) -> f
         for dz in -1..=1 {
             let mut local_moisture = 0.0;
 
-            let (block, block_state) =
-                world.get_block_and_state_id(&down_pos.offset(Vector3 { x: dx, y: 0, z: dz }));
+            let block_state =
+                world.get_block_state_id(&down_pos.offset(Vector3 { x: dx, y: 0, z: dz }));
+            let block = block_state.to_block();
             if block == &Block::FARMLAND {
                 local_moisture = 1.0;
                 let props = FarmlandProperties::from_state_id(block_state);

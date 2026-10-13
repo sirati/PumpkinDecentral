@@ -21,6 +21,7 @@ impl ItemMetadata for TridentItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for TridentItem {
     fn normal_use(&self, _item: &Item, player: &Player) {
         let inventory = player.inventory();
@@ -144,6 +145,10 @@ impl ItemBehaviour for TridentItem {
         }
 
         player.living_entity.clear_active_hand();
+    }
+
+    fn can_mine_intent(&self, game_mode: u8) -> Option<bool> {
+        Some(game_mode != GameMode::Creative as u8)
     }
 
     fn can_mine(&self, player: &Player) -> bool {

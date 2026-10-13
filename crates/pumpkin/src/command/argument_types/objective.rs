@@ -30,9 +30,7 @@ impl ArgumentType<CommandSource> for ObjectiveArgumentType {
     ) -> Suggestions {
         let scoreboard = context
             .world()
-            .scoreboard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .scoreboard.snapshot();
         for objective_name in scoreboard.get_objectives().keys() {
             builder = builder.filter_and_suggest_one(objective_name.as_str());
         }

@@ -11,6 +11,7 @@ impl ItemMetadata for ShieldItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for ShieldItem {
     fn as_any(&self) -> &dyn Any {
         self

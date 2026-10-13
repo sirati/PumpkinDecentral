@@ -39,6 +39,7 @@ impl BlockMetadata for RedstoneTorchBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for RedstoneTorchBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let world = args.world;
@@ -130,44 +131,81 @@ impl BlockBehaviour for RedstoneTorchBlock {
     }
 
     fn on_neighbor_update(&self, args: OnNeighborUpdateArgs<'_>) {
-        {
-            let state = args.world.get_block_state(args.position);
+        crate::block::neighbor::apply_legacy_neighbor_intent(self, args);
+    }
 
-            if args
+    fn callback_intent(
+        &self,
+        args: crate::block::neighbor::BlockCallbackIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        use crate::block::neighbor::{BlockCallbackEffect, BlockCallbackEvent};
+        let notify_around = || {
+            BlockDirection::all()
+                .into_iter()
+                .map(|direction| BlockCallbackEffect::NotifyNeighbors {
+                    position: args.position.offset(direction.to_offset()),
+                    except: None,
+                })
+                .collect()
+        };
+        match args.event {
+            BlockCallbackEvent::Placed { .. } | BlockCallbackEvent::StateReplaced { .. } => {
+                return Some(notify_around());
+            }
+            BlockCallbackEvent::Prepare { .. } => return Some(Vec::new()),
+            BlockCallbackEvent::Neighbor { .. } | BlockCallbackEvent::Scheduled => {}
+        }
+        let state = args.world.get_block_state_id(args.position);
+        if state.to_block_id() != args.block.id {
+            return Some(Vec::new());
+        }
+        let (lit, direction) = if args.block == &Block::REDSTONE_WALL_TORCH {
+            let properties = RWallTorchProps::from_state_id(state);
+            (
+                properties.lit,
+                properties.facing.to_block_direction().opposite(),
+            )
+        } else if args.block == &Block::REDSTONE_TORCH {
+            (RTorchProps::from_state_id(state).lit, BlockDirection::Down)
+        } else {
+            return None;
+        };
+        if matches!(args.event, BlockCallbackEvent::Neighbor { .. })
+            && args
                 .world
                 .is_block_tick_scheduled(args.position, args.block)
-            {
-                return;
-            }
-
-            if args.block == &Block::REDSTONE_WALL_TORCH {
-                let props = RWallTorchProps::from_state_id(state.id);
-                if props.lit
-                    != should_be_lit(
-                        args.world,
-                        args.position,
-                        props.facing.to_block_direction().opposite(),
-                    )
-                {
-                    args.world.schedule_block_tick(
-                        args.block,
-                        *args.position,
-                        2,
-                        TickPriority::Normal,
-                    );
-                }
-            } else if args.block == &Block::REDSTONE_TORCH {
-                let props = RTorchProps::from_state_id(state.id);
-                if props.lit != should_be_lit(args.world, args.position, BlockDirection::Down) {
-                    args.world.schedule_block_tick(
-                        args.block,
-                        *args.position,
-                        2,
-                        TickPriority::Normal,
-                    );
-                }
-            }
+        {
+            return Some(Vec::new());
         }
+        let support = args.position.offset(direction.to_offset());
+        let should_be_lit = args.world.get_directional_power(&support, direction) == 0;
+        if lit == should_be_lit {
+            return Some(Vec::new());
+        }
+        if matches!(args.event, BlockCallbackEvent::Neighbor { .. }) {
+            return Some(vec![BlockCallbackEffect::ScheduleBlock {
+                position: *args.position,
+                block: args.block.id,
+                delay: 2,
+                priority: TickPriority::Normal,
+            }]);
+        }
+        let after = if args.block == &Block::REDSTONE_WALL_TORCH {
+            let mut properties = RWallTorchProps::from_state_id(state);
+            properties.lit = should_be_lit;
+            properties.to_state_id(args.block)
+        } else {
+            let mut properties = RTorchProps::from_state_id(state);
+            properties.lit = should_be_lit;
+            properties.to_state_id(args.block)
+        };
+        let mut effects = vec![BlockCallbackEffect::SetBlock {
+            position: *args.position,
+            state: after,
+            flags: BlockFlags::NOTIFY_ALL,
+        }];
+        effects.extend(notify_around());
+        Some(effects)
     }
 
     fn emits_redstone_power(&self, _args: EmitsRedstonePowerArgs<'_>) -> bool {
@@ -206,37 +244,20 @@ impl BlockBehaviour for RedstoneTorchBlock {
         0
     }
 
+    fn scheduled_tick_intent(
+        &self,
+        args: crate::block::ScheduledTickIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        self.callback_intent(crate::block::neighbor::BlockCallbackIntentArgs {
+            world: args.world,
+            block: args.block,
+            position: args.position,
+            event: crate::block::neighbor::BlockCallbackEvent::Scheduled,
+        })
+    }
+
     fn on_scheduled_tick(&self, args: OnScheduledTickArgs<'_>) {
-        let (block, state) = args.world.get_block_and_state(args.position);
-        if block == &Block::REDSTONE_WALL_TORCH {
-            let mut props = RWallTorchProps::from_state_id(state.id);
-            let should_be_lit_now = should_be_lit(
-                args.world,
-                args.position,
-                props.facing.to_block_direction().opposite(),
-            );
-            if props.lit != should_be_lit_now {
-                props.lit = should_be_lit_now;
-                args.world.set_block_state(
-                    args.position,
-                    props.to_state_id(block),
-                    BlockFlags::NOTIFY_ALL,
-                );
-                update_neighbors(args.world, args.position);
-            }
-        } else if block == &Block::REDSTONE_TORCH {
-            let mut props = RTorchProps::from_state_id(state.id);
-            let should_be_lit_now = should_be_lit(args.world, args.position, BlockDirection::Down);
-            if props.lit != should_be_lit_now {
-                props.lit = should_be_lit_now;
-                args.world.set_block_state(
-                    args.position,
-                    props.to_state_id(block),
-                    BlockFlags::NOTIFY_ALL,
-                );
-                update_neighbors(args.world, args.position);
-            }
-        }
+        crate::block::neighbor::apply_legacy_scheduled_intent(self, args);
     }
 
     fn placed(&self, args: PlacedArgs<'_>) {
@@ -265,4 +286,84 @@ fn can_place_at(world: &dyn BlockAccessor, block_pos: &BlockPos, facing: BlockDi
     world
         .get_block_state(&block_pos.offset(facing.to_offset()))
         .is_side_solid(facing.opposite())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::neighbor::{
+        BlockCallbackEffect, BlockCallbackEvent, BlockCallbackIntentArgs, CapturedNumericPower,
+        NeighborFact, NeighborSnapshot, NeighborTranscript,
+    };
+
+    #[test]
+    fn powered_support_schedules_then_switches_off_without_duplicate_neighbor_tick() {
+        let position = BlockPos::new(0, 80, 0);
+        let support = position.down();
+        let mut properties = RTorchProps::default(&Block::REDSTONE_TORCH);
+        properties.lit = true;
+        let mut snapshot = NeighborSnapshot::default();
+        snapshot
+            .blocks
+            .insert(position, properties.to_state_id(&Block::REDSTONE_TORCH));
+        snapshot
+            .blocks
+            .insert(support, Block::REDSTONE_BLOCK.default_state.id);
+        snapshot
+            .scheduled
+            .insert((position, u16::from(Block::REDSTONE_TORCH.id)), false);
+        snapshot.directional_power.insert(
+            (support, BlockDirection::Down as u8),
+            CapturedNumericPower {
+                value: 15,
+                reads: vec![(support, Block::REDSTONE_BLOCK.default_state.id)],
+                entity_reads: Vec::new(),
+            },
+        );
+        let evaluate = |snapshot, event| {
+            let view = NeighborTranscript::new(snapshot, 64).unwrap();
+            let result = RedstoneTorchBlock
+                .callback_intent(BlockCallbackIntentArgs {
+                    world: &view,
+                    block: &Block::REDSTONE_TORCH,
+                    position: &position,
+                    event,
+                })
+                .unwrap();
+            (result, view.finish().unwrap().0)
+        };
+        let neighbor = BlockCallbackEvent::Neighbor {
+            source: Block::REDSTONE_BLOCK.id,
+            notify: true,
+        };
+        let (pending, facts) = evaluate(snapshot.clone(), neighbor);
+        assert_eq!(
+            pending,
+            vec![BlockCallbackEffect::ScheduleBlock {
+                position,
+                block: Block::REDSTONE_TORCH.id,
+                delay: 2,
+                priority: TickPriority::Normal,
+            }]
+        );
+        assert!(facts.contains(&NeighborFact::Block(
+            support,
+            Block::REDSTONE_BLOCK.default_state.id
+        )));
+        snapshot
+            .scheduled
+            .insert((position, u16::from(Block::REDSTONE_TORCH.id)), true);
+        assert!(evaluate(snapshot.clone(), neighbor).0.is_empty());
+        let (switched, _) = evaluate(snapshot, BlockCallbackEvent::Scheduled);
+        let BlockCallbackEffect::SetBlock { state, .. } = switched[0] else {
+            panic!("missing torch transition");
+        };
+        assert!(!RTorchProps::from_state_id(state).lit);
+        assert_eq!(switched.len(), 7);
+        assert!(
+            switched[1..]
+                .iter()
+                .all(|effect| matches!(effect, BlockCallbackEffect::NotifyNeighbors { .. }))
+        );
+    }
 }

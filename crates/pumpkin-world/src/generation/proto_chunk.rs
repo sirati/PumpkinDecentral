@@ -124,6 +124,7 @@ impl FluidLevelSamplerImpl for StandardChunkFluidLevelSampler {
 }
 
 pub struct ProtoChunk {
+    pub origin: crate::chunk::ChunkOrigin,
     pub x: i32,
     pub z: i32,
     pub default_block: &'static BlockState,
@@ -220,6 +221,7 @@ impl ProtoChunk {
 
         let default_heightmap = [i16::MIN; CHUNK_AREA];
         Self {
+            origin: crate::chunk::ChunkOrigin::FreshGenerated,
             x,
             z,
             default_block,
@@ -264,6 +266,7 @@ impl ProtoChunk {
         generator: &super::generator::WorldGenerator,
     ) -> Self {
         let mut proto_chunk = Self::new(chunk_data.x, chunk_data.z, generator);
+        proto_chunk.origin = chunk_data.origin;
 
         proto_chunk.light = chunk_data
             .light_engine

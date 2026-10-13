@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::chunks::{ChunkAdvert, ChunkDrop, Directory};
 use crate::protocol::{ChunkKey, StreamKind};
 
-pub const CLUSTER_PROTOCOL_VERSION: u16 = 26;
+pub const CLUSTER_PROTOCOL_VERSION: u16 = 68;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClusterNodeRole {
@@ -167,6 +167,7 @@ pub struct JoinHello {
     pub candidate: u16,
     /// Certificate fingerprint receivers pin against.
     pub cert_fingerprint: [u8; 32],
+    pub incarnation: u64,
     pub protocol_version: u16,
     pub role: ClusterNodeRole,
 }
@@ -430,10 +431,16 @@ impl ClusterState {
 
     /// Builds this peer's hello announcement.
     #[must_use]
-    pub const fn hello(&self, cert_fingerprint: [u8; 32], role: ClusterNodeRole) -> JoinHello {
+    pub const fn hello(
+        &self,
+        cert_fingerprint: [u8; 32],
+        incarnation: u64,
+        role: ClusterNodeRole,
+    ) -> JoinHello {
         JoinHello {
             candidate: self.local,
             cert_fingerprint,
+            incarnation,
             protocol_version: CLUSTER_PROTOCOL_VERSION,
             role,
         }
@@ -550,17 +557,7 @@ impl ClusterState {
         self.membership.remove(peer);
         self.votes.discard_candidate(peer);
         self.votes.discard_voter(peer);
-        let mut touched: Vec<ChunkKey> = Vec::new();
-        for (chunk, holders) in self.directory.holders.iter_mut() {
-            if holders.remove(&peer) {
-                touched.push(*chunk);
-            }
-        }
-        touched.sort_by(|left, right| left.cmp(right));
-        self.directory
-            .holders
-            .retain(|_, holders| !holders.is_empty());
-        touched
+        self.directory.drop_holder(peer)
     }
 
     /// Lists chunk holders in deterministic order.
@@ -714,6 +711,7 @@ mod tests {
             JoinHandshake::Hello(JoinHello {
                 candidate: 4,
                 cert_fingerprint: [9_u8; 32],
+                incarnation: 7,
                 protocol_version: CLUSTER_PROTOCOL_VERSION,
                 role: ClusterNodeRole::Secondary,
             }),
@@ -750,6 +748,7 @@ mod tests {
         let hello = JoinHello {
             candidate,
             cert_fingerprint: [7_u8; 32],
+            incarnation: 7,
             protocol_version: CLUSTER_PROTOCOL_VERSION,
             role: ClusterNodeRole::Secondary,
         };

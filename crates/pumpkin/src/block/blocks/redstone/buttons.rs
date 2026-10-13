@@ -77,7 +77,95 @@ fn click_button(world: &Arc<World>, block_pos: &BlockPos) -> bool {
 #[pumpkin_block_from_tag("minecraft:buttons")]
 pub struct ButtonBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for ButtonBlock {
+    fn placement_intent(
+        &self,
+        args: crate::block::PlacementIntentArgs<'_>,
+    ) -> Option<BlockStateId> {
+        let mut properties = ButtonLikeProperties::default(args.block);
+        properties.face = match args.direction {
+            BlockDirection::Up => AttachFace::Ceiling,
+            BlockDirection::Down => AttachFace::Floor,
+            _ => AttachFace::Wall,
+        };
+        properties.facing = if matches!(args.direction, BlockDirection::Up | BlockDirection::Down) {
+            args.facing
+        } else {
+            args.direction.opposite().to_cardinal_direction()
+        };
+        let direction = properties.get_direction();
+        let offset = direction.to_offset();
+        let support = BlockPos::new(
+            args.position.0.x.checked_add(offset.x)?,
+            args.position.0.y.checked_add(offset.y)?,
+            args.position.0.z.checked_add(offset.z)?,
+        );
+        args.world
+            .get_block_state(&support)
+            .is_side_solid(direction.opposite())
+            .then(|| properties.to_state_id(args.block))
+    }
+
+    fn normal_use_intent(
+        &self,
+        args: crate::block::NormalUseIntentArgs<'_>,
+    ) -> Option<(
+        BlockActionResult,
+        Vec<crate::block::neighbor::BlockCallbackEffect>,
+    )> {
+        use crate::block::neighbor::BlockCallbackEffect;
+        if !args.can_modify_world {
+            return Some((BlockActionResult::Pass, Vec::new()));
+        }
+        let state = args.world.get_block_state_id(args.position);
+        let mut properties = ButtonLikeProperties::from_state_id(state);
+        if properties.powered {
+            return Some((BlockActionResult::Consume, Vec::new()));
+        }
+        properties.powered = true;
+        let offset = properties.get_direction().opposite().to_offset();
+        let attached = BlockPos::new(
+            args.position.0.x.checked_add(offset.x)?,
+            args.position.0.y.checked_add(offset.y)?,
+            args.position.0.z.checked_add(offset.z)?,
+        );
+        Some((
+            BlockActionResult::Success,
+            vec![
+                BlockCallbackEffect::SetBlock {
+                    position: *args.position,
+                    state: properties.to_state_id(args.block),
+                    flags: BlockFlags::NOTIFY_ALL,
+                },
+                BlockCallbackEffect::ScheduleBlock {
+                    position: *args.position,
+                    block: args.block.id,
+                    delay: if args.block == &Block::STONE_BUTTON {
+                        20
+                    } else {
+                        30
+                    },
+                    priority: TickPriority::Normal,
+                },
+                BlockCallbackEffect::NotifyNeighbors {
+                    position: *args.position,
+                    except: None,
+                },
+                BlockCallbackEffect::NotifyNeighbors {
+                    position: attached,
+                    except: None,
+                },
+                BlockCallbackEffect::Sound {
+                    position: *args.position,
+                    sound: get_sound(args.block, true),
+                    volume_milli: 1000,
+                    pitch_milli: 1000,
+                },
+            ],
+        ))
+    }
+
     fn normal_use(&self, args: NormalUseArgs<'_>) -> BlockActionResult {
         if click_button(args.world, args.position) {
             BlockActionResult::Success
@@ -87,34 +175,93 @@ impl BlockBehaviour for ButtonBlock {
     }
 
     fn on_scheduled_tick(&self, args: OnScheduledTickArgs<'_>) {
-        let state = args.world.get_block_state(args.position);
-        let mut props = ButtonLikeProperties::from_state_id(state.id);
-        if props.powered {
-            props.powered = false;
-            let released_button_state = props.to_state_id(args.block);
-            let replaced_release_state = args.world.set_block_state(
-                args.position,
-                released_button_state,
-                BlockFlags::NOTIFY_ALL,
-            );
-            crate::server::cluster_world_delta::emit_redstone_write(
-                args.world,
-                args.position,
-                args.position,
-                replaced_release_state.as_u16(),
-                released_button_state.as_u16(),
-            );
-            Self::update_neighbors(args.world, args.position, props);
-            args.world.play_block_sound(
-                get_sound(args.block, false),
-                SoundCategory::Blocks,
-                *args.position,
-            );
-        }
+        crate::block::neighbor::apply_legacy_scheduled_intent(self, args);
     }
 
     fn emits_redstone_power(&self, _args: EmitsRedstonePowerArgs<'_>) -> bool {
         true
+    }
+
+    fn scheduled_tick_intent(
+        &self,
+        args: crate::block::ScheduledTickIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        use crate::block::neighbor::BlockCallbackEffect;
+        let state = args.world.get_block_state_id(args.position);
+        let mut properties = ButtonLikeProperties::from_state_id(state);
+        if !properties.powered {
+            return Some(Vec::new());
+        }
+        properties.powered = false;
+        let offset = properties.get_direction().opposite().to_offset();
+        let attached = BlockPos::new(
+            args.position.0.x.checked_add(offset.x)?,
+            args.position.0.y.checked_add(offset.y)?,
+            args.position.0.z.checked_add(offset.z)?,
+        );
+        Some(vec![
+            BlockCallbackEffect::SetBlock {
+                position: *args.position,
+                state: properties.to_state_id(args.block),
+                flags: BlockFlags::NOTIFY_ALL,
+            },
+            BlockCallbackEffect::NotifyNeighbors {
+                position: *args.position,
+                except: None,
+            },
+            BlockCallbackEffect::NotifyNeighbors {
+                position: attached,
+                except: None,
+            },
+            BlockCallbackEffect::Sound {
+                position: *args.position,
+                sound: get_sound(args.block, false),
+                volume_milli: 1000,
+                pitch_milli: 1000,
+            },
+        ])
+    }
+
+    fn callback_intent(
+        &self,
+        args: crate::block::neighbor::BlockCallbackIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        use crate::block::neighbor::{BlockCallbackEffect, BlockCallbackEvent};
+        match args.event {
+            BlockCallbackEvent::Scheduled => {
+                self.scheduled_tick_intent(crate::block::ScheduledTickIntentArgs {
+                    world: args.world,
+                    block: args.block,
+                    position: args.position,
+                })
+            }
+            BlockCallbackEvent::StateReplaced {
+                old_state,
+                moved: false,
+            } => {
+                let properties = ButtonLikeProperties::from_state_id(old_state);
+                if !properties.powered {
+                    return Some(Vec::new());
+                }
+                let offset = properties.get_direction().opposite().to_offset();
+                let attached = BlockPos::new(
+                    args.position.0.x.checked_add(offset.x)?,
+                    args.position.0.y.checked_add(offset.y)?,
+                    args.position.0.z.checked_add(offset.z)?,
+                );
+                Some(vec![
+                    BlockCallbackEffect::NotifyNeighbors {
+                        position: *args.position,
+                        except: None,
+                    },
+                    BlockCallbackEffect::NotifyNeighbors {
+                        position: attached,
+                        except: None,
+                    },
+                ])
+            }
+            _ => Some(Vec::new()),
+        }
     }
 
     fn get_weak_redstone_power(&self, args: GetRedstonePowerArgs<'_>) -> u8 {
@@ -132,12 +279,7 @@ impl BlockBehaviour for ButtonBlock {
     }
 
     fn on_state_replaced(&self, args: OnStateReplacedArgs<'_>) {
-        if !args.moved {
-            let button_props = ButtonLikeProperties::from_state_id(args.old_state_id);
-            if button_props.powered {
-                Self::update_neighbors(args.world, args.position, button_props);
-            }
-        }
+        crate::block::neighbor::apply_legacy_replaced_intent(self, args);
     }
 
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {

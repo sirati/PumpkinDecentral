@@ -76,6 +76,7 @@ impl ScreenHandlerFactory for BlastingFurnaceScreenFactory {
 #[pumpkin_block("minecraft:blast_furnace")]
 pub struct BlastFurnaceBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for BlastFurnaceBlock {
     fn normal_use(&self, args: NormalUseArgs<'_>) -> BlockActionResult {
         if let Some(factory) = self.get_screen_handler_factory(GetScreenHandlerFactoryArgs {

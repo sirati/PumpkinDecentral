@@ -211,7 +211,16 @@ mod tests {
     fn replica(actor: GlobalPlayerId, world: WorldId, x: f64) -> PlayerReplicaSnapshot {
         PlayerReplicaSnapshot {
             movement: PosUpdate {
+                spatial_epoch: pumpkin_cluster::canonical_action::SpatialEpoch::Admission {
+                    lease: pumpkin_cluster::canonical_action::LivePlayerLease {
+                        key: pumpkin_cluster::canonical_action::PlayerKey(uuid::Uuid::nil()),
+                        gid: actor,
+                        incarnation: 1,
+                    },
+                    admitted_at: TickStamp(1),
+                },
                 gid: actor,
+                incarnation: 1,
                 seq: PlayerSeq(1),
                 tick: TickStamp(1),
                 world,

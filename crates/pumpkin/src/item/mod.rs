@@ -65,6 +65,10 @@ pub trait ItemBehaviour: Send + Sync {
         true
     }
 
+    fn can_mine_intent(&self, _game_mode: u8) -> Option<bool> {
+        None
+    }
+
     fn get_start_and_end_pos(&self, player: &Player) -> (Vector3<f64>, Vector3<f64>) {
         let start_pos = player.eye_position();
         let (yaw, pitch) = player.rotation();

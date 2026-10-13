@@ -13,6 +13,7 @@ use pumpkin_world::world::{BlockAccessor, BlockFlags};
 #[pumpkin_block("minecraft:small_dripleaf")]
 pub struct SmallDripleafBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for SmallDripleafBlock {
     fn can_place_at(&self, args: CanPlaceAtArgs<'_>) -> bool {
         <Self as PlantBlockBase>::can_place_at(self, args.block_accessor, args.position)

@@ -77,6 +77,7 @@ impl BrushableBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for BrushableBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let props = SuspiciousSandLikeProperties::default(args.block);

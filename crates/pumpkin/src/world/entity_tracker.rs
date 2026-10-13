@@ -139,11 +139,12 @@ impl TrackedEntity {
         let is_visible = dist_sq <= range_sq
             && self.broadcast_to_player(player, world)
             && in_view
-            && player
-                .chunk_sender
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_chunk_ready(&entity_chunk);
+            && player.ready_chunk_view.load().contains(
+                player
+                    .chunk_send_epoch
+                    .load(std::sync::atomic::Ordering::Acquire),
+                &entity_chunk,
+            );
 
         if is_visible {
             if self.seen_by.insert(player.gameprofile.id) {

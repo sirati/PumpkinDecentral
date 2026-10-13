@@ -126,7 +126,7 @@ impl JavaClient {
             return;
         } else {
             let dynamic_id = target_id - crafting_display_count - cooking_display_count;
-            let Some(DynamicRecipe::Crafting(crafting)) = dynamic_recipes.get(dynamic_id) else {
+            let Some(DynamicRecipe::Crafting(crafting)) = dynamic_recipes.iter().filter(|recipe| !matches!(recipe, DynamicRecipe::Brewing(_))).nth(dynamic_id) else {
                 return;
             };
 
@@ -258,6 +258,7 @@ pub(crate) fn process_cluster_place_recipe(
     display_id: i32,
     use_max: bool,
     input_sequence: pumpkin_cluster::identity::PlayerSeq,
+    recipes: Arc<Vec<crate::server::recipe::DynamicRecipe>>,
 ) -> Result<(), pumpkin_cluster::inventory::InventoryApplyError> {
     use crate::net::java::recipe_helper::GenericIngredient;
     use crate::server::recipe::DynamicRecipe;
@@ -267,7 +268,6 @@ pub(crate) fn process_cluster_place_recipe(
         RecipePlacementIngredient,
     };
     use pumpkin_data::recipes::{CraftingRecipeTypes, RECIPES_COOKING, RECIPES_CRAFTING};
-    use pumpkin_inventory::crafting::recipe_provider::RecipeProvider;
 
     let server = player
         .world()
@@ -277,15 +277,6 @@ pub(crate) fn process_cluster_place_recipe(
     let actor = player
         .cluster_gid()
         .ok_or(InventoryApplyError::TargetUnavailable)?;
-    let mut event = crate::plugin::api::events::player::player_recipe_book_click::PlayerRecipeBookClickEvent::new(
-        player.clone(),
-        format!("display_{display_id}"),
-        use_max,
-    );
-    server.plugin_manager.fire_blocking(&server, &mut event);
-    if event.cancelled {
-        return Err(InventoryApplyError::Rejected);
-    }
     let session = InventoryScreenSession {
         actor,
         session: player
@@ -303,16 +294,6 @@ pub(crate) fn process_cluster_place_recipe(
     };
     let grid_size = grid_width * grid_width;
     let player_target = InventoryTarget::Player(actor);
-    let player_snapshot = crate::server::cluster_invsee::inventory_snapshot(&server, player_target)
-        .ok_or(InventoryApplyError::TargetUnavailable)?;
-    let mut available_items = player_snapshot
-        .cells
-        .iter()
-        .filter(|cell| cell.loc.inv == INV_MAIN && !cell.is_empty())
-        .map(|cell| cell.item)
-        .collect::<Vec<_>>();
-    available_items.sort_unstable();
-    available_items.dedup();
     let target_id = usize::try_from(display_id).map_err(|_| InventoryApplyError::Rejected)?;
     let crafting_display_count = RECIPES_CRAFTING
         .iter()
@@ -325,9 +306,7 @@ pub(crate) fn process_cluster_place_recipe(
         })
         .count();
     let matching_items = |ingredient: GenericIngredient<'_>| {
-        available_items
-            .iter()
-            .copied()
+        (0..=u16::MAX)
             .filter(|item| {
                 pumpkin_data::item::Item::from_id(*item)
                     .is_some_and(|item| ingredient.match_item(item))
@@ -354,6 +333,11 @@ pub(crate) fn process_cluster_place_recipe(
             .ok_or(InventoryApplyError::Rejected)?;
         match recipe {
             CraftingRecipeTypes::CraftingShaped { pattern, key, .. } => {
+                if pattern.len() > grid_width
+                    || pattern.iter().any(|row| row.chars().count() > grid_width)
+                {
+                    return Err(InventoryApplyError::Rejected);
+                }
                 for (row, value) in pattern.iter().enumerate() {
                     for (column, character) in value.chars().enumerate() {
                         if character != ' '
@@ -369,6 +353,9 @@ pub(crate) fn process_cluster_place_recipe(
                 }
             }
             CraftingRecipeTypes::CraftingShapeless { ingredients, .. } => {
+                if ingredients.len() > grid_size {
+                    return Err(InventoryApplyError::Rejected);
+                }
                 for (index, ingredient) in ingredients.iter().enumerate().take(grid_size) {
                     layout[index] = Some(matching_items(GenericIngredient::Vanilla(ingredient)));
                 }
@@ -387,9 +374,8 @@ pub(crate) fn process_cluster_place_recipe(
             return Err(InventoryApplyError::Rejected);
         }
         let dynamic_id = target_id - crafting_display_count - cooking_display_count;
-        let recipes = server.recipe_manager.get_dynamic_recipes();
-        let DynamicRecipe::Crafting(recipe) = recipes
-            .get(dynamic_id)
+        let DynamicRecipe::Crafting(recipe) = recipes.iter().filter(|recipe| !matches!(recipe, DynamicRecipe::Brewing(_)))
+            .nth(dynamic_id)
             .ok_or(InventoryApplyError::Rejected)?
         else {
             return Err(InventoryApplyError::Rejected);
@@ -398,6 +384,11 @@ pub(crate) fn process_cluster_place_recipe(
             pumpkin_protocol::codec::recipe::OwnedCraftingRecipe::Shaped {
                 pattern, key, ..
             } => {
+                if pattern.len() > grid_width
+                    || pattern.iter().any(|row| row.chars().count() > grid_width)
+                {
+                    return Err(InventoryApplyError::Rejected);
+                }
                 for (row, value) in pattern.iter().enumerate() {
                     for (column, character) in value.chars().enumerate() {
                         if character != ' '
@@ -414,6 +405,9 @@ pub(crate) fn process_cluster_place_recipe(
             pumpkin_protocol::codec::recipe::OwnedCraftingRecipe::Shapeless {
                 ingredients, ..
             } => {
+                if ingredients.len() > grid_size {
+                    return Err(InventoryApplyError::Rejected);
+                }
                 for (index, ingredient) in ingredients.iter().enumerate().take(grid_size) {
                     layout[index] = Some(matching_items(GenericIngredient::Dynamic(ingredient)));
                 }

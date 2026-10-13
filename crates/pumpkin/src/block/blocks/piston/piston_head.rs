@@ -13,6 +13,7 @@ pub(crate) type PistonHeadProperties = pumpkin_data::block_properties::PistonHea
 #[pumpkin_block("minecraft:piston_head")]
 pub struct PistonHeadBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for PistonHeadBlock {
     fn broken(&self, args: BrokenArgs<'_>) {
         let props = PistonHeadProperties::from_state_id(args.state.id);

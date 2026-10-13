@@ -56,7 +56,6 @@ use pumpkin_protocol::{
         MetadataSerializer,
     },
 };
-use pumpkin_util::math::vector3::Axis;
 use pumpkin_util::math::{
     boundingbox::{BoundingBox, EntityDimensions},
     get_section_cord,
@@ -68,7 +67,7 @@ use pumpkin_util::math::{
 use pumpkin_util::text::TextComponent;
 use pumpkin_util::text::hover::HoverEvent;
 use pumpkin_util::version::JavaMinecraftVersion;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::sync::{
     Arc,
     atomic::{
@@ -265,9 +264,7 @@ pub trait EntityBase: Send + Sync + std::any::Any {
         }
         let world = self.get_entity().world.load();
         let scoreboard = world
-            .scoreboard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .scoreboard.snapshot();
         if scoreboard.get_teams().is_empty() {
             return None;
         }
@@ -285,9 +282,7 @@ pub trait EntityBase: Send + Sync + std::any::Any {
         }
         let world = self.get_entity().world.load();
         let scoreboard = world
-            .scoreboard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .scoreboard.snapshot();
         if scoreboard.get_teams().is_empty() {
             return None;
         }
@@ -841,6 +836,17 @@ impl RemovalReason {
 // IMPORTANT: have that 1 and not 0 because fetch_add returns previous value and 0 would be invalid
 static CURRENT_ID: AtomicI32 = AtomicI32::new(1);
 
+fn reserve_entity_ids(allocator: &AtomicI32, count: i32) -> Option<i32> {
+    if count <= 0 {
+        return None;
+    }
+    allocator
+        .fetch_update(Relaxed, Relaxed, |next| {
+            (next > 0).then(|| next.checked_add(count)).flatten()
+        })
+        .ok()
+}
+
 /// Represents a non-living Entity (e.g. Item, Egg, Snowball...)
 pub struct Entity {
     /// A unique identifier for the entity
@@ -986,13 +992,19 @@ impl Entity {
     }
 
     pub fn reserve_ids(count: i32) -> i32 {
-        CURRENT_ID.fetch_add(count, Relaxed)
+        Self::try_reserve_ids(count).expect("entity client ID namespace exhausted")
+    }
+
+    pub fn try_reserve_ids(count: i32) -> Option<i32> {
+        reserve_entity_ids(&CURRENT_ID, count)
     }
 
     #[must_use]
-    pub fn cluster_generation(&self) -> u32 {
+    pub fn cluster_generation(&self) -> u64 {
         let bytes = self.entity_uuid.as_bytes();
-        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+        u64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ])
     }
 
     pub fn from_uuid(
@@ -1002,7 +1014,7 @@ impl Entity {
         entity_type: &'static EntityType,
     ) -> Self {
         Self::from_uuid_with_id(
-            CURRENT_ID.fetch_add(1, Relaxed),
+            Self::reserve_ids(1),
             entity_uuid,
             world,
             position,
@@ -1021,16 +1033,35 @@ impl Entity {
         let floor_y = position.y.floor() as i32;
         let floor_z = position.z.floor() as i32;
 
+        let current_biome = world
+            .level
+            .get_rough_biome(&BlockPos::new(floor_x, floor_y, floor_z));
+        Self::from_uuid_with_id_in_biome(
+            entity_id,
+            entity_uuid,
+            world,
+            position,
+            entity_type,
+            current_biome,
+        )
+    }
+
+    pub fn from_uuid_with_id_in_biome(
+        entity_id: i32,
+        entity_uuid: uuid::Uuid,
+        world: Arc<World>,
+        position: Vector3<f64>,
+        entity_type: &'static EntityType,
+        current_biome: &'static pumpkin_data::biome::Biome,
+    ) -> Self {
+        let floor_x = position.x.floor() as i32;
+        let floor_y = position.y.floor() as i32;
+        let floor_z = position.z.floor() as i32;
         let bounding_box_size = EntityDimensions {
             width: entity_type.dimension[0],
             height: entity_type.dimension[1],
             eye_height: entity_type.eye_height,
         };
-
-        let current_biome = world
-            .level
-            .get_rough_biome(&BlockPos::new(floor_x, floor_y, floor_z));
-
         Self {
             entity_id,
             entity_uuid,
@@ -1461,81 +1492,18 @@ impl Entity {
             return movement;
         }
 
-        let mut adjusted_movement = movement;
-
-        // Y-Axis adjustment
-        if movement.get_axis(Axis::Y) != 0.0 {
-            let mut max_time = 1.0;
-            let mut positions = block_positions.into_iter();
-            if let Some((mut collisions_len, mut position)) = positions.next() {
-                let mut supporting_block_pos = None;
-
-                for (i, inert_box) in collisions.iter().enumerate() {
-                    if i == collisions_len {
-                        let Some((next_len, next_pos)) = positions.next() else {
-                            break;
-                        };
-                        collisions_len = next_len;
-                        position = next_pos;
-                    }
-
-                    if let Some(collision_time) = bounding_box.calculate_collision_time(
-                        inert_box,
-                        adjusted_movement,
-                        Axis::Y,
-                        max_time,
-                    ) {
-                        max_time = collision_time;
-
-                        // If the entity is moving downwards and collides, set the supporting block position
-                        if movement.get_axis(Axis::Y) < 0.0 {
-                            supporting_block_pos = Some(position);
-                        }
-                    }
-                }
-
-                if max_time != 1.0 {
-                    let changed_component = adjusted_movement.get_axis(Axis::Y) * max_time;
-                    adjusted_movement.set_axis(Axis::Y, changed_component);
-                }
-
-                self.on_ground
-                    .store(supporting_block_pos.is_some(), Ordering::SeqCst);
-                self.supporting_block_pos.store(supporting_block_pos);
-            }
-        }
-
-        let mut horizontal_collision = false;
-
-        for axis in Axis::horizontal() {
-            if movement.get_axis(axis) == 0.0 {
-                continue;
-            }
-
-            let mut max_time = 1.0;
-
-            for inert_box in &collisions {
-                if let Some(collision_time) = bounding_box.calculate_collision_time(
-                    inert_box,
-                    adjusted_movement,
-                    axis,
-                    max_time,
-                ) {
-                    max_time = collision_time;
-                }
-            }
-
-            if max_time != 1.0 {
-                let changed_component = adjusted_movement.get_axis(axis) * max_time;
-                adjusted_movement.set_axis(axis, changed_component);
-                horizontal_collision = true;
-            }
-        }
-
+        let collision = pumpkin_util::math::collision::resolve_block_movement(
+            bounding_box,
+            movement,
+            &collisions,
+            &block_positions,
+        );
+        self.on_ground
+            .store(collision.supporting_block.is_some(), Ordering::SeqCst);
+        self.supporting_block_pos.store(collision.supporting_block);
         self.horizontal_collision
-            .store(horizontal_collision, Ordering::SeqCst);
-
-        adjusted_movement
+            .store(collision.horizontal_collision, Ordering::SeqCst);
+        collision.movement
     }
 
     /// Applies knockback to the entity, following vanilla Minecraft's mechanics.
@@ -2027,83 +1995,20 @@ impl Entity {
     // updateWaterState() in yarn
 
     fn update_fluid_state(&self, caller: &dyn EntityBase) {
-        let is_pushed = caller.is_pushed_by_fluids();
-        let mut fluids = BTreeMap::new();
-
-        let water_push = Vector3::default();
-
-        let water_n = 0;
-
-        let lava_push = Vector3::default();
-
-        let lava_n = 0;
-
-        let mut fluid_push = [water_push, lava_push];
-
-        let mut fluid_n = [water_n, lava_n];
-
-        let mut in_fluid = [false, false];
-
-        // The maximum fluid height found
-
-        let mut fluid_height: [f64; 2] = [0.0, 0.0];
-
-        let entity_box = self.bounding_box.load();
-        let bounding_box = entity_box.expand(-0.001, -0.001, -0.001);
-
-        let min = bounding_box.min_block_pos();
-
-        let max = bounding_box.max_block_pos();
-
         let world = self.world.load();
-
-        for x in min.0.x..=max.0.x {
-            for y in min.0.y..=max.0.y {
-                for z in min.0.z..=max.0.z {
-                    let pos = BlockPos::new(x, y, z);
-
-                    let (fluid, state) = world.get_fluid_and_fluid_state(&pos);
-
-                    if fluid.id != Fluid::EMPTY.id {
-                        let surface_y =
-                            f64::from(world.get_fluid_height(&pos, fluid, &state)) + f64::from(y);
-
-                        if surface_y >= bounding_box.min.y {
-                            let marginal_height = surface_y - entity_box.min.y;
-                            let i = usize::from(
-                                fluid.id == Fluid::FLOWING_LAVA.id || fluid.id == Fluid::LAVA.id,
-                            );
-
-                            fluid_height[i] = fluid_height[i].max(marginal_height);
-
-                            in_fluid[i] = true;
-
-                            if !is_pushed {
-                                fluids.insert(fluid.id, fluid);
-
-                                continue;
-                            }
-
-                            let mut fluid_velo = world.get_fluid_velocity(pos, fluid, &state);
-
-                            if fluid_height[i] < 0.4 {
-                                fluid_velo = fluid_velo * fluid_height[i];
-                            }
-
-                            fluid_push[i] += fluid_velo;
-
-                            fluid_n[i] += 1;
-
-                            fluids.insert(fluid.id, fluid);
-                        }
-                    }
-                }
-            }
-        }
+        // The maximum fluid height found
+        let sampled = pumpkin_world::fluid_snapshot::sample_entity_fluid_contacts(
+            self.bounding_box.load(),
+            usize::MAX,
+            caller.is_pushed_by_fluids(),
+            |position| Ok::<_, std::convert::Infallible>(world.get_block_state_id(&position)),
+        )
+        .unwrap_or_default();
+        let contacts = sampled.contacts;
 
         // BTreeMap auto-sorts water before lava as in vanilla
 
-        for (_, fluid) in fluids {
+        for fluid in sampled.fluids {
             world
                 .block_registry
                 .on_entity_collision_fluid(fluid, caller);
@@ -2115,13 +2020,13 @@ impl Entity {
             0.002_333_333
         };
 
-        self.push_by_fluid(0.014, fluid_push[0], fluid_n[0]);
+        self.push_by_fluid(0.014, contacts[0].push, contacts[0].samples);
 
-        self.push_by_fluid(lava_speed, fluid_push[1], fluid_n[1]);
+        self.push_by_fluid(lava_speed, contacts[1].push, contacts[1].samples);
 
-        let water_height = fluid_height[0];
+        let water_height = contacts[0].height;
 
-        let in_water = in_fluid[0];
+        let in_water = contacts[0].touching;
 
         if in_water {
             if let Some(living) = caller.get_living_entity() {
@@ -2138,9 +2043,9 @@ impl Entity {
 
         self.touching_water.store(in_water, Ordering::SeqCst);
 
-        let lava_height = fluid_height[1];
+        let lava_height = contacts[1].height;
 
-        let in_lava = in_fluid[1];
+        let in_lava = contacts[1].touching;
 
         if in_lava && let Some(living) = caller.get_living_entity() {
             let halved_fall = living.fall_distance.load() / 2.0;
@@ -2155,26 +2060,16 @@ impl Entity {
         self.touching_lava.store(in_lava, Ordering::SeqCst);
     }
 
-    fn push_by_fluid(&self, speed: f64, mut push: Vector3<f64>, n: usize) {
+    fn push_by_fluid(&self, speed: f64, push: Vector3<f64>, n: usize) {
         if push.length_squared() != 0.0 {
-            if n > 0 {
-                push = push * (1.0 / (n as f64));
-            }
-
-            if self.entity_type != &EntityType::PLAYER {
-                push = push.normalize();
-            }
-
-            push = push * speed;
-
-            let velo = self.velocity.load();
-
-            if velo.x.abs() < 0.003 && velo.z.abs() < 0.003 && velo.length_squared() < 0.000_020_25
-            {
-                push = push.normalize() * 0.0045;
-            }
-
-            self.velocity.store(velo + push);
+            self.velocity
+                .store(pumpkin_util::math::item_motion::apply_fluid_push(
+                    self.velocity.load(),
+                    push,
+                    n,
+                    speed,
+                    self.entity_type != &EntityType::PLAYER,
+                ));
         }
     }
 
@@ -2369,54 +2264,26 @@ impl Entity {
 
         let delta = center_pos.sub(&block_pos.0.to_f64());
 
-        let mut min_dist = f64::MAX;
-
-        let mut direction = BlockDirection::Up;
-
+        let mut full_cube_neighbors = [true; 6];
         for dir in BlockDirection::all() {
             if dir == BlockDirection::Down {
                 continue;
             }
-
             let offset = dir.to_offset();
-
-            if self
+            full_cube_neighbors[usize::from(dir.to_index())] = self
                 .world
                 .load()
                 .get_block_state(&block_pos.offset(offset))
-                .is_full_cube()
-            {
-                continue;
-            }
-
-            let component = delta.get_axis(dir.to_axis().into());
-
-            let dist = if dir.positive() {
-                1.0 - component
-            } else {
-                component
-            };
-
-            if dist < min_dist {
-                min_dist = dist;
-
-                direction = dir;
-            }
+                .is_full_cube();
         }
-
         let amplitude = rand::random::<f64>().mul_add(0.2, 0.1);
-
-        let axis = direction.to_axis().into();
-
-        let sign = if direction.positive() { 1.0 } else { -1.0 };
-
-        let mut velo = self.velocity.load();
-
-        velo = velo * 0.75;
-
-        velo.set_axis(axis, sign * amplitude);
-
-        self.velocity.store(velo);
+        self.velocity
+            .store(pumpkin_world::collision::resolve_block_push_out(
+                delta,
+                self.velocity.load(),
+                full_cube_neighbors,
+                amplitude,
+            ));
     }
 
     fn tick_portal(&self, caller: &dyn EntityBase) {
@@ -2576,7 +2443,7 @@ impl Entity {
             });
 
             if let Some(axis) = source_axis
-                && let Some(portal) = NetherPortal::get_on_axis(&world, &pos, axis)
+                && let Some(portal) = NetherPortal::get_on_axis(&**world, &pos, axis)
                 && portal.was_already_valid()
             {
                 new_manager.set_source_portal(SourcePortalInfo {
@@ -2595,7 +2462,7 @@ impl Entity {
                 let (block, state) = world.get_block_and_state(&pos);
                 if block == &pumpkin_data::Block::NETHER_PORTAL {
                     let props = <pumpkin_data::block_properties::NetherPortalLikeProperties as pumpkin_data::block_properties::BlockProperties>::from_state_id(state.id, block);
-                    if let Some(portal) = NetherPortal::get_on_axis(&world, &pos, props.axis)
+                    if let Some(portal) = NetherPortal::get_on_axis(&**world, &pos, props.axis)
                         && portal.was_already_valid()
                     {
                         manager.set_source_portal(SourcePortalInfo {
@@ -4302,6 +4169,58 @@ impl Entity {
     }
 
     pub fn read_nbt_non_mut(&self, nbt: &NbtCompound) {
+        self.read_nbt_scalars(nbt);
+        if let Some(tag_list) = nbt.get_list("Tags") {
+            let mut tags = self
+                .scoreboard_tags
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            tags.clear();
+            tags.extend(
+                tag_list
+                    .iter()
+                    .filter_map(|tag| tag.extract_string().map(str::to_owned))
+                    .take(MAX_SCOREBOARD_TAGS),
+            );
+        }
+        if let Some(custom_data) = nbt
+            .get_compound("PumpkinCustomData")
+            .or_else(|| nbt.get_compound("BukkitValues"))
+        {
+            *self
+                .custom_data
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = custom_data.clone();
+        }
+    }
+
+    pub(crate) fn read_nbt_off_registry(&mut self, nbt: &NbtCompound) {
+        self.read_nbt_scalars(nbt);
+        if let Some(tag_list) = nbt.get_list("Tags") {
+            let tags = self
+                .scoreboard_tags
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            tags.clear();
+            tags.extend(
+                tag_list
+                    .iter()
+                    .filter_map(|tag| tag.extract_string().map(str::to_owned))
+                    .take(MAX_SCOREBOARD_TAGS),
+            );
+        }
+        if let Some(custom_data) = nbt
+            .get_compound("PumpkinCustomData")
+            .or_else(|| nbt.get_compound("BukkitValues"))
+        {
+            *self
+                .custom_data
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = custom_data.clone();
+        }
+    }
+
+    fn read_nbt_scalars(&self, nbt: &NbtCompound) {
         if let Some(position) = nbt.get_list("Pos")
             && position.len() >= 3
         {
@@ -4352,31 +4271,6 @@ impl Entity {
         }
         self.custom_name_visible
             .store(nbt.get_bool("CustomNameVisible").unwrap_or(false), Relaxed);
-
-        if let Some(tag_list) = nbt.get_list("Tags") {
-            let mut tags = self
-                .scoreboard_tags
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            tags.clear();
-            tags.extend(
-                tag_list
-                    .iter()
-                    .filter_map(|tag| tag.extract_string().map(str::to_owned))
-                    .take(MAX_SCOREBOARD_TAGS),
-            );
-        }
-
-        if let Some(custom_data) = nbt
-            .get_compound("PumpkinCustomData")
-            .or_else(|| nbt.get_compound("BukkitValues"))
-        {
-            let mut data = self
-                .custom_data
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *data = custom_data.clone();
-        }
 
         // todo more...
     }
@@ -4508,6 +4402,22 @@ impl Flag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entity_id_reservation_never_wraps_or_reuses_an_allocated_range() {
+        let allocator = AtomicI32::new(1);
+        assert_eq!(reserve_entity_ids(&allocator, 0), None);
+        assert_eq!(reserve_entity_ids(&allocator, -1), None);
+        assert_eq!(reserve_entity_ids(&allocator, 8), Some(1));
+        assert_eq!(reserve_entity_ids(&allocator, 2), Some(9));
+        assert_eq!(allocator.load(Relaxed), 11);
+        let allocator = AtomicI32::new(i32::MAX - 2);
+        assert_eq!(reserve_entity_ids(&allocator, 3), None);
+        assert_eq!(allocator.load(Relaxed), i32::MAX - 2);
+        assert_eq!(reserve_entity_ids(&allocator, 2), Some(i32::MAX - 2));
+        assert_eq!(reserve_entity_ids(&allocator, 1), None);
+        assert_eq!(allocator.load(Relaxed), i32::MAX);
+    }
 
     #[test]
     fn equipment_break_status_maps_all_slots() {

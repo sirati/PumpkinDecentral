@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     io::{Error, ErrorKind},
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::{Arc, LazyLock},
+    sync::Arc,
     time::Duration,
 };
 
@@ -12,10 +12,7 @@ use aes::{
 };
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use tokio::{
-    net::UdpSocket,
-    sync::{Mutex, mpsc},
-};
+use tokio::{net::UdpSocket, sync::mpsc};
 use tracing::{debug, trace, warn};
 use webrtc::peer_connection::RTCIceCandidateInit;
 
@@ -32,14 +29,16 @@ const SERVER_DATA_VERSION: u8 = 6;
 
 type ConnectionKey = (u64, u64);
 
-static KEY: LazyLock<[u8; 32]> =
-    LazyLock::new(|| Sha256::digest(0xdeadbeefu64.to_le_bytes()).into());
+fn discovery_key() -> [u8; 32] {
+    Sha256::digest(0xdeadbeefu64.to_le_bytes()).into()
+}
 
 pub struct NetherNetDiscovery {
     socket: Arc<UdpSocket>,
     network_id: u64,
     advertisement_id: u64,
-    candidates: Arc<Mutex<HashMap<ConnectionKey, mpsc::UnboundedSender<RTCIceCandidateInit>>>>,
+    candidates: HashMap<ConnectionKey, (tokio::time::Instant, mpsc::Sender<RTCIceCandidateInit>)>,
+    saturated: bool,
 }
 
 impl NetherNetDiscovery {
@@ -53,17 +52,32 @@ impl NetherNetDiscovery {
             socket: Arc::new(socket),
             network_id,
             advertisement_id: rand::random(),
-            candidates: Arc::default(),
+            candidates: HashMap::new(),
+            saturated: false,
         })
     }
 
     pub async fn receive(
-        &self,
+        &mut self,
         server: &Server,
         listener: &NetherNetListener,
         buffer: &mut [u8],
     ) -> Result<(), Error> {
-        let (length, address) = self.socket.recv_from(buffer).await?;
+        self.candidates.retain(|_, (expires, sender)| {
+            *expires > tokio::time::Instant::now() && !sender.is_closed()
+        });
+        let expiry = self.candidates.values().map(|(expires, _)| *expires).min();
+        let (length, address) = if let Some(expiry) = expiry {
+            tokio::select! {
+                packet = self.socket.recv_from(buffer) => packet?,
+                _ = tokio::time::sleep_until(expiry) => {
+                    self.candidates.retain(|_, (expires, sender)| *expires > tokio::time::Instant::now() && !sender.is_closed());
+                    return Ok(());
+                }
+            }
+        } else {
+            self.socket.recv_from(buffer).await?
+        };
         match decode_packet(&buffer[..length]) {
             Some(Packet::Request) => {
                 trace!("Received NetherNet LAN discovery request from {address}");
@@ -82,7 +96,7 @@ impl NetherNetDiscovery {
                         .map_or(data.as_str(), |(signal, _)| signal),
                     "Received NetherNet LAN signal from {address}"
                 );
-                self.handle_signal(listener, address, sender_id, data).await;
+                self.handle_signal(listener, address, sender_id, data);
             }
             Some(Packet::Message {
                 sender_id,
@@ -127,8 +141,8 @@ impl NetherNetDiscovery {
         Ok(())
     }
 
-    async fn handle_signal(
-        &self,
+    fn handle_signal(
+        &mut self,
         listener: &NetherNetListener,
         address: SocketAddr,
         sender_id: u64,
@@ -153,12 +167,28 @@ impl NetherNetDiscovery {
         match signal_type {
             "CONNECTREQUEST" => {
                 trace!(%address, sender_id, connection_id, "Accepted NetherNet LAN connection request");
-                let (candidate_sender, candidate_receiver) = mpsc::unbounded_channel();
-                self.candidates.lock().await.insert(key, candidate_sender);
+                if self.candidates.contains_key(&key) {
+                    return;
+                }
+                if self.candidates.len() >= 128 {
+                    if !self.saturated {
+                        warn!("NetherNet discovery negotiation capacity exhausted");
+                        self.saturated = true;
+                    }
+                    return;
+                }
+                self.saturated = false;
+                let (candidate_sender, candidate_receiver) = mpsc::channel(128);
+                self.candidates.insert(
+                    key,
+                    (
+                        tokio::time::Instant::now() + Duration::from_secs(30),
+                        candidate_sender,
+                    ),
+                );
 
                 let state = listener.state.clone();
                 let socket = self.socket.clone();
-                let candidates = self.candidates.clone();
                 let offer = data.to_owned();
                 let network_id = self.network_id;
                 tokio::spawn(async move {
@@ -188,8 +218,6 @@ impl NetherNetDiscovery {
                         }
                         Err(error) => warn!("Failed to encode NetherNet LAN signal: {error}"),
                     }
-                    tokio::time::sleep(Duration::from_secs(30)).await;
-                    candidates.lock().await.remove(&key);
                 });
             }
             "CANDIDATEADD" => {
@@ -198,8 +226,12 @@ impl NetherNetDiscovery {
                         candidate: data.to_owned(),
                         ..Default::default()
                     });
-                if let Some(sender) = self.candidates.lock().await.get(&key) {
-                    let _ = sender.send(candidate);
+                if let Some((_, sender)) = self.candidates.get(&key) {
+                    if sender.try_send(candidate).is_err() {
+                        self.candidates.remove(&key);
+                        warn!(%address, sender_id, connection_id, "NetherNet ICE candidate queue exhausted or closed");
+                        return;
+                    }
                     trace!(%address, sender_id, connection_id, "Forwarded NetherNet LAN ICE candidate");
                 } else {
                     trace!(%address, sender_id, connection_id, "Ignored NetherNet LAN ICE candidate for unknown connection");
@@ -244,7 +276,7 @@ fn decode_packet(data: &[u8]) -> Option<Packet> {
     }
     payload.truncate(payload.len() - padding);
 
-    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(KEY.as_slice()).ok()?;
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(discovery_key().as_slice()).ok()?;
     mac.update(&payload);
     mac.verify_slice(data.get(..CHECKSUM_SIZE)?).ok()?;
 
@@ -335,7 +367,7 @@ fn encode_packet(packet_id: u16, network_id: u64, body: &[u8]) -> Result<Vec<u8>
     payload.extend_from_slice(&[0; 8]);
     payload.extend_from_slice(body);
 
-    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(KEY.as_slice())
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(discovery_key().as_slice())
         .map_err(|_| Error::other("invalid NetherNet discovery key"))?;
     mac.update(&payload);
     let checksum = mac.finalize().into_bytes();
@@ -361,7 +393,7 @@ fn push_string(buffer: &mut Vec<u8>, value: &str) -> Result<(), Error> {
 fn encrypt(data: &mut [u8]) {
     let (blocks, remainder) = Block::slice_as_chunks_mut(data);
     debug_assert!(remainder.is_empty());
-    Aes256::new((&*KEY).into()).encrypt_blocks(blocks);
+    Aes256::new((&discovery_key()).into()).encrypt_blocks(blocks);
 }
 
 fn decrypt(data: &mut [u8]) -> Option<()> {
@@ -369,7 +401,7 @@ fn decrypt(data: &mut [u8]) -> Option<()> {
     if !remainder.is_empty() {
         return None;
     }
-    Aes256::new((&*KEY).into()).decrypt_blocks(blocks);
+    Aes256::new((&discovery_key()).into()).decrypt_blocks(blocks);
     Some(())
 }
 

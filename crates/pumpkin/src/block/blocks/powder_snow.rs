@@ -85,6 +85,7 @@ pub(crate) fn inside_collision_shape_for_entity(
     collision_shape_for_entity(entity, position).unwrap_or_else(BoundingBox::full_block)
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for PowderSnowBlock {
     fn on_landed_upon(&self, args: OnLandedUponArgs<'_>) {
         if let Some(living) = args.entity.get_living_entity()

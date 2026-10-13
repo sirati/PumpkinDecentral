@@ -100,6 +100,47 @@ pub fn set_broadcast_console_to_ops(value: bool) {
     BROADCAST_CONSOLE_TO_OPS.store(value, std::sync::atomic::Ordering::Relaxed);
 }
 
+pub struct RconOutput {
+    lines: crossbeam::queue::ArrayQueue<String>,
+    rejected: std::sync::atomic::AtomicU64,
+}
+
+impl Default for RconOutput {
+    fn default() -> Self {
+        Self {
+            lines: crossbeam::queue::ArrayQueue::new(256),
+            rejected: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+impl RconOutput {
+    fn push(&self, line: String) {
+        if line.len() > 65_536 || self.lines.push(line).is_err() {
+            self.rejected
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn drain(&self) -> Vec<String> {
+        let mut lines = Vec::with_capacity(self.lines.len());
+        for _ in 0..self.lines.capacity() {
+            let Some(line) = self.lines.pop() else {
+                break;
+            };
+            lines.push(line);
+        }
+        let rejected = self.rejected.swap(0, std::sync::atomic::Ordering::Relaxed);
+        if rejected != 0 {
+            tracing::error!(rejected, "RCON command output capacity exceeded");
+            lines.push(format!(
+                "RCON command output capacity exceeded: {rejected} lines omitted"
+            ));
+        }
+        lines
+    }
+}
+
 /// Represents the source of a command execution.
 ///
 /// Different senders have different permissions, output targets, and
@@ -111,7 +152,7 @@ pub enum CommandSender {
     ///
     /// Stores an buffer to capture command output
     /// so it can be sent back over the network to the RCON client.
-    Rcon(Arc<std::sync::Mutex<Vec<String>>>),
+    Rcon(Arc<RconOutput>),
     /// The local server terminal/console.
     ///
     /// This sender typically has absolute permissions (bypass) and
@@ -160,11 +201,15 @@ impl CommandSender {
             Self::Player(c) => c.send_system_message(&text),
             Self::Lobby(c) => c.send_system_message(&text),
             Self::PreJoin(c) => c.send_message(&text),
-            Self::Rcon(s) => s
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(text.to_pretty_console()),
-            Self::CommandBlock(block_entity, _) => {
+            Self::Rcon(s) => s.push(text.to_pretty_console()),
+            Self::CommandBlock(block_entity, world) => {
+                if world
+                    .server
+                    .upgrade()
+                    .is_some_and(|server| server.advanced_config.cluster.enabled)
+                {
+                    return;
+                }
                 let mut last_output = block_entity
                     .last_output
                     .lock()
@@ -183,7 +228,14 @@ impl CommandSender {
     }
 
     pub fn set_success_count(&self, count: u32) {
-        if let Self::CommandBlock(c, _) = self {
+        if let Self::CommandBlock(c, world) = self {
+            if world
+                .server
+                .upgrade()
+                .is_some_and(|server| server.advanced_config.cluster.enabled)
+            {
+                return;
+            }
             c.success_count
                 .store(count, std::sync::atomic::Ordering::SeqCst);
         }
@@ -252,6 +304,11 @@ impl CommandSender {
             Self::Player(p) => p.has_permission(server, node),
             Self::Lobby(p) => p.has_permission(server, node),
             Self::PreJoin(p) => {
+                if let Some(decision) =
+                    crate::server::cluster_permissions::frozen_command_decision(p.profile.id, node)
+                {
+                    return decision;
+                }
                 let Some(default) = server.permission_manager.get_default_snapshot(node) else {
                     return false;
                 };
@@ -262,7 +319,7 @@ impl CommandSender {
                 }
             }
             Self::CommandBlock(..) | Self::Dummy => {
-                let Some(p) = server.permission_manager.get_permission(node) else {
+                let Some(p) = server.permission_manager.get_permission_snapshot(node) else {
                     return false;
                 };
                 match p.default {
@@ -426,16 +483,23 @@ impl CommandSender {
                     server.clone(),
                 )
             }
-            Self::Player(player) => CommandSource::new(
-                Self::Player(player.clone()),
-                player.world(),
-                Some(player.clone()),
-                player.position(),
-                player.rotation().into(),
-                player.get_display_name().get_text(),
-                player.get_display_name(),
-                server.clone(),
-            ),
+            Self::Player(player) => {
+                let display_name = if server.advanced_config.cluster.enabled {
+                    TextComponent::text(player.gameprofile.name.clone())
+                } else {
+                    player.get_display_name()
+                };
+                CommandSource::new(
+                    Self::Player(player.clone()),
+                    player.world(),
+                    Some(player.clone()),
+                    player.position(),
+                    player.rotation().into(),
+                    display_name.clone().get_text(),
+                    display_name,
+                    server.clone(),
+                )
+            }
             Self::Lobby(player) => {
                 let (world, spawn_point) = Self::get_world_and_spawn_point(server);
                 CommandSource::new(
@@ -530,3 +594,29 @@ const fn command_block_y_rot(facing: Facing) -> f32 {
 pub use context::command_context::CommandContext;
 pub use node::dispatcher::CommandDispatcher;
 pub use node::{Command, CommandExecutor, CommandExecutorResult};
+
+#[cfg(test)]
+mod rcon_output_tests {
+    use super::RconOutput;
+
+    #[test]
+    fn bounded_rcon_output_preserves_order_and_reports_overflow_once() {
+        let output = RconOutput::default();
+        let expected = (0..256)
+            .map(|index| format!("line {index} é"))
+            .collect::<Vec<_>>();
+        for line in &expected {
+            output.push(line.clone());
+        }
+        output.push("queue overflow".into());
+        output.push("x".repeat(65_537));
+        let lines = output.drain();
+        assert_eq!(&lines[..256], expected.as_slice());
+        assert_eq!(lines.len(), 257);
+        assert!(lines[256].contains("2 lines omitted"));
+        assert!(output.drain().is_empty());
+        let boundary = "é".repeat(32_768);
+        output.push(boundary.clone());
+        assert_eq!(output.drain(), vec![boundary]);
+    }
+}

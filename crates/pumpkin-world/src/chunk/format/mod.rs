@@ -427,6 +427,7 @@ impl ChunkData {
 
         Ok((
             Self {
+                origin: crate::chunk::ChunkOrigin::Persisted,
                 section,
                 heightmap: std::sync::Mutex::new(heightmaps),
                 x: position.x,

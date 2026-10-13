@@ -32,7 +32,7 @@ use pumpkin_config::{
 use pumpkin_data::dimension::Dimension;
 use pumpkin_util::permission::PermissionManager;
 use pumpkin_util::text::color::NamedColor;
-use pumpkin_world::dimension::into_level;
+use pumpkin_world::dimension::into_level_with_cluster_genesis;
 use pumpkin_world::generation::generator::GeneratorInit;
 use pumpkin_world::level::set_cluster_secondary;
 use pumpkin_world::world::WorldPortalExt;
@@ -61,54 +61,202 @@ use tokio_util::task::TaskTracker;
 
 pub mod cluster;
 pub mod cluster_access_policy;
-pub mod cluster_actor_statistics;
+mod cluster_action_work;
+mod cluster_actor_chunk_pin;
 pub mod cluster_actor_import;
+mod cluster_actor_local_cut;
+pub mod cluster_actor_statistics;
 pub mod cluster_admin_apply;
 pub mod cluster_admin_journal;
-pub mod cluster_block_action;
+mod cluster_admin_replica;
+pub mod cluster_advancements;
+mod cluster_area_cloud;
+pub(crate) mod cluster_attribute_commands;
+pub(crate) mod cluster_bedrock_lobby;
+mod cluster_bootstrap_lineage;
 pub mod cluster_chat_in;
 pub mod cluster_chat_out;
 pub mod cluster_chat_pm;
 pub mod cluster_chat_presentation;
+pub mod cluster_checkpoint;
+pub mod cluster_chunk_presentation;
 pub mod cluster_chunk_state;
+pub(crate) mod cluster_chunk_watch;
 pub mod cluster_combat_apply;
+#[cfg(all(test, feature = "cluster-e2e"))]
+mod cluster_combat_benchmark;
+mod cluster_combat_directory;
+mod cluster_command_issuance;
 pub mod cluster_command_suggestions;
+pub(crate) mod cluster_control_registers;
 pub mod cluster_controller;
 pub mod cluster_datagram;
 pub mod cluster_entity_apply;
+mod cluster_entity_command;
 pub mod cluster_entity_emit;
+mod cluster_entity_health;
+mod cluster_entity_placement;
+mod cluster_entity_projection;
+pub(crate) mod cluster_entity_registry;
+pub mod cluster_environment;
+pub(crate) mod cluster_configuration_authority;
+pub(crate) mod cluster_execute_continuation;
+pub(crate) mod cluster_gamemode_commands;
+pub mod cluster_gamerules;
 pub mod cluster_ghost;
 pub mod cluster_global_outbound;
 pub mod cluster_ground;
 pub mod cluster_handoff;
 pub mod cluster_health_policy;
 pub mod cluster_hide;
+mod cluster_inventory_block_tick;
+mod cluster_inventory_close;
+mod cluster_inventory_machine;
+mod cluster_inventory_menu;
+pub(crate) mod cluster_inventory_merchant;
+mod cluster_inventory_pair;
 pub mod cluster_inventory_protocol;
 /// Cluster-wide invsee snapshot and edit routing.
 pub mod cluster_invsee;
 pub mod cluster_item_action;
+pub(crate) mod cluster_item_birth;
+pub(crate) mod cluster_item_bootstrap;
+pub(crate) mod cluster_item_contacts;
+pub(crate) mod cluster_item_drop;
+pub(crate) mod cluster_item_launch;
+pub(crate) mod cluster_item_lifecycle;
+pub(crate) mod cluster_item_merchant;
+pub(crate) mod cluster_item_merge;
+pub(crate) mod cluster_item_physics;
+pub(crate) mod cluster_item_physics_source;
+pub(crate) mod cluster_item_pickup;
+pub(crate) mod cluster_item_raycast;
+pub(crate) mod cluster_item_status;
+pub(crate) mod cluster_item_use;
+mod cluster_living_attributes;
+mod cluster_living_command;
+mod cluster_living_environment;
+pub(crate) mod cluster_living_metadata;
+mod cluster_living_motion;
+mod cluster_living_sleep;
+mod cluster_living_tick;
 pub mod cluster_lobby;
 pub mod cluster_movement_sample;
+pub mod cluster_namespaces;
+mod cluster_object_birth;
+mod cluster_object_bootstrap;
+mod cluster_object_bootstrap_display;
+mod cluster_object_command;
+mod cluster_object_frame;
+mod cluster_object_interaction;
+mod cluster_object_metadata;
+mod cluster_object_motion;
+mod cluster_object_terminal;
+mod cluster_object_tick;
+pub(crate) mod cluster_owned_mob_admission;
+pub(crate) mod cluster_owned_mob_birth;
+pub(crate) mod cluster_owned_mob_breeding;
+pub(crate) mod cluster_owned_mob_commands;
+pub(crate) mod cluster_owned_mob_contacts;
+pub(crate) mod cluster_owned_mob_death;
+pub(crate) mod cluster_owned_mob_disk;
+pub(crate) mod cluster_owned_mob_goal_environment;
+pub(crate) mod cluster_owned_mob_goals;
+pub(crate) mod cluster_owned_mob_initial;
+pub(crate) mod cluster_owned_mob_metadata;
+pub(crate) mod cluster_owned_mob_navigation;
+pub(crate) mod cluster_owned_mob_nbt;
+pub(crate) mod cluster_owned_mob_phase;
+pub(crate) mod cluster_owned_mob_spawn;
+pub(crate) mod cluster_owned_mob_spawn_facts;
+pub(crate) mod cluster_owned_mob_world;
+pub mod cluster_permissions;
 pub mod cluster_player_admin;
+pub mod cluster_player_commands;
+pub(crate) mod cluster_player_cosmetics;
+pub(crate) mod cluster_player_ender;
+pub mod cluster_player_lifecycle;
+pub(crate) mod cluster_player_projection;
 pub mod cluster_presence;
+pub(crate) mod cluster_projectile_potion;
+pub(crate) mod cluster_projectile_source;
+pub(crate) mod cluster_projectile_tick;
+mod cluster_roster;
+pub(crate) mod cluster_scoreboard;
+pub(crate) mod cluster_sleep_validation;
+pub(crate) mod cluster_world_bucket_source;
+mod cluster_world_bucket_transition;
+pub(crate) mod cluster_world_placement;
+pub mod cluster_world_rules;
+mod cluster_world_sound;
+pub(crate) mod cluster_world_tool_transform;
+pub(crate) use cluster_command_issuance::capture_completion_source;
+mod cluster_actor_mount;
+mod cluster_inventory_block_roots;
+#[cfg(feature = "cluster-e2e")]
+pub(crate) mod cluster_inventory_scenario_source;
+pub mod cluster_profile_skins;
 pub mod cluster_regions;
+pub(crate) mod cluster_remote_player_packet_cache;
+pub(crate) mod cluster_remote_player_packets;
+pub(crate) mod cluster_remote_player_presentation;
+mod cluster_replica_binding;
 pub mod cluster_secure_chat;
 pub mod cluster_session_ingress;
+mod cluster_source_dispatch;
 pub mod cluster_status;
+pub mod cluster_status_hooks;
+pub mod cluster_sync_stats;
 #[cfg(feature = "cluster-e2e")]
 pub mod cluster_test;
+#[cfg(feature = "cluster-e2e")]
+pub(crate) mod cluster_test_handoff;
+#[cfg(feature = "cluster-e2e")]
+pub(crate) mod cluster_test_health_policy;
+#[cfg(feature = "cluster-e2e")]
+mod cluster_test_observation;
+#[cfg(feature = "cluster-e2e")]
+pub(crate) mod cluster_test_preflight;
+#[cfg(feature = "cluster-e2e")]
+pub(crate) mod cluster_test_scenarios;
+#[cfg(feature = "cluster-e2e")]
+mod cluster_test_watch;
 pub mod cluster_tick_pump;
 pub mod cluster_transient;
+pub(crate) mod cluster_vehicle_birth;
+mod cluster_vehicle_control;
+mod cluster_vehicle_interaction;
+mod cluster_vehicle_metadata;
+pub(crate) mod cluster_vehicle_snapshot;
+mod cluster_vehicle_storage;
+mod cluster_vehicle_world;
 pub mod cluster_visual;
 pub mod cluster_world_actions;
 pub mod cluster_world_actor;
 pub mod cluster_world_administration;
 pub mod cluster_world_apply;
 pub mod cluster_world_block_actions;
+mod cluster_world_block_use;
+mod cluster_world_callback_light;
+mod cluster_world_callback_policy;
+mod cluster_world_callback_snapshot;
+mod cluster_world_callback_work;
+mod cluster_world_callbacks;
+mod cluster_world_canonical;
+mod cluster_world_combat_actions;
 pub mod cluster_world_delta;
+mod cluster_world_end_portal;
+mod cluster_world_environment_bank;
+mod cluster_world_environment_callbacks;
+mod cluster_world_explosion;
 pub mod cluster_world_inventory;
+mod cluster_world_inventory_actions;
 pub mod cluster_world_item_actions;
+mod cluster_world_mining;
+mod cluster_world_mining_context;
 pub mod cluster_world_owner;
+mod cluster_world_presentation;
+mod cluster_world_respawn;
 pub mod cluster_world_settlement;
 pub mod cluster_world_time;
 pub mod cluster_world_view;
@@ -182,11 +330,28 @@ pub struct Server {
     /// Manages player data storage
     pub player_data_storage: ServerPlayerData,
     pub primary_save: Option<PrimarySaveHandle>,
+    pub(crate) cluster_lobby_images: cluster_lobby::LobbyImages,
     pub(crate) cluster_global_outbound: cluster_global_outbound::GlobalOutboundRuntime,
     pub(crate) cluster_admin_local_route:
         ArcSwapOption<tokio::sync::mpsc::Sender<cluster_admin_apply::LocalAdminMutation>>,
     pub(crate) cluster_admin_seed_route:
         ArcSwapOption<tokio::sync::mpsc::Sender<pumpkin_cluster::identity::ServerId>>,
+    pub(crate) cluster_fresh_admission_route:
+        ArcSwapOption<tokio::sync::mpsc::Sender<pumpkin_world::level::FreshChunkAdmission>>,
+    pub(crate) cluster_chunk_inventory_route:
+        ArcSwapOption<tokio::sync::mpsc::Sender<cluster_world_owner::ChunkInventoryRequest>>,
+    pub(crate) cluster_chunk_need_route:
+        ArcSwapOption<tokio::sync::mpsc::Sender<cluster::ChunkNeed>>,
+    pub(crate) cluster_chunk_watch_route:
+        ArcSwapOption<tokio::sync::mpsc::Sender<cluster_chunk_watch::WatchCommand>>,
+    pub(crate) cluster_chunk_watches: ArcSwap<
+        std::collections::HashMap<
+            pumpkin_cluster::identity::GlobalPlayerId,
+            cluster_chunk_watch::WatchPublication,
+        >,
+    >,
+    pub(crate) cluster_checkpoint_result_route:
+        ArcSwapOption<tokio::sync::mpsc::Sender<cluster_world_owner::CheckpointSaveResult>>,
     pub(crate) cluster_admin_view: ArcSwap<pumpkin_cluster::admin_sync::AdminSnapshot>,
     pub(crate) cluster_chat_presentation_tx:
         tokio::sync::mpsc::Sender<cluster_chat_presentation::ChatPresentation>,
@@ -197,33 +362,49 @@ pub struct Server {
     pub(crate) cluster_command_suggestions_tx:
         tokio::sync::mpsc::Sender<cluster_command_suggestions::SuggestionRequest>,
     pub(crate) cluster_secure_chat: cluster_secure_chat::SecureChatRuntime,
+    pub(crate) cluster_environment: cluster_environment::EnvironmentRuntime,
+    pub(crate) cluster_sync_stats: ArcSwap<cluster_sync_stats::SyncStatsSnapshot>,
+    pub(crate) cluster_player_commands: cluster_player_commands::PlayerCommandRuntime,
+    pub(crate) cluster_namespaces: cluster_namespaces::NamespaceRuntime,
+    pub(crate) cluster_permission_failures: tokio::sync::mpsc::Sender<uuid::Uuid>,
+    pub(crate) cluster_prepared_permissions: ArcSwap<
+        std::collections::HashMap<uuid::Uuid, cluster_permissions::PreparedPlayerPermissions>,
+    >,
+    pub(crate) cluster_permission_prepare: tokio::sync::mpsc::Sender<std::sync::Weak<Player>>,
     pub(crate) cluster_access_policy: cluster_access_policy::AccessPolicyRuntime,
+    pub(crate) cluster_custom_scoreboard_updates:
+        tokio::sync::mpsc::Sender<crate::world::scoreboard::CustomScoreboardUpdate>,
+    pub(crate) cluster_scoreboard_updates:
+        tokio::sync::mpsc::Sender<cluster_scoreboard::ScoreboardUpdate>,
+    pub(crate) cluster_scoreboard_inbound:
+        ArcSwapOption<tokio::sync::mpsc::Sender<pumpkin_cluster::streams::InboundParcel>>,
+    pub(crate) cluster_policy_inbound:
+        ArcSwapOption<tokio::sync::mpsc::Sender<pumpkin_cluster::streams::InboundParcel>>,
+    pub(crate) cluster_status_hooks: cluster_status_hooks::StatusHooks,
     pub(crate) cluster_health_policy: ArcSwap<HealthPolicySnapshot>,
+    pub(crate) cluster_health_policy_state:
+        ArcSwapOption<pumpkin_cluster::health_policy::HealthPolicyState>,
     pub(crate) cluster_health_policy_tx:
         OnceLock<tokio::sync::mpsc::Sender<cluster_health_policy::HealthPolicyCommand>>,
     pub(crate) cluster_invsee_tx: tokio::sync::mpsc::Sender<cluster_invsee::InvseeCommand>,
+    pub(crate) cluster_inventory_close_notification_tx:
+        tokio::sync::mpsc::Sender<cluster_invsee::InvseeCommand>,
     pub(crate) cluster_inventory_action_route_tx:
-        tokio::sync::watch::Sender<cluster_invsee::InventoryActionRoute>,
+        ArcSwapOption<tokio::sync::mpsc::Sender<cluster_invsee::LocalInventoryAction>>,
     pub(crate) cluster_inventory_screen_route_tx:
-        tokio::sync::watch::Sender<cluster_invsee::InventoryScreenRoute>,
-    pub(crate) cluster_inventory_menu_route_tx:
-        tokio::sync::watch::Sender<cluster_inventory_protocol::InventoryMenuRoute>,
+        ArcSwapOption<tokio::sync::mpsc::Sender<cluster_invsee::LocalInventoryScreenCommand>>,
+    pub(crate) cluster_inventory_menu_route_tx: ArcSwapOption<
+        tokio::sync::mpsc::Sender<cluster_inventory_protocol::LocalInventoryMenuIntent>,
+    >,
     pub(crate) cluster_item_action_route_tx:
         tokio::sync::watch::Sender<cluster_item_action::ItemActionRoute>,
-    pub(crate) cluster_block_action_route_tx:
-        tokio::sync::watch::Sender<cluster_block_action::BlockActionRoute>,
     pub(crate) cluster_inventory_snapshot_route_tx:
-        tokio::sync::watch::Sender<cluster_invsee::InventorySnapshotRoute>,
+        ArcSwapOption<tokio::sync::mpsc::Sender<cluster_invsee::LocalInventorySnapshotRequest>>,
     pub(crate) cluster_inventory_install_route_tx:
-        tokio::sync::watch::Sender<cluster_invsee::InventoryInstallRoute>,
+        ArcSwapOption<tokio::sync::mpsc::Sender<cluster_invsee::LocalInventoryLifecycle>>,
     pub(crate) cluster_inventory_publication_tx:
         tokio::sync::broadcast::Sender<cluster_invsee::InventoryPublication>,
-    pub(crate) cluster_inventory_snapshots: ArcSwap<
-        std::collections::HashMap<
-            pumpkin_cluster::inventory::InventoryTarget,
-            pumpkin_cluster::inventory::InventoryStateSnapshot,
-        >,
-    >,
+    pub(crate) cluster_inventory_snapshots: ArcSwap<cluster_invsee::InventoryPublicationSnapshot>,
     pub(crate) cluster_inventory_screens: ArcSwap<
         std::collections::HashMap<
             pumpkin_cluster::inventory::InventoryScreenSession,
@@ -238,7 +419,7 @@ pub struct Server {
     >,
     pub(crate) cluster_inventory_handoff_installed: ArcSwap<
         std::collections::HashMap<
-            pumpkin_cluster::identity::GlobalPlayerId,
+            (pumpkin_cluster::identity::GlobalPlayerId, u64),
             cluster_world_inventory::InventoryHandoffInstallStatus,
         >,
     >,
@@ -267,10 +448,14 @@ pub struct Server {
     pub(crate) cluster_lobby_directory: cluster_lobby::LobbyDirectory,
     pub(crate) cluster_presence: cluster_presence::PresenceRuntime,
     pub(crate) cluster_presence_slot: AtomicU16,
+    pub(crate) cluster_bed_leave_callbacks:
+        tokio::sync::mpsc::Sender<cluster_player_lifecycle::BedLeaveCallback>,
     pub(crate) cluster_lobby_session_generation: AtomicU64,
     pub(crate) cluster_connected_peers:
         ArcSwap<std::collections::HashSet<pumpkin_cluster::identity::ServerId>>,
     pub(crate) cluster_peer_generations:
+        ArcSwap<std::collections::HashMap<pumpkin_cluster::identity::ServerId, u64>>,
+    pub(crate) cluster_peer_incarnations:
         ArcSwap<std::collections::HashMap<pumpkin_cluster::identity::ServerId, u64>>,
     pub(crate) cluster_primary_peers:
         ArcSwap<std::collections::HashSet<pumpkin_cluster::identity::ServerId>>,
@@ -292,8 +477,37 @@ pub struct Server {
             std::sync::Arc<cluster_chunk_state::OwnedChunkBlocks>,
         >,
     >,
+    pub(crate) cluster_chunk_presentations: ArcSwap<
+        std::collections::HashMap<
+            pumpkin_cluster::protocol::ChunkKey,
+            std::sync::Arc<cluster_chunk_presentation::ChunkPresentation>,
+        >,
+    >,
     pub(crate) cluster_controller: cluster_controller::ControllerRuntime,
     pub(crate) cluster_actor_statistics: cluster_actor_statistics::StatisticsPublication,
+    pub(crate) cluster_actor_spatial: ArcSwap<
+        std::collections::HashMap<
+            pumpkin_cluster::identity::GlobalPlayerId,
+            cluster_world_actor::ActorSpatialPublication,
+        >,
+    >,
+    pub(crate) cluster_gamerules: tokio::sync::mpsc::Sender<cluster_gamerules::GameruleInput>,
+    pub(crate) cluster_gamerules_view: ArcSwapOption<cluster_gamerules::GameruleSnapshot>,
+    pub(crate) cluster_configuration_authority:
+        ArcSwapOption<cluster_environment::CertifiedConfigurationCut>,
+    pub(crate) cluster_environment_roots: ArcSwap<pumpkin_cluster::world_time::EnvironmentRoots>,
+    pub(crate) cluster_original_source_slots:
+        ArcSwap<std::collections::BTreeMap<pumpkin_cluster::canonical_action::ActionRef, u64>>,
+    pub(crate) cluster_environment_history:
+        ArcSwap<pumpkin_cluster::world_time::EnvironmentHistory>,
+    pub(crate) cluster_mornings: ArcSwap<pumpkin_cluster::world_time::WorldMorningHistory>,
+    pub(crate) cluster_world_borders: ArcSwap<pumpkin_cluster::world_time::WorldBorderHistory>,
+    pub(crate) cluster_ground_sleep: ArcSwap<
+        std::collections::HashMap<
+            pumpkin_cluster::actor::ActorId,
+            cluster_environment::GroundSleepView,
+        >,
+    >,
     pub(crate) cluster_actor_living: ArcSwap<
         std::collections::HashMap<
             pumpkin_cluster::actor::ActorId,
@@ -306,10 +520,51 @@ pub struct Server {
         ArcSwapOption<tokio::sync::mpsc::Sender<cluster_actor_statistics::ActorStatisticsRetire>>,
     pub(crate) cluster_actor_living_import_route:
         ArcSwapOption<tokio::sync::mpsc::Sender<cluster_world_actor::ActorLivingImport>>,
+    pub(crate) cluster_vehicle_control_route: ArcSwapOption<
+        tokio::sync::mpsc::Sender<pumpkin_cluster::actor_relation::VehicleControlInput>,
+    >,
+    pub(crate) cluster_vehicle_views: ArcSwap<cluster_vehicle_snapshot::VehicleViews>,
+    pub(crate) cluster_remote_player_movement_route: ArcSwapOption<
+        tokio::sync::mpsc::Sender<cluster_remote_player_presentation::RemotePlayerMovement>,
+    >,
+    pub(crate) cluster_remote_player_visual_inbox: crossbeam::queue::ArrayQueue<
+        tokio::sync::mpsc::Receiver<pumpkin_cluster::streams::InboundParcel>,
+    >,
+    pub(crate) cluster_local_player_cosmetic_route: ArcSwapOption<
+        tokio::sync::mpsc::Sender<cluster_remote_player_presentation::LocalPlayerCosmetic>,
+    >,
+    pub(crate) cluster_remote_players:
+        ArcSwap<cluster_remote_player_presentation::RemotePlayerDirectory>,
+    pub(crate) cluster_canonical_entities:
+        ArcSwap<cluster_entity_registry::CanonicalEntityDirectory>,
+    pub(crate) cluster_global_shutdown: Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) cluster_roster: cluster_roster::RosterRuntime,
+    pub(crate) cluster_admin_replica_inbound:
+        ArcSwapOption<tokio::sync::mpsc::Sender<pumpkin_cluster::streams::InboundParcel>>,
+    pub(crate) cluster_world_rules: ArcSwap<pumpkin_cluster::world_rules::WorldRulesHistory>,
+    pub(crate) cluster_world_rules_inbound:
+        ArcSwapOption<tokio::sync::mpsc::Sender<pumpkin_cluster::streams::InboundParcel>>,
+    pub(crate) cluster_profile_skins:
+        ArcSwap<std::collections::HashMap<uuid::Uuid, cluster_profile_skins::ProfileSkin>>,
+    pub(crate) cluster_profile_skin_fragments:
+        tokio::sync::mpsc::Sender<cluster_profile_skins::SkinFragment>,
+    pub(crate) cluster_profile_skin_seeds:
+        tokio::sync::mpsc::Sender<cluster_profile_skins::SkinSeed>,
+    pub(crate) cluster_chunk_directory: ArcSwap<pumpkin_cluster::chunks::Directory>,
     pub(crate) cluster_actor_admission_import_route:
         ArcSwapOption<tokio::sync::mpsc::Sender<cluster_world_actor::ActorAdmissionImport>>,
+    pub(crate) cluster_replica_binding_route:
+        ArcSwapOption<tokio::sync::mpsc::Sender<cluster_replica_binding::ReplicaBindingNotice>>,
+    pub(crate) cluster_combat_client_targets:
+        ArcSwap<std::collections::HashMap<i32, cluster_combat_directory::CombatClientTarget>>,
     pub(crate) cluster_action_route:
-        ArcSwapOption<tokio::sync::mpsc::Sender<pumpkin_cluster::canonical_action::CanonicalAction>>,
+        ArcSwapOption<tokio::sync::mpsc::Sender<pumpkin_cluster::canonical_action::ActionInput>>,
+    pub(crate) cluster_datagram_outlet:
+        ArcSwapOption<tokio::sync::mpsc::Sender<(pumpkin_cluster::identity::ServerId, Vec<u8>)>>,
+    pub(crate) cluster_datagram_limits:
+        ArcSwap<std::collections::HashMap<pumpkin_cluster::identity::ServerId, usize>>,
+    pub(crate) cluster_item_spatial_route:
+        ArcSwapOption<tokio::sync::mpsc::Sender<cluster_item_physics::IncomingItemSpatial>>,
     pub(crate) cluster_actor_drain_route:
         ArcSwapOption<tokio::sync::mpsc::Sender<cluster_world_owner::ActorDrainRequest>>,
     #[cfg(feature = "cluster-e2e")]
@@ -522,19 +777,22 @@ impl Server {
             HealthMaskMode::All => ClusterHealthMaskMode::All,
         };
         let (cluster_invsee_tx, cluster_invsee_rx) = tokio::sync::mpsc::channel(256);
-        let (cluster_inventory_action_route_tx, _) = tokio::sync::watch::channel(None);
-        let (cluster_inventory_screen_route_tx, _) = tokio::sync::watch::channel(None);
-        let (cluster_inventory_menu_route_tx, _) = tokio::sync::watch::channel(None);
+        let (cluster_inventory_close_notification_tx, cluster_inventory_close_notification_rx) =
+            tokio::sync::mpsc::channel(256);
+        let cluster_inventory_action_route_tx = ArcSwapOption::empty();
+        let cluster_inventory_screen_route_tx = ArcSwapOption::empty();
+        let cluster_inventory_menu_route_tx = ArcSwapOption::empty();
         let (cluster_item_action_route_tx, _) = tokio::sync::watch::channel(None);
-        let (cluster_block_action_route_tx, _) = tokio::sync::watch::channel(None);
-        let (cluster_inventory_snapshot_route_tx, _) = tokio::sync::watch::channel(None);
-        let (cluster_inventory_install_route_tx, _) = tokio::sync::watch::channel(None);
+        let cluster_inventory_snapshot_route_tx = ArcSwapOption::empty();
+        let cluster_inventory_install_route_tx = ArcSwapOption::empty();
         let (cluster_inventory_publication_tx, _) = tokio::sync::broadcast::channel(256);
         let (cluster_administrative_action_route_tx, _) = tokio::sync::watch::channel(None);
         let (cluster_administrative_publication_tx, _) = tokio::sync::broadcast::channel(256);
         let (cluster_lobby_chat_tx, _) = tokio::sync::broadcast::channel(256);
         let (cluster_lobby_directory, cluster_lobby_directory_rx) =
             cluster_lobby::LobbyDirectory::new(4096);
+        let (cluster_bed_leave_callbacks, cluster_bed_leave_callbacks_rx) =
+            tokio::sync::mpsc::channel(256);
         let (cluster_presence, cluster_presence_rx) = cluster_presence::PresenceRuntime::new(4096);
         let (cluster_chat_presentation_tx, cluster_chat_presentation_rx) =
             tokio::sync::mpsc::channel(1024);
@@ -545,12 +803,55 @@ impl Server {
             tokio::sync::mpsc::channel(256);
         let (cluster_secure_chat, cluster_secure_chat_rx) =
             cluster_secure_chat::SecureChatRuntime::new();
+        let (cluster_gamerules, cluster_gamerules_rx) = tokio::sync::mpsc::channel(256);
+        let (cluster_environment, cluster_environment_rx, cluster_environment_hooks) =
+            cluster_environment::EnvironmentRuntime::new();
+        let (cluster_permission_prepare, cluster_permission_prepare_rx) =
+            tokio::sync::mpsc::channel(256);
+        let (cluster_profile_skin_fragments, cluster_profile_skin_fragment_rx) =
+            tokio::sync::mpsc::channel(128);
+        let (cluster_profile_skin_seeds, cluster_profile_skin_seed_rx) =
+            tokio::sync::mpsc::channel(128);
+        let (cluster_permission_failures, cluster_permission_failure_rx) =
+            tokio::sync::mpsc::channel(256);
+        let (cluster_namespaces, cluster_namespace_requests) =
+            cluster_namespaces::NamespaceRuntime::new(
+                advanced_config.cluster.enabled
+                    && matches!(
+                        advanced_config.cluster.role,
+                        pumpkin_config::ClusterRole::Primary
+                    ),
+            );
+        let (cluster_player_commands, cluster_player_commands_rx) =
+            cluster_player_commands::PlayerCommandRuntime::new();
+        let (cluster_custom_scoreboard_updates, cluster_custom_scoreboard_updates_rx) =
+            tokio::sync::mpsc::channel(256);
+        let (cluster_scoreboard_updates, cluster_scoreboard_updates_rx) =
+            tokio::sync::mpsc::channel(256);
         let (cluster_access_policy, cluster_access_policy_rx) =
-            cluster_access_policy::AccessPolicyRuntime::new(&vanilla_data);
+            cluster_access_policy::AccessPolicyRuntime::new(&vanilla_data, basic_config.white_list);
+        let (cluster_status_hooks, cluster_status_hooks_rx) =
+            cluster_status_hooks::StatusHooks::new();
         let (cluster_handoff_commit_wake, _) = tokio::sync::watch::channel(0_u64);
 
         let (cluster_global_outbound, cluster_global_outbound_rx, cluster_global_outbound_ack_rx) =
             cluster_global_outbound::GlobalOutboundRuntime::new();
+        let compression = &advanced_config.networking.java.compression;
+        let cluster_lobby_images = cluster_lobby::LobbyImages::new(
+            cluster_secondary,
+            compression
+                .enabled
+                .then_some((compression.info.threshold as usize, compression.info.level)),
+            (
+                advanced_config
+                    .networking
+                    .bedrock
+                    .compression
+                    .info
+                    .threshold as usize,
+                advanced_config.networking.bedrock.compression.info.level,
+            ),
+        );
         let server = Self {
             basic_config,
             advanced_config,
@@ -578,9 +879,16 @@ impl Server {
             defaultgamemode,
             player_data_storage,
             primary_save,
+            cluster_lobby_images,
             cluster_global_outbound,
             cluster_admin_local_route: ArcSwapOption::empty(),
             cluster_admin_seed_route: ArcSwapOption::empty(),
+            cluster_fresh_admission_route: ArcSwapOption::empty(),
+            cluster_chunk_inventory_route: ArcSwapOption::empty(),
+            cluster_chunk_need_route: ArcSwapOption::empty(),
+            cluster_chunk_watch_route: ArcSwapOption::empty(),
+            cluster_chunk_watches: ArcSwap::from_pointee(std::collections::HashMap::new()),
+            cluster_checkpoint_result_route: ArcSwapOption::empty(),
             cluster_admin_view: ArcSwap::from_pointee(
                 pumpkin_cluster::admin_sync::AdminSnapshot::default(),
             ),
@@ -589,22 +897,39 @@ impl Server {
             cluster_lobby_command_tx,
             cluster_command_suggestions_tx,
             cluster_secure_chat,
+            cluster_environment,
+            cluster_sync_stats: ArcSwap::from_pointee(
+                cluster_sync_stats::SyncStatsSnapshot::default(),
+            ),
+            cluster_player_commands,
+            cluster_namespaces,
+            cluster_permission_failures,
+            cluster_prepared_permissions: ArcSwap::from_pointee(std::collections::HashMap::new()),
+            cluster_permission_prepare,
             cluster_access_policy,
+            cluster_policy_inbound: ArcSwapOption::empty(),
+            cluster_scoreboard_updates,
+            cluster_custom_scoreboard_updates,
+            cluster_scoreboard_inbound: ArcSwapOption::empty(),
+            cluster_status_hooks,
             cluster_health_policy: ArcSwap::from_pointee(HealthPolicySnapshot::new(
                 0,
                 cluster_health_mask,
             )),
+            cluster_health_policy_state: ArcSwapOption::empty(),
             cluster_health_policy_tx: OnceLock::new(),
             cluster_invsee_tx,
+            cluster_inventory_close_notification_tx,
             cluster_inventory_action_route_tx,
             cluster_inventory_screen_route_tx,
             cluster_inventory_menu_route_tx,
             cluster_item_action_route_tx,
-            cluster_block_action_route_tx,
             cluster_inventory_snapshot_route_tx,
             cluster_inventory_install_route_tx,
             cluster_inventory_publication_tx,
-            cluster_inventory_snapshots: ArcSwap::from_pointee(std::collections::HashMap::new()),
+            cluster_inventory_snapshots: ArcSwap::from_pointee(
+                cluster_invsee::InventoryPublicationSnapshot::default(),
+            ),
             cluster_inventory_screens: ArcSwap::from_pointee(std::collections::HashMap::new()),
             cluster_inventory_close_status: ArcSwap::from_pointee(std::collections::HashMap::new()),
             cluster_inventory_handoff_installed: ArcSwap::from_pointee(
@@ -626,23 +951,76 @@ impl Server {
             cluster_lobby_directory,
             cluster_presence,
             cluster_presence_slot: AtomicU16::new(1),
+            cluster_bed_leave_callbacks,
             cluster_lobby_session_generation: AtomicU64::new(1),
             cluster_connected_peers: ArcSwap::from_pointee(std::collections::HashSet::new()),
             cluster_peer_generations: ArcSwap::from_pointee(std::collections::HashMap::new()),
+            cluster_peer_incarnations: ArcSwap::from_pointee(std::collections::HashMap::new()),
             cluster_primary_peers: ArcSwap::from_pointee(std::collections::HashSet::new()),
             cluster_entity_owners: ArcSwap::from_pointee(std::collections::HashMap::new()),
             cluster_ground_snapshots: ArcSwap::from_pointee(std::collections::HashMap::new()),
             cluster_owned_chunk_blocks: ArcSwap::from_pointee(std::collections::HashMap::new()),
-            cluster_controller: cluster_controller::ControllerRuntime::new(4096),
+            cluster_chunk_presentations: ArcSwap::from_pointee(std::collections::HashMap::new()),
+            cluster_controller: cluster_controller::ControllerRuntime::new_with_player_commands(
+                4096,
+                cluster_player_commands_rx,
+            ),
             cluster_actor_statistics: Arc::new(ArcSwap::from_pointee(
                 std::collections::HashMap::new(),
             )),
+            cluster_gamerules,
+            cluster_gamerules_view: ArcSwapOption::empty(),
+            cluster_configuration_authority: ArcSwapOption::empty(),
+            cluster_environment_roots: ArcSwap::from_pointee(
+                pumpkin_cluster::world_time::EnvironmentRoots::default(),
+            ),
+            cluster_original_source_slots: ArcSwap::from_pointee(std::collections::BTreeMap::new()),
+            cluster_environment_history: ArcSwap::from_pointee(
+                pumpkin_cluster::world_time::EnvironmentHistory::default(),
+            ),
+            cluster_mornings: ArcSwap::from_pointee(
+                pumpkin_cluster::world_time::WorldMorningHistory::default(),
+            ),
+            cluster_world_borders: ArcSwap::from_pointee(
+                pumpkin_cluster::world_time::WorldBorderHistory::default(),
+            ),
+            cluster_ground_sleep: ArcSwap::from_pointee(std::collections::HashMap::new()),
             cluster_actor_living: ArcSwap::from_pointee(std::collections::HashMap::new()),
+            cluster_actor_spatial: ArcSwap::from_pointee(std::collections::HashMap::new()),
             cluster_actor_statistics_import_route: ArcSwapOption::empty(),
+            cluster_vehicle_control_route: ArcSwapOption::empty(),
+            cluster_vehicle_views: ArcSwap::from_pointee(
+                cluster_vehicle_snapshot::VehicleViews::default(),
+            ),
             cluster_actor_statistics_retire_route: ArcSwapOption::empty(),
             cluster_actor_living_import_route: ArcSwapOption::empty(),
+            cluster_remote_player_movement_route: ArcSwapOption::empty(),
+            cluster_remote_player_visual_inbox: crossbeam::queue::ArrayQueue::new(1),
+            cluster_local_player_cosmetic_route: ArcSwapOption::empty(),
+            cluster_remote_players: ArcSwap::from_pointee(
+                cluster_remote_player_presentation::RemotePlayerDirectory::default(),
+            ),
+            cluster_canonical_entities: ArcSwap::from_pointee(
+                cluster_entity_registry::CanonicalEntityDirectory::default(),
+            ),
+            cluster_global_shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cluster_roster: cluster_roster::RosterRuntime::new(),
+            cluster_admin_replica_inbound: ArcSwapOption::empty(),
+            cluster_world_rules: ArcSwap::from_pointee(Default::default()),
+            cluster_world_rules_inbound: ArcSwapOption::empty(),
+            cluster_profile_skins: ArcSwap::from_pointee(std::collections::HashMap::new()),
+            cluster_profile_skin_seeds,
+            cluster_profile_skin_fragments,
+            cluster_chunk_directory: ArcSwap::from_pointee(
+                pumpkin_cluster::chunks::Directory::new(),
+            ),
             cluster_actor_admission_import_route: ArcSwapOption::empty(),
+            cluster_replica_binding_route: ArcSwapOption::empty(),
+            cluster_combat_client_targets: ArcSwap::from_pointee(std::collections::HashMap::new()),
             cluster_action_route: ArcSwapOption::empty(),
+            cluster_datagram_outlet: ArcSwapOption::empty(),
+            cluster_datagram_limits: ArcSwap::from_pointee(std::collections::HashMap::new()),
+            cluster_item_spatial_route: ArcSwapOption::empty(),
             cluster_actor_drain_route: ArcSwapOption::empty(),
             #[cfg(feature = "cluster-e2e")]
             cluster_test: cluster_test::TestRuntime::new(),
@@ -669,6 +1047,9 @@ impl Server {
             level_info,
         };
         let server = Arc::new(server);
+        if server.advanced_config.cluster.enabled {
+            cluster_roster::spawn(&server);
+        }
         server
             .cluster_admin_view
             .store(Arc::new(cluster_admin_apply::snapshot_from_stores(
@@ -681,12 +1062,32 @@ impl Server {
         );
         cluster_lobby::spawn_lobby_directory(&server, cluster_lobby_directory_rx);
         cluster_presence::spawn_presence_owner(&server, cluster_presence_rx);
+        cluster_player_lifecycle::spawn_bed_leave(&server, cluster_bed_leave_callbacks_rx);
         cluster_chat_presentation::spawn(&server, cluster_chat_presentation_rx);
         cluster_session_ingress::spawn(&server, cluster_session_ingress_rx);
         cluster_session_ingress::spawn_lobby_commands(&server, cluster_lobby_command_rx);
         cluster_command_suggestions::spawn(&server, cluster_command_suggestions_rx);
         cluster_secure_chat::spawn(&server, cluster_secure_chat_rx);
+        cluster_environment::spawn(&server, cluster_environment_rx, cluster_environment_hooks);
+        cluster_gamerules::spawn(&server, cluster_gamerules_rx);
+        cluster_player_commands::spawn_observer(&server);
+        cluster_namespaces::spawn(&server, cluster_namespace_requests);
+        cluster_permissions::spawn_diagnostics(&server, cluster_permission_failure_rx);
+        cluster_permissions::spawn_preparation(&server, cluster_permission_prepare_rx);
+        if server.advanced_config.cluster.enabled {
+            cluster_profile_skins::spawn(
+                &server,
+                cluster_profile_skin_seed_rx,
+                cluster_profile_skin_fragment_rx,
+            );
+        }
         cluster_access_policy::spawn(&server, cluster_access_policy_rx);
+        cluster_scoreboard::spawn(
+            &server,
+            cluster_scoreboard_updates_rx,
+            cluster_custom_scoreboard_updates_rx,
+        );
+        cluster_status_hooks::spawn(&server, cluster_status_hooks_rx);
         {
             let operators = server
                 .data
@@ -698,6 +1099,10 @@ impl Server {
             }
         }
         cluster_invsee::spawn_invsee_owner(&server, cluster_invsee_rx);
+        cluster_invsee::spawn_inventory_close_notifications(
+            &server,
+            cluster_inventory_close_notification_rx,
+        );
         {
             let favicon = server
                 .listing
@@ -718,17 +1123,33 @@ impl Server {
                     inbox
                         .run(
                             |accepted| {
-                                debug!(
-                                    tick = accepted.tick.0,
-                                    bytes = accepted.payload.len(),
-                                    "Primary saver applying accepted tick"
-                                );
+                                debug!(tick = accepted.tick.0, "Primary saver checkpoint requested");
                             },
-                            || {
+                            |accepted| {
                                 let saver = saver.clone();
+                                let dirty = accepted.payload.clone();
                                 async move {
-                                    if let Err(err) = saver.save_all().await {
-                                        error!("Primary saver failed to persist world: {err}");
+                                    let Ok((request, chunks)) = postcard::from_bytes::<(u64, Vec<pumpkin_cluster::protocol::ChunkKey>)>(&dirty) else {
+                                        error!("Primary checkpoint request is invalid");
+                                        return;
+                                    };
+                                    let checkpoint_fsynced = match cluster::save_primary_checkpoints(&saver, request, &chunks).await {
+                                        Ok(()) => true,
+                                        Err(err) => {
+                                            error!("Primary accepted-ground checkpoint was not persisted: {err}");
+                                            false
+                                        }
+                                    };
+                                    if let Some(route) = saver.cluster_checkpoint_result_route.load_full() {
+                                        let _ = route.send(cluster_world_owner::CheckpointSaveResult {
+                                            request,
+                                            checkpoint_fsynced,
+                                        }).await;
+                                    }
+                                    if checkpoint_fsynced {
+                                        if let Err(err) = saver.save_all().await {
+                                            error!("Primary saver failed to persist world metadata: {err}");
+                                        }
                                     }
                                 }
                             },
@@ -808,7 +1229,13 @@ impl Server {
                     .to_pretty_console()
             );
             let config = Arc::new(server.advanced_config.world.clone());
-            let level = into_level(dim.clone(), &config, world_path.clone(), seed);
+            let level = into_level_with_cluster_genesis(
+                dim.clone(),
+                &config,
+                world_path.clone(),
+                seed,
+                server.is_cluster_primary(),
+            );
             let world = Arc::new(World::load(
                 level.clone(),
                 server.level_info.clone(),
@@ -819,6 +1246,11 @@ impl Server {
             let portal: Arc<dyn WorldPortalExt> = Arc::new(WorldPortal(world.clone()));
             level.world_portal.store(Arc::new(Some(portal)));
             worlds_vec.push(world);
+        }
+
+        if server.is_cluster_primary() {
+            server.worlds.store(Arc::new(worlds_vec.clone()));
+            crate::server::cluster::maybe_bootstrap(&server);
         }
 
         for world in &worlds_vec {
@@ -837,9 +1269,10 @@ impl Server {
                 .await;
         }
 
-        server.worlds.store(Arc::new(worlds_vec));
-
-        crate::server::cluster::maybe_bootstrap(&server);
+        if !server.is_cluster_primary() {
+            server.worlds.store(Arc::new(worlds_vec));
+            crate::server::cluster::maybe_bootstrap(&server);
+        }
 
         info!("All worlds loaded successfully.");
 
@@ -898,8 +1331,21 @@ impl Server {
         let config = Arc::new(self.advanced_config.world.clone());
         let seed = self.level_info.load().world_gen_settings.seed;
 
-        let level =
-            pumpkin_world::dimension::into_level(dimension.clone(), &config, world_path, seed);
+        let level = into_level_with_cluster_genesis(
+            dimension.clone(),
+            &config,
+            world_path,
+            seed,
+            self.is_cluster_primary(),
+        );
+        if self.is_cluster_primary() {
+            level
+                .fresh_chunk_admission
+                .store(self.cluster_fresh_admission_route.load_full());
+            if let Some(wake) = level.fresh_chunk_wake.load_full() {
+                let _ = wake.try_send(());
+            }
+        }
         let world: World = World::load(level.clone(), l_info, dimension, registry, weak);
         let world = Arc::new(world);
         let portal: Arc<dyn WorldPortalExt> = Arc::new(WorldPortal(world.clone()));
@@ -953,7 +1399,7 @@ impl Server {
             && matches!(self.advanced_config.cluster.role, ClusterRole::Secondary)
     }
 
-    fn is_cluster_primary(&self) -> bool {
+    pub(crate) fn is_cluster_primary(&self) -> bool {
         self.advanced_config.cluster.enabled
             && matches!(self.advanced_config.cluster.role, ClusterRole::Primary)
     }
@@ -1077,7 +1523,7 @@ impl Server {
         config: Option<PlayerConfig>,
     ) -> Option<(Arc<Player>, Arc<World>)> {
         let prepared = self.prepare_player_with_data(
-            client, profile, config, None, None, None, None, None, None,
+            client, profile, config, None, None, None, None, None, None, None,
         )?;
         let mut event = PlayerLoginEvent::new(
             prepared.player.clone(),
@@ -1104,7 +1550,14 @@ impl Server {
         data: Option<pumpkin_nbt::compound::NbtCompound>,
         chunk_sender: crate::net::ChunkSender,
         world: Arc<World>,
+        hint: pumpkin_cluster::handoff::PlayerResumeHint,
     ) -> Option<PreparedPlayerJoin> {
+        let pinned_position = pumpkin_util::math::vector3::Vector3::new(
+            hint.position[0],
+            hint.position[1],
+            hint.position[2],
+        );
+        let pinned_rotation = hint.rotation;
         let prepared = self.prepare_player_with_data(
             client,
             profile,
@@ -1115,16 +1568,40 @@ impl Server {
             Some(data),
             Some(chunk_sender),
             Some(world),
+            Some(hint),
         )?;
         let mut event = PlayerLoginEvent::new(
             prepared.player.clone(),
             TextComponent::text("You have been kicked from the server"),
         );
-        self.plugin_manager.fire(self, &mut event).await;
+        let source = crate::command::CommandSource::new(
+            crate::command::CommandSender::Player(prepared.player.clone()),
+            prepared.player.world(),
+            Some(prepared.player.clone()),
+            pinned_position,
+            pumpkin_util::math::vector2::Vector2::new(pinned_rotation[0], pinned_rotation[1]),
+            prepared.player.gameprofile.name.clone(),
+            TextComponent::text(prepared.player.gameprofile.name.clone()),
+            self.clone(),
+        );
+        cluster_permissions::with_source(self, &source, self.plugin_manager.fire(self, &mut event))
+            .await;
         if event.cancelled {
             prepared
                 .player
                 .kick(DisconnectReason::Kicked, &event.kick_message);
+            return None;
+        }
+        let entity = &prepared.player.living_entity.entity;
+        if entity.pos.load() != pinned_position
+            || entity.yaw.load() != pinned_rotation[0]
+            || entity.pitch.load() != pinned_rotation[1].clamp(-90.0, 90.0) % 360.0
+        {
+            tracing::error!(?gid, "cluster handoff login event changed pinned target");
+            prepared.player.client.try_kick(
+                DisconnectReason::Kicked,
+                &TextComponent::text("Player handoff target mismatch"),
+            );
             return None;
         }
         Some(prepared)
@@ -1141,6 +1618,7 @@ impl Server {
         handoff_data: Option<Option<pumpkin_nbt::compound::NbtCompound>>,
         chunk_sender: Option<crate::net::ChunkSender>,
         handoff_world: Option<Arc<World>>,
+        handoff_hint: Option<pumpkin_cluster::handoff::PlayerResumeHint>,
     ) -> Option<PreparedPlayerJoin> {
         if self.is_cluster_primary() {
             client.try_kick(
@@ -1190,21 +1668,22 @@ impl Server {
             .map(|actor| {
                 cluster_actor_statistics::ActorStatisticsImport::from_nbt(actor, nbt.as_ref())
             });
-        let living_import = if let Some(actor) = gid.filter(|_| self.advanced_config.cluster.enabled) {
-            match cluster_actor_import::from_player_nbt(actor, nbt.as_ref()) {
-                Ok(import) => Some(import),
-                Err(error) => {
-                    tracing::error!(?actor, ?error, "cluster living handoff decode failed");
-                    client.try_kick(
-                        DisconnectReason::Kicked,
-                        &TextComponent::text("Living state handoff unavailable"),
-                    );
-                    return None;
+        let mut living_import =
+            if let Some(actor) = gid.filter(|_| self.advanced_config.cluster.enabled) {
+                match cluster_actor_import::from_player_nbt(actor, nbt.as_ref()) {
+                    Ok(import) => Some(import),
+                    Err(error) => {
+                        tracing::error!(?actor, ?error, "cluster living handoff decode failed");
+                        client.try_kick(
+                            DisconnectReason::Kicked,
+                            &TextComponent::text("Living state handoff unavailable"),
+                        );
+                        return None;
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
         let inventory_snapshot = if let Some(gid) = gid {
             match cluster_invsee::player_inventory_snapshot_from_nbt(gid, nbt.as_ref()) {
@@ -1244,7 +1723,7 @@ impl Server {
             (gid, handoff_inventory_token, inventory_snapshot.as_ref())
         {
             let installed = self.cluster_inventory_handoff_installed.load();
-            if !installed.get(&gid).is_some_and(|status| {
+            if !installed.get(&(gid, token)).is_some_and(|status| {
                 status.token == token && status.revision == Ok(snapshot.revision)
             }) {
                 client.try_kick(
@@ -1293,6 +1772,7 @@ impl Server {
 
         if let Some(mut nbt_data) = nbt {
             if handoff_inventory_token.is_some() {
+                player.cluster_handoff_base_nbt = nbt_data.clone();
                 player.read_cluster_handoff_nbt(&mut nbt_data);
             } else {
                 player.read_nbt(&mut nbt_data);
@@ -1317,6 +1797,91 @@ impl Server {
             return None;
         }
 
+        if let Some(hint) = handoff_hint.as_ref() {
+            player
+                .living_entity
+                .entity
+                .set_pos(pumpkin_util::math::vector3::Vector3::new(
+                    hint.position[0],
+                    hint.position[1],
+                    hint.position[2],
+                ));
+            player
+                .living_entity
+                .entity
+                .set_rotation(hint.rotation[0], hint.rotation[1]);
+        }
+
+        if self.advanced_config.cluster.enabled {
+            if let Some(import) = living_import.as_mut() {
+                let mut attributes: std::collections::BTreeMap<u16, u64> = player
+                    .living_entity
+                    .attributes
+                    .get_mut()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .map(|(id, attribute)| (u16::from(*id), attribute.base_value.to_bits()))
+                    .collect();
+                attributes.extend(
+                    import
+                        .state
+                        .combat
+                        .effective_attributes
+                        .iter()
+                        .map(|(id, value)| (*id, *value)),
+                );
+                import.state.combat.effective_attributes = attributes;
+            }
+            player.cluster_initial_administrative = Some(
+                cluster_player_admin::capture_initial_state_off_registry(&mut player),
+            );
+            player.cluster_initial_experience =
+                pumpkin_cluster::player_experience::PlayerExperienceState {
+                    total: player.experience_points.load(Ordering::Relaxed).max(0) as u32,
+                    level: player.experience_level.load(Ordering::Relaxed).max(0) as u32,
+                    progress: player.experience_progress.load().to_bits(),
+                };
+            if !player.cluster_initial_experience.is_valid() {
+                player.client.try_kick(
+                    DisconnectReason::Kicked,
+                    &TextComponent::text("Invalid player experience state"),
+                );
+                return None;
+            }
+            player.cluster_initial_presentation.respawn = player
+                .respawn_point
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map(|respawn| {
+                    let world = self.get_world_from_dimension(&respawn.dimension);
+                    pumpkin_cluster::item_action::PlayerRespawnState {
+                        world: cluster_world_delta::world_id(&world),
+                        position: pumpkin_cluster::protocol::BlockPos {
+                            x: respawn.position.0.x,
+                            y: respawn.position.0.y,
+                            z: respawn.position.0.z,
+                        },
+                        yaw: respawn.yaw.to_bits(),
+                        forced: respawn.force,
+                    }
+                });
+            if let (Some(import), Some(initial)) = (
+                living_import.as_mut(),
+                player.cluster_initial_administrative.as_ref(),
+            ) {
+                import.state.effects = initial.effects.clone();
+                import.state.combat.status = crate::entity::combat::normalized_status(
+                    initial.effects.iter(),
+                    player
+                        .living_entity
+                        .entity
+                        .invulnerable
+                        .load(Ordering::Relaxed),
+                );
+            }
+        }
+
         // Wrap in Arc after data is loaded
         let player = if self.advanced_config.cluster.enabled {
             Arc::new_cyclic(|weak| {
@@ -1331,6 +1896,11 @@ impl Server {
             Arc::new(player)
         };
         player.set_cluster_gid(gid);
+        if let Some(generation) = handoff_inventory_token {
+            player
+                .cluster_owner_install_generation
+                .store(generation, std::sync::atomic::Ordering::Release);
+        }
         let _ = cluster_presence::assign_login_gid(self, &player);
         if !self.advanced_config.cluster.enabled {
             let mut advancements = player
@@ -1370,9 +1940,21 @@ impl Server {
         let admission = match (gid, statistics_import, living_import) {
             (Some(actor), Some(statistics), Some(living)) => {
                 Some(cluster_world_actor::ActorAdmissionImport {
+                    completion: self.cluster_controller.reserve_actor_admission_result()?,
                     actor,
+                    key: player.gameprofile.id,
                     statistics,
                     living: living.state,
+                    presentation: player.cluster_initial_presentation.clone(),
+                    fall_distance: player
+                        .cluster_initial_administrative
+                        .as_ref()?
+                        .fall_distance,
+                    experience: player.cluster_initial_experience,
+                    client_entity_id: player.living_entity.entity.entity_id,
+                    install_generation: player
+                        .cluster_owner_install_generation
+                        .load(Ordering::Acquire),
                 })
             }
             (None, None, None) => None,
@@ -1408,11 +1990,29 @@ impl Server {
         } else {
             None
         };
-        player
-            .screen_handler_sync_handler
-            .store_player(player.clone());
-        if world.add_player(&player).is_err() {
-            return None;
+        if let Some(admission) = admission.as_ref() {
+            if player.cluster_gid() != Some(admission.actor)
+                || player.gameprofile.id != admission.key
+                || inventory_install_token != Some(admission.install_generation)
+                || player
+                    .cluster_owner_install_generation
+                    .load(Ordering::Acquire)
+                    != admission.install_generation
+                || !world.add_cluster_player_registry(&player)
+            {
+                player.kick(
+                    DisconnectReason::Kicked,
+                    &TextComponent::text("Cluster player registry admission unavailable"),
+                );
+                return None;
+            }
+        } else {
+            player
+                .screen_handler_sync_handler
+                .store_player(player.clone());
+            if world.add_player(&player).is_err() {
+                return None;
+            }
         }
         if let (Some(permit), Some(admission)) = (admission_permit, admission) {
             permit.send(admission);
@@ -1458,6 +2058,7 @@ impl Server {
     }
 
     pub async fn shutdown(&self) {
+        self.cluster_global_shutdown.store(true, Ordering::Release);
         crate::server::cluster::log_cluster_shutdown_progress(self, "server shutdown starting");
         crate::server::cluster::begin_cluster_leave_drain(self);
         if let Some(primary) = self.primary_save.as_ref() {
@@ -1587,6 +2188,17 @@ impl Server {
     ///
     /// This function does not handle the actual mob spawn options update, which is a TODO item for future implementation.
     pub fn set_difficulty(&self, difficulty: Difficulty, force_update: bool) {
+        if self.advanced_config.cluster.enabled {
+            cluster_gamerules::submit(
+                self,
+                cluster_gamerules::ConfigMutation::Difficulty {
+                    value: difficulty,
+                    force: force_update,
+                },
+            );
+            return;
+        }
+
         let current_info = self.level_info.load();
         if current_info.difficulty_locked && !force_update {
             return;
@@ -1617,6 +2229,14 @@ impl Server {
 
     /// Sets the difficulty lock status of the server and broadcasts the update to all players.
     pub fn set_difficulty_locked(&self, locked: bool) {
+        if self.advanced_config.cluster.enabled {
+            cluster_gamerules::submit(
+                self,
+                cluster_gamerules::ConfigMutation::DifficultyLock(locked),
+            );
+            return;
+        }
+
         let current_info = self.level_info.load();
         let mut new_info = (**current_info).clone();
         new_info.difficulty_locked = locked;
@@ -1883,8 +2503,10 @@ impl Server {
             if pumpkin_world::level::is_cluster_secondary() && world.players.load().is_empty() {
                 continue;
             }
-            world.flush_block_updates();
-            world.flush_synced_block_events();
+            if !self.advanced_config.cluster.enabled {
+                world.flush_block_updates();
+                world.flush_synced_block_events();
+            }
 
             let players = world.players.load();
             let player_handle = handle.clone();
@@ -1995,6 +2617,9 @@ impl Server {
     }
 
     pub fn set_cluster_health_mask(&self, mode: HealthMaskMode) -> bool {
+        if self.cluster_global_shutdown.load(Ordering::Relaxed) {
+            return false;
+        }
         let mode = match mode {
             HealthMaskMode::Off => ClusterHealthMaskMode::Off,
             HealthMaskMode::Players => ClusterHealthMaskMode::Players,
@@ -2014,49 +2639,8 @@ impl Server {
         })
     }
 
-    pub(crate) fn publish_cluster_health_policy_to(&self, peer: u16) {
-        if let Some(tx) = self.cluster_health_policy_tx.get() {
-            let _ = tx.try_send(cluster_health_policy::HealthPolicyCommand::PublishTo(peer));
-        }
-    }
-
-    pub(crate) fn note_cluster_health_policy_primary(&self, peer: u16) {
-        if let Some(tx) = self.cluster_health_policy_tx.get() {
-            let _ = tx.try_send(cluster_health_policy::HealthPolicyCommand::PrimaryObserved(
-                peer,
-            ));
-        }
-    }
-
-    pub(crate) fn note_cluster_health_policy_connected(&self, peer: u16) {
-        if let Some(tx) = self.cluster_health_policy_tx.get() {
-            let _ = tx.try_send(cluster_health_policy::HealthPolicyCommand::PeerConnected(
-                peer,
-            ));
-        }
-    }
-
-    pub(crate) fn note_cluster_health_policy_admitted(&self, peer: u16) {
-        if let Some(tx) = self.cluster_health_policy_tx.get() {
-            let _ = tx.try_send(cluster_health_policy::HealthPolicyCommand::PeerAdmitted(
-                peer,
-            ));
-        }
-    }
-
-    pub(crate) fn note_cluster_health_policy_disconnected(&self, peer: u16) {
-        if let Some(tx) = self.cluster_health_policy_tx.get() {
-            let _ = tx.try_send(cluster_health_policy::HealthPolicyCommand::PeerDisconnected(peer));
-        }
-    }
-
-    pub(crate) fn note_cluster_health_policy_local_admitted(&self) {
-        if let Some(tx) = self.cluster_health_policy_tx.get() {
-            let _ = tx.try_send(cluster_health_policy::HealthPolicyCommand::LocalAdmitted);
-        }
-    }
-
     pub(crate) fn refresh_client_health_metadata(&self) {
+        if self.advanced_config.cluster.enabled { return; }
         for world in self.worlds.load().iter() {
             for entity in world.entities.load().iter() {
                 if let Some(living) = entity.get_living_entity() {

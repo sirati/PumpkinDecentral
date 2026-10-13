@@ -226,7 +226,7 @@ impl EntityDataAccessor {
 
 impl DataAccessor for EntityDataAccessor {
     fn set_data(&self, tag: &NbtCompound) -> Result<(), CommandSyntaxError> {
-        if self.entity.get_player().is_some() {
+        if self.entity.get_entity().entity_type.id == pumpkin_data::entity::EntityType::PLAYER.id {
             return Err(ERROR_ENTITY_INVALID.create_without_context());
         }
         self.entity.read_nbt_non_mut(tag);

@@ -16,6 +16,7 @@ use crate::block::{
 #[pumpkin_block("minecraft:test_block")]
 pub struct TestBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for TestBlock {
     fn normal_use(&self, args: NormalUseArgs<'_>) -> BlockActionResult {
         if args.player.permission_lvl.load() < PermissionLvl::Two {
@@ -84,20 +85,17 @@ impl BlockBehaviour for TestBlock {
             return 0;
         }
 
-        let Some(entity) = args.world.get_block_entity(args.position) else {
-            return 0;
-        };
-        let Some(test_block) = entity.as_any().downcast_ref::<TestBlockBlockEntity>() else {
-            return 0;
-        };
-
-        if test_block.is_powered() { 15 } else { 0 }
+        args.world.block_entity_signal(
+            args.position,
+            crate::block::BlockEntitySignal::TestBlockPowered,
+        )
     }
 }
 
 #[pumpkin_block("minecraft:test_instance_block")]
 pub struct TestInstanceBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for TestInstanceBlock {
     fn normal_use(&self, args: NormalUseArgs<'_>) -> BlockActionResult {
         if args.player.permission_lvl.load() < PermissionLvl::Two {

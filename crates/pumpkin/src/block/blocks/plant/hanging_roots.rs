@@ -20,6 +20,7 @@ impl HangingRootsBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for HangingRootsBlock {
     fn can_place_at(&self, args: CanPlaceAtArgs<'_>) -> bool {
         Self::can_survive(args.block_accessor, args.position)

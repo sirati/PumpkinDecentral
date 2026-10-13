@@ -461,7 +461,7 @@ pub fn get_first_state(current_block: &Block, state_id: BlockStateId) -> BlockSt
 /// Returns `Some((same_age_count, higher_age_count))` otherwise.
 #[must_use]
 pub fn scan_neighbor_oxidation_levels(
-    world: &World,
+    world: &dyn pumpkin_world::world::BlockAccessor,
     center: &BlockPos,
     current_age: WeatherState,
 ) -> Option<(usize, usize)> {
@@ -499,6 +499,48 @@ pub fn scan_neighbor_oxidation_levels(
     }
 
     Some((same_age_count, higher_age_count))
+}
+
+/// Freezes the finite oxidation neighborhood through the callback transcript.
+pub fn change_over_time_intent(
+    args: crate::block::RandomTickIntentArgs<'_>,
+) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+    use pumpkin_util::random::RandomImpl;
+    let state = args.world.get_block_state_id(args.position);
+    if state.to_block_id() != args.block.id {
+        return Some(Vec::new());
+    }
+    if state.to_state().block_entity_type != u16::MAX
+        || args
+            .block
+            .has_tag(&pumpkin_data::tag::Block::MINECRAFT_DOORS)
+    {
+        return None;
+    }
+    if args.random.next_f32() >= BASE_DEGRADATION_CHANCE {
+        return Some(Vec::new());
+    }
+    let Some(age) = get_weather_state(args.block) else {
+        return Some(Vec::new());
+    };
+    let Some(next) = get_next(args.block) else {
+        return Some(Vec::new());
+    };
+    let Some((same, higher)) = scan_neighbor_oxidation_levels(args.world, args.position, age)
+    else {
+        return Some(Vec::new());
+    };
+    let ratio = (higher + 1) as f32 / (higher + same + 1) as f32;
+    if args.random.next_f32() >= ratio * ratio * get_chance_modifier(age) {
+        return Some(Vec::new());
+    }
+    Some(vec![
+        crate::block::neighbor::BlockCallbackEffect::SetBlock {
+            position: *args.position,
+            state: with_properties_of(args.block, state, next),
+            flags: BlockFlags::NOTIFY_ALL,
+        },
+    ])
 }
 
 /// Executes a random tick change-over-time attempt on a weathering copper block using vanilla's probability formula.
@@ -639,9 +681,17 @@ impl BlockMetadata for WeatheringCopperBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for WeatheringCopperBlock {
     fn random_tick(&self, args: RandomTickArgs<'_>) {
         change_over_time(args.world, args.position, args.block);
+    }
+
+    fn random_tick_intent(
+        &self,
+        args: crate::block::RandomTickIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        change_over_time_intent(args)
     }
 
     /// Only statues carry a pose, every other copper block here reads nothing.
@@ -705,7 +755,22 @@ impl BlockMetadata for WeatheringCopperStairBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for WeatheringCopperStairBlock {
+    fn placement_intent(
+        &self,
+        args: crate::block::PlacementIntentArgs<'_>,
+    ) -> Option<BlockStateId> {
+        StairBlock.placement_intent(args)
+    }
+
+    fn callback_intent(
+        &self,
+        args: crate::block::neighbor::BlockCallbackIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        StairBlock.callback_intent(args)
+    }
+
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         StairBlock.on_place(args)
     }
@@ -729,6 +794,13 @@ impl BlockBehaviour for WeatheringCopperStairBlock {
 
     fn random_tick(&self, args: RandomTickArgs<'_>) {
         change_over_time(args.world, args.position, args.block);
+    }
+
+    fn random_tick_intent(
+        &self,
+        args: crate::block::RandomTickIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        change_over_time_intent(args)
     }
 
     fn is_pathfindable(&self, state: &BlockState, computation_type: PathComputationType) -> bool {
@@ -776,7 +848,32 @@ impl BlockMetadata for WeatheringCopperTrapDoorBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for WeatheringCopperTrapDoorBlock {
+    fn placement_intent(
+        &self,
+        args: crate::block::PlacementIntentArgs<'_>,
+    ) -> Option<BlockStateId> {
+        TrapDoorBlock.placement_intent(args)
+    }
+
+    fn normal_use_intent(
+        &self,
+        args: crate::block::NormalUseIntentArgs<'_>,
+    ) -> Option<(
+        BlockActionResult,
+        Vec<crate::block::neighbor::BlockCallbackEffect>,
+    )> {
+        TrapDoorBlock.normal_use_intent(args)
+    }
+
+    fn callback_intent(
+        &self,
+        args: crate::block::neighbor::BlockCallbackIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        TrapDoorBlock.callback_intent(args)
+    }
+
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         TrapDoorBlock.on_place(args)
     }
@@ -791,6 +888,13 @@ impl BlockBehaviour for WeatheringCopperTrapDoorBlock {
 
     fn random_tick(&self, args: RandomTickArgs<'_>) {
         change_over_time(args.world, args.position, args.block);
+    }
+
+    fn random_tick_intent(
+        &self,
+        args: crate::block::RandomTickIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        change_over_time_intent(args)
     }
 
     fn is_pathfindable(&self, state: &BlockState, computation_type: PathComputationType) -> bool {
@@ -838,7 +942,18 @@ impl BlockMetadata for WeatheringCopperSlabBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for WeatheringCopperSlabBlock {
+    fn placement_intent(
+        &self,
+        args: crate::block::PlacementIntentArgs<'_>,
+    ) -> Option<BlockStateId> {
+        SlabBlock.placement_intent(args)
+    }
+    fn can_update_intent(&self, args: crate::block::CanUpdateIntentArgs<'_>) -> Option<bool> {
+        SlabBlock.can_update_intent(args)
+    }
+
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         SlabBlock.on_place(args)
     }
@@ -849,6 +964,13 @@ impl BlockBehaviour for WeatheringCopperSlabBlock {
 
     fn random_tick(&self, args: RandomTickArgs<'_>) {
         change_over_time(args.world, args.position, args.block);
+    }
+
+    fn random_tick_intent(
+        &self,
+        args: crate::block::RandomTickIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        change_over_time_intent(args)
     }
 
     fn is_pathfindable(&self, state: &BlockState, computation_type: PathComputationType) -> bool {
@@ -896,7 +1018,32 @@ impl BlockMetadata for WeatheringCopperDoorBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for WeatheringCopperDoorBlock {
+    fn placement_intent(
+        &self,
+        args: crate::block::PlacementIntentArgs<'_>,
+    ) -> Option<BlockStateId> {
+        DoorBlock.placement_intent(args)
+    }
+
+    fn normal_use_intent(
+        &self,
+        args: crate::block::NormalUseIntentArgs<'_>,
+    ) -> Option<(
+        BlockActionResult,
+        Vec<crate::block::neighbor::BlockCallbackEffect>,
+    )> {
+        DoorBlock.normal_use_intent(args)
+    }
+
+    fn callback_intent(
+        &self,
+        args: crate::block::neighbor::BlockCallbackIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        DoorBlock.callback_intent(args)
+    }
+
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         DoorBlock.on_place(args)
     }
@@ -915,6 +1062,13 @@ impl BlockBehaviour for WeatheringCopperDoorBlock {
 
     fn broken(&self, args: BrokenArgs<'_>) {
         DoorBlock.broken(args);
+    }
+
+    fn player_broken_intent(
+        &self,
+        args: crate::block::neighbor::PlayerBrokenIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        DoorBlock.player_broken_intent(args)
     }
 
     fn on_neighbor_update(&self, args: OnNeighborUpdateArgs<'_>) {
@@ -985,6 +1139,7 @@ impl BlockMetadata for WeatheringCopperGrateBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for WeatheringCopperGrateBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut props = MangroveRootsLikeProperties::default(args.block);
@@ -994,5 +1149,12 @@ impl BlockBehaviour for WeatheringCopperGrateBlock {
 
     fn random_tick(&self, args: RandomTickArgs<'_>) {
         change_over_time(args.world, args.position, args.block);
+    }
+
+    fn random_tick_intent(
+        &self,
+        args: crate::block::RandomTickIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        change_over_time_intent(args)
     }
 }

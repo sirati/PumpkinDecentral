@@ -230,6 +230,15 @@ mod tests {
     fn sample_pos() -> PosUpdate {
         PosUpdate {
             gid: sample_gid(),
+            incarnation: 1,
+            spatial_epoch: crate::canonical_action::SpatialEpoch::Admission {
+                lease: crate::canonical_action::LivePlayerLease {
+                    key: crate::canonical_action::PlayerKey(uuid::Uuid::nil()),
+                    gid: sample_gid(),
+                    incarnation: 1,
+                },
+                admitted_at: TickStamp(0),
+            },
             seq: PlayerSeq(12),
             tick: TickStamp(90),
             world: crate::protocol::WorldId::new(0, 7),

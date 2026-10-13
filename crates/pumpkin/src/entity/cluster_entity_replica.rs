@@ -94,7 +94,7 @@ mod tests {
     use pumpkin_cluster::identity::ServerId;
     use pumpkin_cluster::protocol::{ChunkKey, WorldId};
 
-    fn entity(owner: u16, local_id: i32, generation: u32) -> EntityRef {
+    fn entity(owner: u16, local_id: i32, generation: u64) -> EntityRef {
         EntityRef {
             origin: ServerId(owner),
             local_id,
@@ -107,9 +107,11 @@ mod tests {
     fn replica_uuid_prevents_origin_and_generation_reuse_collisions() {
         let original = replica_uuid(entity(2, 41, 7));
         let reused = replica_uuid(entity(2, 41, 8));
+        let high_generation = replica_uuid(entity(2, 41, (1_u64 << 32) | 7));
         let other_owner = replica_uuid(entity(3, 41, 7));
 
         assert_ne!(original, reused);
+        assert_ne!(original, high_generation);
         assert_ne!(original, other_owner);
         assert_eq!(original.get_version_num(), 4);
         assert_eq!(original.get_variant(), uuid::Variant::RFC4122);

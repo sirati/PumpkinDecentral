@@ -116,6 +116,9 @@ impl CommandBlock {
         block_entity: Arc<dyn BlockEntity>,
         command: &str,
     ) {
+        if server.advanced_config.cluster.enabled {
+            return;
+        }
         let command_blocks_work = { world.level_info.load().game_rules.command_blocks_work };
         if !command_blocks_work {
             return;
@@ -139,6 +142,9 @@ impl CommandBlock {
     }
 
     fn chain_execute(server: &Arc<Server>, world: &Arc<World>, start: BlockPos) {
+        if server.advanced_config.cluster.enabled {
+            return;
+        }
         let mut i = u16::MAX;
         let mut pos = start;
 
@@ -209,6 +215,7 @@ impl BlockMetadata for CommandBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for CommandBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut props = CommandBlockLikeProperties::default(args.block);
@@ -217,6 +224,14 @@ impl BlockBehaviour for CommandBlock {
     }
 
     fn normal_use(&self, args: NormalUseArgs<'_>) -> BlockActionResult {
+        if args
+            .world
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            return BlockActionResult::Pass;
+        }
         {
             if args.player.permission_lvl.load() < PermissionLvl::Two {
                 return BlockActionResult::Pass;
@@ -230,6 +245,14 @@ impl BlockBehaviour for CommandBlock {
     }
 
     fn on_neighbor_update(&self, args: OnNeighborUpdateArgs<'_>) {
+        if args
+            .world
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            return;
+        }
         {
             let command_blocks_work =
                 { args.world.level_info.load().game_rules.command_blocks_work };
@@ -259,6 +282,14 @@ impl BlockBehaviour for CommandBlock {
     }
 
     fn on_scheduled_tick(&self, args: OnScheduledTickArgs<'_>) {
+        if args
+            .world
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            return;
+        }
         let command_blocks_work = { args.world.level_info.load().game_rules.command_blocks_work };
         if !command_blocks_work {
             return;
@@ -334,6 +365,14 @@ impl BlockBehaviour for CommandBlock {
     }
 
     fn placed(&self, args: PlacedArgs<'_>) {
+        if args
+            .world
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            return;
+        }
         {
             let send_command_feedback = {
                 let game_rules = &args.world.level_info.load().game_rules;

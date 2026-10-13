@@ -23,7 +23,15 @@ impl BlockMetadata for GrassBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for GrassBlock {
+    fn random_tick_intent(
+        &self,
+        args: crate::block::RandomTickIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        SpreadingSnowyBlock::random_tick_intent(args, &Block::DIRT)
+    }
+
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         SnowyBlock::on_place(args.block, args.world, args.position)
     }

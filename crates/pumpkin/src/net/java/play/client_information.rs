@@ -90,15 +90,25 @@ impl JavaClient {
             }
 
             if skin_changed {
-                pumpkin_cluster::visual::emit_skin(
-                    player.cluster_gid(),
-                    pumpkin_cluster::visual::tick_from_counter(
-                        player
-                            .tick_counter
-                            .load(std::sync::atomic::Ordering::Relaxed),
-                    ),
-                    client_information.skin_parts,
-                );
+                if player.cluster_gid().is_some() {
+                    crate::server::cluster_remote_player_presentation::submit_cosmetic(
+                        server,
+                        player,
+                        crate::server::cluster_remote_player_presentation::CosmeticChange::Skin(
+                            client_information.skin_parts,
+                        ),
+                    );
+                } else {
+                    pumpkin_cluster::visual::emit_skin(
+                        player.cluster_gid(),
+                        pumpkin_cluster::visual::tick_from_counter(
+                            player
+                                .tick_counter
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                        ),
+                        client_information.skin_parts,
+                    );
+                }
             }
 
             if update_settings {

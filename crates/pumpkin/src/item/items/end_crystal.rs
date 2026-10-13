@@ -22,6 +22,7 @@ impl ItemMetadata for EndCrystalItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for EndCrystalItem {
     fn use_on_block(
         &self,

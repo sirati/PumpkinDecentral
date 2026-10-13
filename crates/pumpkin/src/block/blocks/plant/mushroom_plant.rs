@@ -221,6 +221,7 @@ fn place_huge_red_mushroom(world: &Arc<World>, pos: &BlockPos, tree_height: i32)
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for MushroomPlantBlock {
     fn can_place_at(&self, args: CanPlaceAtArgs<'_>) -> bool {
         Self::can_survive(args.block_accessor, args.world, args.position)
@@ -230,7 +231,13 @@ impl BlockBehaviour for MushroomPlantBlock {
         &self,
         args: GetStateForNeighborUpdateArgs<'_>,
     ) -> BlockStateId {
-        if !Self::can_survive(args.world, Some(args.world), args.position) {
+        if !(args
+            .world
+            .get_block(&args.position.down())
+            .has_tag(&tag::Block::MINECRAFT_OVERRIDES_MUSHROOM_LIGHT_REQUIREMENT)
+            || (args.world.get_raw_brightness(args.position, 0) < 13
+                && Self::may_place_on(args.world.get_block_state(&args.position.down()))))
+        {
             return Block::AIR.default_state.id;
         }
         args.state_id

@@ -301,6 +301,7 @@ fn broken_chest_impl(args: &BrokenArgs<'_>) {
 #[pumpkin_block_from_tag("c:chests/wooden")]
 pub struct ChestBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for ChestBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         on_place_chest_impl(&args)
@@ -376,6 +377,7 @@ impl
 
 impl crate::block::blocks::weathering_copper::WeatheringCopper for CopperChestBlock {}
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for CopperChestBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         on_place_chest_impl(&args)
@@ -441,6 +443,7 @@ impl BlockBehaviour for CopperChestBlock {
 #[pumpkin_block("minecraft:trapped_chest")]
 pub struct TrappedChestBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for TrappedChestBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         on_place_chest_impl(&args)
@@ -475,20 +478,11 @@ impl BlockBehaviour for TrappedChestBlock {
     }
 
     fn get_weak_redstone_power(&self, args: GetRedstonePowerArgs<'_>) -> u8 {
-        use crate::block::entities::trapped_chest::TrappedChestBlockEntity;
-
         // Get viewer count from this chest
-        let viewer_count = if let Some(block_entity) = args.world.get_block_entity(args.position)
-            && let Some(trapped_chest) = block_entity
-                .as_any()
-                .downcast_ref::<TrappedChestBlockEntity>()
-        {
-            trapped_chest.get_viewer_count()
-        } else {
-            0
-        };
-
-        viewer_count.min(15) as u8
+        args.world.block_entity_signal(
+            args.position,
+            crate::block::BlockEntitySignal::TrappedChestViewers,
+        )
     }
 
     fn get_strong_redstone_power(&self, args: GetRedstonePowerArgs<'_>) -> u8 {

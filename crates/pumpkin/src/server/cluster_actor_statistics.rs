@@ -116,7 +116,9 @@ pub(crate) struct ActorStatisticsImport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ActorStatisticsRetire {
     pub actor: GlobalPlayerId,
+    pub player_key: uuid::Uuid,
     pub incarnation: u64,
+    pub install_generation: u64,
 }
 
 impl ActorStatisticsImport {
@@ -188,11 +190,18 @@ impl OwnedActorStatistics {
         }
     }
 
+    pub(crate) fn can_import(&self, actor: GlobalPlayerId) -> bool {
+        !self.actors.contains_key(&actor) && self.next_incarnation.checked_add(1).is_some()
+    }
+
     pub fn import(&mut self, import: ActorStatisticsImport) -> bool {
-        if self.actors.contains_key(&import.actor) {
+        if !self.can_import(import.actor) {
             return false;
         }
-        self.next_incarnation = self.next_incarnation.wrapping_add(1);
+        self.next_incarnation = self
+            .next_incarnation
+            .checked_add(1)
+            .expect("preflighted actor incarnation");
         self.actors.insert(
             import.actor,
             ActorStatistics {
@@ -599,6 +608,10 @@ impl OwnedActorStatistics {
         self.actors.get(&actor).map(|state| state.ground_revision)
     }
 
+    pub fn incarnation(&self, actor: GlobalPlayerId) -> Option<u64> {
+        self.actors.get(&actor).map(|state| state.incarnation)
+    }
+
     pub fn leave_game_status(&self, actor: GlobalPlayerId) -> Option<bool> {
         self.actors
             .get(&actor)
@@ -648,16 +661,19 @@ mod tests {
     fn losing_one_optimistic_increment_preserves_other_local_and_ground_changes() {
         let actor = GlobalPlayerId::new(ServerId(4), PlayerSlot(11));
         let key_a = ActionKey {
+            incarnation: 0,
             actor: ActorId::Player(actor),
             sequence: 1,
             family: 4,
         };
         let key_b = ActionKey {
+            incarnation: 0,
             actor: ActorId::Player(actor),
             sequence: 2,
             family: 4,
         };
         let key_remote = ActionKey {
+            incarnation: 0,
             actor: ActorId::Peer(ServerId(5)),
             sequence: 3,
             family: 4,
@@ -805,6 +821,7 @@ mod tests {
     fn accepted_statistics_apply_as_one_revision_and_reject_stale_replay() {
         let actor = GlobalPlayerId::new(ServerId(3), PlayerSlot(8));
         let key = ActionKey {
+            incarnation: 0,
             actor: ActorId::Player(actor),
             sequence: 19,
             family: 1,
@@ -924,7 +941,9 @@ mod tests {
         let old = owner.snapshot(actor).unwrap().incarnation;
         assert!(owner.retire(ActorStatisticsRetire {
             actor,
+            player_key: uuid::Uuid::nil(),
             incarnation: old,
+            install_generation: 1,
         }));
         assert!(owner.import(ActorStatisticsImport::from_nbt(actor, None)));
         owner.publish();
@@ -932,7 +951,9 @@ mod tests {
         assert_ne!(old, newer);
         assert!(!owner.retire(ActorStatisticsRetire {
             actor,
+            player_key: uuid::Uuid::nil(),
             incarnation: old,
+            install_generation: 1,
         }));
         assert_eq!(owner.snapshot(actor).unwrap().incarnation, newer);
     }

@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use pumpkin_cluster::completion::{
     ActionKey, ChunkPendingTick, CompletionLedger, DropReport, FinishResult, RequirementResult,
@@ -11,6 +11,8 @@ use pumpkin_cluster::protocol::{ChunkKey, GlobalEntityId, PlayerChunkTransition,
 use pumpkin_cluster::time::TickStamp;
 
 use super::cluster_world_apply::CLUSTER_SEED;
+
+const MAX_PENDING_CANONICAL_ADMISSION: usize = 4096;
 
 pub struct ReadyPromotion {
     pub tick: TickStamp,
@@ -27,12 +29,16 @@ pub struct WorldTickBuckets {
     seen: HashSet<(TickStamp, ServerId, ActionKey)>,
     promoted: HashSet<(TickStamp, ActionKey)>,
     resolved: HashSet<TickStamp>,
+    resolved_order: VecDeque<TickStamp>,
     departures: HashMap<GlobalPlayerId, PlayerChunkTransition>,
     invalid: HashSet<(ServerId, TickStamp)>,
     captured_holders: HashMap<(TickStamp, ChunkKey), Vec<ServerId>>,
     settlement_blocked: HashSet<(TickStamp, ActionKey)>,
     observer_chunks: HashSet<(TickStamp, ChunkKey)>,
     quarantined_chunks: HashSet<ChunkKey>,
+    admitted_canonical: Vec<(ServerId, pumpkin_cluster::canonical_action::Action)>,
+    authenticated_generations: HashMap<(TickStamp, ServerId), u64>,
+    authenticated_finishes: HashMap<(TickStamp, ServerId), TickFinish>,
 }
 
 impl WorldTickBuckets {
@@ -51,6 +57,112 @@ impl WorldTickBuckets {
         self.push_batch_with_entity_owners(source, local, batch, holders, |_| None);
     }
 
+    pub fn push_authenticated_batch(
+        &mut self,
+        source: ServerId,
+        generation: u64,
+        local: ServerId,
+        batch: TickBatch,
+        holders: impl Fn(ChunkKey) -> Vec<u16> + Copy,
+        current_owner: impl Fn(GlobalEntityId) -> Option<ServerId> + Copy,
+    ) -> Vec<pumpkin_cluster::canonical_action::Action> {
+        if !self.bind_generation(batch.tick, source, generation) {
+            self.invalid.insert((source, batch.tick));
+            return Vec::new();
+        }
+        if self
+            .authenticated_finishes
+            .get(&(batch.tick, source))
+            .is_some_and(|finish| !batch_declared_in_finish(&batch, finish))
+        {
+            self.invalid.insert((source, batch.tick));
+            return Vec::new();
+        }
+        self.push_batch_with_entity_owners(source, local, batch, holders, current_owner)
+    }
+
+    pub fn note_authenticated_finish(
+        &mut self,
+        source: ServerId,
+        generation: u64,
+        local: ServerId,
+        finish: TickFinish,
+        holders: impl Fn(ChunkKey) -> Vec<u16>,
+        current_owner: impl Fn(GlobalEntityId) -> Option<ServerId>,
+    ) -> bool {
+        if !self.bind_generation(finish.tick, source, generation) {
+            self.invalid.insert((source, finish.tick));
+            return false;
+        }
+        match self.authenticated_finishes.get(&(finish.tick, source)) {
+            Some(existing) if existing != &finish => {
+                self.invalid.insert((source, finish.tick));
+                return false;
+            }
+            Some(_) => {}
+            None => {
+                if self.pending.get(&finish.tick).is_some_and(|batches| {
+                    batches
+                        .iter()
+                        .filter(|batch| batch.source == source)
+                        .any(|batch| !batch_declared_in_finish(&batch.batch, &finish))
+                }) {
+                    self.invalid.insert((source, finish.tick));
+                    return false;
+                }
+                self.authenticated_finishes
+                    .insert((finish.tick, source), finish.clone());
+            }
+        }
+        self.note_finish_with_entity_owners(source, local, finish, holders, current_owner);
+        true
+    }
+
+    fn bind_generation(&mut self, tick: TickStamp, source: ServerId, generation: u64) -> bool {
+        match self.authenticated_generations.entry((tick, source)) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(generation);
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => *entry.get() == generation,
+        }
+    }
+
+    pub fn legacy_chunk_closed(
+        &self,
+        tick: TickStamp,
+        chunk: ChunkKey,
+        producers: &BTreeMap<ServerId, u64>,
+    ) -> bool {
+        if producers.is_empty() {
+            return false;
+        }
+        let mut named = false;
+        for (source, generation) in producers {
+            if self.invalid.contains(&(*source, tick)) {
+                return false;
+            }
+            if self.authenticated_generations.get(&(tick, *source)) != Some(generation) {
+                return false;
+            }
+            let Some(finish) = self.authenticated_finishes.get(&(tick, *source)) else {
+                return false;
+            };
+            named |= finish
+                .chunks
+                .iter()
+                .any(|entry| entry.chunk == chunk && !entry.actions.is_empty());
+        }
+        !named || self.completion.chunk_complete(tick, chunk) || self.resolved.contains(&tick)
+    }
+
+    pub fn retire_authenticated_tick(&mut self, tick: TickStamp) {
+        self.authenticated_generations
+            .retain(|(entry, _), _| *entry != tick);
+        self.authenticated_finishes
+            .retain(|(entry, _), _| *entry != tick);
+    }
+
     pub fn push_batch_with_entity_owners(
         &mut self,
         source: ServerId,
@@ -58,10 +170,10 @@ impl WorldTickBuckets {
         mut batch: TickBatch,
         holders: impl Fn(ChunkKey) -> Vec<u16> + Copy,
         current_owner: impl Fn(GlobalEntityId) -> Option<ServerId> + Copy,
-    ) {
+    ) -> Vec<pumpkin_cluster::canonical_action::Action> {
         let tick = batch.tick;
         if self.resolved.contains(&tick) {
-            return;
+            return Vec::new();
         }
         for transition in batch.player_chunk_transition.clone() {
             self.relocate_pending(transition);
@@ -72,7 +184,7 @@ impl WorldTickBuckets {
         }
         let Ok(manifest) = TickFinish::try_from_batch(&batch) else {
             self.invalid.insert((source, tick));
-            return;
+            return Vec::new();
         };
         let requirements = joint_requirements(&manifest, holders);
         let mut relevant = BTreeSet::new();
@@ -91,7 +203,7 @@ impl WorldTickBuckets {
                     == RequirementResult::RecordedWithUnexpectedSources
             {
                 self.invalid.insert((source, tick));
-                return;
+                return Vec::new();
             }
             self.captured_holders
                 .entry((tick, entry.chunk))
@@ -99,26 +211,84 @@ impl WorldTickBuckets {
             relevant.extend(entry.actions.iter().copied());
         }
         if relevant.is_empty() {
-            return;
+            return Vec::new();
         }
         retain_actions(&mut batch, |action| relevant.contains(&action));
+        if self.admitted_canonical.len() + batch.canonical_actions.len()
+            > MAX_PENDING_CANONICAL_ADMISSION
+        {
+            self.invalid.insert((source, tick));
+            return Vec::new();
+        }
         if self
             .completion
             .note_batch_with_entity_owners(source, &batch, current_owner)
             .is_err()
         {
             self.invalid.insert((source, tick));
-            return;
+            return Vec::new();
         }
         retain_actions(&mut batch, |action| {
             self.seen.insert((tick, source, action))
         });
+        let accepted = batch.canonical_actions.clone();
+        self.admitted_canonical
+            .extend(accepted.iter().cloned().map(|action| (source, action)));
         if !batch.is_empty() {
             self.pending
                 .entry(tick)
                 .or_default()
                 .push(SourcedTickBatch { source, batch });
         }
+        accepted
+    }
+
+    pub fn drain_admitted_canonical_matching(
+        &mut self,
+        mut ready: impl FnMut(TickStamp) -> bool,
+    ) -> Vec<(ServerId, pumpkin_cluster::canonical_action::Action)> {
+        self.drain_admitted_canonical_actions_matching(|_, action| ready(action.tick))
+    }
+
+    pub fn drain_admitted_canonical_actions_matching(
+        &mut self,
+        mut ready: impl FnMut(ServerId, &pumpkin_cluster::canonical_action::Action) -> bool,
+    ) -> Vec<(ServerId, pumpkin_cluster::canonical_action::Action)> {
+        let mut selected = Vec::new();
+        self.admitted_canonical.retain(|(source, action)| {
+            if ready(*source, action) {
+                selected.push((*source, action.clone()));
+                false
+            } else {
+                true
+            }
+        });
+        selected
+    }
+
+    pub fn can_admit_canonical(&self, count: usize) -> bool {
+        count <= MAX_PENDING_CANONICAL_ADMISSION.saturating_sub(self.admitted_canonical.len())
+    }
+
+    pub fn pending_legacy_chunks(&self) -> HashSet<ChunkKey> {
+        self.pending
+            .values()
+            .flatten()
+            .flat_map(|sourced| {
+                let mut legacy = sourced.batch.clone();
+                legacy.canonical_actions.clear();
+                if legacy.is_empty() {
+                    return Vec::new();
+                }
+                TickFinish::try_from_batch(&legacy)
+                    .map(|finish| finish.chunks.into_iter().map(|entry| entry.chunk).collect())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    pub fn chunk_manifest_complete(&self, tick: TickStamp, chunk: ChunkKey) -> bool {
+        self.completion.chunk_complete(tick, chunk) || self.resolved.contains(&tick)
     }
 
     pub fn note_finish(
@@ -252,6 +422,15 @@ impl WorldTickBuckets {
                     holders: self.completion.holders_for(tick, chunk),
                     finishes: self.completion.known_finishes_for(tick),
                     batches,
+                    generations: self
+                        .authenticated_generations
+                        .iter()
+                        .filter_map(|((entry_tick, source), generation)| {
+                            (*entry_tick == tick).then_some((*source, *generation))
+                        })
+                        .collect::<BTreeMap<_, _>>()
+                        .into_iter()
+                        .collect(),
                 })
             })
             .collect()
@@ -267,6 +446,24 @@ impl WorldTickBuckets {
         for state in states {
             if state.holders.is_empty()
                 || state.holders.windows(2).any(|pair| pair[0] >= pair[1])
+                || state
+                    .generations
+                    .windows(2)
+                    .any(|pair| pair[0].0 >= pair[1].0)
+                || state
+                    .generations
+                    .iter()
+                    .any(|(_, generation)| *generation == 0)
+                || state
+                    .finishes
+                    .iter()
+                    .any(|(source, _)| !state.generations.iter().any(|(peer, _)| peer == source))
+                || state.batches.iter().any(|batch| {
+                    !state
+                        .generations
+                        .iter()
+                        .any(|(peer, _)| *peer == batch.source)
+                })
                 || state
                     .batches
                     .iter()
@@ -293,18 +490,32 @@ impl WorldTickBuckets {
             }
             next.observer_chunks.insert((state.tick, state.chunk));
             for (source, finish) in state.finishes {
-                next.note_finish_with_entity_owners(
+                let generation = state
+                    .generations
+                    .iter()
+                    .find_map(|(peer, generation)| (*peer == source).then_some(*generation))
+                    .ok_or(())?;
+                if !next.note_authenticated_finish(
                     source,
+                    generation,
                     local,
                     finish,
                     |_| Vec::new(),
                     current_owner,
-                );
+                ) {
+                    return Err(());
+                }
                 next.completion.mark_imported_finish(state.tick, source);
             }
             for sourced in state.batches {
-                next.push_batch_with_entity_owners(
+                let generation = state
+                    .generations
+                    .iter()
+                    .find_map(|(peer, generation)| (*peer == sourced.source).then_some(*generation))
+                    .ok_or(())?;
+                next.push_authenticated_batch(
                     sourced.source,
+                    generation,
                     local,
                     sourced.batch,
                     |_| Vec::new(),
@@ -321,6 +532,10 @@ impl WorldTickBuckets {
 
     pub fn quarantine_chunk(&mut self, chunk: ChunkKey) {
         self.quarantined_chunks.insert(chunk);
+    }
+
+    pub fn is_quarantined(&self, chunk: ChunkKey) -> bool {
+        self.quarantined_chunks.contains(&chunk)
     }
 
     pub fn ready_chunk(&mut self, chunk: ChunkKey) {
@@ -406,7 +621,78 @@ impl WorldTickBuckets {
                 })
     }
 
-    pub fn pop_ready(&mut self) -> Option<ReadyPromotion> {
+    pub fn canonical_admission_unresolved_through(
+        &self,
+        gid: GlobalPlayerId,
+        lease: Option<pumpkin_cluster::canonical_action::LivePlayerLease>,
+        through_tick: TickStamp,
+    ) -> bool {
+        self.admitted_canonical.iter().any(|(_, action)| {
+            through_tick.distance_since(action.tick) < 32_768
+                && (action.id.actor == pumpkin_cluster::actor::ActorId::Player(gid)
+                    || lease.is_some_and(|lease| action.player_leases.contains(&lease)))
+        })
+    }
+
+    pub fn commit_canonical_ground_applied(
+        &mut self,
+        reference: pumpkin_cluster::canonical_action::ActionRef,
+    ) -> bool {
+        if self.resolved.contains(&reference.tick) {
+            return true;
+        }
+        let key = ActionKey {
+            actor: reference.id.actor,
+            incarnation: reference.id.incarnation,
+            sequence: reference.id.sequence,
+            family: reference.id.family | 0x80,
+        };
+        if self.promoted.contains(&(reference.tick, key)) {
+            return true;
+        }
+        let chunks = self.completion.action_chunks(reference.tick, key);
+        if chunks.is_empty()
+            || chunks
+                .iter()
+                .any(|chunk| !self.completion.chunk_complete(reference.tick, *chunk))
+        {
+            return false;
+        }
+        let batches = self
+            .pending
+            .get(&reference.tick)
+            .into_iter()
+            .flatten()
+            .filter_map(|sourced| {
+                let mut selected = sourced.clone();
+                retain_actions(&mut selected.batch, |action| action == key);
+                (!selected.batch.is_empty()).then_some(selected)
+            })
+            .collect::<Vec<_>>();
+        if batches.is_empty() {
+            return false;
+        }
+        let holders = chunks
+            .iter()
+            .flat_map(|chunk| {
+                self.captured_holders
+                    .get(&(reference.tick, *chunk))
+                    .into_iter()
+                    .flatten()
+                    .copied()
+            })
+            .collect();
+        self.commit_ready(ReadyPromotion {
+            tick: reference.tick,
+            chunks: chunks.into_iter().collect(),
+            actions: BTreeSet::from([key]),
+            holders,
+            batches,
+        });
+        true
+    }
+
+    pub fn pop_ready(&self) -> Option<ReadyPromotion> {
         let tracked = self.completion.tracked_chunks();
         for tick in self.pending.keys().copied().collect::<Vec<_>>() {
             let tick_chunks: Vec<_> = tracked
@@ -421,7 +707,8 @@ impl WorldTickBuckets {
                 .iter()
                 .copied()
                 .filter(|action| {
-                    self.settlement_blocked.contains(&(tick, *action))
+                    (action.family & 0x80 != 0 && !self.promoted.contains(&(tick, *action)))
+                        || self.settlement_blocked.contains(&(tick, *action))
                         || self
                             .completion
                             .action_chunks(tick, *action)
@@ -431,6 +718,9 @@ impl WorldTickBuckets {
                 .collect();
             let mut ready = BTreeSet::new();
             for action in &all_actions {
+                if action.family & 0x80 != 0 {
+                    continue;
+                }
                 if self.promoted.contains(&(tick, *action))
                     || unresolved.contains(action)
                     || self.settlement_blocked.contains(&(tick, *action))
@@ -449,7 +739,9 @@ impl WorldTickBuckets {
                 let blocked = unresolved.iter().any(|other| {
                     let other_chunks = self.completion.action_chunks(tick, *other);
                     chunks.iter().any(|chunk| other_chunks.contains(chunk))
-                        && (action.family == 8 || action_priority(tick, *other, *action).is_lt())
+                        && (other.family & 0x80 != 0
+                            || action.family == 8
+                            || action_priority(tick, *other, *action).is_lt())
                 });
                 if !blocked {
                     ready.insert(*action);
@@ -468,29 +760,9 @@ impl WorldTickBuckets {
             if batches.is_empty() {
                 continue;
             }
-            if let Some(pending) = self.pending.get_mut(&tick) {
-                for sourced in pending.iter_mut() {
-                    retain_actions(&mut sourced.batch, |action| !ready.contains(&action));
-                }
-                pending.retain(|sourced| !sourced.batch.is_empty());
-            }
-            self.promoted
-                .extend(ready.iter().map(|action| (tick, *action)));
             let chunks: BTreeSet<_> = ready
                 .iter()
                 .flat_map(|action| self.completion.action_chunks(tick, *action))
-                .collect();
-            let removable: BTreeSet<_> = chunks
-                .iter()
-                .copied()
-                .filter(|chunk| {
-                    self.completion.chunk_complete(tick, *chunk)
-                        && self
-                            .completion
-                            .chunk_actions(tick, *chunk)
-                            .iter()
-                            .all(|action| self.promoted.contains(&(tick, *action)))
-                })
                 .collect();
             let holders = chunks
                 .iter()
@@ -502,30 +774,6 @@ impl WorldTickBuckets {
                         .copied()
                 })
                 .collect();
-            self.completion.remove_chunks(tick, &removable);
-            for chunk in &removable {
-                self.captured_holders.remove(&(tick, *chunk));
-                self.observer_chunks.remove(&(tick, *chunk));
-            }
-            for batch in &batches {
-                for transition in &batch.batch.player_chunk_transition {
-                    self.departures.remove(&transition.gid);
-                }
-            }
-            if !self
-                .completion
-                .tracked_chunks()
-                .iter()
-                .any(|(entry_tick, _)| *entry_tick == tick)
-                && self.pending.get(&tick).is_none_or(Vec::is_empty)
-            {
-                self.pending.remove(&tick);
-                self.seen.retain(|(entry_tick, _, _)| *entry_tick != tick);
-                self.promoted.retain(|(entry_tick, _)| *entry_tick != tick);
-                self.settlement_blocked
-                    .retain(|(entry_tick, _)| *entry_tick != tick);
-                self.resolved.insert(tick);
-            }
             return Some(ReadyPromotion {
                 tick,
                 chunks,
@@ -535,6 +783,67 @@ impl WorldTickBuckets {
             });
         }
         None
+    }
+
+    pub fn commit_ready(&mut self, ready: ReadyPromotion) {
+        let ReadyPromotion {
+            tick,
+            chunks,
+            actions,
+            batches,
+            ..
+        } = ready;
+        if let Some(pending) = self.pending.get_mut(&tick) {
+            for sourced in pending.iter_mut() {
+                retain_actions(&mut sourced.batch, |action| !actions.contains(&action));
+            }
+            pending.retain(|sourced| !sourced.batch.is_empty());
+        }
+        self.promoted
+            .extend(actions.iter().map(|action| (tick, *action)));
+        let removable: BTreeSet<_> = chunks
+            .iter()
+            .copied()
+            .filter(|chunk| {
+                self.completion.chunk_complete(tick, *chunk)
+                    && self
+                        .completion
+                        .chunk_actions(tick, *chunk)
+                        .iter()
+                        .all(|action| self.promoted.contains(&(tick, *action)))
+            })
+            .collect();
+        self.completion.remove_chunks(tick, &removable);
+        for chunk in &removable {
+            self.captured_holders.remove(&(tick, *chunk));
+            self.observer_chunks.remove(&(tick, *chunk));
+        }
+        for batch in &batches {
+            for transition in &batch.batch.player_chunk_transition {
+                self.departures.remove(&transition.gid);
+            }
+        }
+        if !self
+            .completion
+            .tracked_chunks()
+            .iter()
+            .any(|(entry_tick, _)| *entry_tick == tick)
+            && self.pending.get(&tick).is_none_or(Vec::is_empty)
+        {
+            self.pending.remove(&tick);
+            self.seen.retain(|(entry_tick, _, _)| *entry_tick != tick);
+            self.promoted.retain(|(entry_tick, _)| *entry_tick != tick);
+            self.settlement_blocked
+                .retain(|(entry_tick, _)| *entry_tick != tick);
+            if self.resolved.insert(tick) {
+                self.resolved_order.push_back(tick);
+            }
+            if self.resolved_order.len() > 32_768
+                && let Some(retired) = self.resolved_order.pop_front()
+            {
+                self.resolved.remove(&retired);
+            }
+        }
     }
 
     #[must_use]
@@ -606,6 +915,27 @@ fn tick_at_or_after(tick: TickStamp, boundary: TickStamp) -> bool {
     tick.distance_since(boundary) < (u16::MAX / 2)
 }
 
+fn batch_declared_in_finish(batch: &TickBatch, finish: &TickFinish) -> bool {
+    if batch.tick != finish.tick {
+        return false;
+    }
+    let declared = finish
+        .chunks
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .actions
+                .iter()
+                .map(move |action| (*action, entry.chunk))
+        })
+        .collect::<BTreeSet<_>>();
+    action_chunks(batch).into_iter().all(|(action, chunks)| {
+        chunks
+            .into_iter()
+            .all(|chunk| declared.contains(&(action, chunk)))
+    })
+}
+
 fn action_chunks(batch: &TickBatch) -> BTreeMap<ActionKey, BTreeSet<ChunkKey>> {
     let mut result = BTreeMap::new();
     for entry in TickFinish::from_batch(batch).chunks {
@@ -664,6 +994,9 @@ fn relocate_player_references(batch: &mut TickBatch, transition: PlayerChunkTran
 
 fn retain_actions(batch: &mut TickBatch, mut retain: impl FnMut(ActionKey) -> bool) {
     batch
+        .canonical_actions
+        .retain(|action| retain(ActionKey::canonical(action)));
+    batch
         .break_block
         .retain(|update| retain(ActionKey::break_block(update)));
     batch
@@ -693,6 +1026,9 @@ fn retain_actions(batch: &mut TickBatch, mut retain: impl FnMut(ActionKey) -> bo
     batch
         .entity_chunk_transition
         .retain(|update| retain(ActionKey::entity_chunk_transition(update)));
+    batch
+        .item_action
+        .retain(|update| retain(ActionKey::item_action(update)));
 }
 
 #[cfg(test)]
@@ -725,8 +1061,308 @@ mod tests {
         batch
     }
 
+    fn canonical_action(sequence: u16) -> pumpkin_cluster::canonical_action::Action {
+        use pumpkin_cluster::canonical_action::{
+            Action, ActionClass, ActionId, ActionKind, ClientOrigin, Condition, Effect, Expected,
+            Stakeholder, Target, UndoProcedure, Value,
+        };
+        let target = Target::Chunk {
+            key: chunk(),
+            part: pumpkin_cluster::canonical_action::ChunkPart::Block(BlockPos {
+                x: 32,
+                y: 70,
+                z: 48,
+            }),
+            inventory: None,
+        };
+        Action {
+            edit_authority: None,
+            id: ActionId {
+                actor: pumpkin_cluster::actor::ActorId::Peer(ServerId(1)),
+                incarnation: 0,
+                sequence,
+                family: 0,
+            },
+            tick: TickStamp(17),
+            class: ActionClass::Undoable,
+            chunk_transition: false,
+            actor_chunk: None,
+            player_leases: Vec::new(),
+            player_chunks: Vec::new(),
+            stakeholders: vec![Stakeholder::Chunk(chunk())],
+            dependencies: Vec::new(),
+            conditions: vec![Condition {
+                target,
+                expected: Expected::BlockState(0),
+            }],
+            effects: vec![Effect::Put {
+                target,
+                value: Value::Block(sequence),
+            }],
+            counterfactual_conditions: Vec::new(),
+            counterfactual_effects: Vec::new(),
+            semantic_intent: None,
+            factual_result: None,
+            undo: vec![UndoProcedure::RestoreWrittenTargets],
+            kind: ActionKind::Block,
+            client_origin: ClientOrigin::None,
+            presentation: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn actor_drain_covers_canonical_actions_waiting_for_graph_admission() {
+        let gid = GlobalPlayerId::new(ServerId(1), pumpkin_cluster::identity::PlayerSlot(4));
+        let lease = pumpkin_cluster::canonical_action::LivePlayerLease {
+            key: pumpkin_cluster::canonical_action::PlayerKey(uuid::Uuid::from_u128(44)),
+            gid,
+            incarnation: 7,
+        };
+        let mut action = canonical_action(8);
+        action.id.actor = pumpkin_cluster::actor::ActorId::Player(gid);
+        action.id.incarnation = lease.incarnation;
+        action.actor_chunk = Some(chunk());
+        action.validate().unwrap();
+        let tick = action.tick;
+        let mut buckets = WorldTickBuckets::new();
+        buckets.admitted_canonical.push((ServerId(1), action));
+        assert!(!buckets.actor_unresolved_through(gid, tick));
+        assert!(buckets.canonical_admission_unresolved_through(gid, Some(lease), tick));
+        assert!(!buckets.canonical_admission_unresolved_through(
+            gid,
+            Some(lease),
+            TickStamp(tick.0 - 1)
+        ));
+        buckets.drain_admitted_canonical_matching(|_| true);
+        assert!(!buckets.canonical_admission_unresolved_through(gid, Some(lease), tick));
+        let target = pumpkin_cluster::canonical_action::Target::Player {
+            key: lease.key,
+            lease: None,
+            inventory: None,
+        };
+        let mut action = canonical_action(9);
+        action.player_leases = vec![lease];
+        action.stakeholders = vec![target.stakeholder()];
+        action.conditions = vec![pumpkin_cluster::canonical_action::Condition {
+            target,
+            expected: pumpkin_cluster::canonical_action::Expected::ScalarAtLeast(1),
+        }];
+        action.effects = vec![pumpkin_cluster::canonical_action::Effect::Put {
+            target,
+            value: pumpkin_cluster::canonical_action::Value::Scalar(2),
+        }];
+        action.kind = pumpkin_cluster::canonical_action::ActionKind::PlayerAdministration;
+        action.validate().unwrap();
+        buckets.admitted_canonical.push((ServerId(1), action));
+        assert!(buckets.canonical_admission_unresolved_through(gid, Some(lease), tick));
+        assert!(!buckets.canonical_admission_unresolved_through(gid, None, tick));
+    }
+
+    #[test]
+    fn empty_legacy_tick_closes_only_after_every_frozen_generation_finishes() {
+        let mut buckets = WorldTickBuckets::new();
+        let tick = TickStamp(17);
+        let producers = BTreeMap::from([(ServerId(1), 10), (ServerId(2), 20)]);
+        let empty = TickFinish {
+            tick,
+            chunks: Vec::new(),
+        };
+        assert!(!buckets.legacy_chunk_closed(tick, chunk(), &producers));
+        assert!(buckets.note_authenticated_finish(
+            ServerId(1),
+            10,
+            ServerId(1),
+            empty.clone(),
+            |_| vec![1, 2],
+            |_| None,
+        ));
+        assert!(!buckets.legacy_chunk_closed(tick, chunk(), &producers));
+        assert!(buckets.note_authenticated_finish(
+            ServerId(2),
+            20,
+            ServerId(1),
+            empty,
+            |_| vec![1, 2],
+            |_| None,
+        ));
+        assert!(buckets.legacy_chunk_closed(tick, chunk(), &producers));
+        assert!(!buckets.legacy_chunk_closed(
+            tick,
+            chunk(),
+            &BTreeMap::from([(ServerId(1), 10), (ServerId(2), 21)]),
+        ));
+    }
+
+    #[test]
+    fn named_legacy_action_keeps_chunk_open_until_its_batch_arrives() {
+        let mut buckets = WorldTickBuckets::new();
+        let tick = TickStamp(17);
+        let producers = BTreeMap::from([(ServerId(1), 10), (ServerId(2), 20)]);
+        let batch = action(2, 1);
+        let named = TickFinish::from_batch(&batch);
+        assert!(buckets.note_authenticated_finish(
+            ServerId(1),
+            10,
+            ServerId(1),
+            TickFinish {
+                tick,
+                chunks: Vec::new(),
+            },
+            |_| vec![1, 2],
+            |_| None,
+        ));
+        assert!(buckets.note_authenticated_finish(
+            ServerId(2),
+            20,
+            ServerId(1),
+            named,
+            |_| vec![1, 2],
+            |_| None,
+        ));
+        assert!(!buckets.legacy_chunk_closed(tick, chunk(), &producers));
+        buckets.push_authenticated_batch(
+            ServerId(2),
+            20,
+            ServerId(1),
+            batch,
+            |_| vec![1, 2],
+            |_| None,
+        );
+        assert!(buckets.legacy_chunk_closed(tick, chunk(), &producers));
+    }
+
+    #[test]
+    fn undeclared_legacy_batch_cannot_close_as_an_empty_tick() {
+        let mut buckets = WorldTickBuckets::new();
+        let tick = TickStamp(17);
+        let producers = BTreeMap::from([(ServerId(1), 10)]);
+        buckets.push_authenticated_batch(
+            ServerId(1),
+            10,
+            ServerId(1),
+            action(1, 1),
+            |_| vec![1],
+            |_| None,
+        );
+        assert!(!buckets.note_authenticated_finish(
+            ServerId(1),
+            10,
+            ServerId(1),
+            TickFinish {
+                tick,
+                chunks: Vec::new(),
+            },
+            |_| vec![1],
+            |_| None,
+        ));
+        assert!(!buckets.legacy_chunk_closed(tick, chunk(), &producers));
+
+        let mut finish_first = WorldTickBuckets::new();
+        assert!(finish_first.note_authenticated_finish(
+            ServerId(1),
+            10,
+            ServerId(1),
+            TickFinish {
+                tick,
+                chunks: Vec::new(),
+            },
+            |_| vec![1],
+            |_| None,
+        ));
+        finish_first.push_authenticated_batch(
+            ServerId(1),
+            10,
+            ServerId(1),
+            action(1, 1),
+            |_| vec![1],
+            |_| None,
+        );
+        assert!(!finish_first.legacy_chunk_closed(tick, chunk(), &producers));
+    }
+
+    #[test]
+    fn canonical_batch_retires_only_after_graph_ground_marker() {
+        let canonical = canonical_action(6);
+        let mut batch = TickBatch::new(canonical.tick);
+        batch.canonical_actions.push(canonical.clone());
+        let finish = TickFinish::try_from_batch(&batch).unwrap();
+        let mut buckets = WorldTickBuckets::new();
+        buckets.push_authenticated_batch(
+            ServerId(1),
+            10,
+            ServerId(1),
+            batch,
+            |_| vec![1],
+            |_| None,
+        );
+        assert!(buckets.note_authenticated_finish(
+            ServerId(1),
+            10,
+            ServerId(1),
+            finish,
+            |_| vec![1],
+            |_| None,
+        ));
+        assert!(buckets.pop_ready().is_none());
+        assert!(buckets.commit_canonical_ground_applied(
+            pumpkin_cluster::canonical_action::ActionRef {
+                tick: canonical.tick,
+                id: canonical.id,
+            },
+        ));
+        assert!(buckets.pop_ready().is_none());
+    }
+
     fn holders(_: ChunkKey) -> Vec<u16> {
         vec![1, 2, 3]
+    }
+
+    #[test]
+    fn graph_intake_receives_only_actions_admitted_by_tick_buckets() {
+        let canonical = canonical_action(5);
+        let mut batch = TickBatch::new(canonical.tick);
+        batch.canonical_actions.push(canonical.clone());
+        let mut buckets = WorldTickBuckets::new();
+        let accepted = buckets.push_batch_with_entity_owners(
+            ServerId(1),
+            ServerId(2),
+            batch.clone(),
+            holders,
+            |_| None,
+        );
+        assert_eq!(accepted, vec![canonical.clone()]);
+        assert!(
+            buckets
+                .push_batch_with_entity_owners(ServerId(1), ServerId(2), batch, holders, |_| None)
+                .is_empty()
+        );
+        assert_eq!(
+            buckets.drain_admitted_canonical_matching(|_| true),
+            vec![(ServerId(1), canonical)]
+        );
+        assert!(
+            buckets
+                .drain_admitted_canonical_matching(|_| true)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn future_action_survives_until_its_owner_tick_scope_exists() {
+        let canonical = canonical_action(7);
+        let mut batch = TickBatch::new(canonical.tick);
+        batch.canonical_actions.push(canonical.clone());
+        let mut buckets = WorldTickBuckets::new();
+        buckets.push_authenticated_batch(ServerId(1), 10, ServerId(2), batch, holders, |_| None);
+        assert!(
+            buckets
+                .drain_admitted_canonical_matching(|tick| TickStamp(16).is_after(tick))
+                .is_empty()
+        );
+        assert_eq!(
+            buckets.drain_admitted_canonical_matching(|tick| tick == TickStamp(17)),
+            vec![(ServerId(1), canonical)]
+        );
     }
 
     #[test]
@@ -767,6 +1403,8 @@ mod tests {
         });
         let promoted = buckets.pop_ready().unwrap();
         assert_eq!(promoted.actions.len(), 1);
+        assert!(buckets.actor_unresolved_through(gid, tick));
+        buckets.commit_ready(promoted);
         assert!(!buckets.actor_unresolved_through(gid, tick));
     }
 
@@ -806,11 +1444,35 @@ mod tests {
         let key = ActionKey::administrative(&batch.administrative[0]);
         let finish = TickFinish::try_from_batch(&batch).unwrap();
         let mut provider = WorldTickBuckets::new();
-        provider.push_batch(ServerId(1), ServerId(1), batch, holders);
-        provider.note_finish(ServerId(1), ServerId(1), finish, holders);
+        provider.push_authenticated_batch(ServerId(1), 11, ServerId(1), batch, holders, |_| None);
+        assert!(provider.note_authenticated_finish(
+            ServerId(1),
+            11,
+            ServerId(1),
+            finish,
+            holders,
+            |_| None,
+        ));
         let exported = provider.export_pending_chunk(chunk());
         assert_eq!(exported.len(), 1);
         assert_eq!(exported[0].holders, vec![ServerId(1), ServerId(2)]);
+        let mut stale_generation = WorldTickBuckets::new();
+        assert!(stale_generation.note_authenticated_finish(
+            ServerId(1),
+            12,
+            ServerId(3),
+            TickFinish {
+                tick,
+                chunks: Vec::new(),
+            },
+            |_| vec![1, 2, 3],
+            |_| None,
+        ));
+        assert!(
+            stale_generation
+                .import_pending_chunk(ServerId(3), exported.clone(), |_| None)
+                .is_err()
+        );
         let mut observer = WorldTickBuckets::new();
         observer
             .import_pending_chunk(ServerId(3), exported, |_| None)
@@ -852,6 +1514,74 @@ mod tests {
             finish_first.pop_ready().unwrap().actions,
             action_first.pop_ready().unwrap().actions
         );
+    }
+
+    #[test]
+    fn legacy_bucket_retires_canonical_entries_after_owner_commit() {
+        let source = ServerId(1);
+        let mut batch = TickBatch::new(TickStamp(17));
+        batch.canonical_actions = vec![canonical_action(1), canonical_action(2)];
+        let actions = batch.canonical_actions.clone();
+        let finish = TickFinish::try_from_batch(&batch).unwrap();
+        let mut buckets = WorldTickBuckets::new();
+        buckets.push_batch(source, source, batch, |_| vec![1]);
+        buckets.note_finish(source, source, finish, |_| vec![1]);
+
+        assert!(buckets.pop_ready().is_none());
+        for action in actions {
+            assert!(buckets.commit_canonical_ground_applied(
+                pumpkin_cluster::canonical_action::ActionRef {
+                    tick: action.tick,
+                    id: action.id,
+                },
+            ));
+        }
+        assert!(buckets.pop_ready().is_none());
+    }
+
+    #[test]
+    fn legacy_bucket_separates_canonical_entries_from_legacy_actions() {
+        let source = ServerId(1);
+        let mut batch = action(1, 3);
+        batch.canonical_actions.push(canonical_action(4));
+        let finish = TickFinish::try_from_batch(&batch).unwrap();
+        let mut buckets = WorldTickBuckets::new();
+        buckets.push_batch(source, source, batch, |_| vec![1]);
+        buckets.note_finish(source, source, finish, |_| vec![1]);
+
+        assert!(buckets.pop_ready().is_none());
+        assert!(buckets.commit_canonical_ground_applied(
+            pumpkin_cluster::canonical_action::ActionRef {
+                tick: TickStamp(17),
+                id: canonical_action(4).id,
+            },
+        ));
+        let ready = buckets.pop_ready().unwrap();
+        assert!(ready.batches[0].batch.canonical_actions.is_empty());
+        assert_eq!(ready.batches[0].batch.administrative.len(), 1);
+    }
+
+    #[test]
+    fn new_actions_survive_wrapping_tick_identity() {
+        let source = ServerId(1);
+        let mut buckets = WorldTickBuckets::new();
+        for raw in 0..=u16::MAX {
+            let mut batch = action(1, raw);
+            batch.tick = TickStamp(raw);
+            batch.administrative[0].tick = batch.tick;
+            let finish = TickFinish::try_from_batch(&batch).unwrap();
+            buckets.push_batch(source, source, batch, |_| vec![1]);
+            buckets.note_finish(source, source, finish, |_| vec![1]);
+            let ready = buckets.pop_ready().unwrap();
+            buckets.commit_ready(ready);
+        }
+        let mut wrapped = action(1, 0);
+        wrapped.tick = TickStamp(0);
+        wrapped.administrative[0].tick = wrapped.tick;
+        let finish = TickFinish::try_from_batch(&wrapped).unwrap();
+        buckets.push_batch(source, source, wrapped, |_| vec![1]);
+        buckets.note_finish(source, source, finish, |_| vec![1]);
+        assert!(buckets.pop_ready().is_some());
     }
 
     #[test]

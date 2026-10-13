@@ -59,14 +59,20 @@ impl LpVector3d {
     }
 
     pub fn read<R: std::io::Read>(reader: &mut R) -> Result<Self, ReadingError> {
-        let mut low_16 = [0u8; 2];
+        let mut first = [0u8; 1];
         reader
-            .read_exact(&mut low_16)
+            .read_exact(&mut first)
             .map_err(|e| ReadingError::Message(e.to_string()))?;
 
-        if low_16[0] == 0 && low_16[1] == 0 {
+        if first[0] == 0 {
             return Ok(Self(Vector3::new(0.0, 0.0, 0.0)));
         }
+
+        let mut second = [0u8; 1];
+        reader
+            .read_exact(&mut second)
+            .map_err(|e| ReadingError::Message(e.to_string()))?;
+        let low_16 = [first[0], second[0]];
 
         let mut mid_32 = [0u8; 4];
         reader
@@ -150,6 +156,37 @@ fn from_long(quantized: i64, scale: f64) -> f64 {
 mod tests {
     use super::{LpVector3d, encode_legacy_velocity_component};
     use pumpkin_util::math::vector3::Vector3;
+
+    #[test]
+    fn zero_velocity_does_not_consume_the_next_packet_field() {
+        let vector = LpVector3d(Vector3::new(0.0, 0.0, 0.0));
+        let mut bytes = Vec::new();
+        vector.write(&mut bytes).unwrap();
+        assert_eq!(bytes, [0]);
+        bytes.extend([0, 255, 127]);
+        let mut read = bytes.as_slice();
+        assert_eq!(LpVector3d::read(&mut read).unwrap(), vector);
+        assert_eq!(read, &[0, 255, 127]);
+        let mut standalone = &[0][..];
+        assert_eq!(LpVector3d::read(&mut standalone).unwrap(), vector);
+        assert!(standalone.is_empty());
+    }
+
+    #[test]
+    fn packed_velocity_preserves_the_following_field() {
+        for vector in [Vector3::new(0.5, -0.5, 0.0), Vector3::new(4.0, -2.5, 1.0)] {
+            let vector = LpVector3d(vector);
+            let mut bytes = Vec::new();
+            vector.write(&mut bytes).unwrap();
+            bytes.push(255);
+            let mut read = bytes.as_slice();
+            let decoded = LpVector3d::read(&mut read).unwrap();
+            assert_eq!(read, &[255]);
+            assert!((decoded.0.x - vector.0.x).abs() < 0.0003);
+            assert!((decoded.0.y - vector.0.y).abs() < 0.0003);
+            assert!((decoded.0.z - vector.0.z).abs() < 0.0003);
+        }
+    }
 
     #[test]
     fn legacy_component_is_clamped_and_scaled() {

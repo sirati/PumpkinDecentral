@@ -29,6 +29,7 @@ impl PitcherCropBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for PitcherCropBlock {
     fn can_place_at(&self, args: CanPlaceAtArgs<'_>) -> bool {
         let props = PitcherCropLikeProperties::from_state_id(args.state.id);

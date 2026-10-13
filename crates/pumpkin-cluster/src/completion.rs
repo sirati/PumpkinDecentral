@@ -10,6 +10,7 @@ use crate::time::TickStamp;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ActionKey {
     pub actor: ActorId,
+    pub incarnation: u64,
     pub sequence: u16,
     pub family: u8,
 }
@@ -64,6 +65,7 @@ impl ActionKey {
     pub const fn break_block(update: &crate::protocol::BreakBlockUpdate) -> Self {
         Self {
             actor: ActorId::Player(update.gid),
+            incarnation: 0,
             sequence: update.seq.0,
             family: 0,
         }
@@ -73,6 +75,7 @@ impl ActionKey {
     pub const fn place_block(update: &crate::protocol::PlaceBlockUpdate) -> Self {
         Self {
             actor: ActorId::Player(update.gid),
+            incarnation: 0,
             sequence: update.seq.0,
             family: 1,
         }
@@ -82,6 +85,7 @@ impl ActionKey {
     pub const fn inventory(update: &crate::inventory::InventoryOp) -> Self {
         Self {
             actor: update.actor,
+            incarnation: 0,
             sequence: update.seq.0,
             family: 2,
         }
@@ -91,6 +95,7 @@ impl ActionKey {
     pub const fn hit_player(update: &crate::protocol::HitPlayerUpdate) -> Self {
         Self {
             actor: ActorId::Player(update.gid),
+            incarnation: 0,
             sequence: update.seq.0,
             family: 3,
         }
@@ -100,6 +105,7 @@ impl ActionKey {
     pub const fn hit_entity(update: &crate::protocol::HitEntityUpdate) -> Self {
         Self {
             actor: ActorId::Player(update.gid),
+            incarnation: 0,
             sequence: update.seq.0,
             family: 4,
         }
@@ -109,6 +115,7 @@ impl ActionKey {
     pub const fn fire_projectile(update: &crate::protocol::FireProjectileUpdate) -> Self {
         Self {
             actor: ActorId::Player(update.gid),
+            incarnation: 0,
             sequence: update.seq.0,
             family: 5,
         }
@@ -118,6 +125,7 @@ impl ActionKey {
     pub const fn administrative(update: &crate::world_delta::AdministrativeDelta) -> Self {
         Self {
             actor: ActorId::Peer(update.holder),
+            incarnation: 0,
             sequence: update.sequence,
             family: 6,
         }
@@ -129,6 +137,7 @@ impl ActionKey {
     ) -> Self {
         Self {
             actor: ActorId::Player(update.target),
+            incarnation: 0,
             sequence: update.seq.0,
             family: 7,
         }
@@ -138,6 +147,7 @@ impl ActionKey {
     pub const fn player_chunk_transition(update: &crate::protocol::PlayerChunkTransition) -> Self {
         Self {
             actor: ActorId::Player(update.gid),
+            incarnation: update.incarnation,
             sequence: update.seq.0,
             family: 8,
         }
@@ -149,6 +159,7 @@ impl ActionKey {
     ) -> Self {
         Self {
             actor: ActorId::Entity(update.entity),
+            incarnation: 0,
             sequence: update.sequence,
             family: 9,
         }
@@ -158,8 +169,24 @@ impl ActionKey {
     pub const fn item_action(update: &crate::item_action::ItemAction) -> Self {
         Self {
             actor: update.actor,
+            incarnation: 0,
             sequence: update.sequence.0,
             family: 10,
+        }
+    }
+
+    #[must_use]
+    pub const fn canonical(action: &crate::canonical_action::Action) -> Self {
+        Self::canonical_id(action.id)
+    }
+
+    #[must_use]
+    pub const fn canonical_id(id: crate::canonical_action::ActionId) -> Self {
+        Self {
+            actor: id.actor,
+            incarnation: id.incarnation,
+            sequence: id.sequence,
+            family: id.family | 0x80,
         }
     }
 }
@@ -175,6 +202,7 @@ pub struct ChunkPendingTick {
     pub tick: TickStamp,
     pub chunk: ChunkKey,
     pub holders: Vec<ServerId>,
+    pub generations: Vec<(ServerId, u64)>,
     pub finishes: Vec<(ServerId, TickFinish)>,
     pub batches: Vec<SourcedTickBatch>,
 }
@@ -190,6 +218,7 @@ pub struct DropReport {
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompletionMessage {
     Finish(TickFinish),
+    RealmFinish(crate::realm_completion::HolisticFinish),
     DropReport(DropReport),
     Dependency(crate::settlement::DependencyNotice),
     Settlement(crate::settlement::SettlementPublication),
@@ -211,6 +240,21 @@ impl TickFinish {
     #[must_use]
     pub fn from_batch(batch: &TickBatch) -> Self {
         let mut chunks: BTreeMap<ChunkKey, BTreeSet<ActionKey>> = BTreeMap::new();
+        for action in &batch.canonical_actions {
+            let key = ActionKey::canonical(action);
+            for stakeholder in &action.stakeholders {
+                let chunk = match stakeholder {
+                    crate::canonical_action::Stakeholder::Chunk(chunk) => Some(*chunk),
+                    crate::canonical_action::Stakeholder::Player(player) => action
+                        .player_chunks
+                        .iter()
+                        .find_map(|(key, chunk)| (key == player).then_some(*chunk)),
+                };
+                if let Some(chunk) = chunk {
+                    chunks.entry(chunk).or_default().insert(key);
+                }
+            }
+        }
         for update in &batch.break_block {
             let key = ActionKey::break_block(update);
             chunks.entry(update.actor_chunk).or_default().insert(key);
@@ -321,11 +365,28 @@ pub enum RequirementResult {
 pub enum ManifestError {
     EmptyAffectedChunks(ActionKey),
     TickMismatch(ActionKey),
+    InvalidCanonicalAction(ActionKey),
+    UnsupportedPlayerStakeholder(ActionKey),
     SourceNotHolder { action: ActionKey, chunk: ChunkKey },
     SourceNotActorOwner { action: ActionKey, source: ServerId },
 }
 
 pub fn validate_manifest_batch(batch: &TickBatch) -> Result<(), ManifestError> {
+    for action in &batch.canonical_actions {
+        let key = ActionKey::canonical(action);
+        if action.tick != batch.tick {
+            return Err(ManifestError::TickMismatch(key));
+        }
+        if action.validate().is_err() {
+            return Err(ManifestError::InvalidCanonicalAction(key));
+        }
+        if action.stakeholders.iter().any(|stakeholder| {
+            matches!(stakeholder, crate::canonical_action::Stakeholder::Player(player)
+                if !action.player_chunks.iter().any(|(key, _)| key == player))
+        }) {
+            return Err(ManifestError::UnsupportedPlayerStakeholder(key));
+        }
+    }
     for update in &batch.break_block {
         if update.tick != batch.tick {
             return Err(ManifestError::TickMismatch(ActionKey::break_block(update)));
@@ -578,7 +639,9 @@ impl CompletionLedger {
             }
             if let Some(action) = entry.actions.iter().find(|action| match action.actor {
                 ActorId::Player(player) => player.server != source,
-                ActorId::Entity(entity) => current_owner(entity) != Some(source),
+                ActorId::Entity(entity) => {
+                    action.family & 0x80 == 0 && current_owner(entity) != Some(source)
+                }
                 ActorId::Peer(peer) => peer != source,
             }) {
                 return Err(ManifestError::SourceNotActorOwner {
@@ -628,7 +691,9 @@ impl CompletionLedger {
             .flat_map(|entry| &entry.actions)
             .any(|action| match action.actor {
                 ActorId::Player(player) => player.server != source,
-                ActorId::Entity(entity) => current_owner(entity) != Some(source),
+                ActorId::Entity(entity) => {
+                    action.family & 0x80 == 0 && current_owner(entity) != Some(source)
+                }
                 ActorId::Peer(peer) => peer != source,
             });
         if !self.ticks.contains_key(&tick) {
@@ -942,6 +1007,7 @@ fn gap_for(state: &TickState, tick: TickStamp, chunk: ChunkKey, peer: ServerId) 
 }
 
 const FINISH_PREFIX: [u8; 4] = *b"TFN1";
+const REALM_FINISH_PREFIX: [u8; 4] = *b"RFN1";
 const MAX_FINISH_BYTES: usize = 1024 * 1024;
 const MAX_FINISH_CHUNKS: usize = 16_384;
 const MAX_FINISH_ACTIONS: usize = 262_144;
@@ -987,6 +1053,48 @@ pub fn decode_finish(bytes: &[u8]) -> Result<TickFinish, postcard::Error> {
             .try_fold(0_usize, |count, chunk| {
                 count.checked_add(chunk.actions.len())
             })
+            .is_none_or(|count| count > MAX_FINISH_ACTIONS)
+    {
+        return Err(postcard::Error::DeserializeBadEncoding);
+    }
+    Ok(finish)
+}
+
+pub fn encode_realm_finish(
+    finish: &crate::realm_completion::HolisticFinish,
+) -> Result<Vec<u8>, postcard::Error> {
+    if finish.issued.len() > MAX_FINISH_CHUNKS
+        || finish
+            .issued
+            .values()
+            .try_fold(0_usize, |count, actions| count.checked_add(actions.len()))
+            .is_none_or(|count| count > MAX_FINISH_ACTIONS)
+    {
+        return Err(postcard::Error::SerializeBufferFull);
+    }
+    let bytes = postcard::to_extend(finish, REALM_FINISH_PREFIX.to_vec())?;
+    if bytes.len() > MAX_FINISH_BYTES {
+        Err(postcard::Error::SerializeBufferFull)
+    } else {
+        Ok(bytes)
+    }
+}
+
+pub fn decode_realm_finish(
+    bytes: &[u8],
+) -> Result<crate::realm_completion::HolisticFinish, postcard::Error> {
+    if bytes.len() > MAX_FINISH_BYTES {
+        return Err(postcard::Error::DeserializeBadEncoding);
+    }
+    let payload = bytes
+        .strip_prefix(&REALM_FINISH_PREFIX)
+        .ok_or(postcard::Error::DeserializeBadEncoding)?;
+    let finish: crate::realm_completion::HolisticFinish = postcard::from_bytes(payload)?;
+    if finish.issued.len() > MAX_FINISH_CHUNKS
+        || finish
+            .issued
+            .values()
+            .try_fold(0_usize, |count, actions| count.checked_add(actions.len()))
             .is_none_or(|count| count > MAX_FINISH_ACTIONS)
     {
         return Err(postcard::Error::DeserializeBadEncoding);
@@ -1073,6 +1181,8 @@ pub fn encode_settlement(
 pub fn decode_message(bytes: &[u8]) -> Result<CompletionMessage, postcard::Error> {
     if bytes.starts_with(&FINISH_PREFIX) {
         decode_finish(bytes).map(CompletionMessage::Finish)
+    } else if bytes.starts_with(&REALM_FINISH_PREFIX) {
+        decode_realm_finish(bytes).map(CompletionMessage::RealmFinish)
     } else if bytes.starts_with(&DROP_REPORT_PREFIX) {
         decode_drop_report(bytes).map(CompletionMessage::DropReport)
     } else if let Some(payload) = bytes.strip_prefix(&DEPENDENCY_PREFIX) {
@@ -1093,6 +1203,41 @@ mod tests {
         BlockPos, BreakBlockUpdate, ChunkAddr, EntityRef, FireProjectileUpdate, HitEntityUpdate,
         HitPlayerUpdate, WorldId,
     };
+
+    #[test]
+    fn canonical_entity_finish_does_not_read_live_owner() {
+        let key = ActionKey {
+            actor: ActorId::Entity(crate::protocol::GlobalEntityId {
+                origin: ServerId(1),
+                local_id: 4,
+                generation: 7,
+            }),
+            incarnation: 7,
+            sequence: 1,
+            family: 0x88,
+        };
+        let finish = TickFinish {
+            tick: TickStamp(7),
+            chunks: vec![ChunkActions {
+                chunk: chunk(0, 0),
+                actions: vec![key],
+            }],
+        };
+        let mut ledger = CompletionLedger::default();
+        assert_eq!(
+            ledger.note_finish_with_entity_owners(ServerId(2), finish.clone(), |_| {
+                panic!("canonical authority belongs to frozen realm capture")
+            }),
+            FinishResult::Recorded
+        );
+        let mut legacy = finish;
+        legacy.chunks[0].actions[0].family = 8;
+        let mut ledger = CompletionLedger::default();
+        assert_eq!(
+            ledger.note_finish_with_entity_owners(ServerId(2), legacy, |_| Some(ServerId(1))),
+            FinishResult::Conflicting
+        );
+    }
 
     fn gid(server: u16) -> GlobalPlayerId {
         GlobalPlayerId::new(ServerId(server), PlayerSlot(1))
@@ -1588,6 +1733,47 @@ mod tests {
         assert_eq!(decode_finish(&encoded).expect("decode finish"), finish);
         assert!(decode_finish(&encoded[FINISH_PREFIX.len()..]).is_err());
         assert!(decode_finish(&vec![0_u8; MAX_FINISH_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn realm_finish_wire_preserves_joint_action_identity_and_rejects_bad_framing() {
+        use crate::canonical_action::{ActionId, Stakeholder};
+        use crate::realm_completion::{HolderDomain, HolisticFinish, RequirementKey};
+
+        let id = ActionId {
+            actor: ActorId::Player(gid(1)),
+            incarnation: 17,
+            sequence: 19,
+            family: 3,
+        };
+        let finish = HolisticFinish {
+            full_source_slot: u64::from((TickStamp(7)).0),
+            acquisition_prefix: None,
+            tick: TickStamp(7),
+            issued: BTreeMap::from([
+                (
+                    RequirementKey {
+                        stakeholder: Stakeholder::Chunk(chunk(1, 1)),
+                        domain: HolderDomain::Chunk { epoch: 9 },
+                    },
+                    BTreeSet::from([id]),
+                ),
+                (
+                    RequirementKey {
+                        stakeholder: Stakeholder::Chunk(chunk(2, 1)),
+                        domain: HolderDomain::Chunk { epoch: 12 },
+                    },
+                    BTreeSet::from([id]),
+                ),
+            ]),
+        };
+        let encoded = encode_realm_finish(&finish).unwrap();
+        assert_eq!(
+            decode_message(&encoded).unwrap(),
+            CompletionMessage::RealmFinish(finish)
+        );
+        assert!(decode_realm_finish(&encoded[REALM_FINISH_PREFIX.len()..]).is_err());
+        assert!(decode_realm_finish(&vec![0_u8; MAX_FINISH_BYTES + 1]).is_err());
     }
 
     #[test]

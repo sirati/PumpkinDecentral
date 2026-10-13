@@ -240,7 +240,7 @@ impl EntityGhosts {
             .copied()
     }
 
-    fn locate_key(&self, origin: ServerId, local_id: i32, generation: u32) -> Option<EntityRef> {
+    fn locate_key(&self, origin: ServerId, local_id: i32, generation: u64) -> Option<EntityRef> {
         self.by_ref
             .keys()
             .find(|key| {
@@ -694,13 +694,7 @@ mod tests {
             &directory
         ));
         let loopback = entity_ref(1, 7, 0, 0);
-        assert!(!should_accept(
-            local,
-            local,
-            &loopback,
-            local,
-            &directory
-        ));
+        assert!(!should_accept(local, local, &loopback, local, &directory));
     }
 
     #[test]

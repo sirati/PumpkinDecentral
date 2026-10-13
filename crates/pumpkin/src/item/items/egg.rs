@@ -20,6 +20,7 @@ impl ItemMetadata for EggItem {
 
 const POWER: f32 = 1.5;
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for EggItem {
     fn normal_use(&self, _block: &Item, player: &Player) {
         let position = player.position();

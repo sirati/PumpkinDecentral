@@ -27,6 +27,7 @@ use rand::RngExt;
 #[pumpkin_block("minecraft:big_dripleaf")]
 pub struct BigDripleafBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for BigDripleafBlock {
     fn on_entity_step(&self, args: OnEntityStepArgs<'_>) {
         {

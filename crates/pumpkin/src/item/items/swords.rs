@@ -11,7 +11,12 @@ impl ItemMetadata for SwordItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for SwordItem {
+    fn can_mine_intent(&self, game_mode: u8) -> Option<bool> {
+        Some(game_mode != GameMode::Creative as u8)
+    }
+
     fn can_mine(&self, player: &Player) -> bool {
         player.gamemode.load() != GameMode::Creative
     }

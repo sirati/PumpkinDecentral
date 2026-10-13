@@ -86,6 +86,7 @@ impl ItemMetadata for BoatItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for BoatItem {
     /// Vanilla: `BoatItem.use()` - raycasts to find placement position
     fn normal_use(&self, item: &Item, player: &Player) {

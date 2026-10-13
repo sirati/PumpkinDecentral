@@ -34,6 +34,7 @@ impl ItemMetadata for SpearItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for SpearItem {
     fn normal_use(&self, item: &Item, player: &Player) {
         if player

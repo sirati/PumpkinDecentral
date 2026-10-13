@@ -53,6 +53,17 @@ pub struct RecipeResult {
     pub count: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CraftingRecipeIdentity {
+    Vanilla(usize),
+    Dynamic(usize),
+}
+
+pub struct FrozenCraftingMatch {
+    pub recipe: CraftingRecipeIdentity,
+    pub result: RecipeResult,
+}
+
 /// Checks if a recipe pattern is symmetrical horizontally.
 fn is_symmetrical_horizontally(pattern: &[&str]) -> bool {
     let width = pattern.first().map_or(0, |s| s.len());
@@ -69,6 +80,30 @@ fn is_symmetrical_horizontally(pattern: &[&str]) -> bool {
     true
 }
 
+struct FrozenCraftingGrid<'a> {
+    width: usize,
+    height: usize,
+    stacks: &'a [ItemStack],
+}
+
+impl FrozenCraftingGrid<'_> {
+    fn get_width(&self) -> usize {
+        self.width
+    }
+    fn get_height(&self) -> usize {
+        self.height
+    }
+    fn size(&self) -> usize {
+        self.stacks.len()
+    }
+    fn get_stack(&self, slot: usize) -> ItemStack {
+        self.stacks
+            .get(slot)
+            .cloned()
+            .unwrap_or_else(|| ItemStack::EMPTY.clone())
+    }
+}
+
 /// Checks if a crafting recipe matches the current inventory state.
 #[expect(clippy::too_many_lines)]
 fn recipe_matches(
@@ -78,7 +113,7 @@ fn recipe_matches(
     top_x: usize,
     top_y: usize,
     count: usize,
-    inventory: &dyn RecipeInputInventory,
+    inventory: &FrozenCraftingGrid<'_>,
 ) -> Option<RecipeResult> {
     match recipe {
         GenericRecipe::Vanilla(CraftingRecipeTypes::CraftingShaped {
@@ -329,6 +364,45 @@ pub fn match_crafting_recipe(
     inventory: &dyn RecipeInputInventory,
     provider: Option<&dyn RecipeProvider>,
 ) -> Option<RecipeResult> {
+    let stacks = (0..inventory.size())
+        .map(|slot| inventory.get_stack(slot))
+        .collect::<Vec<_>>();
+    let dynamic = provider
+        .map(RecipeProvider::get_dynamic_recipes)
+        .unwrap_or_default();
+    match_crafting_stacks(
+        inventory.get_width(),
+        inventory.get_height(),
+        &stacks,
+        &dynamic,
+    )
+}
+
+#[must_use]
+pub fn match_crafting_stacks(
+    width: usize,
+    height: usize,
+    stacks: &[ItemStack],
+    dynamic: &[DynamicRecipe],
+) -> Option<RecipeResult> {
+    match_crafting_catalogue(width, height, stacks, dynamic).map(|matched| matched.result)
+}
+
+#[must_use]
+pub fn match_crafting_catalogue(
+    width: usize,
+    height: usize,
+    stacks: &[ItemStack],
+    dynamic: &[DynamicRecipe],
+) -> Option<FrozenCraftingMatch> {
+    if width == 0 || height == 0 || width > 3 || height > 3 || stacks.len() != width * height {
+        return None;
+    }
+    let inventory = &FrozenCraftingGrid {
+        width,
+        height,
+        stacks,
+    };
     let mut count: usize = 0;
     let inventory_width = inventory.get_width();
     let mut top_x = 9;
@@ -353,7 +427,7 @@ pub fn match_crafting_recipe(
     let input_width = bottom_x + 1 - top_x;
     let input_height = bottom_y + 1 - top_y;
 
-    for recipe in RECIPES_CRAFTING {
+    for (index, recipe) in RECIPES_CRAFTING.iter().enumerate() {
         if let Some(result) = recipe_matches(
             GenericRecipe::Vanilla(recipe),
             input_height,
@@ -363,13 +437,15 @@ pub fn match_crafting_recipe(
             count,
             inventory,
         ) {
-            return Some(result);
+            return Some(FrozenCraftingMatch {
+                recipe: CraftingRecipeIdentity::Vanilla(index),
+                result,
+            });
         }
     }
 
-    if let Some(provider) = provider {
-        let dynamic = provider.get_dynamic_recipes();
-        for recipe in &dynamic {
+    {
+        for (index, recipe) in dynamic.iter().enumerate() {
             if let DynamicRecipe::Crafting(crafting) = recipe
                 && let Some(result) = recipe_matches(
                     GenericRecipe::Dynamic(crafting),
@@ -381,7 +457,10 @@ pub fn match_crafting_recipe(
                     inventory,
                 )
             {
-                return Some(result);
+                return Some(FrozenCraftingMatch {
+                    recipe: CraftingRecipeIdentity::Dynamic(index),
+                    result,
+                });
             }
         }
     }

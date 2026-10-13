@@ -138,6 +138,7 @@ mod tests {
     fn intent(x: i32, world: WorldId, tick: u16) -> ViewIntent {
         ViewIntent {
             actor: GlobalPlayerId::new(ServerId(1), PlayerSlot(2)),
+            owner_install_generation: 1,
             world,
             center: ChunkAddr { x, z: 0 },
             radius: NonZero::new(2).unwrap(),

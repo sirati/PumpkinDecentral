@@ -16,6 +16,7 @@ impl ItemMetadata for CarrotOnAStickItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for CarrotOnAStickItem {
     fn normal_use(&self, _item: &Item, player: &Player) {
         let vehicle_opt = player
@@ -50,6 +51,7 @@ impl ItemMetadata for WarpedFungusOnAStickItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for WarpedFungusOnAStickItem {
     fn normal_use(&self, _item: &Item, player: &Player) {
         let vehicle_opt = player

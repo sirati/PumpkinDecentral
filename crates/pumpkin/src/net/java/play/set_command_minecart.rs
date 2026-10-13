@@ -4,6 +4,13 @@ use pumpkin_protocol::java::server::play::SSetCommandMinecart;
 
 impl JavaClient {
     pub fn handle_set_command_minecart(&self, player: &Player, packet: &SSetCommandMinecart<'_>) {
+        if player.cluster_gid().is_some() {
+            player.send_system_message(&TextComponent::text(
+                "Command minecart editing is unavailable.",
+            ));
+            return;
+        }
+
         if player.permission_lvl.load() < PermissionLvl::Two {
             return;
         }

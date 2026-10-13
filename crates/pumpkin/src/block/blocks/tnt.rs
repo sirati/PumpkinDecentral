@@ -32,6 +32,13 @@ const DEFAULT_POWER: f32 = 4.0;
 
 impl TNTBlock {
     pub fn prime(world: &Arc<World>, location: &BlockPos) -> bool {
+        if world
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            return false;
+        }
         if !world.level_info.load().game_rules.tnt_explodes {
             return false;
         }
@@ -80,7 +87,16 @@ impl TNTBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for TNTBlock {
+    fn player_broken_intent(
+        &self,
+        args: crate::block::neighbor::PlayerBrokenIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        (args.context.creative || !TntLikeProperties::from_state_id(args.context.state).r#unstable)
+            .then(Vec::new)
+    }
+
     fn use_with_item(&self, args: UseWithItemArgs<'_>) -> BlockActionResult {
         let item_id = args.item_stack.item.id;
         if item_id != Item::FLINT_AND_STEEL.id && item_id != Item::FIRE_CHARGE.id {
@@ -137,6 +153,14 @@ impl BlockBehaviour for TNTBlock {
     }
 
     fn explode(&self, args: ExplodeArgs<'_>) {
+        if args
+            .world
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            return;
+        }
         if !args.world.level_info.load().game_rules.tnt_explodes {
             return;
         }

@@ -125,6 +125,19 @@ pub enum PacketHandlerResult {
 /// Maximum payload bytes that may be queued for a client before it is considered stalled/overflowing and disconnected.
 pub const MAX_PENDING_BYTES: usize = 64 * 1024 * 1024; // 64 MB
 
+fn try_enqueue_packet_burst<T>(
+    outgoing: &tokio::sync::mpsc::Sender<T>,
+    pending_bytes: &AtomicUsize,
+    packets: Vec<Bytes>,
+    encode: impl Fn(Bytes) -> T,
+) -> Result<(), Vec<Bytes>> {
+    let Some(total) = packets.iter().try_fold(0_usize, |total, packet| total.checked_add(packet.len())) else { return Err(packets); };
+    let Ok(permits) = outgoing.try_reserve_many(packets.len()) else { return Err(packets); };
+    if pending_bytes.fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| pending.checked_add(total).filter(|next| *next <= MAX_PENDING_BYTES)).is_err() { return Err(packets); }
+    for (permit, packet) in permits.zip(packets) { permit.send(encode(packet)); }
+    Ok(())
+}
+
 /// Defensively decrement an atomic pending byte counter without underflowing.
 #[inline]
 pub fn decrement_pending_bytes(pending_bytes: &AtomicUsize, bytes: usize) {
@@ -195,6 +208,13 @@ impl ClientPlatform {
         match self {
             Self::Java(java) => java.pending_bytes.load(Ordering::Relaxed),
             Self::Bedrock(bedrock) => bedrock.pending_bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn try_enqueue_packet_burst(&self, packets: Vec<Bytes>) -> Result<(), Vec<Bytes>> {
+        match self {
+            Self::Java(client) => client.try_enqueue_packet_burst(packets),
+            Self::Bedrock(client) => client.try_enqueue_packet_burst(packets),
         }
     }
 
@@ -393,7 +413,11 @@ pub async fn can_not_join(
             None => text,
         });
     }
-    if server.white_list.load(Ordering::Relaxed) {
+    if if server.advanced_config.cluster.enabled {
+        server.cluster_access_policy.snapshot().enabled
+    } else {
+        server.white_list.load(Ordering::Relaxed)
+    } {
         let is_op = if server.advanced_config.cluster.enabled {
             server
                 .cluster_admin_view
@@ -765,6 +789,32 @@ mod tests {
             !is_valid_player_name(&name),
             "Name containing DEL (127) should be invalid"
         );
+    }
+
+    #[test]
+    fn packet_burst_reserves_all_queue_and_byte_credits_before_any_delivery() {
+        let frames = vec![bytes::Bytes::from_static(b"a"), bytes::Bytes::from_static(b"bc")];
+        let (small, mut small_rx) = tokio::sync::mpsc::channel(1);
+        let bytes = std::sync::atomic::AtomicUsize::new(0);
+        assert_eq!(super::try_enqueue_packet_burst(&small, &bytes, frames.clone(), |frame| frame), Err(frames.clone()));
+        assert!(small_rx.try_recv().is_err());
+        assert_eq!(small.capacity(), 1);
+        assert_eq!(bytes.load(std::sync::atomic::Ordering::Acquire), 0);
+        let (outgoing, mut rx) = tokio::sync::mpsc::channel(2);
+        bytes.store(super::MAX_PENDING_BYTES - 1, std::sync::atomic::Ordering::Release);
+        assert_eq!(super::try_enqueue_packet_burst(&outgoing, &bytes, frames.clone(), |frame| frame), Err(frames.clone()));
+        assert_eq!(outgoing.capacity(), 2);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(bytes.load(std::sync::atomic::Ordering::Acquire), super::MAX_PENDING_BYTES - 1);
+        bytes.store(0, std::sync::atomic::Ordering::Release);
+        assert!(super::try_enqueue_packet_burst(&outgoing, &bytes, frames.clone(), |frame| frame).is_ok());
+        assert_eq!(rx.try_recv().unwrap(), frames[0]);
+        assert_eq!(rx.try_recv().unwrap(), frames[1]);
+        assert_eq!(bytes.load(std::sync::atomic::Ordering::Acquire), 3);
+        drop(rx);
+        bytes.store(0, std::sync::atomic::Ordering::Release);
+        assert_eq!(super::try_enqueue_packet_burst(&outgoing, &bytes, frames.clone(), |frame| frame), Err(frames));
+        assert_eq!(bytes.load(std::sync::atomic::Ordering::Acquire), 0);
     }
 
     #[test]

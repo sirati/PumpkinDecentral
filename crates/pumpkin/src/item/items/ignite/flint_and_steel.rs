@@ -25,6 +25,7 @@ impl ItemMetadata for FlintAndSteelItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for FlintAndSteelItem {
     fn use_on_block(
         &self,

@@ -55,6 +55,7 @@ impl StemBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for StemBlock {
     fn is_valid_bonemeal_target(&self, args: crate::block::BonemealArgs<'_>) -> bool {
         <Self as CropBlockBase>::is_valid_bonemeal_target(self, args.world, args.position)
@@ -93,7 +94,7 @@ impl BlockBehaviour for StemBlock {
 
     fn random_tick(&self, args: RandomTickArgs<'_>) {
         // TODO add light level check
-        let f: f32 = get_available_moisture(args.world, args.position, args.block);
+        let f: f32 = get_available_moisture(args.world.as_ref(), args.position, args.block);
         if rand::rng().random_range(0..=(25.0 / f).floor() as i32) == 0 {
             let (block, state) = args.world.get_block_and_state_id(args.position);
             let props = StemProperties::from_state_id(state);

@@ -24,6 +24,7 @@ impl ItemMetadata for LeadItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for LeadItem {
     fn use_on_block(
         &self,

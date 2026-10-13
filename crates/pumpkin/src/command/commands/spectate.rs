@@ -8,6 +8,7 @@ use pumpkin_util::{GameMode, PermissionLvl};
 
 use crate::command::argument_builder::{ArgumentBuilder, argument, command};
 use crate::command::argument_types::entity::EntityArgumentType;
+use crate::command::argument_types::entity_selector::EntitySelector;
 use crate::command::context::command_context::CommandContext;
 use crate::command::errors::error_types::CommandErrorType;
 use crate::command::node::dispatcher::CommandDispatcher;
@@ -41,6 +42,9 @@ struct StopSpectateExecutor;
 
 impl CommandExecutor for StopSpectateExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
+        if context.server().advanced_config.cluster.enabled {
+            return execute_cluster(context, true, true);
+        }
         let player = context
             .source
             .output
@@ -74,6 +78,9 @@ struct SpectateTargetExecutor {
 
 impl CommandExecutor for SpectateTargetExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
+        if context.server().advanced_config.cluster.enabled {
+            return execute_cluster(context, self.is_self, false);
+        }
         let target = EntityArgumentType::get_entity(context, "target")?;
         let target_entity = target.get_entity();
         let target_world = target_entity.world.load_full();
@@ -123,6 +130,90 @@ impl CommandExecutor for SpectateTargetExecutor {
 
         Ok(1)
     }
+}
+
+fn execute_cluster(
+    context: &CommandContext,
+    is_self: bool,
+    stopping: bool,
+) -> CommandExecutorResult {
+    let entries = crate::server::cluster_presence::all_presence_entries(context.server());
+    let viewer = if is_self {
+        let player = context
+            .source
+            .output
+            .as_player()
+            .ok_or_else(|| ERROR_NOT_PLAYER.create_without_context())?;
+        let gid = player
+            .cluster_gid()
+            .ok_or_else(|| ERROR_NOT_PLAYER.create_without_context())?;
+        (gid, *player.gameprofile.id.as_bytes())
+    } else {
+        let selector = context.get_argument::<EntitySelector>("player")?;
+        let Some(name) = selector.player_name.as_deref() else {
+            context
+                .source
+                .send_error(TextComponent::text("A specific player name is required"));
+            return Ok(0);
+        };
+        let Some((gid, entry)) = entries
+            .iter()
+            .find(|(_, entry)| entry.name.eq_ignore_ascii_case(name) && !entry.in_lobby)
+        else {
+            return Err(
+                crate::command::argument_types::entity::NO_PLAYERS_ERROR_TYPE
+                    .create_without_context(),
+            );
+        };
+        (*gid, entry.uuid)
+    };
+    let target = if stopping {
+        None
+    } else {
+        let selector = context.get_argument::<EntitySelector>("target")?;
+        let Some(name) = selector.player_name.as_deref() else {
+            context
+                .source
+                .send_error(TextComponent::text("A specific player name is required"));
+            return Ok(0);
+        };
+        let Some((gid, entry)) = entries
+            .iter()
+            .find(|(_, entry)| entry.name.eq_ignore_ascii_case(name) && !entry.in_lobby)
+        else {
+            return Err(
+                crate::command::argument_types::entity::NO_PLAYERS_ERROR_TYPE
+                    .create_without_context(),
+            );
+        };
+        if *gid == viewer.0 {
+            return Err(ERROR_SELF.create_without_context());
+        }
+        Some(
+            pumpkin_cluster::player_command_control::PlayerCommandTarget {
+                gid: *gid,
+                uuid: entry.uuid,
+            },
+        )
+    };
+    match crate::server::cluster_player_commands::submit(
+        context.server(),
+        &context.source,
+        viewer.0,
+        viewer.1,
+        pumpkin_cluster::player_command_control::PlayerCommandMutation::Spectate { target },
+    ) {
+        Ok(_) => context
+            .source
+            .send_message(TextComponent::text("Spectate queued")),
+        Err(error) => {
+            context.source.send_error(TextComponent::text(format!(
+                "Spectate could not be queued: {error:?}"
+            )));
+            return Ok(0);
+        }
+    }
+    Ok(1)
 }
 
 pub fn register(dispatcher: &mut CommandDispatcher, registry: &PermissionRegistry) {

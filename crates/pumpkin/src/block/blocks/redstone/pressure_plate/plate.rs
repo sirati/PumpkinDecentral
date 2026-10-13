@@ -30,6 +30,7 @@ impl BlockMetadata for PressurePlateBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for PressurePlateBlock {
     fn on_entity_collision(&self, args: OnEntityCollisionArgs<'_>) {
         self.on_entity_collision_pp(args);

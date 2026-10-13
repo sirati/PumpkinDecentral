@@ -4,7 +4,7 @@ use pumpkin_data::{Block, BlockId, BlockState};
 
 use pumpkin_data::BlockStateId;
 use pumpkin_util::math::position::BlockPos;
-use pumpkin_util::random::{RandomGenerator, get_seed, xoroshiro128::Xoroshiro};
+use pumpkin_util::random::get_seed;
 
 use crate::entity::experience_orb::ExperienceOrbEntity;
 use crate::entity::player::Player;
@@ -15,6 +15,7 @@ use std::sync::Arc;
 pub mod blocks;
 pub mod entities;
 pub mod fluid;
+pub mod neighbor;
 pub mod registry;
 pub mod viewer;
 
@@ -86,6 +87,13 @@ pub trait BlockBehaviour: Send + Sync {
         BlockActionResult::Pass
     }
 
+    fn normal_use_intent(
+        &self,
+        _args: NormalUseIntentArgs<'_>,
+    ) -> Option<(BlockActionResult, Vec<neighbor::BlockCallbackEffect>)> {
+        None
+    }
+
     fn get_screen_handler_factory(
         &self,
         _args: GetScreenHandlerFactoryArgs<'_>,
@@ -122,10 +130,18 @@ pub trait BlockBehaviour: Send + Sync {
         args.block.default_state.id
     }
 
+    fn placement_intent(&self, _args: PlacementIntentArgs<'_>) -> Option<BlockStateId> {
+        None
+    }
+
     fn random_tick(&self, _args: RandomTickArgs<'_>) {}
 
     fn can_place_at(&self, _args: CanPlaceAtArgs<'_>) -> bool {
         true
+    }
+
+    fn can_update_intent(&self, _args: CanUpdateIntentArgs<'_>) -> Option<bool> {
+        None
     }
 
     fn can_update_at(&self, _args: CanUpdateAtArgs<'_>) -> bool {
@@ -149,6 +165,13 @@ pub trait BlockBehaviour: Send + Sync {
 
     fn broken(&self, _args: BrokenArgs<'_>) {}
 
+    fn player_broken_intent(
+        &self,
+        _args: neighbor::PlayerBrokenIntentArgs<'_>,
+    ) -> Option<Vec<neighbor::BlockCallbackEffect>> {
+        None
+    }
+
     fn on_neighbor_update(&self, _args: OnNeighborUpdateArgs<'_>) {}
 
     /// Called if a block state is replaced or it replaces another state
@@ -162,6 +185,38 @@ pub trait BlockBehaviour: Send + Sync {
     }
 
     fn on_scheduled_tick(&self, _args: OnScheduledTickArgs<'_>) {}
+
+    /// Returns the callback's semantic requests against a captured owner view.
+    /// None means this callback has not yet moved to the pure interpreter.
+    fn scheduled_tick_intent(
+        &self,
+        _args: ScheduledTickIntentArgs<'_>,
+    ) -> Option<Vec<neighbor::BlockCallbackEffect>> {
+        None
+    }
+
+    fn random_tick_intent(
+        &self,
+        _args: RandomTickIntentArgs<'_>,
+    ) -> Option<Vec<neighbor::BlockCallbackEffect>> {
+        None
+    }
+
+    fn callback_intent(
+        &self,
+        args: neighbor::BlockCallbackIntentArgs<'_>,
+    ) -> Option<Vec<neighbor::BlockCallbackEffect>> {
+        match args.event {
+            neighbor::BlockCallbackEvent::Scheduled => {
+                self.scheduled_tick_intent(ScheduledTickIntentArgs {
+                    world: args.world,
+                    block: args.block,
+                    position: args.position,
+                })
+            }
+            _ => None,
+        }
+    }
 
     fn on_state_replaced(&self, _args: OnStateReplacedArgs<'_>) {}
 
@@ -230,6 +285,15 @@ pub struct NormalUseArgs<'a> {
     pub position: &'a BlockPos,
     pub player: &'a Arc<Player>,
     pub hit: &'a BlockHitResult<'a>,
+}
+
+pub struct NormalUseIntentArgs<'a> {
+    pub world: &'a dyn NeighborUpdateWorld,
+    pub block: &'a Block,
+    pub position: &'a BlockPos,
+    pub can_modify_world: bool,
+    pub sneaking: bool,
+    pub facing: pumpkin_data::block_properties::HorizontalFacing,
 }
 
 #[derive(Clone, Copy)]
@@ -310,10 +374,28 @@ pub struct OnPlaceArgs<'a> {
     pub use_item_on: &'a SUseItemOn,
 }
 
+pub struct PlacementIntentArgs<'a> {
+    pub world: &'a dyn NeighborUpdateWorld,
+    pub block: &'a Block,
+    pub position: &'a BlockPos,
+    pub direction: BlockDirection,
+    pub facing: pumpkin_data::block_properties::HorizontalFacing,
+    pub replacing: BlockIsReplacing,
+    pub hit: [f32; 3],
+}
+
 pub struct RandomTickArgs<'a> {
     pub world: &'a Arc<World>,
     pub block: &'a Block,
     pub position: &'a BlockPos,
+}
+
+pub struct RandomTickIntentArgs<'a> {
+    pub world: &'a dyn NeighborUpdateWorld,
+    pub block: &'a Block,
+    pub position: &'a BlockPos,
+    pub random: &'a mut pumpkin_util::random::RandomGenerator,
+    pub ambient_darkness: u8,
 }
 
 pub struct CanPlaceAtArgs<'a> {
@@ -326,6 +408,15 @@ pub struct CanPlaceAtArgs<'a> {
     pub direction: Option<BlockDirection>,
     pub player: Option<&'a Player>,
     pub use_item_on: Option<&'a SUseItemOn>,
+}
+
+pub struct CanUpdateIntentArgs<'a> {
+    pub world: &'a dyn NeighborUpdateWorld,
+    pub block: &'a Block,
+    pub state_id: BlockStateId,
+    pub position: &'a BlockPos,
+    pub direction: BlockDirection,
+    pub hit: [f32; 3],
 }
 
 pub struct CanUpdateAtArgs<'a> {
@@ -392,7 +483,7 @@ pub struct PrepareArgs<'a> {
 }
 
 pub struct GetStateForNeighborUpdateArgs<'a> {
-    pub world: &'a World,
+    pub world: &'a dyn NeighborUpdateWorld,
     pub block: &'a Block,
     pub state_id: BlockStateId,
     pub position: &'a BlockPos,
@@ -401,8 +492,155 @@ pub struct GetStateForNeighborUpdateArgs<'a> {
     pub neighbor_state_id: BlockStateId,
 }
 
+/// The state-query callback only observes blocks and emits scheduled work.
+/// Owner interpreters implement this interface against their private snapshot.
+pub trait NeighborUpdateWorld: BlockAccessor {
+    fn get_directional_power(&self, position: &BlockPos, direction: BlockDirection) -> u8;
+    fn receives_redstone_power(&self, position: &BlockPos) -> bool;
+    fn get_raw_brightness(&self, position: &BlockPos, ambient_darkness: u8) -> u8;
+    fn emits_redstone_power(
+        &self,
+        block: &Block,
+        state: &BlockState,
+        direction: BlockDirection,
+    ) -> bool;
+    fn get_power_on_side(
+        &self,
+        position: &BlockPos,
+        side: pumpkin_data::block_properties::HorizontalFacing,
+        only_gate: bool,
+    ) -> u8;
+    fn schedule_block_tick(
+        &self,
+        block: &Block,
+        position: BlockPos,
+        delay: u8,
+        priority: pumpkin_world::tick::TickPriority,
+    );
+    fn schedule_fluid_tick(
+        &self,
+        fluid: &Fluid,
+        position: BlockPos,
+        delay: u8,
+        priority: pumpkin_world::tick::TickPriority,
+    );
+    fn is_block_tick_scheduled(&self, position: &BlockPos, block: &Block) -> bool;
+    fn get_block_and_state_id(&self, position: &BlockPos) -> (&'static Block, BlockStateId) {
+        let id = self.get_block_state_id(position);
+        (Block::from_state_id(id), id)
+    }
+}
+
+impl<T: NeighborUpdateWorld + ?Sized> NeighborUpdateWorld for Arc<T> {
+    fn get_directional_power(&self, position: &BlockPos, direction: BlockDirection) -> u8 {
+        (**self).get_directional_power(position, direction)
+    }
+    fn receives_redstone_power(&self, position: &BlockPos) -> bool {
+        (**self).receives_redstone_power(position)
+    }
+    fn get_raw_brightness(&self, position: &BlockPos, ambient_darkness: u8) -> u8 {
+        (**self).get_raw_brightness(position, ambient_darkness)
+    }
+    fn emits_redstone_power(
+        &self,
+        block: &Block,
+        state: &BlockState,
+        direction: BlockDirection,
+    ) -> bool {
+        (**self).emits_redstone_power(block, state, direction)
+    }
+    fn get_power_on_side(
+        &self,
+        position: &BlockPos,
+        side: pumpkin_data::block_properties::HorizontalFacing,
+        only_gate: bool,
+    ) -> u8 {
+        (**self).get_power_on_side(position, side, only_gate)
+    }
+    fn schedule_block_tick(
+        &self,
+        block: &Block,
+        position: BlockPos,
+        delay: u8,
+        priority: pumpkin_world::tick::TickPriority,
+    ) -> () {
+        (**self).schedule_block_tick(block, position, delay, priority)
+    }
+    fn schedule_fluid_tick(
+        &self,
+        fluid: &Fluid,
+        position: BlockPos,
+        delay: u8,
+        priority: pumpkin_world::tick::TickPriority,
+    ) -> () {
+        (**self).schedule_fluid_tick(fluid, position, delay, priority)
+    }
+    fn is_block_tick_scheduled(&self, position: &BlockPos, block: &Block) -> bool {
+        (**self).is_block_tick_scheduled(position, block)
+    }
+}
+
+impl NeighborUpdateWorld for World {
+    fn get_directional_power(&self, position: &BlockPos, direction: BlockDirection) -> u8 {
+        let (block, state) = self.get_block_and_state(position);
+        crate::block::blocks::redstone::get_redstone_power(block, state, self, position, direction)
+    }
+    fn receives_redstone_power(&self, position: &BlockPos) -> bool {
+        crate::block::blocks::redstone::block_receives_redstone_power(self, position)
+    }
+    fn get_raw_brightness(&self, position: &BlockPos, ambient_darkness: u8) -> u8 {
+        World::get_raw_brightness(self, position, ambient_darkness)
+    }
+    fn emits_redstone_power(
+        &self,
+        block: &Block,
+        state: &BlockState,
+        direction: BlockDirection,
+    ) -> bool {
+        self.block_registry
+            .emits_redstone_power(block, state, direction)
+    }
+    fn get_power_on_side(
+        &self,
+        position: &BlockPos,
+        side: pumpkin_data::block_properties::HorizontalFacing,
+        only_gate: bool,
+    ) -> u8 {
+        crate::block::blocks::redstone::abstract_redstone_gate::get_power_on_side(
+            self, position, side, only_gate,
+        )
+    }
+    fn schedule_block_tick(
+        &self,
+        block: &Block,
+        position: BlockPos,
+        delay: u8,
+        priority: pumpkin_world::tick::TickPriority,
+    ) {
+        World::schedule_block_tick(self, block, position, delay, priority);
+    }
+    fn schedule_fluid_tick(
+        &self,
+        fluid: &Fluid,
+        position: BlockPos,
+        delay: u8,
+        priority: pumpkin_world::tick::TickPriority,
+    ) {
+        World::schedule_fluid_tick(self, fluid, position, delay, priority);
+    }
+    fn is_block_tick_scheduled(&self, position: &BlockPos, block: &Block) -> bool {
+        World::is_block_tick_scheduled(self, position, block)
+    }
+}
+
 pub struct OnScheduledTickArgs<'a> {
     pub world: &'a Arc<World>,
+    pub block: &'a Block,
+    pub position: &'a BlockPos,
+}
+
+pub struct ScheduledTickIntentArgs<'a> {
+    pub world: &'a dyn NeighborUpdateWorld,
     pub block: &'a Block,
     pub position: &'a BlockPos,
 }
@@ -422,11 +660,73 @@ pub struct EmitsRedstonePowerArgs<'a> {
 }
 
 pub struct GetRedstonePowerArgs<'a> {
-    pub world: &'a World,
+    pub world: &'a dyn RedstonePowerWorld,
     pub block: &'a Block,
     pub state: &'a BlockState,
     pub position: &'a BlockPos,
     pub direction: BlockDirection,
+}
+
+pub trait RedstonePowerWorld: BlockAccessor {
+    fn power_registry(&self) -> &registry::BlockRegistry;
+    fn block_entity_signal(&self, position: &BlockPos, signal: BlockEntitySignal) -> u8;
+    fn comparator_output(&self, position: &BlockPos) -> u8 {
+        self.block_entity_signal(position, BlockEntitySignal::Comparator)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum BlockEntitySignal {
+    Comparator,
+    TrappedChestViewers,
+    TestBlockPowered,
+    JukeboxPlaying,
+}
+
+impl<T: RedstonePowerWorld + ?Sized> RedstonePowerWorld for Arc<T> {
+    fn power_registry(&self) -> &registry::BlockRegistry {
+        (**self).power_registry()
+    }
+    fn block_entity_signal(&self, position: &BlockPos, signal: BlockEntitySignal) -> u8 {
+        (**self).block_entity_signal(position, signal)
+    }
+}
+
+impl RedstonePowerWorld for World {
+    fn power_registry(&self) -> &registry::BlockRegistry {
+        &self.block_registry
+    }
+    fn block_entity_signal(&self, position: &BlockPos, signal: BlockEntitySignal) -> u8 {
+        use crate::block::entities::{
+            comparator::ComparatorBlockEntity, jukebox::JukeboxBlockEntity,
+            test_block::TestBlockBlockEntity, trapped_chest::TrappedChestBlockEntity,
+        };
+        let Some(entity) = self.get_block_entity(position) else {
+            return 0;
+        };
+        match signal {
+            BlockEntitySignal::Comparator => entity
+                .as_any()
+                .downcast_ref::<ComparatorBlockEntity>()
+                .map_or(0, |comparator| {
+                    comparator
+                        .output_signal
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                }),
+            BlockEntitySignal::TrappedChestViewers => entity
+                .as_any()
+                .downcast_ref::<TrappedChestBlockEntity>()
+                .map_or(0, |chest| chest.get_viewer_count().min(15) as u8),
+            BlockEntitySignal::TestBlockPowered => entity
+                .as_any()
+                .downcast_ref::<TestBlockBlockEntity>()
+                .map_or(0, |block| if block.is_powered() { 15 } else { 0 }),
+            BlockEntitySignal::JukeboxPlaying => entity
+                .as_any()
+                .downcast_ref::<JukeboxBlockEntity>()
+                .map_or(0, |jukebox| if jukebox.is_playing() { 15 } else { 0 }),
+        }
+    }
 }
 
 pub struct GetComparatorOutputArgs<'a> {
@@ -488,22 +788,13 @@ pub fn drop_loot(
         }
     }
 
-    let has_silk_touch = params.tool.as_ref().is_some_and(|tool| {
-        pumpkin_data::Enchantment::from_name("silk_touch")
-            .is_some_and(|e| tool.get_enchantment_level(e) > 0)
-    });
-
-    if experience
-        && !has_silk_touch
-        && let Some(experience) = &block.experience
-    {
-        let mut random = RandomGenerator::Xoroshiro(Xoroshiro::from_seed(get_seed()));
-        let amount = experience.experience.get(&mut random);
+    if experience && block.experience.is_some() {
+        let amount = crate::world::loot::block_experience_fact(block, get_seed(), true, params);
         if amount > 0 {
             let mut event = crate::plugin::block::block_exp::BlockExpEvent {
                 block_pos: *pos,
                 world: world.clone(),
-                exp: amount,
+                exp: i32::try_from(amount).expect("block XP provider returns an i32"),
             };
             if let Some(server) = world.server.upgrade() {
                 server.plugin_manager.fire_blocking(&server, &mut event);
@@ -531,7 +822,7 @@ pub fn calc_block_breaking(player: &Player, state: &BlockState, block: &'static 
     player.get_mining_speed(block) / hardness / i
 }
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BlockIsReplacing {
     Itself(BlockStateId),
     Water(u8),

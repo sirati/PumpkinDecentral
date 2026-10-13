@@ -30,15 +30,32 @@ pub fn submit(
     command: String,
     id: VarInt,
 ) -> bool {
-    server
+    let result = server
         .cluster_command_suggestions_tx
         .try_send(SuggestionRequest {
             client,
             source,
             command,
             id,
-        })
-        .is_ok()
+        });
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            send_empty(error.into_inner());
+            false
+        }
+    }
+}
+
+fn send_empty(request: SuggestionRequest) {
+    if let ClientPlatform::Java(client) = request.client.as_ref() {
+        client.try_send_packet(&CCommandSuggestions::new(
+            request.id,
+            (request.command.len() as i32).into(),
+            0.into(),
+            Box::new([]),
+        ));
+    }
 }
 
 pub fn register<F>(server: &Server, future: F) -> bool
@@ -61,12 +78,32 @@ where
 pub fn spawn(server: &Arc<Server>, mut rx: mpsc::Receiver<SuggestionRequest>) {
     let task_server = Arc::clone(server);
     let permits = Arc::new(tokio::sync::Semaphore::new(32));
+    let (failure_tx, mut failure_rx) = mpsc::channel::<usize>(256);
     server.spawn_task(async move {
-        while let Some(request) = rx.recv().await {
-            let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
-                break;
+        let mut failures = std::collections::HashMap::<usize, std::time::Instant>::new();
+        loop {
+            let request = tokio::select! {
+                request = rx.recv() => {
+                    let Some(request) = request else { break };
+                    request
+                }
+                client = failure_rx.recv() => {
+                    let Some(client) = client else { break };
+                    let now = std::time::Instant::now();
+                    failures.retain(|_, last| now.duration_since(*last).as_secs() < 300);
+                    if !failures.contains_key(&client) && failures.len() < 4096 {
+                        failures.insert(client, now);
+                        tracing::warn!(client, "cluster plugin suggestions did not complete");
+                    }
+                    continue;
+                }
+            };
+            let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                send_empty(request);
+                continue;
             };
             let server = Arc::clone(&task_server);
+            let failure_tx = failure_tx.clone();
             task_server.spawn_task(async move {
                 let _permit = permit;
                 let Some(command) = request.command.strip_prefix('/') else {
@@ -79,10 +116,13 @@ pub fn spawn(server: &Arc<Server>, mut rx: mpsc::Receiver<SuggestionRequest>) {
                 let (tasks, mut results) = mpsc::channel(16);
                 let base = SUGGESTION_TASKS
                     .scope(tasks, async {
-                        server
-                            .command_dispatcher
-                            .load()
-                            .suggest_with_range(command, &request.source)
+                        super::cluster_permissions::with_source(&server, &request.source, async {
+                            server
+                                .command_dispatcher
+                                .load()
+                                .suggest_with_range(command, &request.source)
+                        })
+                        .await
                     })
                     .await;
                 let mut sets = vec![base];
@@ -90,7 +130,7 @@ pub fn spawn(server: &Arc<Server>, mut rx: mpsc::Receiver<SuggestionRequest>) {
                     match tokio::time::timeout(Duration::from_secs(5), result).await {
                         Ok(Ok(suggestions)) => sets.push(suggestions),
                         Ok(Err(_)) | Err(_) => {
-                            tracing::warn!("cluster plugin suggestions did not complete");
+                            let _ = failure_tx.try_send(Arc::as_ptr(&request.client) as usize);
                         }
                     }
                 }

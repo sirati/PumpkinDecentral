@@ -135,12 +135,7 @@ pub struct AdvancementRewards {
 impl ToTokens for AdvancementRewards {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         let experience = self.experience;
-        let recipes = self.recipes.iter().map(|_recipe| {
-            quote! {
-                //TODO implement recipe reward
-                //Recipe::from_id(#recipe)
-            }
-        });
+        let recipes = self.recipes.iter().map(ToString::to_string);
         tokens.extend(quote! {
             AdvancementReward {
                 experience: #experience,

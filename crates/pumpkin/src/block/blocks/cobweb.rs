@@ -7,6 +7,7 @@ use pumpkin_util::math::vector3::Vector3;
 #[pumpkin_block(Block::COBWEB)]
 pub struct CobwebBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for CobwebBlock {
     fn on_entity_collision(&self, args: OnEntityCollisionArgs<'_>) {
         let entity = args.entity.get_entity();

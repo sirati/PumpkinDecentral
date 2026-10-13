@@ -10,6 +10,7 @@ use crate::{
 
 /// Decoder: Client -> Server
 /// Supports Zlib decompression.
+#[derive(Clone)]
 pub struct BedrockBatchDecoder {
     compression: Option<CompressionThreshold>,
 }

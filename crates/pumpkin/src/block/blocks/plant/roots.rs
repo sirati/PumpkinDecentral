@@ -11,7 +11,15 @@ impl BlockMetadata for RootsBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for RootsBlock {
+    fn callback_intent(
+        &self,
+        _args: crate::block::neighbor::BlockCallbackIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        Some(Vec::new())
+    }
+
     fn can_place_at(&self, args: CanPlaceAtArgs<'_>) -> bool {
         let block_below = args.block_accessor.get_block(&args.position.down());
         if args.block == &Block::WARPED_ROOTS {

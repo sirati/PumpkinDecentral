@@ -151,6 +151,11 @@ impl ItemRegistry {
         true
     }
 
+    pub fn can_mine_owned(&self, item: &Item, game_mode: u8) -> Option<bool> {
+        if game_mode > 3 { return None; }
+        self.get_pumpkin_item(item.id).map_or(Some(true), |behavior| behavior.can_mine_intent(game_mode))
+    }
+
     #[must_use]
     pub fn get_pumpkin_item(&self, item: u16) -> Option<&Arc<dyn ItemBehaviour>> {
         self.items.get(&item)

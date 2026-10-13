@@ -6,6 +6,7 @@ use pumpkin_macros::pumpkin_block;
 #[pumpkin_block("minecraft:nether_sprouts")]
 pub struct NetherSproutsBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for NetherSproutsBlock {
     fn can_place_at(&self, args: CanPlaceAtArgs<'_>) -> bool {
         <Self as PlantBlockBase>::can_place_at(self, args.block_accessor, args.position)

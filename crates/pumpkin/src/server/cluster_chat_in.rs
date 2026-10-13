@@ -8,7 +8,6 @@ use pumpkin_cluster::chat_sync::{
 use pumpkin_cluster::identity::ServerId;
 use pumpkin_cluster::protocol::StreamKind;
 use pumpkin_cluster::streams::InboundParcel;
-use pumpkin_data::translation;
 use pumpkin_data::world::{EMOTE_COMMAND, MSG_COMMAND_INCOMING, RAW, SAY_COMMAND};
 use pumpkin_protocol::codec::var_int::VarInt;
 use pumpkin_util::text::TextComponent;
@@ -114,47 +113,14 @@ pub fn apply_chat_effect(
             true
         }
         ChatInboundEffect::TeamDelivery(broadcast) => {
-            if !is_valid_chat_body(&broadcast.body)
-                || !is_valid_chat_name(&broadcast.sender_name)
-                || broadcast.team.is_empty()
+            if !broadcast.valid()
+                || serde_json::from_str::<TextComponent>(&broadcast.team_display_json).is_err()
+                || serde_json::from_str::<TextComponent>(&broadcast.sender_display_json).is_err()
             {
-                debug!("cluster team chat dropped: invalid body, name, or team");
                 return false;
             }
-            let sender_display = TextComponent::text(broadcast.sender_name.clone());
-            let msg_component = TextComponent::text(broadcast.body.clone());
-            for world in server.worlds.load().iter() {
-                let team = world
-                    .team_chat_snapshot
-                    .load()
-                    .get(&broadcast.team)
-                    .cloned();
-                let Some(team) = team else {
-                    continue;
-                };
-                let team_display = team.display_name.clone().color_named(team.color);
-                for player in world.players.load().iter() {
-                    if !team.players.contains(&player.gameprofile.name) {
-                        continue;
-                    }
-                    let msg = TextComponent::translate_cross(
-                        translation::java::CHAT_TYPE_TEAM_TEXT,
-                        translation::java::CHAT_TYPE_TEAM_TEXT,
-                        [
-                            team_display.clone(),
-                            sender_display.clone(),
-                            msg_component.clone(),
-                        ],
-                    );
-                    player.send_system_message(&msg);
-                }
-            }
+            super::cluster_chat_pm::deliver_team_frozen(server, &broadcast);
             CHAT_DELIVERED.fetch_add(1, Ordering::Relaxed);
-            debug!(
-                from = broadcast.sender.server.0,
-                team = broadcast.team.as_str(),
-                "cluster team chat delivered"
-            );
             true
         }
         ChatInboundEffect::EmoteDelivery(broadcast) => {
@@ -216,11 +182,77 @@ pub fn apply_chat_effect(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TeamSenderAuthentication {
+    Accepted,
+    Deferred,
+    Rejected,
+}
+
+fn authenticate_team_transport(
+    local: ServerId,
+    peer: ServerId,
+    generation: u64,
+    current: Option<u64>,
+    broadcast: &pumpkin_cluster::chat_sync::TeamChatBroadcast,
+) -> TeamSenderAuthentication {
+    if peer == local || broadcast.sender.server != peer || generation == 0 {
+        return TeamSenderAuthentication::Rejected;
+    }
+    match current {
+        None => TeamSenderAuthentication::Deferred,
+        Some(current) if current < generation => TeamSenderAuthentication::Deferred,
+        Some(current) if current == generation => TeamSenderAuthentication::Accepted,
+        Some(_) => TeamSenderAuthentication::Rejected,
+    }
+}
+
+fn authenticate_team_sender(
+    broadcast: &pumpkin_cluster::chat_sync::TeamChatBroadcast,
+    boot: Option<u64>,
+) -> TeamSenderAuthentication {
+    if !broadcast.valid() {
+        return TeamSenderAuthentication::Rejected;
+    }
+    match boot {
+        None | Some(0) => TeamSenderAuthentication::Deferred,
+        Some(boot) if boot != broadcast.source.generation => TeamSenderAuthentication::Rejected,
+        Some(_) => TeamSenderAuthentication::Accepted,
+    }
+}
+
+#[derive(Default)]
+struct TeamMessageDedupe {
+    seen: std::collections::HashSet<(pumpkin_cluster::realm_completion::PeerGeneration, [u8; 16])>,
+    order:
+        std::collections::VecDeque<(pumpkin_cluster::realm_completion::PeerGeneration, [u8; 16])>,
+}
+
+impl TeamMessageDedupe {
+    fn remember(&mut self, broadcast: &pumpkin_cluster::chat_sync::TeamChatBroadcast) -> bool {
+        let key = (broadcast.source, broadcast.message_id);
+        if !self.seen.insert(key) {
+            return false;
+        }
+        self.order.push_back(key);
+        if self.order.len() > 4096 {
+            self.seen.remove(&self.order.pop_front().unwrap());
+        }
+        true
+    }
+}
+
 pub async fn chat_delivery_task(
     server: Arc<Server>,
     local: ServerId,
     mut chat_rx: mpsc::Receiver<InboundParcel>,
 ) {
+    let mut team_dedupe = TeamMessageDedupe::default();
+    let mut team_diagnostics = super::cluster_control_registers::Diagnostics::default();
+    let mut team_deferred_since = std::collections::HashMap::<
+        (pumpkin_cluster::realm_completion::PeerGeneration, [u8; 16]),
+        std::time::Instant,
+    >::new();
     let mut first = true;
     let mut pending = std::collections::VecDeque::new();
     let mut source_open = true;
@@ -233,7 +265,11 @@ pub async fn chat_delivery_task(
             }
             _ = retry.tick() => {}
         }
-        while let Some(parcel) = pending.front() {
+        let work = pending.len();
+        for _ in 0..work {
+            let Some(parcel) = pending.front() else {
+                break;
+            };
             if parcel.header.kind != StreamKind::Control {
                 pending.pop_front();
                 continue;
@@ -247,6 +283,92 @@ pub async fn chat_delivery_task(
                 continue;
             };
             let generations = server.cluster_peer_generations.load();
+            if let pumpkin_cluster::chat_sync::ChatControlMessage::Team(broadcast) = &message {
+                match authenticate_team_transport(
+                    local,
+                    parcel.peer,
+                    parcel.generation,
+                    generations.get(&parcel.peer).copied(),
+                    broadcast,
+                ) {
+                    TeamSenderAuthentication::Deferred => {
+                        let since = team_deferred_since
+                            .entry((broadcast.source, broadcast.message_id))
+                            .or_insert_with(std::time::Instant::now);
+                        if since.elapsed().as_secs() >= 10 {
+                            team_diagnostics.deferred(
+                                "team_chat",
+                                parcel.peer.0,
+                                "awaiting transport publication",
+                            );
+                        }
+                        let parcel = pending.pop_front().unwrap();
+                        pending.push_back(parcel);
+                        continue;
+                    }
+                    TeamSenderAuthentication::Rejected => {
+                        team_diagnostics.rejected(
+                            "team_chat",
+                            parcel.peer.0,
+                            "stale or forged transport origin",
+                        );
+                        team_deferred_since.remove(&(broadcast.source, broadcast.message_id));
+                        pending.pop_front();
+                        continue;
+                    }
+                    TeamSenderAuthentication::Accepted => {}
+                }
+                if !broadcast.valid()
+                    || serde_json::from_str::<TextComponent>(&broadcast.team_display_json).is_err()
+                    || serde_json::from_str::<TextComponent>(&broadcast.sender_display_json)
+                        .is_err()
+                {
+                    team_diagnostics.rejected(
+                        "team_chat",
+                        parcel.peer.0,
+                        "invalid frozen team message",
+                    );
+                    pending.pop_front();
+                    continue;
+                }
+                match authenticate_team_sender(
+                    broadcast,
+                    server
+                        .cluster_peer_incarnations
+                        .load()
+                        .get(&parcel.peer)
+                        .copied(),
+                ) {
+                    TeamSenderAuthentication::Deferred => {
+                        let since = team_deferred_since
+                            .entry((broadcast.source, broadcast.message_id))
+                            .or_insert_with(std::time::Instant::now);
+                        if since.elapsed().as_secs() >= 10 {
+                            team_diagnostics.deferred(
+                                "team_chat",
+                                parcel.peer.0,
+                                "awaiting source boot publication",
+                            );
+                        }
+                        let parcel = pending.pop_front().unwrap();
+                        pending.push_back(parcel);
+                        continue;
+                    }
+                    TeamSenderAuthentication::Rejected => {
+                        team_diagnostics.rejected(
+                            "team_chat",
+                            parcel.peer.0,
+                            "stale sender identity",
+                        );
+                        team_deferred_since.remove(&(broadcast.source, broadcast.message_id));
+                        pending.pop_front();
+                        continue;
+                    }
+                    TeamSenderAuthentication::Accepted => {
+                        team_deferred_since.remove(&(broadcast.source, broadcast.message_id));
+                    }
+                }
+            }
             if !authorized_chat_message(
                 local,
                 parcel.peer,
@@ -256,6 +378,12 @@ pub async fn chat_delivery_task(
             ) {
                 pending.pop_front();
                 continue;
+            }
+            if let pumpkin_cluster::chat_sync::ChatControlMessage::Team(broadcast) = &message {
+                if !team_dedupe.remember(broadcast) {
+                    pending.pop_front();
+                    continue;
+                }
             }
             let effect = match handle_chat_bytes(local, &parcel.bytes) {
                 Ok(effect) => effect,
@@ -521,5 +649,111 @@ mod control_fanout_tests {
             .await
             .unwrap()
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod team_tests {
+    use super::*;
+    use pumpkin_cluster::chat_sync::TeamChatBroadcast;
+    use pumpkin_cluster::identity::{GlobalPlayerId, PlayerSlot};
+    use pumpkin_cluster::realm_completion::PeerGeneration;
+
+    fn message() -> TeamChatBroadcast {
+        TeamChatBroadcast::new(
+            GlobalPlayerId::new(ServerId(2), PlayerSlot(7)),
+            "Alice".into(),
+            pumpkin_cluster::protocol::WorldId::new(0, 1),
+            "red".into(),
+            "hello".into(),
+            PeerGeneration {
+                server: ServerId(2),
+                generation: 12,
+            },
+            [1; 16],
+            17,
+            vec![[1; 16], [2; 16]],
+            "{\"text\":\"Red\",\"color\":\"red\"}".into(),
+            "{\"text\":\"Alice\",\"bold\":true}".into(),
+        )
+    }
+
+    #[test]
+    fn newer_transport_parcel_defers_until_publication_but_old_epoch_rejects() {
+        let message = message();
+        assert_eq!(
+            authenticate_team_transport(ServerId(1), ServerId(2), 3, Some(2), &message),
+            TeamSenderAuthentication::Deferred
+        );
+        assert_eq!(
+            authenticate_team_transport(ServerId(1), ServerId(2), 3, Some(3), &message),
+            TeamSenderAuthentication::Accepted
+        );
+        assert_eq!(
+            authenticate_team_transport(ServerId(1), ServerId(2), 2, Some(3), &message),
+            TeamSenderAuthentication::Rejected
+        );
+        assert_eq!(
+            authenticate_team_transport(ServerId(1), ServerId(9), 3, Some(3), &message),
+            TeamSenderAuthentication::Rejected
+        );
+    }
+
+    #[test]
+    fn missing_source_boot_defers_then_exact_original_boot_authenticates() {
+        let message = message();
+        assert_eq!(
+            authenticate_team_sender(&message, None),
+            TeamSenderAuthentication::Deferred
+        );
+        assert_eq!(
+            authenticate_team_sender(&message, Some(12)),
+            TeamSenderAuthentication::Accepted
+        );
+        assert_eq!(
+            authenticate_team_sender(&message, Some(13)),
+            TeamSenderAuthentication::Rejected
+        );
+        let mut forged = message.clone();
+        forged.source.server = ServerId(9);
+        assert_eq!(
+            authenticate_team_sender(&forged, Some(12)),
+            TeamSenderAuthentication::Rejected
+        );
+    }
+
+    #[test]
+    fn original_source_attested_session_survives_newer_session_arriving_first() {
+        let original = message();
+        let mut relogged = original.clone();
+        relogged.sender_session += 1;
+        relogged.sender_uuid = [3; 16];
+        relogged.recipients.push([3; 16]);
+        relogged.message_id = [4; 16];
+        assert_eq!(
+            authenticate_team_sender(&relogged, Some(12)),
+            TeamSenderAuthentication::Accepted
+        );
+        assert_eq!(
+            authenticate_team_sender(&original, Some(12)),
+            TeamSenderAuthentication::Accepted
+        );
+        let mut dedupe = TeamMessageDedupe::default();
+        assert!(dedupe.remember(&relogged));
+        assert!(dedupe.remember(&original));
+        assert!(!dedupe.remember(&original));
+    }
+
+    #[test]
+    fn original_team_message_id_deduplicates_across_payload_replay() {
+        let message = message();
+        let mut dedupe = TeamMessageDedupe::default();
+        assert!(dedupe.remember(&message));
+        let mut replay = message.clone();
+        replay.body = "different current text".into();
+        replay.recipients = vec![[1; 16]];
+        assert!(!dedupe.remember(&replay));
+        replay.source.generation += 1;
+        assert!(dedupe.remember(&replay));
     }
 }

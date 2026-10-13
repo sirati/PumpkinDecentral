@@ -65,7 +65,94 @@ fn get_sound(block: &Block, open: bool) -> Sound {
 #[pumpkin_block_from_tag("minecraft:trapdoors")]
 pub struct TrapDoorBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for TrapDoorBlock {
+    fn placement_intent(
+        &self,
+        args: crate::block::PlacementIntentArgs<'_>,
+    ) -> Option<BlockStateId> {
+        let mut properties = TrapDoorProperties::default(args.block);
+        properties.waterlogged = args.replacing.water_source();
+        properties.facing = args.direction.to_horizontal_facing().unwrap_or(args.facing);
+        properties.half = match args.direction {
+            BlockDirection::Up => Half::Top,
+            BlockDirection::Down => Half::Bottom,
+            _ if args.hit[1] < 0.5 => Half::Bottom,
+            _ => Half::Top,
+        };
+        let powered = args.world.receives_redstone_power(args.position);
+        properties.powered = powered;
+        properties.open = powered;
+        Some(properties.to_state_id(args.block))
+    }
+
+    fn normal_use_intent(
+        &self,
+        args: crate::block::NormalUseIntentArgs<'_>,
+    ) -> Option<(
+        BlockActionResult,
+        Vec<crate::block::neighbor::BlockCallbackEffect>,
+    )> {
+        use crate::block::neighbor::BlockCallbackEffect;
+        if !can_open_trapdoor(args.block) || !args.can_modify_world {
+            return Some((BlockActionResult::Pass, Vec::new()));
+        }
+        let mut props =
+            TrapDoorProperties::from_state_id(args.world.get_block_state_id(args.position));
+        props.open = !props.open;
+        Some((
+            BlockActionResult::Success,
+            vec![
+                BlockCallbackEffect::SetBlock {
+                    position: *args.position,
+                    state: props.to_state_id(args.block),
+                    flags: BlockFlags::NOTIFY_LISTENERS,
+                },
+                BlockCallbackEffect::Sound {
+                    position: *args.position,
+                    sound: get_sound(args.block, props.open),
+                    volume_milli: 1000,
+                    pitch_milli: 1000,
+                },
+            ],
+        ))
+    }
+
+    fn callback_intent(
+        &self,
+        args: crate::block::neighbor::BlockCallbackIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        use crate::block::neighbor::BlockCallbackEffect;
+        if !matches!(
+            args.event,
+            crate::block::neighbor::BlockCallbackEvent::Neighbor { .. }
+        ) {
+            return Some(Vec::new());
+        }
+        let mut props =
+            TrapDoorProperties::from_state_id(args.world.get_block_state_id(args.position));
+        let powered = args.world.receives_redstone_power(args.position);
+        let mut effects = Vec::new();
+        if powered != props.powered {
+            props.powered = powered;
+            if powered != props.open {
+                props.open = powered;
+                effects.push(BlockCallbackEffect::Sound {
+                    position: *args.position,
+                    sound: get_sound(args.block, powered),
+                    volume_milli: 1000,
+                    pitch_milli: 1000,
+                });
+            }
+        }
+        effects.push(BlockCallbackEffect::SetBlock {
+            position: *args.position,
+            state: props.to_state_id(args.block),
+            flags: BlockFlags::NOTIFY_LISTENERS,
+        });
+        Some(effects)
+    }
+
     fn normal_use(&self, args: NormalUseArgs<'_>) -> BlockActionResult {
         {
             if !can_open_trapdoor(args.block) {

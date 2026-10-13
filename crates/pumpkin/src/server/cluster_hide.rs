@@ -69,6 +69,7 @@ pub fn publish_hide_announce(
     uuid: [u8; 16],
     name: &str,
     hidden: bool,
+    session: u64,
 ) -> bool {
     if !is_valid_hide_name(name) {
         return false;
@@ -76,7 +77,9 @@ pub fn publish_hide_announce(
     let update = HideUpdate::new(gid, uuid, name.to_string(), hidden);
     server
         .cluster_presence
-        .try_submit(super::cluster_presence::PresenceCommand::LocalHide(update))
+        .try_submit(super::cluster_presence::PresenceCommand::LocalHide(
+            update, session,
+        ))
 }
 
 #[must_use]
@@ -117,6 +120,19 @@ fn broadcast_fake_hide(server: &Server, name: &str, hidden: bool, except: Option
         }
         viewer.send_system_message(&message);
     }
+    if server.advanced_config.cluster.enabled {
+        let local = ServerId(server.advanced_config.cluster.server_id);
+        for profile in server.cluster_presence.snapshot().entries.values() {
+            if profile.gid.server == local
+                && profile.in_lobby
+                && except != Some(uuid::Uuid::from_bytes(profile.uuid))
+            {
+                let _ = server
+                    .cluster_lobby_chat_tx
+                    .send((Some(profile.name.clone()), message.clone()));
+            }
+        }
+    }
 }
 
 fn remove_remote_from_viewer(viewer: &Player, uuid: uuid::Uuid, name: &str) {
@@ -142,14 +158,33 @@ fn remove_remote_from_viewer(viewer: &Player, uuid: uuid::Uuid, name: &str) {
 }
 
 fn add_remote_to_viewer(
+    server: &Server,
     viewer: &Player,
     uuid: uuid::Uuid,
     name: &str,
     properties: &[pumpkin_protocol::Property],
 ) {
+    let skin = if matches!(
+        viewer.client.as_ref(),
+        crate::net::ClientPlatform::Bedrock(_)
+    ) {
+        let Some(skin) = super::cluster_profile_skins::get(server, uuid) else {
+            return;
+        };
+        (*skin).clone()
+    } else {
+        Skin::steve()
+    };
+    let listed = server
+        .cluster_presence
+        .snapshot()
+        .entries
+        .values()
+        .find(|entry| entry.uuid == *uuid.as_bytes())
+        .is_some_and(|entry| entry.listed);
     let actions = [
         PlayerAction::AddPlayer { name, properties },
-        PlayerAction::UpdateListed(true),
+        PlayerAction::UpdateListed(listed),
         PlayerAction::UpdateLatency(VarInt(0)),
     ];
     let entry = [pumpkin_protocol::java::client::play::Player {
@@ -173,7 +208,7 @@ fn add_remote_to_viewer(
                 xuid: String::new(),
                 platform_chat_id: String::new(),
                 build_platform: BuildPlatform::Unknown,
-                skin: Skin::steve(),
+                skin,
                 is_teacher: false,
                 is_host: false,
                 is_sub_client: false,
@@ -190,6 +225,7 @@ pub fn push_remote_login_to_viewers(
     name: &str,
     properties: &[pumpkin_protocol::Property],
 ) {
+    if server.advanced_config.cluster.enabled { return; }
     if !is_valid_hide_name(name) {
         return;
     }
@@ -199,7 +235,7 @@ pub fn push_remote_login_to_viewers(
         if hidden {
             continue;
         }
-        add_remote_to_viewer(&viewer, uuid, name, properties);
+        add_remote_to_viewer(server, &viewer, uuid, name, properties);
     }
 }
 
@@ -209,6 +245,7 @@ pub fn push_remote_logout_to_viewers(
     uuid_bytes: &[u8; 16],
     name: &str,
 ) {
+    if server.advanced_config.cluster.enabled { return; }
     if !is_valid_hide_name(name) {
         return;
     }
@@ -331,6 +368,13 @@ pub fn apply_hide_visibility(
     hidden: bool,
 ) {
     let viewers = server.get_all_players();
+    if server.advanced_config.cluster.enabled {
+        let snapshot = server.cluster_presence.snapshot();
+        let Some(name) = snapshot.by_uuid(hidden_uuid.as_bytes()).map(|entry| entry.name.as_str()).or(fallback_name) else { super::cluster_status::refresh_cluster_status(server); return; };
+        broadcast_fake_hide(server, name, hidden, Some(hidden_uuid));
+        super::cluster_status::refresh_cluster_status(server);
+        return;
+    }
     if hidden {
         let local = viewers
             .iter()
@@ -346,7 +390,7 @@ pub fn apply_hide_visibility(
                     super::cluster_status::refresh_cluster_status(server);
                     return;
                 };
-                let entity_id = super::cluster_ghost::remote_player_replica(gid)
+                let entity_id = super::cluster_ghost::remote_player_replica(server, gid)
                     .map(|replica| replica.get_entity().entity_id);
                 (entity_id, entry.name)
             }
@@ -389,7 +433,7 @@ pub fn apply_hide_visibility(
                 .find(|(_, entry)| entry.uuid == *hidden_uuid.as_bytes());
             let entity_id = remote
                 .as_ref()
-                .and_then(|(gid, _)| super::cluster_ghost::remote_player_replica(*gid))
+                .and_then(|(gid, _)| super::cluster_ghost::remote_player_replica(server, *gid))
                 .map(|replica| replica.get_entity().entity_id);
             for viewer in &viewers {
                 if viewer.gameprofile.id == hidden_uuid {
@@ -402,7 +446,7 @@ pub fn apply_hide_visibility(
                             super::cluster_chat_pm::remote_player_properties(server, gid)
                         })
                         .unwrap_or_default();
-                    add_remote_to_viewer(viewer, hidden_uuid, &name, &properties);
+                    add_remote_to_viewer(server, viewer, hidden_uuid, &name, &properties);
                 }
                 if let Some(entity_id) = entity_id {
                     restore_entity_pairing(server, viewer, entity_id);
@@ -425,6 +469,9 @@ pub fn toggle_hide_for(server: &Arc<Server>, player: &Player) -> Option<bool> {
         uuid_bytes,
         &player.gameprofile.name,
         now_hidden,
+        player
+            .cluster_owner_install_generation
+            .load(std::sync::atomic::Ordering::Acquire),
     )
     .then_some(now_hidden)
 }
@@ -435,8 +482,15 @@ pub fn toggle_hide_lobby(
 ) -> Option<bool> {
     let uuid = *lobby.profile.id.as_bytes();
     let now_hidden = !is_hidden_gid(server, &lobby.gid) && !is_hidden_uuid_bytes(server, &uuid);
-    publish_hide_announce(server, lobby.gid, uuid, &lobby.profile.name, now_hidden)
-        .then_some(now_hidden)
+    publish_hide_announce(
+        server,
+        lobby.gid,
+        uuid,
+        &lobby.profile.name,
+        now_hidden,
+        lobby.session_generation,
+    )
+    .then_some(now_hidden)
 }
 
 pub fn apply_hide_bytes(
@@ -498,4 +552,10 @@ pub fn spawn_hide_apply(server: &Arc<Server>, hide_rx: mpsc::Receiver<InboundPar
 #[must_use]
 pub fn is_hidden_remote_gid(server: &Server, gid: &GlobalPlayerId) -> bool {
     is_hidden_gid(server, gid)
+}
+
+pub fn refresh_profile_skin(server: &Server, uuid: uuid::Uuid) -> bool {
+    let snapshot = server.cluster_presence.snapshot();
+    let Some(entry) = snapshot.by_uuid(uuid.as_bytes()) else { return true; };
+    super::cluster_roster::changed(server, entry.gid)
 }

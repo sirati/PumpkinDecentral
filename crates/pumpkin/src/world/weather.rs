@@ -91,7 +91,11 @@ impl Weather {
     }
 
     pub fn tick_weather(&mut self, world: &World) {
-        if !self.weather_cycle_enabled {
+        self.tick_weather_with_cycle(world, !self.weather_cycle_enabled);
+    }
+
+    pub(crate) fn advance_weather(&mut self, advance_cycle: bool) {
+        if advance_cycle {
             self.advance_weather_cycle();
         }
 
@@ -110,7 +114,10 @@ impl Weather {
         } else {
             self.thunder_level = (self.thunder_level - WEATHER_TRANSITION_SPEED).max(0.0);
         }
+    }
 
+    pub fn tick_weather_with_cycle(&mut self, world: &World, advance_cycle: bool) {
+        self.advance_weather(advance_cycle);
         // Broadcast level changes if needed
         let lobby_waiters: Vec<_> = world
             .players

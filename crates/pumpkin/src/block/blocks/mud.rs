@@ -5,6 +5,7 @@ use crate::block::{BlockBehaviour, PathComputationType};
 #[pumpkin_block("minecraft:mud")]
 pub struct MudBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for MudBlock {
     fn is_pathfindable(
         &self,

@@ -50,6 +50,7 @@ pub struct ShulkerBoxBlock;
 
 type EndRodLikeProperties = pumpkin_data::block_properties::EndRodLikeProperties;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for ShulkerBoxBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut props = EndRodLikeProperties::default(args.block);

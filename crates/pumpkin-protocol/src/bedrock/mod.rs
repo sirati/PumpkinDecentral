@@ -1,5 +1,6 @@
 pub mod client;
 pub mod enum_as_str;
+mod item_components;
 pub mod network_item;
 pub mod packet_decoder;
 pub mod packet_encoder;

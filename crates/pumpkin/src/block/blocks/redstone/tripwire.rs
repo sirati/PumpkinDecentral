@@ -22,6 +22,7 @@ type TripwireHookProperties = pumpkin_data::block_properties::TripwireHookLikePr
 #[pumpkin_block("minecraft:tripwire")]
 pub struct TripwireBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for TripwireBlock {
     fn on_entity_collision(&self, args: OnEntityCollisionArgs<'_>) {
         let mut props = TripwireProperties::from_state_id(args.state.id);

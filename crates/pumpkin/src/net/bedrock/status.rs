@@ -16,10 +16,7 @@ use pumpkin_protocol::{
     serial::PacketRead,
 };
 use pumpkin_world::{CURRENT_BEDROCK_MC_PROTOCOL, CURRENT_BEDROCK_MC_VERSION};
-use tokio::{
-    net::UdpSocket,
-    sync::{Mutex, mpsc},
-};
+use tokio::{net::UdpSocket, sync::mpsc};
 use tracing::trace;
 
 pub struct StatusResponder {
@@ -33,7 +30,7 @@ pub struct StatusResponder {
 /// The WebRTC side of the UDP socket shared with Bedrock server-list status.
 pub struct IceSocket {
     socket: Arc<UdpSocket>,
-    packets: Mutex<mpsc::Receiver<(Bytes, SocketAddr)>>,
+    packets: crossbeam::queue::ArrayQueue<mpsc::Receiver<(Bytes, SocketAddr)>>,
 }
 
 impl StatusResponder {
@@ -56,7 +53,7 @@ impl StatusResponder {
             },
             IceSocket {
                 socket: ipv4,
-                packets: Mutex::new(packets),
+                packets: crate::net::bedrock::nethernet::receiver_slot(packets),
             },
         ))
     }
@@ -170,9 +167,11 @@ impl IceSocket {
     }
 
     pub async fn recv_from(&self, buffer: &mut [u8]) -> Result<(usize, SocketAddr), Error> {
-        let (packet, address) = self.packets.lock().await.recv().await.ok_or_else(|| {
-            Error::new(std::io::ErrorKind::BrokenPipe, "Bedrock UDP socket closed")
-        })?;
+        let (packet, address) = crate::net::bedrock::nethernet::receive_owned(&self.packets, None)
+            .await
+            .ok_or_else(|| {
+                Error::new(std::io::ErrorKind::BrokenPipe, "Bedrock UDP socket closed")
+            })?;
         let length = buffer.len().min(packet.len());
         buffer[..length].copy_from_slice(&packet[..length]);
         Ok((length, address))
@@ -268,7 +267,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel(1);
         let ice = IceSocket {
             socket: server.clone(),
-            packets: Mutex::new(receiver),
+            packets: crate::net::bedrock::nethernet::receiver_slot(receiver),
         };
         sender
             .send((Bytes::from_static(b"request"), client.local_addr().unwrap()))

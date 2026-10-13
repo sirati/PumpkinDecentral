@@ -18,6 +18,7 @@ use std::sync::Mutex;
 #[pumpkin_block("minecraft:loom")]
 pub struct LoomBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for LoomBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut props = WallTorchLikeProperties::default(args.block);

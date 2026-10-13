@@ -144,6 +144,7 @@ impl LecternBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for LecternBlock {
     fn placed(&self, args: PlacedArgs<'_>) {
         let block_entity = LecternBlockEntity::new(*args.position);

@@ -9,6 +9,20 @@ use crate::errors::command_syntax_error::CommandSyntaxError;
 
 pub trait ReturnValueCallable: Send + Sync {
     fn call(&self, value: ReturnValue);
+
+    fn call_deferred(&self, _token: crate::deferred::DeferredCommandToken, value: ReturnValue) {
+        self.call(value);
+    }
+
+    fn complete_deferred_branch(&self, _token: crate::deferred::DeferredCommandToken) {}
+
+    fn reserve_deferred_terminal(&self, _token: crate::deferred::DeferredCommandToken) -> Result<Option<Box<dyn crate::deferred::DeferredCompletionTerminal>>, crate::deferred::DeferredCompletionUnavailable> {
+        Ok(None)
+    }
+
+    fn deferred_completion_readiness(&self, _token: crate::deferred::DeferredCommandToken) -> crate::deferred::CompletionReadiness {
+        crate::deferred::CompletionReadiness::Ready
+    }
 }
 
 pub type ReturnValueCallback = Arc<dyn ReturnValueCallable>;
@@ -38,6 +52,39 @@ impl ResultValueTaker {
         for callback in &self.0 {
             callback.call(return_value);
         }
+    }
+
+    pub fn call_deferred(&self, token: crate::deferred::DeferredCommandToken, return_value: ReturnValue) {
+        for callback in &self.0 {
+            callback.call_deferred(token, return_value);
+        }
+    }
+
+    pub fn complete_deferred_branch(&self, token: crate::deferred::DeferredCommandToken) {
+        for callback in &self.0 {
+            callback.complete_deferred_branch(token);
+        }
+    }
+
+    pub fn reserve_deferred_terminal(&self, token: crate::deferred::DeferredCommandToken) -> Result<Option<Box<dyn crate::deferred::DeferredCompletionTerminal>>, crate::deferred::DeferredCompletionUnavailable> {
+        let mut terminals = Vec::new();
+        for callback in &self.0 {
+            if let Some(terminal) = callback.reserve_deferred_terminal(token)? { terminals.push(terminal); }
+        }
+        Ok((!terminals.is_empty()).then(|| Box::new(crate::deferred::DeferredTerminalGroup(terminals)) as Box<dyn crate::deferred::DeferredCompletionTerminal>))
+    }
+
+    pub fn deferred_completion_readiness(&self, token: crate::deferred::DeferredCommandToken) -> crate::deferred::CompletionReadiness {
+        use crate::deferred::CompletionReadiness;
+        let mut readiness = CompletionReadiness::Ready;
+        for callback in &self.0 {
+            match callback.deferred_completion_readiness(token) {
+                CompletionReadiness::Denied => return CompletionReadiness::Denied,
+                CompletionReadiness::Pending => readiness = CompletionReadiness::Pending,
+                CompletionReadiness::Ready => {},
+            }
+        }
+        readiness
     }
 }
 
@@ -77,6 +124,20 @@ pub trait CommandSource: Clone + Send + Sync + 'static {
 
     /// Invokes callbacks for the command's return value.
     fn call_result(&self, _result: ReturnValue) {}
+
+    fn call_deferred_result(&self, _token: crate::deferred::DeferredCommandToken, result: ReturnValue) {
+        self.call_result(result);
+    }
+
+    fn complete_deferred_branch(&self, _token: crate::deferred::DeferredCommandToken) {}
+
+    fn reserve_deferred_terminal(&self, _token: crate::deferred::DeferredCommandToken) -> Result<Option<Box<dyn crate::deferred::DeferredCompletionTerminal>>, crate::deferred::DeferredCompletionUnavailable> {
+        Ok(None)
+    }
+
+    fn deferred_completion_readiness(&self, _token: crate::deferred::DeferredCommandToken) -> crate::deferred::CompletionReadiness {
+        crate::deferred::CompletionReadiness::Ready
+    }
 
     /// Checks if this command source has the specified permission.
     fn has_permission(&self, _permission: &str) -> bool {
@@ -144,6 +205,22 @@ impl CommandSource for DummySource {
     fn call_result(&self, result: ReturnValue) {
         self.command_result_taker.call(result);
     }
+
+    fn call_deferred_result(&self, token: crate::deferred::DeferredCommandToken, result: ReturnValue) {
+        self.command_result_taker.call_deferred(token, result);
+    }
+
+    fn complete_deferred_branch(&self, token: crate::deferred::DeferredCommandToken) {
+        self.command_result_taker.complete_deferred_branch(token);
+    }
+
+    fn reserve_deferred_terminal(&self, token: crate::deferred::DeferredCommandToken) -> Result<Option<Box<dyn crate::deferred::DeferredCompletionTerminal>>, crate::deferred::DeferredCompletionUnavailable> {
+        self.command_result_taker.reserve_deferred_terminal(token)
+    }
+
+    fn deferred_completion_readiness(&self, token: crate::deferred::DeferredCommandToken) -> crate::deferred::CompletionReadiness {
+        self.command_result_taker.deferred_completion_readiness(token)
+    }
 }
 
 impl CommandSource for () {
@@ -181,6 +258,22 @@ impl<S: CommandSource> CommandSource for Arc<S> {
 
     fn call_result(&self, result: ReturnValue) {
         (**self).call_result(result);
+    }
+
+    fn call_deferred_result(&self, token: crate::deferred::DeferredCommandToken, result: ReturnValue) {
+        (**self).call_deferred_result(token, result);
+    }
+
+    fn complete_deferred_branch(&self, token: crate::deferred::DeferredCommandToken) {
+        (**self).complete_deferred_branch(token);
+    }
+
+    fn reserve_deferred_terminal(&self, token: crate::deferred::DeferredCommandToken) -> Result<Option<Box<dyn crate::deferred::DeferredCompletionTerminal>>, crate::deferred::DeferredCompletionUnavailable> {
+        (**self).reserve_deferred_terminal(token)
+    }
+
+    fn deferred_completion_readiness(&self, token: crate::deferred::DeferredCommandToken) -> crate::deferred::CompletionReadiness {
+        (**self).deferred_completion_readiness(token)
     }
 
     fn check_block_loaded(&self, pos: &BlockPos) -> Result<(), CommandSyntaxError> {

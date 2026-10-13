@@ -1,7 +1,6 @@
 use crate::block::{
     BlockBehaviour, GetStateForNeighborUpdateArgs, OnPlaceArgs, PathComputationType,
 };
-use crate::world::World;
 use pumpkin_data::block_properties::HorizontalFacing;
 use pumpkin_data::tag::Taggable;
 use pumpkin_data::{Block, BlockDirection, BlockState, BlockStateId, HorizontalFacingExt, tag};
@@ -13,6 +12,7 @@ type IronBarsProperties = pumpkin_data::block_properties::OakFenceLikeProperties
 #[pumpkin_block("minecraft:iron_bars")]
 pub struct IronBarsBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for IronBarsBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut bars_props = IronBarsProperties::default(args.block);
@@ -36,7 +36,7 @@ impl BlockBehaviour for IronBarsBlock {
 
 pub fn compute_bars_state(
     mut bars_props: IronBarsProperties,
-    world: &World,
+    world: &dyn pumpkin_world::world::BlockAccessor,
     block: &Block,
     block_pos: &BlockPos,
 ) -> BlockStateId {

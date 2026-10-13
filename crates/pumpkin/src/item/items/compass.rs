@@ -21,6 +21,7 @@ impl ItemMetadata for CompassItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for CompassItem {
     fn use_on_block(
         &self,

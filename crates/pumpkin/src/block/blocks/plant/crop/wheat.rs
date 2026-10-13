@@ -10,6 +10,7 @@ use crate::block::{BlockBehaviour, CanPlaceAtArgs, GetStateForNeighborUpdateArgs
 #[pumpkin_block("minecraft:wheat")]
 pub struct WheatBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for WheatBlock {
     fn is_valid_bonemeal_target(&self, args: crate::block::BonemealArgs<'_>) -> bool {
         <Self as CropBlockBase>::is_valid_bonemeal_target(self, args.world, args.position)

@@ -20,6 +20,13 @@ impl CommandExecutor for TargetsExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let targets = EntityArgumentType::get_entities(context, ARG_TARGETS)?;
 
+        if let Some(server) = context.source.server.as_ref().filter(|server| server.advanced_config.cluster.enabled) {
+            let mut queued = 0;
+            for target in &targets {
+                if queue_canonical_kill(context, server, target.as_ref()) { queued += 1; }
+            }
+            return Ok(queued);
+        }
         let target_count = targets.len();
         for target in &targets {
             target.kill(target.as_ref());
@@ -50,6 +57,9 @@ struct SelfExecutor;
 impl CommandExecutor for SelfExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let target = context.source.entity_or_err()?;
+        if let Some(server) = context.source.server.as_ref().filter(|server| server.advanced_config.cluster.enabled) {
+            return Ok(i32::from(queue_canonical_kill(context, server, target.as_ref())));
+        }
         target.kill(&*target);
 
         context.source.send_feedback(
@@ -78,4 +88,21 @@ pub fn register(dispatcher: &mut CommandDispatcher, registry: &PermissionRegistr
             .then(argument(ARG_TARGETS, EntityArgumentType::Entities).executes(TargetsExecutor))
             .executes(SelfExecutor),
     );
+}
+
+fn queue_canonical_kill(context: &CommandContext, server: &crate::server::Server,
+    target: &dyn crate::entity::EntityBase) -> bool {
+    let Some(target) = crate::server::cluster_player_commands::entity_target(server, target) else {
+        context.source.send_error(TextComponent::text("Kill target has no current canonical identity"));
+        return false;
+    };
+    match crate::server::cluster_player_commands::submit_target(server, &context.source, target,
+        pumpkin_cluster::player_command_control::PlayerCommandMutation::Kill,
+        Some(TextComponent::text("Kill applied"))) {
+        Ok(_) => true,
+        Err(error) => {
+            context.source.send_error(TextComponent::text(format!("Kill could not be queued: {error:?}")));
+            false
+        }
+    }
 }

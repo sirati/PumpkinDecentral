@@ -43,6 +43,7 @@ impl NetherPortalBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for NetherPortalBlock {
     fn get_state_for_neighbor_update(
         &self,

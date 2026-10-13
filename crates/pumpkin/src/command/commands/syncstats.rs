@@ -157,13 +157,18 @@ fn send_ticks(context: &CommandContext) {
 }
 
 fn send_world_time(context: &CommandContext) {
-    let snapshot = context
-        .source
-        .world()
-        .level_time
-        .try_lock()
-        .ok()
-        .map(|time| (time.time_of_day, time.world_age));
+    let snapshot = if context.server().advanced_config.cluster.enabled {
+        let view = context.source.world().cluster_environment_view.load_full();
+        Some((view.time.time_of_day, view.time.world_age))
+    } else {
+        context
+            .source
+            .world()
+            .level_time
+            .try_lock()
+            .ok()
+            .map(|time| (time.time_of_day, time.world_age))
+    };
     let line = match snapshot {
         Some((time_of_day, _)) => format!(
             "World time {}d+{} ticks",
@@ -216,6 +221,9 @@ struct SyncstatsAllExecutor;
 
 impl CommandExecutor for SyncstatsAllExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
+        if context.server().advanced_config.cluster.enabled {
+            return execute_cluster(context, None);
+        }
         let level = &context.source.world().level;
         let totals = collect_pending_totals(level);
         send_overall(context, &totals);
@@ -231,6 +239,7 @@ struct SyncstatsChunkSelfExecutor;
 
 impl CommandExecutor for SyncstatsChunkSelfExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
+        context.source.entity_or_err()?;
         execute_single_chunk(context, sender_chunk(context))
     }
 }
@@ -248,6 +257,9 @@ impl CommandExecutor for SyncstatsChunkAtExecutor {
 }
 
 fn execute_single_chunk(context: &CommandContext, position: Vector2<i32>) -> CommandExecutorResult {
+    if context.server().advanced_config.cluster.enabled {
+        return execute_cluster(context, Some(position));
+    }
     let level = &context.source.world().level;
     let item = pending_for_chunk(level, position);
     let totals = collect_pending_totals(level);
@@ -257,6 +269,83 @@ fn execute_single_chunk(context: &CommandContext, position: Vector2<i32>) -> Com
     send_world_time(context);
     send_ntp_time(context);
     Ok(saturate_count(item.actions))
+}
+
+fn execute_cluster(
+    context: &CommandContext,
+    position: Option<Vector2<i32>>,
+) -> CommandExecutorResult {
+    let server = context.server();
+    let snapshot = server.cluster_sync_stats.load_full();
+    let world = crate::server::cluster_world_delta::world_id(context.source.world());
+    let mut chunks = snapshot
+        .chunks
+        .iter()
+        .filter(|(key, _)| key.world == world)
+        .collect::<Vec<_>>();
+    chunks.sort_by_key(|(key, _)| (key.x(), key.z()));
+    let totals = PendingTotals {
+        tracked_chunks: chunks.iter().filter(|(_, stats)| stats.tracked).count(),
+        pending_actions: snapshot.pending_by_world.get(&world).copied().unwrap_or(0),
+        pending_chunks: chunks
+            .iter()
+            .filter(|(_, stats)| stats.pending_actions > 0)
+            .count(),
+    };
+    let result = if let Some(position) = position {
+        let key = pumpkin_cluster::protocol::ChunkKey::new(world, position.x, position.y);
+        let stats = snapshot.chunks.get(&key);
+        let item = ChunkPending {
+            position,
+            actions: stats.map_or(0, |stats| stats.pending_actions),
+            tracked: stats.is_some_and(|stats| stats.tracked),
+        };
+        send_chunk_line(context, &item);
+        item.actions
+    } else {
+        for (key, stats) in chunks
+            .iter()
+            .filter(|(_, stats)| stats.pending_actions > 0)
+            .take(MAX_LISTED_CHUNKS)
+        {
+            send_chunk_line(
+                context,
+                &ChunkPending {
+                    position: Vector2::new(key.x(), key.z()),
+                    actions: stats.pending_actions,
+                    tracked: stats.tracked,
+                },
+            );
+        }
+        if totals.pending_chunks > MAX_LISTED_CHUNKS {
+            context.source.send_feedback(
+                TextComponent::text(format!(
+                    "... and {} more chunks with pending actions",
+                    totals.pending_chunks - MAX_LISTED_CHUNKS
+                )),
+                false,
+            );
+        }
+        totals.pending_actions
+    };
+    send_overall(context, &totals);
+    let ground = chunks
+        .iter()
+        .filter(|(key, _)| {
+            position.is_none_or(|position| key.x() == position.x && key.z() == position.y)
+        })
+        .filter_map(|(_, stats)| stats.ground_tick)
+        .filter(|tick| snapshot.published_tick.distance_since(*tick) < 32768)
+        .max_by_key(|tick| snapshot.published_tick.distance_since(*tick));
+    let behind = ground.map(|ground| snapshot.published_tick.distance_since(ground));
+    context.source.send_feedback(TextComponent::text(format!(
+        "Disciplined global tick {}, ground tick {}, applied tick {}, {} ticks behind ground truth",
+        TickStamp::now().0, tick_label(ground.map(|tick| tick.0)), snapshot.published_tick.0,
+        behind.map_or_else(|| "unknown".to_owned(), |behind| behind.to_string()),
+    )), false);
+    send_world_time(context);
+    send_ntp_time(context);
+    Ok(saturate_count(result))
 }
 
 pub fn register(dispatcher: &mut CommandDispatcher, registry: &PermissionRegistry) {

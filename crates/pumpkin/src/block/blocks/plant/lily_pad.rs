@@ -11,6 +11,7 @@ use crate::block::{BlockBehaviour, CanPlaceAtArgs, OnEntityCollisionArgs};
 #[pumpkin_block("minecraft:lily_pad")]
 pub struct LilyPadBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for LilyPadBlock {
     fn on_entity_collision(&self, args: OnEntityCollisionArgs<'_>) {
         {

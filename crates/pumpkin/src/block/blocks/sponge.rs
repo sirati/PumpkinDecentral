@@ -91,6 +91,7 @@ impl SpongeBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for SpongeBlock {
     fn placed(&self, args: PlacedArgs<'_>) {
         // Attempt to absorb water on placement
@@ -108,6 +109,7 @@ impl BlockBehaviour for SpongeBlock {
 #[pumpkin_block("minecraft:wet_sponge")]
 pub struct WetSpongeBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for WetSpongeBlock {
     fn placed(&self, args: PlacedArgs<'_>) {
         {

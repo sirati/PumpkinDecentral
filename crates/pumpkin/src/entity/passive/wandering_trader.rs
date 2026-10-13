@@ -56,7 +56,7 @@ fn create_invisibility_potion() -> ItemStack {
     stack
 }
 
-fn add_offers_from_trade_set(
+pub(crate) fn add_offers_from_trade_set(
     offers: &mut Vec<pumpkin_protocol::java::client::play::MerchantOffer>,
     trade_pool: &'static [VillagerTrade],
     amount: usize,

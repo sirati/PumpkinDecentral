@@ -75,7 +75,14 @@ impl PrimaryNode {
     fn serve_frame(&self, holder: u16, frame: &[u8]) -> Option<Vec<u8>> {
         let fetch: ChunkFetch = decode_request(frame).ok()?;
         let snapshot = self.snapshots.get(&fetch.chunk)?.clone();
-        let payload = ChunkPayload::new(fetch.chunk, holder, snapshot, Vec::new(), vec![holder]);
+        let payload = ChunkPayload::new(
+            fetch.chunk,
+            holder,
+            pumpkin_cluster::time::TickStamp(0),
+            snapshot,
+            Vec::new(),
+            vec![holder],
+        );
         encode_payload(&payload).ok()
     }
 

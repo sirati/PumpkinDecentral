@@ -2,14 +2,13 @@ use crate::command::argument_builder::{ArgumentBuilder, argument, command, liter
 use crate::command::argument_types::core::integer::IntegerArgumentType;
 use crate::command::argument_types::objective::ObjectiveArgumentType;
 use crate::command::context::command_context::CommandContext;
+use crate::command::errors::command_syntax_error::CommandSyntaxError;
 use crate::command::errors::error_types::CommandErrorType;
 use crate::command::node::dispatcher::CommandDispatcher;
 use crate::command::node::{CommandExecutor, CommandExecutorResult};
-use crate::world::scoreboard::ScoreboardScore;
+use pumpkin_command::deferred::CommandExecution;
 use pumpkin_data::translation;
-use pumpkin_protocol::codec::var_int::VarInt;
 use pumpkin_util::permission::{Permission, PermissionDefault, PermissionRegistry};
-use pumpkin_util::text::TextComponent;
 
 const DESCRIPTION: &str = "Modifies a trigger scoreboard objective.";
 const PERMISSION: &str = "minecraft:command.trigger";
@@ -28,203 +27,78 @@ const UNPRIMED_TRIGGER_ERROR: CommandErrorType<0> = CommandErrorType::new(
 );
 
 struct SimpleTriggerExecutor;
-
-impl CommandExecutor for SimpleTriggerExecutor {
-    fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
-        let player = context.source.player_or_err()?;
-        let player_name = player.gameprofile.name.clone();
-        let objective_name = ObjectiveArgumentType::get(context, ARG_OBJECTIVE)?.to_string();
-
-        let world = context.world().clone();
-
-        let mut scoreboard = world
-            .scoreboard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let Some(objective) = scoreboard.get_objectives().get(&objective_name) else {
-            return Err(INVALID_TRIGGER_ERROR.create_without_context());
-        };
-
-        if objective.criterion != "trigger" {
-            return Err(INVALID_TRIGGER_ERROR.create_without_context());
-        }
-
-        let objective_display_name = objective.display_name.clone();
-
-        let is_locked = scoreboard
-            .get_scores()
-            .get(&objective_name)
-            .and_then(|m| m.get(&player_name))
-            .is_none_or(|s| s.locked);
-
-        if is_locked {
-            return Err(UNPRIMED_TRIGGER_ERROR.create_without_context());
-        }
-
-        let current_value = scoreboard
-            .get_scores()
-            .get(&objective_name)
-            .and_then(|m| m.get(&player_name))
-            .map_or(0, |s| s.value.0);
-
-        let new_value = current_value + 1;
-
-        let updated_score = ScoreboardScore {
-            entity_name: player_name,
-            objective_name: objective_name.clone(),
-            value: VarInt(new_value),
-            display_name: None,
-            number_format: None,
-            locked: true,
-        };
-
-        scoreboard.update_score(&world, updated_score);
-
-        context.source.send_feedback(
-            TextComponent::translate_cross(
-                translation::java::COMMANDS_TRIGGER_SIMPLE_SUCCESS,
-                translation::java::COMMANDS_TRIGGER_SIMPLE_SUCCESS,
-                [objective_display_name],
-            ),
-            true,
-        );
-
-        Ok(new_value)
-    }
-}
-
 struct AddTriggerExecutor;
-
-impl CommandExecutor for AddTriggerExecutor {
-    fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
-        let player = context.source.player_or_err()?;
-        let player_name = player.gameprofile.name.clone();
-        let objective_name = ObjectiveArgumentType::get(context, ARG_OBJECTIVE)?.to_string();
-        let value = IntegerArgumentType::get(context, ARG_VALUE)?;
-
-        let world = context.world().clone();
-
-        let mut scoreboard = world
-            .scoreboard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let Some(objective) = scoreboard.get_objectives().get(&objective_name) else {
-            return Err(INVALID_TRIGGER_ERROR.create_without_context());
-        };
-
-        if objective.criterion != "trigger" {
-            return Err(INVALID_TRIGGER_ERROR.create_without_context());
-        }
-
-        let objective_display_name = objective.display_name.clone();
-
-        let is_locked = scoreboard
-            .get_scores()
-            .get(&objective_name)
-            .and_then(|m| m.get(&player_name))
-            .is_none_or(|s| s.locked);
-
-        if is_locked {
-            return Err(UNPRIMED_TRIGGER_ERROR.create_without_context());
-        }
-
-        let current_value = scoreboard
-            .get_scores()
-            .get(&objective_name)
-            .and_then(|m| m.get(&player_name))
-            .map_or(0, |s| s.value.0);
-
-        let new_value = current_value + value;
-
-        let updated_score = ScoreboardScore {
-            entity_name: player_name,
-            objective_name: objective_name.clone(),
-            value: VarInt(new_value),
-            display_name: None,
-            number_format: None,
-            locked: true,
-        };
-
-        scoreboard.update_score(&world, updated_score);
-
-        context.source.send_feedback(
-            TextComponent::translate_cross(
-                translation::java::COMMANDS_TRIGGER_ADD_SUCCESS,
-                translation::java::COMMANDS_TRIGGER_ADD_SUCCESS,
-                [
-                    objective_display_name,
-                    TextComponent::text(value.to_string()),
-                ],
-            ),
-            true,
-        );
-
-        Ok(new_value)
-    }
-}
-
 struct SetTriggerExecutor;
 
+fn submit_trigger(
+    context: &CommandContext,
+    value: i32,
+    add: bool,
+) -> Result<CommandExecution, CommandSyntaxError> {
+    let player = context.source.player_or_err()?;
+    let objective = ObjectiveArgumentType::get(context, ARG_OBJECTIVE)?.to_string();
+    let board = context.world().scoreboard.snapshot();
+    if board
+        .get_objective(&objective)
+        .is_none_or(|objective| objective.criterion != "trigger")
+    {
+        return Err(INVALID_TRIGGER_ERROR.create_without_context());
+    }
+    if board
+        .get_score(&player.gameprofile.name, &objective)
+        .is_none_or(|score| score.locked)
+    {
+        return Err(UNPRIMED_TRIGGER_ERROR.create_without_context());
+    }
+    let token = context
+        .world()
+        .scoreboard
+        .submit_scores(
+            crate::server::cluster_scoreboard::ScoreMutation {
+                targets: vec![player.gameprofile.name.clone()],
+                objective,
+                action: crate::server::cluster_scoreboard::ScoreAction::Trigger { value, add },
+            },
+            Some(context.source.clone()),
+        )
+        .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
+    Ok(CommandExecution::Deferred(token))
+}
+impl CommandExecutor for SimpleTriggerExecutor {
+    fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
+        self.execute_outcome(context).map(|_| 0)
+    }
+    fn execute_outcome(
+        &self,
+        context: &CommandContext,
+    ) -> Result<CommandExecution, CommandSyntaxError> {
+        submit_trigger(context, 1, true)
+    }
+}
+impl CommandExecutor for AddTriggerExecutor {
+    fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
+        self.execute_outcome(context).map(|_| 0)
+    }
+    fn execute_outcome(
+        &self,
+        context: &CommandContext,
+    ) -> Result<CommandExecution, CommandSyntaxError> {
+        submit_trigger(context, IntegerArgumentType::get(context, ARG_VALUE)?, true)
+    }
+}
 impl CommandExecutor for SetTriggerExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
-        let player = context.source.player_or_err()?;
-        let player_name = player.gameprofile.name.clone();
-        let objective_name = ObjectiveArgumentType::get(context, ARG_OBJECTIVE)?.to_string();
-        let value = IntegerArgumentType::get(context, ARG_VALUE)?;
-
-        let world = context.world().clone();
-
-        let mut scoreboard = world
-            .scoreboard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let Some(objective) = scoreboard.get_objectives().get(&objective_name) else {
-            return Err(INVALID_TRIGGER_ERROR.create_without_context());
-        };
-
-        if objective.criterion != "trigger" {
-            return Err(INVALID_TRIGGER_ERROR.create_without_context());
-        }
-
-        let objective_display_name = objective.display_name.clone();
-
-        let is_locked = scoreboard
-            .get_scores()
-            .get(&objective_name)
-            .and_then(|m| m.get(&player_name))
-            .is_none_or(|s| s.locked);
-
-        if is_locked {
-            return Err(UNPRIMED_TRIGGER_ERROR.create_without_context());
-        }
-
-        let updated_score = ScoreboardScore {
-            entity_name: player_name,
-            objective_name: objective_name.clone(),
-            value: VarInt(value),
-            display_name: None,
-            number_format: None,
-            locked: true,
-        };
-
-        scoreboard.update_score(&world, updated_score);
-
-        context.source.send_feedback(
-            TextComponent::translate_cross(
-                translation::java::COMMANDS_TRIGGER_SET_SUCCESS,
-                translation::java::COMMANDS_TRIGGER_SET_SUCCESS,
-                [
-                    objective_display_name,
-                    TextComponent::text(value.to_string()),
-                ],
-            ),
-            true,
-        );
-
-        Ok(value)
+        self.execute_outcome(context).map(|_| 0)
+    }
+    fn execute_outcome(
+        &self,
+        context: &CommandContext,
+    ) -> Result<CommandExecution, CommandSyntaxError> {
+        submit_trigger(
+            context,
+            IntegerArgumentType::get(context, ARG_VALUE)?,
+            false,
+        )
     }
 }
 

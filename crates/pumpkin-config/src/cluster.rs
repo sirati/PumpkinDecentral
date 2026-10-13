@@ -29,6 +29,7 @@ pub struct PinnedPeerConfig {
 #[serde(default)]
 pub struct ClusterConfig {
     pub enabled: bool,
+    pub bootstrap_vanilla_world: bool,
     pub role: ClusterRole,
     pub server_id: u16,
     pub bind_addr: String,
@@ -44,6 +45,7 @@ impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            bootstrap_vanilla_world: false,
             role: ClusterRole::Secondary,
             server_id: 0,
             bind_addr: String::from("0.0.0.0:24577"),
@@ -80,6 +82,9 @@ impl ClusterConfig {
             );
         }
         let mut errors = Vec::new();
+        if self.bootstrap_vanilla_world && self.role != ClusterRole::Primary {
+            errors.push(String::from("vanilla world bootstrap requires the cluster primary role"));
+        }
         let primary_first_boot = self.role == ClusterRole::Primary && self.peers.is_empty();
         if self.peers.is_empty() && !primary_first_boot {
             errors.push(String::from(

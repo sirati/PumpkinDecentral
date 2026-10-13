@@ -9,14 +9,42 @@ use pumpkin_util::math::position::BlockPos;
 use pumpkin_world::world::BlockFlags;
 
 use crate::block::{BlockBehaviour, OnNeighborUpdateArgs, OnPlaceArgs, PathComputationType};
-use crate::world::World;
+use pumpkin_world::world::BlockAccessor;
 
 type StairsProperties = pumpkin_data::block_properties::OakStairsLikeProperties;
 
 #[pumpkin_block_from_tag("minecraft:stairs")]
 pub struct StairBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for StairBlock {
+    fn placement_intent(
+        &self,
+        args: crate::block::PlacementIntentArgs<'_>,
+    ) -> Option<BlockStateId> {
+        let mut properties = StairsProperties::default(args.block);
+        properties.waterlogged = args.replacing.water_source();
+        properties.facing = args.facing;
+        properties.half = match args.direction {
+            BlockDirection::Up => Half::Top,
+            BlockDirection::Down => Half::Bottom,
+            _ => {
+                if args.hit[1] < 0.5 {
+                    Half::Bottom
+                } else {
+                    Half::Top
+                }
+            }
+        };
+        properties.shape = compute_stair_shape(
+            args.world,
+            args.position,
+            properties.facing,
+            properties.half,
+        );
+        Some(properties.to_state_id(args.block))
+    }
+
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut stair_props = StairsProperties::default(args.block);
         stair_props.waterlogged = args.replacing.water_source();
@@ -45,26 +73,37 @@ impl BlockBehaviour for StairBlock {
     }
 
     fn on_neighbor_update(&self, args: OnNeighborUpdateArgs<'_>) {
-        {
-            let state_id = args.world.get_block_state_id(args.position);
-            let mut stair_props = StairsProperties::from_state_id(state_id);
+        crate::block::neighbor::apply_legacy_neighbor_intent(self, args);
+    }
 
-            let new_shape = compute_stair_shape(
-                args.world,
-                args.position,
-                stair_props.facing,
-                stair_props.half,
-            );
-
-            if stair_props.shape != new_shape {
-                stair_props.shape = new_shape;
-                args.world.set_block_state(
-                    args.position,
-                    stair_props.to_state_id(args.block),
-                    BlockFlags::NOTIFY_ALL,
-                );
-            }
+    fn callback_intent(
+        &self,
+        args: crate::block::neighbor::BlockCallbackIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        use crate::block::neighbor::{BlockCallbackEffect, BlockCallbackEvent};
+        if !matches!(args.event, BlockCallbackEvent::Neighbor { .. }) {
+            return Some(Vec::new());
         }
+        let state = args.world.get_block_state_id(args.position);
+        if state.to_block_id() != args.block.id {
+            return Some(Vec::new());
+        }
+        let mut properties = StairsProperties::from_state_id(state);
+        let shape = compute_stair_shape(
+            args.world,
+            args.position,
+            properties.facing,
+            properties.half,
+        );
+        if properties.shape == shape {
+            return Some(Vec::new());
+        }
+        properties.shape = shape;
+        Some(vec![BlockCallbackEffect::SetBlock {
+            position: *args.position,
+            state: properties.to_state_id(args.block),
+            flags: BlockFlags::NOTIFY_ALL,
+        }])
     }
 
     fn rotate(
@@ -122,7 +161,7 @@ impl BlockBehaviour for StairBlock {
 }
 
 fn compute_stair_shape(
-    world: &World,
+    world: &dyn BlockAccessor,
     block_pos: &BlockPos,
     facing: HorizontalFacing,
     half: Half,
@@ -172,9 +211,72 @@ fn compute_stair_shape(
     StairsShape::Straight
 }
 
-fn get_stair_properties_if_exists(world: &World, block_pos: &BlockPos) -> Option<StairsProperties> {
-    let (block, block_state) = world.get_block_and_state_id(block_pos);
+fn get_stair_properties_if_exists(
+    world: &dyn BlockAccessor,
+    block_pos: &BlockPos,
+) -> Option<StairsProperties> {
+    let block_state = world.get_block_state_id(block_pos);
+    let block = block_state.to_block();
     block
         .has_tag(&tag::Block::MINECRAFT_STAIRS)
         .then(|| StairsProperties::from_state_id(block_state))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::block::neighbor::{
+        BlockCallbackEffect, BlockCallbackEvent, BlockCallbackIntentArgs, NeighborSnapshot,
+        NeighborTranscript,
+    };
+
+    #[test]
+    fn frozen_neighbor_turn_preserves_waterlogging_and_side_lock_suppresses_corner() {
+        let position = BlockPos::new(0, 80, 0);
+        let mut properties = StairsProperties::default(&Block::OAK_STAIRS);
+        properties.facing = HorizontalFacing::North;
+        properties.waterlogged = true;
+        let before = properties.to_state_id(&Block::OAK_STAIRS);
+        let mut front = properties;
+        front.facing = HorizontalFacing::East;
+        let mut snapshot = NeighborSnapshot::default();
+        for x in -1..=1 {
+            for z in -1..=1 {
+                snapshot
+                    .blocks
+                    .insert(BlockPos::new(x, 80, z), BlockStateId::AIR);
+            }
+        }
+        snapshot.blocks.insert(position, before);
+        snapshot
+            .blocks
+            .insert(position.north(), front.to_state_id(&Block::OAK_STAIRS));
+        let evaluate = |snapshot| {
+            let view = NeighborTranscript::new(snapshot, 64).unwrap();
+            let effects = StairBlock
+                .callback_intent(BlockCallbackIntentArgs {
+                    world: &view,
+                    block: &Block::OAK_STAIRS,
+                    position: &position,
+                    event: BlockCallbackEvent::Neighbor {
+                        source: Block::AIR.id,
+                        notify: true,
+                    },
+                })
+                .unwrap();
+            assert!(view.finish().is_some());
+            effects
+        };
+        let effects = evaluate(snapshot.clone());
+        let [BlockCallbackEffect::SetBlock { state, .. }] = effects.as_slice() else {
+            panic!("expected corner transition");
+        };
+        let after = StairsProperties::from_state_id(*state);
+        assert_eq!(after.shape, StairsShape::OuterRight);
+        assert!(after.waterlogged);
+        assert_eq!(after.half, properties.half);
+        assert_eq!(snapshot.blocks[&position], before);
+        snapshot.blocks.insert(position.west(), before);
+        assert!(evaluate(snapshot).is_empty());
+    }
 }

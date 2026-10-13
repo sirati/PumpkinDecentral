@@ -20,6 +20,7 @@ use crate::world::World;
 #[pumpkin_block("minecraft:bamboo")]
 pub struct BambooBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for BambooBlock {
     fn is_valid_bonemeal_target(&self, args: crate::block::BonemealArgs<'_>) -> bool {
         let above = count_bamboo_above(args.world, args.position);

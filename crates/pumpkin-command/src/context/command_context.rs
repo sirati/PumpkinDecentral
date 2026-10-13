@@ -83,6 +83,7 @@ pub struct CommandContext<'a, S: CommandSource = DummySource> {
 
     /// Whether this context forks or not.
     pub forks: bool,
+    pub forked_execution: bool,
 
     /// The command stored in this context which
     /// is run to get a command result.
@@ -110,6 +111,7 @@ impl<S: CommandSource> CommandContext<'_, S> {
             child: self.child.clone(),
             modifier: self.modifier.clone(),
             forks: self.forks,
+            forked_execution: self.forked_execution,
             command: self.command.clone(),
             tree: self.tree,
             root: self.root,
@@ -233,23 +235,32 @@ impl<'a, S: CommandSource> ContextChain<'a, S> {
         result_consumer: &dyn ResultConsumer<S>,
         forked_mode: bool,
     ) -> Result<Vec<Arc<S>>, CommandSyntaxError> {
-        let source_modifier = &modifier.modifier;
+        Self::run_modifier_outcome(modifier, source, result_consumer, forked_mode)
+            .map(|outcome| match outcome {
+                crate::node::RedirectOutcome::Sources(sources) => sources,
+                crate::node::RedirectOutcome::Deferred(_) => Vec::new(),
+            })
+    }
 
-        if matches!(source_modifier, RedirectModifier::KeepSource) {
-            return Ok(vec![source.clone()]);
-        }
-
-        let context_to_use = modifier.with_source(source.clone());
-        let mut result = source_modifier.sources(&context_to_use);
-
-        if result.is_err() {
-            result_consumer.on_command_completion(&context_to_use, ReturnValue::Failure);
-            if forked_mode {
-                result = Ok(vec![]);
+    pub fn run_modifier_outcome(
+        modifier: &CommandContext<'a, S>,
+        source: &Arc<S>,
+        result_consumer: &dyn ResultConsumer<S>,
+        forked_mode: bool,
+    ) -> Result<crate::node::RedirectOutcome<S>, CommandSyntaxError> {
+        let mut context_to_use = modifier.with_source(source.clone());
+        context_to_use.forked_execution = forked_mode;
+        match modifier.modifier.outcome(&context_to_use) {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => {
+                result_consumer.on_command_completion(&context_to_use, ReturnValue::Failure);
+                if forked_mode {
+                    Ok(crate::node::RedirectOutcome::Sources(Vec::new()))
+                } else {
+                    Err(error)
+                }
             }
         }
-
-        result
     }
 
     /// Runs the given executable, returning an [`i32`] on success.
@@ -263,64 +274,85 @@ impl<'a, S: CommandSource> ContextChain<'a, S> {
         result_consumer: &dyn ResultConsumer<S>,
         forked_mode: bool,
     ) -> Result<i32, CommandSyntaxError> {
+        Self::run_executable_outcome(executable, source, result_consumer, forked_mode)
+            .map(|outcome| match outcome {
+                crate::deferred::CommandExecution::Complete(value) => value,
+                crate::deferred::CommandExecution::Deferred(_) => 0,
+            })
+    }
+
+    pub fn run_executable_outcome(
+        executable: &CommandContext<'a, S>,
+        source: &Arc<S>,
+        result_consumer: &dyn ResultConsumer<S>,
+        forked_mode: bool,
+    ) -> Result<crate::deferred::CommandExecution, CommandSyntaxError> {
+        use crate::deferred::CommandExecution;
         let context_to_use = executable.with_source(source.clone());
-
-        let mut result = executable.command.as_ref().map_or_else(
-            || panic!("Expected `executable` to be executable"),
-            |command| command.execute(&context_to_use),
-        );
-
-        if let Ok(result) = result {
-            result_consumer.on_command_completion(&context_to_use, ReturnValue::Success(result));
-            Ok(if forked_mode { 1 } else { result })
-        } else {
-            result_consumer.on_command_completion(&context_to_use, ReturnValue::Failure);
-            if forked_mode {
-                result = Ok(0);
+        let command = executable.command.as_ref().expect("Expected executable command");
+        match command.execute_outcome(&context_to_use) {
+            Ok(CommandExecution::Complete(value)) => {
+                result_consumer.on_command_completion(&context_to_use, ReturnValue::Success(value));
+                Ok(CommandExecution::Complete(if forked_mode { 1 } else { value }))
             }
-            result
+            Ok(CommandExecution::Deferred(token)) => Ok(CommandExecution::Deferred(token)),
+            Err(error) => {
+                result_consumer.on_command_completion(&context_to_use, ReturnValue::Failure);
+                if forked_mode {
+                    Ok(CommandExecution::Complete(0))
+                } else {
+                    Err(error)
+                }
+            }
         }
     }
 
-    /// Executes all contexts in the chain, returning the ultimate result.
     pub fn execute_all(
         &self,
         source: &Arc<S>,
         result_consumer: &dyn ResultConsumer<S>,
     ) -> Result<i32, CommandSyntaxError> {
-        if self.modifiers.is_empty() {
-            return Self::run_executable(&self.execute, source, result_consumer, false);
-        }
+        self.execute_all_with_forked_mode(source, result_consumer, false)
+    }
 
-        let mut forked_mode = false;
-        let mut current_sources: Vec<Arc<S>> = vec![source.clone()];
+    pub fn execute_all_with_forked_mode(
+        &self,
+        source: &Arc<S>,
+        result_consumer: &dyn ResultConsumer<S>,
+        forked_mode: bool,
+    ) -> Result<i32, CommandSyntaxError> {
+        self.execute_all_outcome(source, result_consumer, forked_mode)
+            .map(|outcome| outcome.completed_result)
+    }
 
+    pub fn execute_all_outcome(
+        &self,
+        source: &Arc<S>,
+        result_consumer: &dyn ResultConsumer<S>,
+        mut forked_mode: bool,
+    ) -> Result<crate::deferred::CommandExecutionSummary, CommandSyntaxError> {
+        let mut summary = crate::deferred::CommandExecutionSummary::default();
+        let mut current_sources = vec![source.clone()];
         for modifier in &self.modifiers {
             forked_mode |= modifier.forks;
-
             let mut next_sources = Vec::new();
             for source in current_sources {
-                let mut to_add =
-                    Self::run_modifier(modifier, &source, result_consumer, forked_mode)?;
-                next_sources.append(&mut to_add);
+                match Self::run_modifier_outcome(modifier, &source, result_consumer, forked_mode)? {
+                    crate::node::RedirectOutcome::Sources(mut sources) => next_sources.append(&mut sources),
+                    crate::node::RedirectOutcome::Deferred(token) => summary.pending.push(token),
+                }
             }
             if next_sources.is_empty() {
-                return Ok(0);
+                return Ok(summary);
             }
             current_sources = next_sources;
         }
-
-        let mut result = 0;
         for execution_source in current_sources {
-            result += Self::run_executable(
-                &self.execute,
-                &execution_source,
-                result_consumer,
-                forked_mode,
-            )?;
+            summary.include(Self::run_executable_outcome(
+                &self.execute, &execution_source, result_consumer, forked_mode,
+            )?, false);
         }
-
-        Ok(result)
+        Ok(summary)
     }
 
     /// Gets the current stage of this context.
@@ -444,6 +476,7 @@ impl<'a, S: CommandSource> CommandContextBuilder<'a, S> {
             child: self.child.map(|child| Arc::new(child.build(input))),
             modifier: self.modifier,
             forks: self.forks,
+            forked_execution: false,
             command: self.command,
         }
     }
@@ -609,6 +642,25 @@ mod test {
             .expect("The context should have properly flattened, as it has a command to execute");
 
         assert_eq!(chain.execute_all(&source, &EmptyResultConsumer), Ok(10));
+    }
+
+    #[test]
+    fn resumed_chain_preserves_inherited_fork_mode() {
+        let mut dispatcher = CommandDispatcher::new();
+        dispatcher
+            .register(CommandArgumentBuilder::new("foo", "A test command").executes(TenExecutor));
+        let source = Arc::new(DummySource::dummy());
+        let parsed = dispatcher.parse_input("foo", &source);
+        let context = parsed.context.build("foo");
+        let chain = ContextChain::try_flatten(&context).unwrap();
+        assert_eq!(
+            chain.execute_all_with_forked_mode(&source, &EmptyResultConsumer, false),
+            Ok(10)
+        );
+        assert_eq!(
+            chain.execute_all_with_forked_mode(&source, &EmptyResultConsumer, true),
+            Ok(1)
+        );
     }
 
     #[test]

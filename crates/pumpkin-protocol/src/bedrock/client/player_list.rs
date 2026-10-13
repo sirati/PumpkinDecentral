@@ -79,7 +79,7 @@ impl PacketWrite for PlayerListEntry {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Skin {
     pub skin_id: String,
     pub play_fab_id: String,
@@ -203,7 +203,7 @@ impl PacketWrite for Skin {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct SkinAnimation {
     pub image_width: u32,
     pub image_height: u32,
@@ -225,7 +225,7 @@ impl PacketWrite for SkinAnimation {
     }
 }
 
-#[derive(Clone, PacketWrite)]
+#[derive(Clone, PacketWrite, serde::Serialize, serde::Deserialize)]
 pub struct PersonaPiece {
     pub piece_id: String,
     pub piece_type: i32,
@@ -234,7 +234,7 @@ pub struct PersonaPiece {
     pub product_id: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct PieceTintColor {
     pub piece_type: String,
     pub colors: [i32; 4],

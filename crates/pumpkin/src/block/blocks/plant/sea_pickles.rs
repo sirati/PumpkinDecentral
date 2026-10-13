@@ -20,6 +20,7 @@ type SeaPickleProperties = pumpkin_data::block_properties::SeaPickleLikeProperti
 #[pumpkin_block("minecraft:sea_pickle")]
 pub struct SeaPickleBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for SeaPickleBlock {
     fn use_with_item(&self, args: UseWithItemArgs<'_>) -> BlockActionResult {
         {

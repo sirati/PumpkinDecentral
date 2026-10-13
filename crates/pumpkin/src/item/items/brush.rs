@@ -53,6 +53,7 @@ fn get_archaeology_loot(is_sand: bool, location: BlockPos, world: &World) -> Ite
     ItemStack::new(1, &Item::SNORT_POTTERY_SHERD)
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for BrushItem {
     fn normal_use(&self, _item: &Item, player: &Player) {
         player.world().play_sound(

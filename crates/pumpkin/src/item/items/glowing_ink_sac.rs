@@ -16,6 +16,7 @@ impl ItemMetadata for GlowingInkSacItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for GlowingInkSacItem {
     fn as_any(&self) -> &dyn std::any::Any {
         self

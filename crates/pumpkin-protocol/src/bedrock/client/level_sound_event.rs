@@ -15,7 +15,7 @@ pub struct CLevelSoundEvent {
     pub is_baby: bool,
     pub is_global: bool,
     pub actor_unique_id: i64,
-    pub fire_at_position: Option<Vector3<f32>>,
+    pub fire_at_position: Vector3<f32>,
 }
 
 #[cfg(test)]
@@ -34,7 +34,7 @@ mod tests {
             is_baby: true,
             is_global: false,
             actor_unique_id: 42,
-            fire_at_position: Some(Vector3::new(4.0, 5.0, 6.0)),
+            fire_at_position: Vector3::new(4.0, 5.0, 6.0),
         };
         let mut encoded = Vec::new();
         packet.write(&mut encoded).unwrap();
@@ -44,7 +44,9 @@ mod tests {
         assert_eq!(&encoded[18..24], b"\x05actor");
         assert_eq!(&encoded[24..26], &[1, 0]);
         assert_eq!(&encoded[26..34], &42i64.to_le_bytes());
-        assert_eq!(encoded[34], 1);
-        assert_eq!(encoded.len(), 47);
+        assert_eq!(&encoded[34..38], &4.0_f32.to_le_bytes());
+        assert_eq!(&encoded[38..42], &5.0_f32.to_le_bytes());
+        assert_eq!(&encoded[42..46], &6.0_f32.to_le_bytes());
+        assert_eq!(encoded.len(), 46);
     }
 }

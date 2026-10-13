@@ -15,6 +15,7 @@ impl ItemMetadata for ArrowItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for ArrowItem {
     fn as_any(&self) -> &dyn Any {
         self

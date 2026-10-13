@@ -101,6 +101,7 @@ impl SculkSensorBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for SculkSensorBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         if args.block.id == BlockId::CALIBRATED_SCULK_SENSOR {

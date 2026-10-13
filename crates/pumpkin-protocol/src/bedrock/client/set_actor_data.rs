@@ -77,7 +77,6 @@ impl PacketWrite for SyncedActorDataList {
         for (key, value) in &self.0 {
             VarUInt(*key).write(writer)?;
             VarUInt(value.type_id()).write(writer)?;
-            (value.type_id() as u8).write(writer)?;
             value.write(writer)?;
         }
         Ok(())
@@ -428,7 +427,21 @@ pub mod entity_data_flag {
 
 #[cfg(test)]
 mod tests {
-    use super::{SyncedActorDataList, entity_data_key};
+    use super::{MetadataValue, SyncedActorDataList, entity_data_key};
+    use crate::serial::PacketWrite;
+
+    #[test]
+    fn actor_metadata_writes_one_type_discriminator() {
+        let mut metadata = SyncedActorDataList::new();
+        metadata.set(entity_data_key::VALUE, MetadataValue::Int(7));
+        let mut bytes = Vec::new();
+        metadata.write(&mut bytes).unwrap();
+        assert_eq!(bytes, [1, 15, 2, 14]);
+        metadata.set(entity_data_key::VALUE, MetadataValue::Byte(7));
+        bytes.clear();
+        metadata.write(&mut bytes).unwrap();
+        assert_eq!(bytes, [1, 15, 0, 7]);
+    }
 
     #[test]
     fn partial_metadata_does_not_reset_flags() {

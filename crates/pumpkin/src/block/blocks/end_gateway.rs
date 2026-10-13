@@ -8,6 +8,7 @@ use crate::block::{BlockBehaviour, OnEntityCollisionArgs, OnSyncedBlockEventArgs
 #[pumpkin_block("minecraft:end_gateway")]
 pub struct EndGatewayBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for EndGatewayBlock {
     fn on_entity_collision(&self, args: OnEntityCollisionArgs<'_>) {
         let entity = args.entity.get_entity();

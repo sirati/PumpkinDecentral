@@ -1204,6 +1204,10 @@ impl PluginManager {
             .is_some_and(|handlers| !handlers.is_empty())
     }
 
+    pub fn handler_snapshot(&self) -> Arc<dyn Send + Sync> {
+        self.handlers.load_full()
+    }
+
     /// Fire an event to all registered handlers
     pub async fn fire<E: Payload + Send + Sync + 'static>(
         &self,

@@ -22,6 +22,7 @@ impl BlockMetadata for DryVegetationBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for DryVegetationBlock {
     fn is_valid_bonemeal_target(&self, args: crate::block::BonemealArgs<'_>) -> bool {
         if args.block == &Block::SHORT_DRY_GRASS {

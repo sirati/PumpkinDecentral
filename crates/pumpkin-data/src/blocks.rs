@@ -141,7 +141,7 @@ impl Block {
         self.jump_velocity_multiplier
     }
 
-    pub(crate) fn shape_offset_delta(&self, pos: &BlockPos) -> Vector3<f64> {
+    pub fn shape_offset_delta(&self, pos: &BlockPos) -> Vector3<f64> {
         let Some(shape_offset) = self.shape_offset() else {
             return Vector3::new(0.0, 0.0, 0.0);
         };

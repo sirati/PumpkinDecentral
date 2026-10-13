@@ -15,6 +15,7 @@ type TorchFlowerProperties = TorchflowerCropLikeProperties;
 #[pumpkin_block("minecraft:torchflower_crop")]
 pub struct TorchFlowerBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for TorchFlowerBlock {
     fn is_valid_bonemeal_target(&self, args: crate::block::BonemealArgs<'_>) -> bool {
         <Self as CropBlockBase>::is_valid_bonemeal_target(self, args.world, args.position)

@@ -48,9 +48,7 @@ impl GoToWantedItemGoal {
             let block = item_pos.to_block_pos();
             item_pos.squared_distance_to_vec(&pos) < max * max
                 && world
-                    .worldborder
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .border_for_command()
                     .contains_block(block.0.x, block.0.z)
         })
     }

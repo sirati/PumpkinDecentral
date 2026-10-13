@@ -18,7 +18,12 @@ struct DifficultyQueryExecutor;
 
 impl CommandExecutor for DifficultyQueryExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
-        let difficulty = context.server().get_difficulty();
+        let difficulty = if context.server().advanced_config.cluster.enabled {
+            crate::server::cluster_gamerules::difficulty(context.server())
+                .ok_or_else(crate::server::cluster_admin_apply::admin_busy_error)?
+        } else {
+            context.server().get_difficulty()
+        };
 
         context.source.send_feedback(
             TextComponent::translate_cross(
@@ -44,15 +49,33 @@ impl CommandExecutor for DifficultySetExecutor {
         let difficulty = self.0;
         let server = context.server();
 
-        {
-            let level_info = server.level_info.load();
-
-            if level_info.difficulty == difficulty {
-                return Err(FAILURE_ERROR_TYPE
-                    .create_without_context(TextComponent::text(difficulty.name())));
-            }
+        let current_difficulty = if server.advanced_config.cluster.enabled {
+            crate::server::cluster_gamerules::difficulty(server)
+                .ok_or_else(crate::server::cluster_admin_apply::admin_busy_error)?
+        } else {
+            server.level_info.load().difficulty
+        };
+        if current_difficulty == difficulty {
+            return Err(
+                FAILURE_ERROR_TYPE.create_without_context(TextComponent::text(difficulty.name()))
+            );
         }
 
+        if server.advanced_config.cluster.enabled {
+            if !crate::server::cluster_gamerules::submit(
+                server,
+                crate::server::cluster_gamerules::ConfigMutation::Difficulty {
+                    value: difficulty,
+                    force: true,
+                },
+            ) {
+                return Err(crate::server::cluster_admin_apply::admin_busy_error());
+            }
+            context
+                .source
+                .send_feedback(TextComponent::text("Difficulty change queued."), false);
+            return Ok(difficulty as i32);
+        }
         server.set_difficulty(difficulty, true);
 
         context.source.send_feedback(

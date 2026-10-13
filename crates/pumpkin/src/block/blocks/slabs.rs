@@ -11,7 +11,55 @@ type SlabProperties = pumpkin_data::block_properties::ResinBrickSlabLikeProperti
 #[pumpkin_block_from_tag("minecraft:slabs")]
 pub struct SlabBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for SlabBlock {
+    fn placement_intent(
+        &self,
+        args: crate::block::PlacementIntentArgs<'_>,
+    ) -> Option<BlockStateId> {
+        let mut properties = if let BlockIsReplacing::Itself(state) = args.replacing {
+            SlabProperties::from_state_id(state)
+        } else {
+            SlabProperties::default(args.block)
+        };
+        if matches!(args.replacing, BlockIsReplacing::Itself(_)) {
+            properties.r#type = SlabType::Double;
+            properties.waterlogged = false;
+        } else {
+            properties.waterlogged = args.replacing.water_source();
+            properties.r#type = match args.direction {
+                BlockDirection::Up => SlabType::Top,
+                BlockDirection::Down => SlabType::Bottom,
+                _ => {
+                    if args.hit[1] < 0.5 {
+                        SlabType::Bottom
+                    } else {
+                        SlabType::Top
+                    }
+                }
+            };
+        }
+        Some(properties.to_state_id(args.block))
+    }
+
+    fn can_update_intent(&self, args: crate::block::CanUpdateIntentArgs<'_>) -> Option<bool> {
+        let properties = SlabProperties::from_state_id(args.state_id);
+        Some(
+            properties.r#type
+                == match args.direction {
+                    BlockDirection::Up => SlabType::Bottom,
+                    BlockDirection::Down => SlabType::Top,
+                    _ => {
+                        if args.hit[1] < 0.5 {
+                            SlabType::Top
+                        } else {
+                            SlabType::Bottom
+                        }
+                    }
+                },
+        )
+    }
+
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         if let BlockIsReplacing::Itself(state_id) = args.replacing {
             let mut slab_props = SlabProperties::from_state_id(state_id);

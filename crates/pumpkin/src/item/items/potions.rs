@@ -36,6 +36,7 @@ impl ItemMetadata for LingeringPotionItem {
 
 const POWER: f32 = 0.5;
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for PotionItem {
     fn normal_use(&self, _item: &Item, _player: &Player) {
         // Drinking is handled by the consumable flow in the server (active hand + consumption tick).
@@ -46,6 +47,7 @@ impl ItemBehaviour for PotionItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for SplashPotionItem {
     fn normal_use(&self, _item: &Item, player: &Player) {
         let position = player.position();
@@ -98,6 +100,7 @@ impl ItemBehaviour for SplashPotionItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for LingeringPotionItem {
     fn normal_use(&self, _item: &Item, player: &Player) {
         let position = player.position();

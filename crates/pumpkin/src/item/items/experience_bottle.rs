@@ -14,6 +14,7 @@ impl ItemMetadata for ExperienceBottleItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for ExperienceBottleItem {
     fn normal_use(&self, _item: &Item, player: &Player) {
         let world = player.world();

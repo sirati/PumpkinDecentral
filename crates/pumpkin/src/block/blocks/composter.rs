@@ -22,6 +22,7 @@ use rand::RngExt;
 #[pumpkin_block("minecraft:composter")]
 pub struct ComposterBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for ComposterBlock {
     fn normal_use(&self, args: NormalUseArgs<'_>) -> BlockActionResult {
         {

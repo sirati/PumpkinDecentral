@@ -10,7 +10,12 @@ impl ItemMetadata for MaceItem {
         [Item::MACE.id].into()
     }
 }
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for MaceItem {
+    fn can_mine_intent(&self, game_mode: u8) -> Option<bool> {
+        Some(game_mode != GameMode::Creative as u8)
+    }
+
     fn can_mine(&self, player: &Player) -> bool {
         player.gamemode.load() != GameMode::Creative
     }

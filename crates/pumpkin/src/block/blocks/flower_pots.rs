@@ -8,6 +8,7 @@ use pumpkin_world::world::BlockFlags;
 #[pumpkin_block_from_tag("minecraft:flower_pots")]
 pub struct FlowerPotBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for FlowerPotBlock {
     fn use_with_item(&self, args: UseWithItemArgs<'_>) -> BlockActionResult {
         {

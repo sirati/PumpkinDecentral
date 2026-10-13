@@ -12,7 +12,7 @@ pub enum ActorChunkId {
     Entity {
         origin: ServerId,
         local_id: i32,
-        generation: u32,
+        generation: u64,
     },
 }
 
@@ -120,7 +120,7 @@ pub struct RoutedBoundary {
 
 #[derive(Debug, Default)]
 pub struct PlayerBoundaryTracker {
-    chunks: HashMap<GlobalPlayerId, ChunkKey>,
+    chunks: HashMap<GlobalPlayerId, (u64, ChunkKey, crate::identity::PlayerSeq)>,
     holders: HashMap<GlobalPlayerId, BTreeSet<u16>>,
 }
 
@@ -138,20 +138,33 @@ impl PlayerBoundaryTracker {
     ) -> Vec<RoutedBoundary> {
         let mut routed = Vec::new();
         for update in updates {
+            if self
+                .chunks
+                .get(&update.gid)
+                .is_some_and(|(incarnation, _, _)| *incarnation > update.incarnation)
+            {
+                continue;
+            }
             let next = chunk_of(update);
-            let previous = self.chunks.insert(update.gid, next);
+            let previous = self
+                .chunks
+                .insert(update.gid, (update.incarnation, next, update.seq));
             let new_holders = holders(next).into_iter().collect::<BTreeSet<_>>();
             let old_holders = self
                 .holders
                 .insert(update.gid, new_holders.clone())
                 .unwrap_or_default();
-            if previous == Some(next) {
+            if previous.is_some_and(|(incarnation, chunk, _)| {
+                incarnation == update.incarnation && chunk == next
+            }) {
                 for peer in old_holders.difference(&new_holders) {
                     routed.push(RoutedBoundary {
                         peer: ServerId(*peer),
                         gid: update.gid,
                         update: PlayerBoundaryUpdate::Leave {
                             gid: update.gid,
+                            incarnation: update.incarnation,
+                            seq: update.seq,
                             tick: update.tick,
                             chunk: next,
                         },
@@ -166,13 +179,38 @@ impl PlayerBoundaryTracker {
                 }
                 continue;
             }
-            if let Some(old) = previous {
+            if let Some((old_incarnation, old, old_seq)) = previous {
+                if old_incarnation != update.incarnation {
+                    for peer in old_holders {
+                        routed.push(RoutedBoundary {
+                            peer: ServerId(peer),
+                            gid: update.gid,
+                            update: PlayerBoundaryUpdate::Leave {
+                                gid: update.gid,
+                                incarnation: old_incarnation,
+                                seq: old_seq,
+                                tick: update.tick,
+                                chunk: old,
+                            },
+                        });
+                    }
+                    for peer in new_holders {
+                        routed.push(RoutedBoundary {
+                            peer: ServerId(peer),
+                            gid: update.gid,
+                            update: PlayerBoundaryUpdate::Enter(snapshot(*update)),
+                        });
+                    }
+                    continue;
+                }
                 for peer in old_holders.union(&new_holders) {
                     routed.push(RoutedBoundary {
                         peer: ServerId(*peer),
                         gid: update.gid,
                         update: PlayerBoundaryUpdate::Transition {
                             gid: update.gid,
+                            incarnation: update.incarnation,
+                            seq: update.seq,
                             tick: update.tick,
                             from: old,
                             to: next,
@@ -221,6 +259,15 @@ mod tests {
     fn update(x: f64, seq: u16) -> PosUpdate {
         PosUpdate {
             gid: GlobalPlayerId::new(ServerId(1), PlayerSlot(4)),
+            incarnation: 1,
+            spatial_epoch: crate::canonical_action::SpatialEpoch::Admission {
+                lease: crate::canonical_action::LivePlayerLease {
+                    key: crate::canonical_action::PlayerKey(uuid::Uuid::nil()),
+                    gid: GlobalPlayerId::new(ServerId(1), PlayerSlot(4)),
+                    incarnation: 1,
+                },
+                admitted_at: TickStamp(0),
+            },
             seq: PlayerSeq(seq),
             tick: TickStamp(seq),
             world: WORLD,
@@ -319,6 +366,31 @@ mod tests {
         assert!(matches!(
             dropped[0].update,
             PlayerBoundaryUpdate::Leave { .. }
+        ));
+    }
+
+    #[test]
+    fn reused_player_slot_retires_old_incarnation_before_new_enter() {
+        let mut tracker = PlayerBoundaryTracker::new();
+        let snapshot = |movement| PlayerReplicaSnapshot {
+            movement,
+            visual: Default::default(),
+        };
+        tracker.route(&[update(1.0, 1)], |_| vec![2], snapshot);
+        let mut replacement = update(17.0, 2);
+        replacement.incarnation = 2;
+        let routed = tracker.route(&[replacement], |_| vec![2], snapshot);
+        assert_eq!(routed.len(), 2);
+        assert!(matches!(
+            routed[0].update,
+            PlayerBoundaryUpdate::Leave { incarnation: 1, .. }
+        ));
+        assert!(matches!(
+            routed[1].update,
+            PlayerBoundaryUpdate::Enter(PlayerReplicaSnapshot {
+                movement: PosUpdate { incarnation: 2, .. },
+                ..
+            })
         ));
     }
 

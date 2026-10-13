@@ -284,6 +284,7 @@ pub(crate) fn try_place_filled_bucket(
     false
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for EmptyBucketItem {
     fn normal_use(&self, item: &Item, player: &Player) {
         let (yaw, pitch) = player.rotation();
@@ -372,6 +373,7 @@ impl ItemBehaviour for EmptyBucketItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for FilledBucketItem {
     fn normal_use(&self, item: &Item, player: &Player) {
         let (yaw, pitch) = player.rotation();
@@ -481,6 +483,7 @@ impl ItemBehaviour for FilledBucketItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for MilkBucketItem {
     fn normal_use(&self, _item: &Item, player: &Player) {
         let stack = player.inventory().held_item();

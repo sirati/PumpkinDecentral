@@ -48,6 +48,7 @@ impl ScreenHandlerFactory for BrewingScreenFactory {
 #[pumpkin_block("minecraft:brewing_stand")]
 pub struct BrewingStandBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for BrewingStandBlock {
     fn normal_use(&self, args: NormalUseArgs<'_>) -> BlockActionResult {
         if let Some(factory) = self.get_screen_handler_factory(GetScreenHandlerFactoryArgs {

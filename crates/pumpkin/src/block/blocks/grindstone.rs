@@ -29,6 +29,7 @@ use super::abstract_wall_mounting::WallMountedBlock;
 #[pumpkin_block("minecraft:grindstone")]
 pub struct GrindstoneBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for GrindstoneBlock {
     fn normal_use(&self, args: NormalUseArgs<'_>) -> BlockActionResult {
         if let Some(factory) = self.get_screen_handler_factory(GetScreenHandlerFactoryArgs {

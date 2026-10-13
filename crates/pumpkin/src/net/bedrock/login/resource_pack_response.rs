@@ -53,6 +53,13 @@ impl BedrockClient {
                 .await;
             }
             SResourcePackClientResponse::STATUS_COMPLETED => {
+                if server.persistence_delegated_to_primary() {
+                    self.try_kick(
+                        DisconnectReason::ResourcePackProblem,
+                        "Resource pack negotiation already completed".to_string(),
+                    );
+                    return;
+                }
                 debug!("Bedrock: SResourcePackResponse::STATUS_COMPLETED");
                 let player = self.player.load_full();
                 if let Some(player) = player.as_ref() {

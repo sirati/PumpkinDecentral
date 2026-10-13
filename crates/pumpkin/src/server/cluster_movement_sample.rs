@@ -27,7 +27,7 @@ thread_local! {
     static FUSED: RefCell<Option<FuseEnds>> = const { RefCell::new(None) };
     static SEQS: RefCell<HashMap<GlobalPlayerId, PlayerSeq>> =
         RefCell::new(HashMap::new());
-    static PLAYER_CHUNKS: RefCell<HashMap<GlobalPlayerId, ChunkKey>> =
+    static PLAYER_CHUNKS: RefCell<HashMap<GlobalPlayerId, (u64, ChunkKey)>> =
         RefCell::new(HashMap::new());
     static MISSING_GIDS: RefCell<HashSet<i32>> = RefCell::new(HashSet::new());
 }
@@ -88,6 +88,8 @@ pub fn take_parked_fuse_ends() -> Option<FuseEnds> {
 /// Pushes one movement sample into the thread-local write bank.
 pub fn sample_local(
     gid: GlobalPlayerId,
+    incarnation: u64,
+    spatial_epoch: pumpkin_cluster::canonical_action::SpatialEpoch,
     tick: TickStamp,
     world: WorldId,
     pos: [f64; 3],
@@ -99,6 +101,8 @@ pub fn sample_local(
 ) -> PosUpdate {
     sample_local_with_seq(
         gid,
+        incarnation,
+        spatial_epoch,
         next_seq(gid),
         tick,
         world,
@@ -113,6 +117,8 @@ pub fn sample_local(
 
 fn sample_local_with_seq(
     gid: GlobalPlayerId,
+    incarnation: u64,
+    spatial_epoch: pumpkin_cluster::canonical_action::SpatialEpoch,
     seq: PlayerSeq,
     tick: TickStamp,
     world: WorldId,
@@ -126,6 +132,8 @@ fn sample_local_with_seq(
     ensure_worker();
     let update = PosUpdate {
         gid,
+        incarnation,
+        spatial_epoch,
         seq,
         tick,
         world,
@@ -154,44 +162,26 @@ pub fn sample_player(
     server: &Server,
     gid: GlobalPlayerId,
     tick: TickStamp,
-) -> PosUpdate {
-    let entity = &player.living_entity.entity;
-    let world = player.world();
-    if let Some(frame) = server.cluster_controller.effective_for_tick(gid, tick) {
-        let effective = frame.effective;
-        return sample_local_with_seq(
-            gid,
-            next_seq(gid),
-            tick,
-            world_id(&world),
-            effective.position,
-            effective.velocity,
-            effective.yaw,
-            entity.head_yaw.load(),
-            effective.pitch,
-            effective.on_ground,
-        );
-    }
-    let pos = entity.pos.load();
-    let vel = entity.velocity.load();
-    sample_local(
+) -> Option<PosUpdate> {
+    let lease = super::cluster_world_owner::player_action_lease(server, player)?;
+    let published = server.cluster_actor_spatial.load();
+    let spatial = published.get(&gid)?;
+    let state = spatial.truth.local;
+    let effective = state.frame.effective;
+    Some(sample_local_with_seq(
         gid,
+        lease.incarnation,
+        spatial.local_epoch,
+        next_seq(gid),
         tick,
-        world_id(&world),
-        [pos.x, pos.y, pos.z],
-        [vel.x, vel.y, vel.z],
-        entity.yaw.load(),
-        entity.head_yaw.load(),
-        entity.pitch.load(),
-        entity.on_ground.load(std::sync::atomic::Ordering::Relaxed),
-    )
-}
-
-fn world_id(world: &crate::world::World) -> WorldId {
-    WorldId::new(
-        world.dimension.id,
-        xxhash_rust::xxh64::xxh64(world.get_world_name().as_bytes(), 0),
-    )
+        state.world,
+        effective.position,
+        effective.velocity,
+        effective.yaw,
+        state.head_yaw,
+        effective.pitch,
+        effective.on_ground,
+    ))
 }
 
 /// Hands the filled write bank to the fuse side as a boxed bank over mpsc.
@@ -318,31 +308,38 @@ pub fn sample_server_tick(server: &Arc<Server>, tick: TickStamp) -> usize {
             });
             continue;
         };
-        let movement = sample_player(&player, server, gid, tick);
+        let Some(movement) = sample_player(&player, server, gid, tick) else {
+            continue;
+        };
+        let incarnation = movement.incarnation;
         let chunk = ChunkKey::new(
             movement.world,
             (movement.pos[0].floor() as i32).div_euclid(16),
             (movement.pos[2].floor() as i32).div_euclid(16),
         );
-        PLAYER_CHUNKS.with_borrow_mut(|known| {
-            if let Some(from) = known.insert(gid, chunk)
-                && from != chunk
-            {
-                super::cluster_tick_pump::stage_player_chunk_transition(
-                    pumpkin_cluster::protocol::PlayerChunkTransition {
-                        gid,
-                        seq: movement.seq,
-                        tick,
-                        from,
-                        to: chunk,
-                        snapshot: pumpkin_cluster::protocol::PlayerReplicaSnapshot {
-                            movement,
-                            visual: super::cluster_tick_pump::player_visual_snapshot(gid),
+        if incarnation != 0 {
+            PLAYER_CHUNKS.with_borrow_mut(|known| {
+                if let Some((previous_incarnation, from)) = known.insert(gid, (incarnation, chunk))
+                    && previous_incarnation == incarnation
+                    && from != chunk
+                {
+                    super::cluster_tick_pump::stage_player_chunk_transition(
+                        pumpkin_cluster::protocol::PlayerChunkTransition {
+                            gid,
+                            incarnation,
+                            seq: movement.seq,
+                            tick,
+                            from,
+                            to: chunk,
+                            snapshot: pumpkin_cluster::protocol::PlayerReplicaSnapshot {
+                                movement,
+                                visual: super::cluster_tick_pump::player_visual_snapshot(gid),
+                            },
                         },
-                    },
-                );
-            }
-        });
+                    );
+                }
+            });
+        }
         chunks.insert(gid, chunk);
         visuals.push(super::cluster_tick_pump::PlayerVisualBase {
             gid,
@@ -375,6 +372,15 @@ mod tests {
         let gid = GlobalPlayerId::new(ServerId(9), PlayerSlot(1));
         sample_local(
             gid,
+            1,
+            pumpkin_cluster::canonical_action::SpatialEpoch::Admission {
+                lease: pumpkin_cluster::canonical_action::LivePlayerLease {
+                    key: pumpkin_cluster::canonical_action::PlayerKey(uuid::Uuid::nil()),
+                    gid,
+                    incarnation: 1,
+                },
+                admitted_at: TickStamp(7),
+            },
             TickStamp(7),
             WorldId::new(0, 7),
             [1.0, 2.0, 3.0],

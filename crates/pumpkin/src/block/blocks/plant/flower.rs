@@ -7,6 +7,7 @@ use crate::block::{BlockBehaviour, CanPlaceAtArgs, GetStateForNeighborUpdateArgs
 #[pumpkin_block_from_tag("minecraft:small_flowers")]
 pub struct FlowerBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for FlowerBlock {
     fn can_place_at(&self, args: CanPlaceAtArgs<'_>) -> bool {
         <Self as PlantBlockBase>::can_place_at(self, args.block_accessor, args.position)

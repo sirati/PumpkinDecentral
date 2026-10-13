@@ -2,7 +2,6 @@ use crate::block::{
     BlockBehaviour, CanPlaceAtArgs, GetStateForNeighborUpdateArgs, OnPlaceArgs,
     OnScheduledTickArgs, PathComputationType,
 };
-use crate::world::World;
 use pumpkin_data::tag::Taggable;
 use pumpkin_data::{BlockDirection, BlockState, BlockStateId, tag};
 use pumpkin_macros::pumpkin_block_from_tag;
@@ -13,6 +12,7 @@ use pumpkin_world::world::BlockFlags;
 #[pumpkin_block_from_tag("minecraft:lanterns")]
 pub struct LanternBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for LanternBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut props = pumpkin_data::block_properties::LanternLikeProperties::default(args.block);
@@ -43,10 +43,14 @@ impl BlockBehaviour for LanternBlock {
     }
 
     fn on_scheduled_tick(&self, args: OnScheduledTickArgs<'_>) {
-        if !can_place_at(args.world, args.position) {
-            args.world
-                .break_block(args.position, None, BlockFlags::empty());
-        }
+        crate::block::neighbor::apply_legacy_scheduled_intent(self, args);
+    }
+
+    fn scheduled_tick_intent(
+        &self,
+        args: crate::block::ScheduledTickIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        crate::block::neighbor::support_tick_intent(args, can_place_at)
     }
 
     fn is_pathfindable(&self, _state: &BlockState, _computation_type: PathComputationType) -> bool {
@@ -54,7 +58,7 @@ impl BlockBehaviour for LanternBlock {
     }
 }
 
-fn can_place_at(world: &World, position: &BlockPos) -> bool {
+fn can_place_at(world: &dyn pumpkin_world::world::BlockAccessor, position: &BlockPos) -> bool {
     //idk why this don't update with .is_center_solid so this is a 'temporary patch'
     if world
         .get_block(&position.down())

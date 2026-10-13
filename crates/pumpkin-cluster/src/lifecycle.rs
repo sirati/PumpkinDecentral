@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use crate::membership::{
@@ -9,6 +10,16 @@ use crate::membership::{
     handshake_channel,
 };
 use crate::protocol::ChunkKey;
+
+fn fresh_source_namespace() -> u64 {
+    loop {
+        let digest = Sha256::digest(uuid::Uuid::new_v4().as_bytes());
+        let generation = u64::from_le_bytes(digest[..8].try_into().unwrap());
+        if generation != 0 {
+            return generation;
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleState {
@@ -196,6 +207,7 @@ impl LifecycleEffect {
 #[derive(Debug)]
 pub struct Lifecycle {
     local_id: u16,
+    local_incarnation: u64,
     state: LifecycleState,
     membership: Membership,
     votes: JoinVotes,
@@ -215,6 +227,7 @@ impl Lifecycle {
     pub fn new_solo(local_id: u16) -> Self {
         Self {
             local_id,
+            local_incarnation: fresh_source_namespace(),
             state: LifecycleState::Solo,
             membership: Membership::new(&[local_id]),
             votes: JoinVotes::new(),
@@ -243,6 +256,7 @@ impl Lifecycle {
         };
         Self {
             local_id,
+            local_incarnation: fresh_source_namespace(),
             state,
             membership: Membership::new(&seeded),
             votes: JoinVotes::new(),
@@ -261,6 +275,23 @@ impl Lifecycle {
     #[must_use]
     pub const fn local_id(&self) -> u16 {
         self.local_id
+    }
+
+    #[must_use]
+    pub const fn local_incarnation(&self) -> u64 {
+        self.local_incarnation
+    }
+
+    #[must_use]
+    pub fn peer_incarnations(&self) -> HashMap<u16, u64> {
+        let mut incarnations = self
+            .hellos
+            .iter()
+            .filter(|(peer, _)| self.authenticated_peers.contains(peer))
+            .map(|(&peer, hello)| (peer, hello.incarnation))
+            .collect::<HashMap<_, _>>();
+        incarnations.insert(self.local_id, self.local_incarnation);
+        incarnations
     }
 
     #[must_use]
@@ -415,6 +446,7 @@ impl Lifecycle {
         let hello = JoinHello {
             candidate: self.local_id,
             cert_fingerprint,
+            incarnation: self.local_incarnation,
             protocol_version: CLUSTER_PROTOCOL_VERSION,
             role,
         };
@@ -472,6 +504,7 @@ impl Lifecycle {
             hello: JoinHello {
                 candidate: self.local_id,
                 cert_fingerprint: self.local_fingerprint,
+                incarnation: self.local_incarnation,
                 protocol_version: CLUSTER_PROTOCOL_VERSION,
                 role: self.local_role,
             },
@@ -557,6 +590,14 @@ impl Lifecycle {
                     approve: false,
                 },
             });
+            return effects;
+        }
+        if self.authenticated_peers.contains(&candidate)
+            && self
+                .hellos
+                .get(&candidate)
+                .is_some_and(|known| known.incarnation != hello.incarnation)
+        {
             return effects;
         }
         let previous = self.hellos.insert(candidate, hello);
@@ -857,6 +898,7 @@ mod tests {
             hello: JoinHello {
                 candidate,
                 cert_fingerprint: FINGERPRINT,
+                incarnation: 1,
                 protocol_version: CLUSTER_PROTOCOL_VERSION,
                 role: ClusterNodeRole::Secondary,
             },
@@ -923,8 +965,16 @@ mod tests {
         assert!(joined(&effects, 4));
         assert!(node.membership().contains(4));
         let authenticated = node.apply(hello(4));
-        assert!(!authenticated.iter().any(|effect| matches!(effect, LifecycleEffect::SendVote { .. })));
-        assert!(authenticated.iter().any(|effect| matches!(effect, LifecycleEffect::PeerAuthenticated { peer: 4 })));
+        assert!(
+            !authenticated
+                .iter()
+                .any(|effect| matches!(effect, LifecycleEffect::SendVote { .. }))
+        );
+        assert!(
+            authenticated
+                .iter()
+                .any(|effect| matches!(effect, LifecycleEffect::PeerAuthenticated { peer: 4 }))
+        );
     }
 
     #[test]
@@ -952,16 +1002,73 @@ mod tests {
         );
         let mut member = member_node(1);
         let role = member.apply(hello(2));
-        assert!(role.iter().any(|effect| matches!(effect, LifecycleEffect::PeerRoleObserved {
-            peer: 2,
-            role: ClusterNodeRole::Secondary
-        })));
-        assert!(role.iter().any(|effect| matches!(effect, LifecycleEffect::PeerAuthenticated { peer: 2 })));
+        assert!(role.iter().any(|effect| matches!(
+            effect,
+            LifecycleEffect::PeerRoleObserved {
+                peer: 2,
+                role: ClusterNodeRole::Secondary
+            }
+        )));
+        assert!(
+            role.iter()
+                .any(|effect| matches!(effect, LifecycleEffect::PeerAuthenticated { peer: 2 }))
+        );
         let effects = member.apply(LifecycleInput::NotePeerConnected { peer: 2 });
-        assert!(effects.iter().any(|effect| matches!(effect, LifecycleEffect::SendHello { to, .. } if to == &vec![2])));
+        assert!(effects.iter().any(
+            |effect| matches!(effect, LifecycleEffect::SendHello { to, .. } if to == &vec![2])
+        ));
         assert!(effects.iter().any(|effect| {
             matches!(effect, LifecycleEffect::SendPeerView { to, view } if to == &vec![2] && view.connected == vec![2])
         }));
+    }
+
+    #[test]
+    fn reconnect_hello_keeps_local_incarnation_and_remote_hello_is_recorded() {
+        let mut node = Lifecycle::new_solo(1);
+        let first = node.apply(LifecycleInput::BeginJoin {
+            cert_fingerprint: FINGERPRINT,
+            peers: vec![2],
+            role: ClusterNodeRole::Secondary,
+        });
+        let first_incarnation = first
+            .iter()
+            .find_map(|effect| match effect {
+                LifecycleEffect::SendHello { hello, .. } => Some(hello.incarnation),
+                _ => None,
+            })
+            .unwrap();
+        let second = node.apply(LifecycleInput::NotePeerConnected { peer: 2 });
+        assert!(second.iter().any(|effect| matches!(effect,
+            LifecycleEffect::SendHello { hello, .. } if hello.incarnation == first_incarnation
+        )));
+        let mut member = member_node(1);
+        member.apply(LifecycleInput::NotePeerConnected { peer: 2 });
+        let mut remote = JoinHello {
+            candidate: 2,
+            cert_fingerprint: FINGERPRINT,
+            incarnation: 91,
+            protocol_version: CLUSTER_PROTOCOL_VERSION,
+            role: ClusterNodeRole::Secondary,
+        };
+        member.apply(LifecycleInput::RemoteHello {
+            hello: remote,
+            pin_match: true,
+        });
+        assert_eq!(member.peer_incarnations().get(&2), Some(&91));
+        remote.incarnation = 92;
+        member.apply(LifecycleInput::RemoteHello {
+            hello: remote,
+            pin_match: true,
+        });
+        assert_eq!(member.peer_incarnations().get(&2), Some(&91));
+        member.apply(LifecycleInput::NotePeerDisconnected { peer: 2 });
+        assert_eq!(member.peer_incarnations().get(&2), None);
+        member.apply(LifecycleInput::NotePeerConnected { peer: 2 });
+        member.apply(LifecycleInput::RemoteHello {
+            hello: remote,
+            pin_match: true,
+        });
+        assert_eq!(member.peer_incarnations().get(&2), Some(&92));
     }
 
     #[test]
@@ -970,49 +1077,82 @@ mod tests {
         node.apply(hello(2));
         node.apply(LifecycleInput::NotePeerDisconnected { peer: 2 });
         let connected = node.apply(LifecycleInput::NotePeerConnected { peer: 2 });
-        assert!(connected.iter().any(|effect| matches!(effect, LifecycleEffect::SendHello { to, .. } if to == &vec![2])));
-        assert!(!connected.iter().any(|effect| matches!(effect, LifecycleEffect::PeerAuthenticated { peer: 2 })));
+        assert!(connected.iter().any(
+            |effect| matches!(effect, LifecycleEffect::SendHello { to, .. } if to == &vec![2])
+        ));
+        assert!(
+            !connected
+                .iter()
+                .any(|effect| matches!(effect, LifecycleEffect::PeerAuthenticated { peer: 2 }))
+        );
         let rejected = node.apply(LifecycleInput::RemoteHello {
             hello: JoinHello {
                 candidate: 2,
                 cert_fingerprint: FINGERPRINT,
+                incarnation: 1,
                 protocol_version: CLUSTER_PROTOCOL_VERSION.wrapping_sub(1),
                 role: ClusterNodeRole::Secondary,
             },
             pin_match: true,
         });
-        assert!(!rejected.iter().any(|effect| matches!(effect, LifecycleEffect::PeerAuthenticated { peer: 2 })));
+        assert!(
+            !rejected
+                .iter()
+                .any(|effect| matches!(effect, LifecycleEffect::PeerAuthenticated { peer: 2 }))
+        );
         let accepted = node.apply(hello(2));
-        assert!(accepted.iter().any(|effect| matches!(effect, LifecycleEffect::PeerAuthenticated { peer: 2 })));
+        assert!(
+            accepted
+                .iter()
+                .any(|effect| matches!(effect, LifecycleEffect::PeerAuthenticated { peer: 2 }))
+        );
     }
 
     #[test]
     fn existing_member_acknowledges_another_peers_join_request() {
         let mut primary = Lifecycle::new_with_members(0, &[0, 1]);
         let mut secondary = Lifecycle::new_with_members(1, &[1, 2]);
-        let request = primary.apply(hello(2)).into_iter().find_map(|effect| match effect {
-            LifecycleEffect::SendVoteRequest { request, .. } => Some(request),
-            _ => None,
-        }).unwrap();
+        let request = primary
+            .apply(hello(2))
+            .into_iter()
+            .find_map(|effect| match effect {
+                LifecycleEffect::SendVoteRequest { request, .. } => Some(request),
+                _ => None,
+            })
+            .unwrap();
         let acknowledgement = secondary.apply(LifecycleInput::RemoteVoteRequest(request));
-        let vote = acknowledgement.into_iter().find_map(|effect| match effect {
-            LifecycleEffect::SendVote { to, vote } if to == vec![0] => Some(vote),
-            _ => None,
-        }).unwrap();
+        let vote = acknowledgement
+            .into_iter()
+            .find_map(|effect| match effect {
+                LifecycleEffect::SendVote { to, vote } if to == vec![0] => Some(vote),
+                _ => None,
+            })
+            .unwrap();
         assert_eq!(vote.candidate, 2);
         assert_eq!(vote.voter, 1);
-        assert!(primary.apply(LifecycleInput::RemoteVote(vote)).iter().any(|effect| matches!(effect, LifecycleEffect::Joined { candidate: 2 })));
+        assert!(
+            primary
+                .apply(LifecycleInput::RemoteVote(vote))
+                .iter()
+                .any(|effect| matches!(effect, LifecycleEffect::Joined { candidate: 2 }))
+        );
     }
 
     #[test]
     fn restarted_member_rejoins_through_fresh_admission() {
         let mut node = member_node(1);
         let role = node.apply(hello(2));
-        assert!(role.iter().any(|effect| matches!(effect, LifecycleEffect::PeerRoleObserved {
-            peer: 2,
-            role: ClusterNodeRole::Secondary
-        })));
-        assert!(role.iter().any(|effect| matches!(effect, LifecycleEffect::PeerAuthenticated { peer: 2 })));
+        assert!(role.iter().any(|effect| matches!(
+            effect,
+            LifecycleEffect::PeerRoleObserved {
+                peer: 2,
+                role: ClusterNodeRole::Secondary
+            }
+        )));
+        assert!(
+            role.iter()
+                .any(|effect| matches!(effect, LifecycleEffect::PeerAuthenticated { peer: 2 }))
+        );
         assert!(node.membership().contains(2));
         let effects = node.apply(LifecycleInput::NotePeerRestarted { peer: 2 });
         assert!(
@@ -1112,6 +1252,7 @@ mod tests {
             hello: JoinHello {
                 candidate: 4,
                 cert_fingerprint: FINGERPRINT,
+                incarnation: 1,
                 protocol_version: CLUSTER_PROTOCOL_VERSION.wrapping_add(1),
                 role: ClusterNodeRole::Secondary,
             },

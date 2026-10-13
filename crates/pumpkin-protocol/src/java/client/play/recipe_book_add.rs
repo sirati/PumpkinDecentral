@@ -496,11 +496,48 @@ fn write_entry(
 }
 
 #[allow(clippy::too_many_lines)]
+pub struct CRecipeBookSelection<'a> {
+    pub replace: bool,
+    pub dynamic_recipes: &'a [DynamicRecipe],
+    pub display_ids: &'a std::collections::BTreeSet<i32>,
+}
+
+impl crate::MultiVersionJavaPacket for CRecipeBookSelection<'_> {
+    fn to_id(version: JavaMinecraftVersion) -> i32 {
+        RECIPE_BOOK_ADD.to_id(version)
+    }
+}
+
+impl ClientPacket for CRecipeBookSelection<'_> {
+    fn write_packet_data(
+        &self,
+        write: impl Write,
+        version: &JavaMinecraftVersion,
+    ) -> Result<(), WritingError> {
+        CRecipeBookAdd::new(self.replace, self.dynamic_recipes).write_selected(
+            write,
+            version,
+            Some(self.display_ids),
+        )
+    }
+}
+
 impl ClientPacket for CRecipeBookAdd<'_> {
     fn write_packet_data(
         &self,
         write: impl Write,
         version: &JavaMinecraftVersion,
+    ) -> Result<(), WritingError> {
+        self.write_selected(write, version, None)
+    }
+}
+
+impl CRecipeBookAdd<'_> {
+    fn write_selected(
+        &self,
+        write: impl Write,
+        version: &JavaMinecraftVersion,
+        selected: Option<&std::collections::BTreeSet<i32>>,
     ) -> Result<(), WritingError> {
         let mut write = write;
 
@@ -527,8 +564,17 @@ impl ClientPacket for CRecipeBookAdd<'_> {
                 )
             })
             .count();
-        let dynamic_count = self.dynamic_recipes.len();
-        let total = crafting_count + RECIPES_COOKING.len() + dynamic_count;
+        let dynamic_count = self
+            .dynamic_recipes
+            .iter()
+            .filter(|recipe| !matches!(recipe, DynamicRecipe::Brewing(_)))
+            .count();
+        let full_total = crafting_count + RECIPES_COOKING.len() + dynamic_count;
+        let total = selected.map_or(full_total, |ids| {
+            (0..full_total)
+                .filter(|index| ids.contains(&(*index as i32)))
+                .count()
+        });
 
         // Entry count (VarInt)
         write.write_var_int(&VarInt(total as i32))?;
@@ -540,6 +586,17 @@ impl ClientPacket for CRecipeBookAdd<'_> {
 
         // Write crafting recipes
         for recipe in RECIPES_CRAFTING {
+            if matches!(
+                recipe,
+                CraftingRecipeTypes::CraftingSpecial
+                    | CraftingRecipeTypes::CraftingDecoratedPot { .. }
+            ) {
+                continue;
+            }
+            if selected.is_some_and(|ids| !ids.contains(&display_id)) {
+                display_id += 1;
+                continue;
+            }
             let (group, notification) = match recipe {
                 CraftingRecipeTypes::CraftingShaped {
                     group,
@@ -576,6 +633,10 @@ impl ClientPacket for CRecipeBookAdd<'_> {
 
         // Write cooking recipes
         for recipe in RECIPES_COOKING {
+            if selected.is_some_and(|ids| !ids.contains(&display_id)) {
+                display_id += 1;
+                continue;
+            }
             let (book_category, group) = match recipe {
                 CookingRecipeType::Smelting(r) => (
                     match r.category {
@@ -620,6 +681,13 @@ impl ClientPacket for CRecipeBookAdd<'_> {
 
         // Write dynamic recipes
         for recipe in self.dynamic_recipes {
+            if matches!(recipe, DynamicRecipe::Brewing(_)) {
+                continue;
+            }
+            if selected.is_some_and(|ids| !ids.contains(&display_id)) {
+                display_id += 1;
+                continue;
+            }
             match recipe {
                 DynamicRecipe::Crafting(crafting) => {
                     let (group, flags) = match crafting {
@@ -963,4 +1031,41 @@ fn write_dynamic_cooking_entry(
     write_dynamic_ingredient_holderset(write, &cooking.ingredient, version)?;
     write.write_u8(flags)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    #[test]
+    fn selected_recipe_keeps_its_registry_display_id() {
+        let display_ids = std::collections::BTreeSet::from([42]);
+        let packet = CRecipeBookSelection {
+            replace: true,
+            dynamic_recipes: &[],
+            display_ids: &display_ids,
+        };
+        let mut bytes = Vec::new();
+        packet
+            .write_packet_data(&mut bytes, &JavaMinecraftVersion::V_26_2)
+            .unwrap();
+        let mut read = bytes.as_slice();
+        assert_eq!(VarInt::decode(&mut read).unwrap().0, 1);
+        assert_eq!(VarInt::decode(&mut read).unwrap().0, 42);
+    }
+
+    #[test]
+    fn empty_selected_book_serializes_no_static_recipes() {
+        let display_ids = std::collections::BTreeSet::new();
+        let packet = CRecipeBookSelection {
+            replace: true,
+            dynamic_recipes: &[],
+            display_ids: &display_ids,
+        };
+        let mut bytes = Vec::new();
+        packet
+            .write_packet_data(&mut bytes, &JavaMinecraftVersion::V_26_2)
+            .unwrap();
+        assert_eq!(bytes, vec![0, 1]);
+    }
 }

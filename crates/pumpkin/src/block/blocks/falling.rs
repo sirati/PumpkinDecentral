@@ -81,6 +81,7 @@ impl BlockMetadata for FallingBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for FallingBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         // Vanilla getPlacementState uses shouldSolidify (own position OR neighbors),

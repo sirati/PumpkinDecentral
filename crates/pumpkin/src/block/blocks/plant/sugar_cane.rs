@@ -15,6 +15,7 @@ use crate::block::{
 #[pumpkin_block("minecraft:sugar_cane")]
 pub struct SugarCaneBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for SugarCaneBlock {
     fn on_scheduled_tick(&self, args: OnScheduledTickArgs<'_>) {
         if !can_place_at(args.world.as_ref(), args.position) {

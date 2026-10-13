@@ -11,6 +11,7 @@ type EndPortalFrameProperties = pumpkin_data::block_properties::EndPortalFrameLi
 #[pumpkin_block("minecraft:end_portal_frame")]
 pub struct EndPortalFrameBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for EndPortalFrameBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut end_portal_frame_props = EndPortalFrameProperties::default(args.block);

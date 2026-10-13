@@ -9,6 +9,7 @@ impl BlockMetadata for SculkCatalystBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for SculkCatalystBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut props = SculkCatalystLikeProperties::default(args.block);

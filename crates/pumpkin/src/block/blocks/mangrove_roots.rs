@@ -8,6 +8,7 @@ use pumpkin_world::tick::TickPriority;
 #[pumpkin_block("minecraft:mangrove_roots")]
 pub struct MangroveRootsBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for MangroveRootsBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut props = MangroveRootsLikeProperties::default(args.block);

@@ -43,6 +43,48 @@ impl CommandExecutor for ChangeExecutor {
         let targets = EntityArgumentType::get_entities(context, ARG_TARGETS)?;
         let tag = StringArgumentType::get(context, ARG_NAME)?.to_owned();
 
+        if let Some(server) = context
+            .source
+            .server
+            .as_ref()
+            .filter(|server| server.advanced_config.cluster.enabled)
+        {
+            let mut queued = 0;
+            for target in &targets {
+                let Some(target) =
+                    crate::server::cluster_player_commands::entity_target(server, target.as_ref())
+                else {
+                    context.source.send_error(TextComponent::text(
+                        "Tag target has no current canonical identity",
+                    ));
+                    continue;
+                };
+                let mutation =
+                    pumpkin_cluster::player_command_control::PlayerCommandMutation::Tags {
+                        tag: tag.clone(),
+                        present: matches!(self.0, Action::Add),
+                    };
+                match crate::server::cluster_player_commands::submit_target(
+                    server,
+                    &context.source,
+                    target,
+                    mutation,
+                    Some(TextComponent::text("Tag change applied")),
+                ) {
+                    Ok(_) => queued += 1,
+                    Err(error) => context.source.send_error(TextComponent::text(format!(
+                        "Tag change could not be queued: {error:?}"
+                    ))),
+                }
+            }
+            if queued != 0 {
+                context
+                    .source
+                    .send_feedback(TextComponent::text("Tag change queued"), false);
+            }
+            return Ok(queued);
+        }
+
         let mut changed = 0;
         for target in &targets {
             let entity = target.get_entity();
@@ -117,6 +159,27 @@ impl CommandExecutor for ListExecutor {
         // BTreeSet keeps the output deterministic.
         let mut all_tags = BTreeSet::new();
         for target in &targets {
+            if let Some(server) = context
+                .source
+                .server
+                .as_ref()
+                .filter(|server| server.advanced_config.cluster.enabled)
+            {
+                if let Some(shell) = target.cast_any()
+                    .downcast_ref::<crate::server::cluster_entity_registry::CanonicalEntityShell>()
+                {
+                    all_tags.extend(shell.body.tags.iter().cloned());
+                    continue;
+                }
+                if let Some(target) = server
+                    .cluster_combat_client_targets
+                    .load()
+                    .get(&target.get_entity().entity_id)
+                {
+                    all_tags.extend(target.tags.iter().cloned());
+                }
+                continue;
+            }
             let tags = target
                 .get_entity()
                 .scoreboard_tags

@@ -156,10 +156,7 @@ impl DependencyNotice {
 
 impl PrimaryLoadSnapshot {
     #[must_use]
-    pub fn new(
-        revision: ElectionRevision,
-        loads: impl IntoIterator<Item = PrimaryLoad>,
-    ) -> Self {
+    pub fn new(revision: ElectionRevision, loads: impl IntoIterator<Item = PrimaryLoad>) -> Self {
         let mut loads: Vec<_> = loads.into_iter().collect();
         loads.sort_by_key(|entry| entry.primary);
         Self { revision, loads }
@@ -267,11 +264,7 @@ impl SettlementCoordinator {
                         )
                     })
                     .collect();
-                let required_holders = holders_by_chunk
-                    .values()
-                    .flatten()
-                    .copied()
-                    .collect();
+                let required_holders = holders_by_chunk.values().flatten().copied().collect();
                 (holders_by_chunk, required_holders)
             });
         let held: BTreeSet<_> = holders_by_chunk
@@ -289,12 +282,15 @@ impl SettlementCoordinator {
         if missing != expected_missing || missing.len() != notice.missing.len() {
             return Err(SettlementError::IncorrectMissingSet);
         }
-        let pending = self.pending.entry(notice.id).or_insert_with(|| PendingSettlement {
-            chunks: chunks.clone(),
-            holders_by_chunk,
-            required_holders,
-            ..PendingSettlement::default()
-        });
+        let pending = self
+            .pending
+            .entry(notice.id)
+            .or_insert_with(|| PendingSettlement {
+                chunks: chunks.clone(),
+                holders_by_chunk,
+                required_holders,
+                ..PendingSettlement::default()
+            });
         pending.waiters.insert(notice.waiter);
         pending
             .missing_by_waiter
@@ -399,8 +395,7 @@ impl SettlementCoordinator {
             .ok_or(SettlementError::UnknownSettlement)?;
         let chunks: BTreeSet<_> = chunks.into_iter().collect();
         if chunks.iter().any(|chunk| {
-            !pending.chunks.contains(chunk)
-                || !pending.holders_by_chunk[chunk].contains(&primary)
+            !pending.chunks.contains(chunk) || !pending.holders_by_chunk[chunk].contains(&primary)
         }) {
             return Err(SettlementError::UnrelatedChunk);
         }
@@ -532,9 +527,10 @@ impl SettlementCoordinator {
                 continue;
             }
             pending.dropped.insert(peer);
-            let election_affected = pending.election.as_ref().is_some_and(|election| {
-                election.loads.iter().any(|entry| entry.primary == peer)
-            });
+            let election_affected = pending
+                .election
+                .as_ref()
+                .is_some_and(|election| election.loads.iter().any(|entry| entry.primary == peer));
             if pending.owner == Some(peer) || election_affected {
                 pending.owner = None;
                 pending.eligible_owners.clear();
@@ -624,10 +620,7 @@ fn validate_election(
     Ok(())
 }
 
-fn assign_owner(
-    pending: &mut PendingSettlement,
-    owner: ServerId,
-) -> Result<(), SettlementError> {
+fn assign_owner(pending: &mut PendingSettlement, owner: ServerId) -> Result<(), SettlementError> {
     match pending.owner {
         Some(current) if current != owner => Err(SettlementError::ConflictingOwner),
         Some(_) => Ok(()),
@@ -653,6 +646,7 @@ mod tests {
         SettlementId {
             tick: TickStamp(9),
             action: ActionKey {
+                incarnation: 0,
                 actor: GlobalPlayerId::new(ServerId(2), PlayerSlot(4)).into(),
                 sequence: 7,
                 family: 3,
@@ -668,10 +662,7 @@ mod tests {
 
     fn election(revision: u64, loads: &[(u16, u64)]) -> PrimaryLoadSnapshot {
         PrimaryLoadSnapshot::new(
-            ElectionRevision {
-                term: 4,
-                revision,
-            },
+            ElectionRevision { term: 4, revision },
             loads.iter().map(|(primary, load)| PrimaryLoad {
                 primary: ServerId(*primary),
                 load: *load,
@@ -686,20 +677,12 @@ mod tests {
         hold(&mut directory, 3, [chunk(2)]);
         hold(&mut directory, 4, [chunk(1), chunk(2)]);
         let mut coordinator = SettlementCoordinator::default();
-        let first = DependencyNotice::from_directory(
-            id(),
-            ServerId(2),
-            [chunk(1), chunk(2)],
-            &directory,
-        )
-        .unwrap();
-        let second = DependencyNotice::from_directory(
-            id(),
-            ServerId(3),
-            [chunk(1), chunk(2)],
-            &directory,
-        )
-        .unwrap();
+        let first =
+            DependencyNotice::from_directory(id(), ServerId(2), [chunk(1), chunk(2)], &directory)
+                .unwrap();
+        let second =
+            DependencyNotice::from_directory(id(), ServerId(3), [chunk(1), chunk(2)], &directory)
+                .unwrap();
         let routing = coordinator
             .note_dependency(ServerId(2), first, &directory)
             .unwrap();
@@ -711,10 +694,7 @@ mod tests {
             routing.recipients,
             BTreeSet::from([ServerId(3), ServerId(4)])
         );
-        assert_eq!(
-            coordinator.assign_complete_holder(id()),
-            Ok(ServerId(4))
-        );
+        assert_eq!(coordinator.assign_complete_holder(id()), Ok(ServerId(4)));
         coordinator
             .note_grounded(id(), ServerId(4), chunk(1))
             .unwrap();
@@ -739,13 +719,9 @@ mod tests {
         hold(&mut directory, 7, [chunk(1)]);
         hold(&mut directory, 8, [chunk(2)]);
         let mut coordinator = SettlementCoordinator::default();
-        let notice = DependencyNotice::from_directory(
-            id(),
-            ServerId(7),
-            [chunk(1), chunk(2)],
-            &directory,
-        )
-        .unwrap();
+        let notice =
+            DependencyNotice::from_directory(id(), ServerId(7), [chunk(1), chunk(2)], &directory)
+                .unwrap();
         coordinator
             .note_dependency(ServerId(7), notice, &directory)
             .unwrap();
@@ -791,13 +767,9 @@ mod tests {
         hold(&mut directory, 2, [chunk(1)]);
         hold(&mut directory, 3, [chunk(2), chunk(3)]);
         let mut coordinator = SettlementCoordinator::default();
-        let notice = DependencyNotice::from_directory(
-            id(),
-            ServerId(2),
-            [chunk(1), chunk(2)],
-            &directory,
-        )
-        .unwrap();
+        let notice =
+            DependencyNotice::from_directory(id(), ServerId(2), [chunk(1), chunk(2)], &directory)
+                .unwrap();
         assert_eq!(
             coordinator.note_dependency(ServerId(3), notice.clone(), &directory),
             Err(SettlementError::SourceMismatch)
@@ -805,13 +777,9 @@ mod tests {
         coordinator
             .note_dependency(ServerId(2), notice, &directory)
             .unwrap();
-        let inconsistent = DependencyNotice::from_directory(
-            id(),
-            ServerId(3),
-            [chunk(1), chunk(3)],
-            &directory,
-        )
-        .unwrap();
+        let inconsistent =
+            DependencyNotice::from_directory(id(), ServerId(3), [chunk(1), chunk(3)], &directory)
+                .unwrap();
         assert_eq!(
             coordinator.note_dependency(ServerId(3), inconsistent, &directory),
             Err(SettlementError::ConflictingDependencySet)
@@ -865,20 +833,12 @@ mod tests {
         hold(&mut original, 2, [chunk(1)]);
         hold(&mut original, 3, [chunk(2)]);
         hold(&mut original, 4, [chunk(1), chunk(2)]);
-        let first = DependencyNotice::from_directory(
-            id(),
-            ServerId(2),
-            [chunk(1), chunk(2)],
-            &original,
-        )
-        .unwrap();
-        let second = DependencyNotice::from_directory(
-            id(),
-            ServerId(3),
-            [chunk(1), chunk(2)],
-            &original,
-        )
-        .unwrap();
+        let first =
+            DependencyNotice::from_directory(id(), ServerId(2), [chunk(1), chunk(2)], &original)
+                .unwrap();
+        let second =
+            DependencyNotice::from_directory(id(), ServerId(3), [chunk(1), chunk(2)], &original)
+                .unwrap();
         let mut left_directory = original.clone();
         let mut right_directory = original.clone();
         let mut left = SettlementCoordinator::default();
@@ -916,13 +876,9 @@ mod tests {
         let mut directory = Directory::new();
         hold(&mut directory, 7, [chunk(1)]);
         hold(&mut directory, 8, [chunk(2)]);
-        let notice = DependencyNotice::from_directory(
-            id(),
-            ServerId(7),
-            [chunk(1), chunk(2)],
-            &directory,
-        )
-        .unwrap();
+        let notice =
+            DependencyNotice::from_directory(id(), ServerId(7), [chunk(1), chunk(2)], &directory)
+                .unwrap();
         let mut first = SettlementCoordinator::default();
         let mut second = SettlementCoordinator::default();
         first
@@ -955,13 +911,9 @@ mod tests {
         hold(&mut directory, 7, [chunk(1)]);
         hold(&mut directory, 8, [chunk(2)]);
         hold(&mut directory, 9, [chunk(2)]);
-        let notice = DependencyNotice::from_directory(
-            id(),
-            ServerId(7),
-            [chunk(1), chunk(2)],
-            &directory,
-        )
-        .unwrap();
+        let notice =
+            DependencyNotice::from_directory(id(), ServerId(7), [chunk(1), chunk(2)], &directory)
+                .unwrap();
         let mut coordinator = SettlementCoordinator::default();
         coordinator
             .note_dependency(ServerId(7), notice, &directory)
@@ -994,13 +946,9 @@ mod tests {
         hold(&mut directory, 7, [chunk(1)]);
         hold(&mut directory, 8, [chunk(2)]);
         hold(&mut directory, 9, [chunk(2)]);
-        let notice = DependencyNotice::from_directory(
-            id(),
-            ServerId(7),
-            [chunk(1), chunk(2)],
-            &directory,
-        )
-        .unwrap();
+        let notice =
+            DependencyNotice::from_directory(id(), ServerId(7), [chunk(1), chunk(2)], &directory)
+                .unwrap();
         let mut coordinator = SettlementCoordinator::default();
         coordinator
             .note_dependency(ServerId(7), notice, &directory)

@@ -1117,7 +1117,11 @@ mod tests {
         value.put_int("count", 2);
         patched.patch.push((
             DataComponent::UseRemainder,
-            Some(UseRemainderImpl::read_data(&NbtTag::Compound(value)).unwrap().to_dyn()),
+            Some(
+                UseRemainderImpl::read_data(&NbtTag::Compound(value))
+                    .unwrap()
+                    .to_dyn(),
+            ),
         ));
         let mut encoded = NbtCompound::new();
         patched.write_item_stack(&mut encoded);

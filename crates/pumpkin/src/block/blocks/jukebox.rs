@@ -75,6 +75,7 @@ impl JukeboxBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for JukeboxBlock {
     /// Called when the jukebox is placed - creates the block entity
     fn placed(&self, args: PlacedArgs<'_>) {
@@ -183,14 +184,10 @@ impl BlockBehaviour for JukeboxBlock {
     /// Vanilla: Returns 15 if playing, 0 otherwise
     fn get_weak_redstone_power(&self, args: GetRedstonePowerArgs<'_>) -> u8 {
         // Vanilla: return world.getBlockEntity(pos) instanceof JukeboxBlockEntity lv && lv.getManager().isPlaying() ? 15 : 0
-        if let Some(block_entity) = args.world.get_block_entity(args.position)
-            && let Some(jukebox_entity) = block_entity.as_any().downcast_ref::<JukeboxBlockEntity>()
-            && jukebox_entity.is_playing()
-        {
-            15
-        } else {
-            0
-        }
+        args.world.block_entity_signal(
+            args.position,
+            crate::block::BlockEntitySignal::JukeboxPlaying,
+        )
     }
 
     /// Vanilla: Returns the song's comparator output (0-15)

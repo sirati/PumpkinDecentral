@@ -1,10 +1,95 @@
-use pumpkin_data::BlockState;
 use pumpkin_data::damage::DamageType;
 use pumpkin_data::entity::EntityType;
 use pumpkin_data::item::Item;
 use pumpkin_data::item_stack::ItemStack;
+use pumpkin_data::{Block, BlockState};
 use pumpkin_util::loot_table::{LootBonusFormula, LootCondition, LootEntry, LootTable};
-use pumpkin_util::random::{RandomImpl, xoroshiro128::Xoroshiro};
+use pumpkin_util::random::{RandomGenerator, RandomImpl, xoroshiro128::Xoroshiro};
+
+/// Semantic loot has no client stack ID; those IDs belong to publication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LootItemFact {
+    pub item: u16,
+    pub count: u32,
+}
+
+/// Splits semantic counts using owned item policy before reserving spawn IDs.
+/// Refuses the whole plan if its declared output capacity is insufficient.
+pub fn partition_loot_facts(facts: &[LootItemFact], capacity: usize) -> Option<Vec<LootItemFact>> {
+    if capacity > 65_536 {
+        return None;
+    }
+    let mut required = 0usize;
+    for fact in facts {
+        let item = Item::from_id(fact.item)?;
+        let limit = u32::from(ItemStack::static_new_java(1, item).get_max_stack_size());
+        if limit == 0 || fact.count == 0 {
+            return None;
+        }
+        required = required.checked_add(usize::try_from(fact.count.div_ceil(limit)).ok()?)?;
+        if required > capacity {
+            return None;
+        }
+    }
+    let mut result = Vec::with_capacity(required);
+    for fact in facts {
+        let limit = u32::from(
+            ItemStack::static_new_java(1, Item::from_id(fact.item)?).get_max_stack_size(),
+        );
+        let mut remaining = fact.count;
+        while remaining > 0 {
+            let count = remaining.min(limit);
+            result.push(LootItemFact {
+                item: fact.item,
+                count,
+            });
+            remaining -= count;
+        }
+    }
+    Some(result)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockLootFacts {
+    pub items: Vec<LootItemFact>,
+    pub experience: u32,
+}
+
+pub fn block_loot_facts(
+    block: &Block,
+    loot_seed: i64,
+    experience_seed: u64,
+    experience: bool,
+    params: &LootContextParameters,
+) -> BlockLootFacts {
+    let key = format!("minecraft:blocks/{}", block.name);
+    let items = pumpkin_data::loot_table::get_loot_table(&key).map_or_else(Vec::new, |table| {
+        generate_loot_facts_with_context(table, loot_seed, params)
+    });
+    let experience = block_experience_fact(block, experience_seed, experience, params);
+    BlockLootFacts { items, experience }
+}
+
+/// The XP leg uses the same frozen tool and seed as its enclosing break.
+pub fn block_experience_fact(
+    block: &Block,
+    seed: u64,
+    enabled: bool,
+    params: &LootContextParameters,
+) -> u32 {
+    let silk_touch = params.tool.as_ref().is_some_and(|tool| {
+        pumpkin_data::Enchantment::from_name("silk_touch")
+            .is_some_and(|enchantment| tool.get_enchantment_level(enchantment) > 0)
+    });
+    if enabled && !silk_touch {
+        block.experience.as_ref().map_or(0, |value| {
+            let mut random = RandomGenerator::Xoroshiro(Xoroshiro::from_seed(seed));
+            value.experience.get(&mut random).max(0) as u32
+        })
+    } else {
+        0
+    }
+}
 
 #[derive(Default, Clone)]
 pub struct LootContextParameters {
@@ -119,8 +204,26 @@ pub fn generate_loot_with_context(
     seed: i64,
     params: &LootContextParameters,
 ) -> Vec<ItemStack> {
+    generate_loot_facts_with_context(table, seed, params)
+        .into_iter()
+        .map(|fact| {
+            ItemStack::new(
+                fact.count as u8,
+                Item::from_id(fact.item).expect("generated loot item exists"),
+            )
+        })
+        .collect()
+}
+
+/// Pure table evaluation, shared by the mutable adapter and owner interpreter.
+/// It does not allocate global Bedrock stack IDs or inspect World.
+pub fn generate_loot_facts_with_context(
+    table: &LootTable,
+    seed: i64,
+    params: &LootContextParameters,
+) -> Vec<LootItemFact> {
     let mut rng = Xoroshiro::from_seed(seed as u64);
-    let mut items_to_place: Vec<ItemStack> = Vec::new();
+    let mut items_to_place = Vec::new();
 
     let has_silk_touch = params.tool.as_ref().is_some_and(|tool| {
         pumpkin_data::Enchantment::from_name("silk_touch")
@@ -218,7 +321,10 @@ pub fn generate_loot_with_context(
                         let item_key = entry.item.strip_prefix("minecraft:").unwrap_or(entry.item);
 
                         if let Some(item) = Item::from_registry_key(item_key) {
-                            items_to_place.push(ItemStack::new(final_count as u8, item));
+                            items_to_place.push(LootItemFact {
+                                count: final_count as u32,
+                                item: item.id,
+                            });
                         }
                     }
                     break;
@@ -311,5 +417,126 @@ fn shuffle_and_split_items(
     for i in (1..n).rev() {
         let j = rng.next_bounded_i32((i + 1) as i32) as usize;
         result.swap(i, j);
+    }
+}
+
+#[cfg(test)]
+mod owned_loot_tests {
+    use super::*;
+
+    #[test]
+    fn frozen_silk_touch_break_preserves_ore_and_suppresses_xp() {
+        let mut tool = ItemStack::static_new_java(1, &Item::DIAMOND_PICKAXE);
+        tool.set_data_component(pumpkin_data::data_component_impl::EnchantmentsImpl {
+            enchantment: std::borrow::Cow::Owned(vec![(
+                pumpkin_data::Enchantment::from_name("silk_touch").unwrap(),
+                1,
+            )]),
+        });
+        let params = LootContextParameters {
+            tool: Some(tool),
+            block_state: Some(Block::DIAMOND_ORE.default_state),
+            ..Default::default()
+        };
+        let result = block_loot_facts(&Block::DIAMOND_ORE, 17, 29, true, &params);
+        assert_eq!(result.experience, 0);
+        assert_eq!(
+            result.items,
+            vec![LootItemFact {
+                item: Item::DIAMOND_ORE.id,
+                count: 1
+            }]
+        );
+        let normal = LootContextParameters {
+            tool: None,
+            ..params
+        };
+        let result = block_loot_facts(&Block::DIAMOND_ORE, 17, 29, true, &normal);
+        assert_eq!(
+            result.items,
+            vec![LootItemFact {
+                item: Item::DIAMOND.id,
+                count: 1
+            }]
+        );
+        assert!((3..=7).contains(&result.experience));
+        assert_eq!(
+            block_loot_facts(&Block::DIAMOND_ORE, 17, 29, false, &normal).experience,
+            0
+        );
+    }
+
+    #[test]
+    fn block_loot_facts_are_deterministic_and_match_legacy_table_evaluation() {
+        for block in [&Block::DIRT, &Block::WHITE_CARPET, &Block::COAL_ORE] {
+            let params = LootContextParameters {
+                block_state: Some(block.default_state),
+                ..Default::default()
+            };
+            let first = block_loot_facts(block, 17, 29, true, &params);
+            assert_eq!(first, block_loot_facts(block, 17, 29, true, &params));
+            let key = format!("minecraft:blocks/{}", block.name);
+            let legacy = pumpkin_data::loot_table::get_loot_table(&key)
+                .map_or_else(Vec::new, |table| {
+                    generate_loot_with_context(table, 17, &params)
+                });
+            assert_eq!(
+                first.items,
+                legacy
+                    .iter()
+                    .map(|stack| LootItemFact {
+                        item: stack.item.id,
+                        count: u32::from(stack.item_count)
+                    })
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn owned_partition_conserves_large_counts_and_uses_item_capacity() {
+        let facts = [
+            LootItemFact {
+                item: Item::STONE.id,
+                count: 257,
+            },
+            LootItemFact {
+                item: Item::IRON_SWORD.id,
+                count: 2,
+            },
+        ];
+        assert!(partition_loot_facts(&facts, 6).is_none());
+        let result = partition_loot_facts(&facts, 7).unwrap();
+        assert_eq!(result.len(), 7);
+        assert_eq!(
+            result
+                .iter()
+                .filter(|fact| fact.item == Item::STONE.id)
+                .map(|fact| fact.count)
+                .sum::<u32>(),
+            257
+        );
+        assert!(
+            result
+                .iter()
+                .filter(|fact| fact.item == Item::STONE.id)
+                .all(|fact| fact.count <= 64)
+        );
+        assert!(
+            result
+                .iter()
+                .filter(|fact| fact.item == Item::IRON_SWORD.id)
+                .all(|fact| fact.count == 1)
+        );
+        assert!(
+            partition_loot_facts(
+                &[LootItemFact {
+                    item: Item::STONE.id,
+                    count: 0
+                }],
+                8
+            )
+            .is_none()
+        );
     }
 }

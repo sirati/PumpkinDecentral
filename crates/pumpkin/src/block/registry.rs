@@ -1320,7 +1320,7 @@ impl BlockRegistry {
     #[expect(clippy::too_many_arguments)]
     pub fn get_state_for_neighbor_update(
         &self,
-        world: &World,
+        world: &dyn crate::block::NeighborUpdateWorld,
         block: &Block,
         state_id: BlockStateId,
         position: &BlockPos,
@@ -1415,7 +1415,7 @@ impl BlockRegistry {
     pub fn get_weak_redstone_power(
         &self,
         block: &Block,
-        world: &World,
+        world: &dyn super::RedstonePowerWorld,
         position: &BlockPos,
         state: &BlockState,
         direction: BlockDirection,
@@ -1436,7 +1436,7 @@ impl BlockRegistry {
     pub fn get_strong_redstone_power(
         &self,
         block: &Block,
-        world: &World,
+        world: &dyn super::RedstonePowerWorld,
         position: &BlockPos,
         state: &BlockState,
         direction: BlockDirection,

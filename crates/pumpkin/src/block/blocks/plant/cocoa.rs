@@ -33,6 +33,7 @@ impl CocoaBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for CocoaBlock {
     fn can_place_at(&self, args: CanPlaceAtArgs<'_>) -> bool {
         let state_id = args.block_accessor.get_block_state_id(args.position);

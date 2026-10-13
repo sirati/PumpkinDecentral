@@ -23,6 +23,7 @@ use std::sync::Arc;
 #[pumpkin_block_from_tag("minecraft:campfires")]
 pub struct CampfireBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for CampfireBlock {
     fn placed(&self, args: PlacedArgs<'_>) {
         let entity = CampfireBlockEntity::new(*args.position);

@@ -97,16 +97,31 @@ impl EntitySelector {
         source: &CommandSource,
     ) -> Result<Vec<Arc<dyn EntityBase>>, CommandSyntaxError> {
         self.check_permissions(source)?;
-        if !self.includes_entities {
+        if !self.includes_entities && !source.server().advanced_config.cluster.enabled {
             self.find_players(source)
                 .map(|v| v.into_iter().map(|p| p as Arc<dyn EntityBase>).collect())
         } else if let Some(name) = self.player_name.as_ref() {
+            if source.server().advanced_config.cluster.enabled {
+                let server = source.server();
+                let presence = server.cluster_presence.snapshot();
+                let Some(gid) = presence.by_name(name) else { return Ok(Vec::new()); };
+                let Some(profile) = presence.entries.get(&gid).filter(|profile| !profile.in_lobby) else { return Ok(Vec::new()); };
+                if let Some(replica) = server.cluster_remote_players.load().get(&gid) {
+                    return Ok(vec![replica.clone() as Arc<dyn EntityBase>]);
+                }
+                return Ok(server.get_player_by_uuid(Uuid::from_bytes(profile.uuid))
+                    .filter(|player| player.cluster_gid() == Some(gid))
+                    .map_or_else(Vec::new, |player| vec![player as Arc<dyn EntityBase>]));
+            }
             // Try to get the player by name.
             let player = source
                 .server
                 .as_ref()
                 .and_then(|s| s.get_player_by_name(name));
-            Ok(player.map_or_else(Vec::new, |p| vec![p as Arc<dyn EntityBase>]))
+            if let Some(player) = player {
+                return Ok(vec![player as Arc<dyn EntityBase>]);
+            }
+            Ok(Vec::new())
         } else if let Some(uuid) = self.entity_uuid.as_ref() {
             // Try to get an entity by UUID.
             for world in source.server().worlds.load().iter() {
@@ -262,6 +277,12 @@ impl EntitySelector {
         bounding_box: Option<BoundingBox>,
     ) -> EntitySelectorPredicate {
         let mut list = self.predicates.clone();
+        if !self.includes_entities {
+            list.push(EntitySelectorPredicate::EntityType(
+                &EntityType::PLAYER,
+                false,
+            ));
+        }
 
         if let Some(bounding_box) = bounding_box {
             list.push(EntitySelectorPredicate::BoundingBox(bounding_box));
@@ -467,7 +488,12 @@ fn matches_nbt_compound(expected: &NbtCompound, actual: &NbtCompound) -> bool {
 
 #[allow(clippy::option_if_let_else)]
 fn entity_actual_name(entity: &dyn EntityBase) -> String {
-    if let Some(player) = entity.get_player() {
+    if let Some(replica) = entity
+        .cast_any()
+        .downcast_ref::<crate::entity::cluster_player_ghost::RemotePlayerReplica>()
+    {
+        replica.frame.profile.name.clone()
+    } else if let Some(player) = entity.get_player() {
         player.gameprofile.name.clone()
     } else if let Some(custom_name) = &**entity.get_entity().custom_name.load() {
         custom_name.clone().get_text()
@@ -485,13 +511,54 @@ impl EntitySelectorPredicate {
     #[allow(clippy::too_many_lines)]
     pub fn test(&self, entity: &dyn EntityBase) -> bool {
         match self {
-            Self::IsAlive => entity.get_entity().is_alive(),
-            Self::GameMode(mode, invert) => entity
-                .get_player()
-                .is_some_and(|p| (p.gamemode.load() == *mode) ^ invert),
+            Self::IsAlive => {
+                if let Some(shell) = entity
+                    .cast_any()
+                    .downcast_ref::<crate::server::cluster_entity_registry::CanonicalEntityShell>()
+                {
+                    return match &shell.body.payload {
+                        pumpkin_cluster::entity_body::EntityPayload::Living(living) => {
+                            living.combat.health_milli != 0
+                        }
+                        _ => true,
+                    };
+                }
+                entity
+                    .cast_any()
+                    .downcast_ref::<crate::entity::cluster_player_ghost::RemotePlayerReplica>()
+                    .map_or_else(
+                        || entity.get_entity().is_alive(),
+                        |replica| replica.frame.living.combat.health_milli != 0,
+                    )
+            }
+            Self::GameMode(mode, invert) => {
+                entity
+                    .get_player()
+                    .map(|p| p.gamemode.load())
+                    .or_else(|| {
+                        entity.cast_any()
+                    .downcast_ref::<crate::entity::cluster_player_ghost::RemotePlayerReplica>()
+                    .and_then(|replica| GameMode::try_from(replica.frame.spatial.game_mode).ok())
+                    })
+                    .is_some_and(|actual| (actual == *mode) ^ invert)
+            }
             Self::ExperienceLevel(bounds) => entity
                 .get_player()
-                .is_some_and(|p| bounds.matches(p.experience_level.load(Ordering::Relaxed))),
+                .map(|p| p.experience_level.load(Ordering::Relaxed))
+                .or_else(|| {
+                    entity
+                        .cast_any()
+                        .downcast_ref::<crate::entity::cluster_player_ghost::RemotePlayerReplica>()
+                        .and_then(|replica| {
+                            replica
+                                .frame
+                                .living
+                                .avatar
+                                .as_ref()
+                                .and_then(|avatar| i32::try_from(avatar.experience.level).ok())
+                        })
+                })
+                .is_some_and(|level| bounds.matches(level)),
             Self::Rotation(bounds, f) => {
                 let min = wrap_degrees(bounds.min().unwrap_or(0.0f32));
                 let max = wrap_degrees(bounds.max().unwrap_or(360.0f32));
@@ -519,6 +586,36 @@ impl EntitySelectorPredicate {
                 (actual_name == *expected_name) ^ invert
             }
             Self::Tag(expected_tag, invert) => {
+                if let Some(shell) = entity
+                    .cast_any()
+                    .downcast_ref::<crate::server::cluster_entity_registry::CanonicalEntityShell>()
+                {
+                    return shell.body.tags.contains(expected_tag) ^ invert;
+                }
+                if let Some(replica) = entity
+                    .cast_any()
+                    .downcast_ref::<crate::entity::cluster_player_ghost::RemotePlayerReplica>(
+                ) {
+                    return replica.frame.living.tags.contains(expected_tag) ^ invert;
+                }
+                if let Some(server) = entity.get_entity().world.load().server.upgrade()
+                    && server.advanced_config.cluster.enabled
+                {
+                    let has_tag = server
+                        .cluster_combat_client_targets
+                        .load()
+                        .get(&entity.get_entity().entity_id)
+                        .filter(|target| {
+                            target.contact.valid()
+                                && server
+                                    .cluster_peer_incarnations
+                                    .load()
+                                    .get(&target.contact.owner.server)
+                                    == Some(&target.contact.owner.generation)
+                        })
+                        .is_some_and(|target| target.tags.contains(expected_tag));
+                    return has_tag ^ invert;
+                }
                 let has_tag = entity
                     .get_entity()
                     .scoreboard_tags
@@ -530,11 +627,8 @@ impl EntitySelectorPredicate {
             Self::Team(expected_team, invert) => {
                 let actual_name = entity_actual_name(entity);
                 let world = entity.get_entity().world.load();
-                let scoreboard = world
-                    .scoreboard
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let has_team = scoreboard.get_teams().iter().any(|(name, team)| {
+                let teams = world.team_chat_snapshot.load();
+                let has_team = teams.iter().any(|(name, team)| {
                     name == expected_team && team.players.contains(&actual_name)
                 });
                 has_team ^ invert
@@ -542,15 +636,25 @@ impl EntitySelectorPredicate {
             Self::Scores(scores_map) => {
                 let actual_name = entity_actual_name(entity);
                 let world = entity.get_entity().world.load();
+                if world
+                    .server
+                    .upgrade()
+                    .is_some_and(|server| server.advanced_config.cluster.enabled)
+                {
+                    let scores = world.score_query_snapshot.load();
+                    return scores_map.iter().all(|(objective, bounds)| {
+                        bounds.matches(
+                            scores
+                                .get(objective)
+                                .and_then(|entities| entities.get(&actual_name))
+                                .map_or(0, |score| score.value.0),
+                        )
+                    });
+                }
                 let scoreboard = world
-                    .scoreboard
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let entity_scores = scoreboard.get_scores().get(&actual_name);
+                    .scoreboard.snapshot();
                 for (objective, bounds) in scores_map {
-                    let score_val = entity_scores
-                        .and_then(|obj_map| obj_map.get(objective))
-                        .map_or(0, |score| score.value.0);
+                    let score_val = scoreboard.get_score_value(&actual_name, objective).unwrap_or(0);
                     if !bounds.matches(score_val) {
                         return false;
                     }
@@ -558,11 +662,49 @@ impl EntitySelectorPredicate {
                 true
             }
             Self::Advancements(advancements_map) => {
+                if let Some(replica) = entity
+                    .cast_any()
+                    .downcast_ref::<crate::entity::cluster_player_ghost::RemotePlayerReplica>(
+                ) {
+                    return advancements_map.iter().all(|(id, expected)| {
+                        let Some(advancement) = Advancement::from_minecraft_name(id).or_else(|| Advancement::from_name(id)) else { return false; };
+                        replica
+                                .frame
+                                .living
+                                .advancements
+                                .progress
+                                .get(&advancement.id.to_string())
+                                .is_some_and(|progress| progress.completed)
+                                == *expected
+                    });
+                }
+                if let Some(server) = entity.get_entity().world.load().server.upgrade()
+                    && server.advanced_config.cluster.enabled
+                {
+                    let Some(gid) = entity.get_player().and_then(|player| player.cluster_gid())
+                    else {
+                        return false;
+                    };
+                    let snapshot = server.cluster_actor_living.load();
+                    let Some(state) = snapshot.get(&pumpkin_cluster::actor::ActorId::Player(gid))
+                    else {
+                        return false;
+                    };
+                    return advancements_map.iter().all(|(id, expected)| {
+                        let Some(advancement) = Advancement::from_minecraft_name(id).or_else(|| Advancement::from_name(id)) else { return false; };
+                        state
+                                .advancements
+                                .progress
+                                .get(&advancement.id.to_string())
+                                .is_some_and(|progress| progress.completed)
+                                == *expected
+                    });
+                }
                 let Some(player) = entity.get_player() else {
                     return false;
                 };
                 for (adv_id, expected_done) in advancements_map {
-                    if let Some(advancement) = Advancement::from_name(adv_id) {
+                    if let Some(advancement) = Advancement::from_minecraft_name(adv_id).or_else(|| Advancement::from_name(adv_id)) {
                         let is_done = player.has_advancement(advancement);
                         if is_done != *expected_done {
                             return false;
@@ -574,6 +716,12 @@ impl EntitySelectorPredicate {
                 true
             }
             Self::Nbt(expected_nbt, invert) => {
+                if expected_nbt.child_tags.contains_key("EnderItems")
+                    && let Some(replica) = entity.cast_any().downcast_ref::<crate::entity::cluster_player_ghost::RemotePlayerReplica>()
+                {
+                    let Some(server) = entity.get_entity().world.load().server.upgrade() else { return false; };
+                    if replica.frame.canonical_ender_cells(&server).is_none() { return false; }
+                }
                 let mut actual_nbt = NbtCompound::default();
                 entity.write_nbt(&mut actual_nbt);
                 matches_nbt_compound(expected_nbt, &actual_nbt) ^ invert

@@ -202,6 +202,7 @@ fn is_water_bottle(stack: &ItemStack) -> bool {
             == Some(i32::from(Potion::WATER.id))
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for DispenserBlock {
     fn normal_use(&self, args: NormalUseArgs<'_>) -> BlockActionResult {
         if let Some(factory) = self.get_screen_handler_factory(GetScreenHandlerFactoryArgs {

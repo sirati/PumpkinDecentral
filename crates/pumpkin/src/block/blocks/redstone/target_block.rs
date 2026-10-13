@@ -31,6 +31,7 @@ fn get_redstone_strength(hit_pos: &Vector3<f64>) -> u8 {
 #[pumpkin_block("minecraft:target")]
 pub struct TargetBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for TargetBlock {
     fn emits_redstone_power(&self, _args: EmitsRedstonePowerArgs<'_>) -> bool {
         true
@@ -82,24 +83,58 @@ impl BlockBehaviour for TargetBlock {
     }
 
     fn on_scheduled_tick(&self, args: OnScheduledTickArgs<'_>) {
-        let state_id = args.world.get_block_state_id(args.position);
-        let mut props = TargetProperties::from_state_id(state_id);
-        if props.r#power != 0 {
-            props.r#power = 0;
-            args.world.set_block_state(
-                args.position,
-                props.to_state_id(args.block),
-                BlockFlags::NOTIFY_ALL,
-            );
+        crate::block::neighbor::apply_legacy_scheduled_intent(self, args);
+    }
+
+    fn scheduled_tick_intent(
+        &self,
+        args: crate::block::ScheduledTickIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        let state = args.world.get_block_state_id(args.position);
+        let mut properties = TargetProperties::from_state_id(state);
+        if properties.power == 0 {
+            return Some(Vec::new());
         }
+        properties.power = 0;
+        Some(vec![
+            crate::block::neighbor::BlockCallbackEffect::SetBlock {
+                position: *args.position,
+                state: properties.to_state_id(args.block),
+                flags: BlockFlags::NOTIFY_ALL,
+            },
+        ])
     }
 
     fn on_state_replaced(&self, args: OnStateReplacedArgs<'_>) {
-        if !args.moved {
-            let props = TargetProperties::from_state_id(args.old_state_id);
-            if props.r#power > 0 {
-                args.world.update_neighbors(args.position, None);
+        crate::block::neighbor::apply_legacy_replaced_intent(self, args);
+    }
+
+    fn callback_intent(
+        &self,
+        args: crate::block::neighbor::BlockCallbackIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        use crate::block::neighbor::{BlockCallbackEffect, BlockCallbackEvent};
+        match args.event {
+            BlockCallbackEvent::Scheduled => {
+                self.scheduled_tick_intent(crate::block::ScheduledTickIntentArgs {
+                    world: args.world,
+                    block: args.block,
+                    position: args.position,
+                })
             }
+            BlockCallbackEvent::StateReplaced { old_state, moved } => {
+                if !moved && TargetProperties::from_state_id(old_state).power > 0 {
+                    Some(vec![BlockCallbackEffect::NotifyNeighbors {
+                        position: *args.position,
+                        except: None,
+                    }])
+                } else {
+                    Some(Vec::new())
+                }
+            }
+            BlockCallbackEvent::Placed { .. }
+            | BlockCallbackEvent::Prepare { .. }
+            | BlockCallbackEvent::Neighbor { .. } => Some(Vec::new()),
         }
     }
 

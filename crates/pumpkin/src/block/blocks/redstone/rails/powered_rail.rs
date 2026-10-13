@@ -37,6 +37,7 @@ use super::common::{
 #[pumpkin_block("minecraft:powered_rail")]
 pub struct PoweredRailBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for PoweredRailBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut rail_props = RailProperties::default(args.block);

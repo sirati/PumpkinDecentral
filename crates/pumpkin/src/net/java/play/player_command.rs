@@ -14,6 +14,28 @@ impl JavaClient {
         if !player.has_client_loaded() {
             return;
         }
+        if server.advanced_config.cluster.enabled {
+            let patch = match command.action {
+                Action::LeaveBed => Some(crate::server::cluster_controller::ControllerPatch::Wake),
+                Action::StartSprinting => Some(
+                    crate::server::cluster_controller::ControllerPatch::Sprint(true),
+                ),
+                Action::StopSprinting => Some(
+                    crate::server::cluster_controller::ControllerPatch::Sprint(false),
+                ),
+                Action::StartFlyingElytra => {
+                    Some(crate::server::cluster_controller::ControllerPatch::Pose {
+                        swimming: None,
+                        gliding: Some(true),
+                    })
+                }
+                _ => None,
+            };
+            if let Some(patch) = patch {
+                crate::server::cluster_controller::submit_patch(server, player, patch);
+                return;
+            }
+        }
         player.update_last_action_time();
 
         let entity = &player.get_entity();

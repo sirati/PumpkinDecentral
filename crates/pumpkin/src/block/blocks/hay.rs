@@ -5,6 +5,7 @@ use crate::block::{BlockBehaviour, OnLandedUponArgs};
 #[pumpkin_block("minecraft:hay_block")]
 pub struct HayBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for HayBlock {
     fn on_landed_upon(&self, args: OnLandedUponArgs<'_>) {
         if let Some(living) = args.entity.get_living_entity() {

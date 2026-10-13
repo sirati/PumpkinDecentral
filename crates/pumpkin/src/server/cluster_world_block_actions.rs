@@ -1,105 +1,44 @@
 use std::collections::HashMap;
 
-use pumpkin_cluster::block_action::{BlockActionIntent, BlockActionKind};
-use pumpkin_cluster::completion::{ActionKey, ManifestError, TickFinish};
-use pumpkin_cluster::identity::{GlobalPlayerId, PlayerSeq};
-use pumpkin_cluster::protocol::{BlockPos, BreakBlockUpdate, TickBatch};
-use tokio::sync::mpsc;
-
-use super::Server;
+use pumpkin_cluster::block_action::BlockActionIntent;
+use pumpkin_cluster::identity::GlobalPlayerId;
 
 pub(super) struct BlockActionOwner {
-    pub(super) receiver: mpsc::Receiver<BlockActionIntent>,
-    sequences: HashMap<GlobalPlayerId, PlayerSeq>,
-    active: HashMap<GlobalPlayerId, (BlockPos, u16)>,
-    client_sequences: HashMap<ActionKey, Option<i32>>,
+    sessions: pumpkin_cluster::block_action::MiningSessions,
+    tools: HashMap<GlobalPlayerId, (u16, Vec<u8>, u64)>,
 }
 
 impl BlockActionOwner {
-    pub(super) fn attach(server: &Server) -> Self {
+    pub(super) fn new() -> Self {
         Self {
-            receiver: super::cluster_block_action::attach_block_action_owner(server),
-            sequences: HashMap::new(),
-            active: HashMap::new(),
-            client_sequences: HashMap::new(),
+            sessions: pumpkin_cluster::block_action::MiningSessions::default(),
+            tools: HashMap::new(),
         }
     }
 
-    pub(super) fn capture(
+    pub(super) fn retire(&mut self, actor: GlobalPlayerId) {
+        self.sessions.retire(actor);
+        self.tools.remove(&actor);
+    }
+
+    pub(super) fn stage(
         &mut self,
         intent: BlockActionIntent,
-        blocks: &super::cluster_chunk_state::OwnedChunkStore,
-    ) -> Result<Option<(TickBatch, TickFinish)>, ManifestError> {
-        let Ok(state) = blocks.block(intent.target_chunk, intent.position) else {
-            return Ok(None);
-        };
-        let authoritative = state.as_u16();
-        if state == pumpkin_data::BlockStateId::AIR
-            || intent
-                .expected_block_state
-                .is_some_and(|expected| expected != authoritative)
-        {
-            return Ok(None);
+        mut evidence: pumpkin_cluster::block_action::MiningEvidence,
+        tool: &pumpkin_cluster::inventory::InventoryCell,
+    ) -> pumpkin_cluster::block_action::MiningDecision {
+        let entry = self
+            .tools
+            .entry(intent.actor)
+            .or_insert_with(|| (tool.item, tool.nbt.clone(), 1));
+        if entry.0 != tool.item || entry.1 != tool.nbt {
+            let Some(version) = entry.2.checked_add(1) else {
+                self.sessions.retire(intent.actor);
+                return pumpkin_cluster::block_action::MiningDecision::Rejected;
+            };
+            *entry = (tool.item, tool.nbt.clone(), version);
         }
-        match intent.kind {
-            BlockActionKind::StartBreak | BlockActionKind::PredictBreak => {
-                self.active
-                    .insert(intent.actor, (intent.position, authoritative));
-                Ok(None)
-            }
-            BlockActionKind::AbortBreak => {
-                self.active.remove(&intent.actor);
-                Ok(None)
-            }
-            BlockActionKind::ContinueBreak => Ok(None),
-            BlockActionKind::StopBreak => {
-                let Some((position, expected)) = self.active.remove(&intent.actor) else {
-                    return Ok(None);
-                };
-                if position != intent.position || expected != authoritative {
-                    return Ok(None);
-                }
-                self.finish(intent, authoritative)
-            }
-            BlockActionKind::CreativeBreak => self.finish(intent, authoritative),
-        }
-    }
-
-    fn finish(
-        &mut self,
-        intent: BlockActionIntent,
-        expected_old_state: u16,
-    ) -> Result<Option<(TickBatch, TickFinish)>, ManifestError> {
-        let sequence = if let Some(sequence) = intent.input_sequence {
-            self.sequences.insert(intent.actor, sequence);
-            sequence
-        } else {
-            *self
-                .sequences
-                .entry(intent.actor)
-                .and_modify(|current| current.0 = current.0.wrapping_add(1))
-                .or_insert(PlayerSeq(0))
-        };
-        let update = BreakBlockUpdate {
-            gid: intent.actor,
-            seq: sequence,
-            tick: intent.tick,
-            pos: intent.position,
-            expected_old_state,
-            actor_chunk: intent.actor_chunk,
-            chunk: intent.target_chunk,
-        };
-        let mut batch = TickBatch::new(intent.tick);
-        batch.break_block.push(update);
-        let finish = TickFinish::try_from_batch(&batch)?;
-        self.client_sequences
-            .insert(ActionKey::break_block(&update), intent.client_sequence);
-        Ok(Some((batch, finish)))
-    }
-
-    pub(super) fn take_client_sequence(&mut self, update: &BreakBlockUpdate) -> Option<i32> {
-        self.client_sequences
-            .remove(&ActionKey::break_block(update))
-            .flatten()
+        evidence.tool_revision = entry.2;
+        self.sessions.apply(intent, evidence)
     }
 }

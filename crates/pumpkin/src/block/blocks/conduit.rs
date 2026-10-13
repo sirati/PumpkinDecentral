@@ -7,6 +7,7 @@ use std::sync::Arc;
 #[pumpkin_block("minecraft:conduit")]
 pub struct ConduitBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for ConduitBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut props =

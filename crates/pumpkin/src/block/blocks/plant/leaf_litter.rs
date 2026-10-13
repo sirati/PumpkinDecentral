@@ -13,6 +13,7 @@ type LeafLitterProperties = pumpkin_data::block_properties::LeafLitterLikeProper
 #[pumpkin_block("minecraft:leaf_litter")]
 pub struct LeafLitterBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for LeafLitterBlock {
     fn can_place_at(&self, args: CanPlaceAtArgs<'_>) -> bool {
         let block_below = args.block_accessor.get_block_state(&args.position.down());

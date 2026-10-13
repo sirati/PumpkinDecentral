@@ -4,7 +4,8 @@ use std::sync::atomic::Ordering;
 use pumpkin_cluster::identity::GlobalPlayerId;
 use pumpkin_cluster::inventory::{
     INV_CURSOR, INV_MAIN, INV_OFFHAND, InvLoc, InventoryApplyError, InventoryGestureEffect,
-    InventoryRemovalKind, InventoryResolution, InventorySlotRef, InventoryTarget,
+    InventoryRemovalKind, InventoryResolution, InventoryScreenSession, InventorySlotRef,
+    InventoryTarget,
 };
 use pumpkin_data::item_stack::ItemStack;
 use pumpkin_protocol::bedrock::client::container_open::CContainerOpen;
@@ -46,7 +47,7 @@ pub(crate) fn attach_inventory_menu_owner(
     let (tx, rx) = tokio::sync::mpsc::channel(256);
     server
         .cluster_inventory_menu_route_tx
-        .send_replace(Some(tx));
+        .store(Some(Arc::new(tx)));
     rx
 }
 
@@ -58,8 +59,7 @@ fn submit_inventory_menu(
 ) -> Result<(), InventoryApplyError> {
     server
         .cluster_inventory_menu_route_tx
-        .borrow()
-        .clone()
+        .load_full()
         .ok_or(InventoryApplyError::TargetUnavailable)?
         .try_send(LocalInventoryMenuIntent {
             intent,
@@ -78,6 +78,13 @@ const BEDROCK_HELD_TAG: u64 = 0x4248_0000_0000_0000;
 const ORIGIN_TAG_MASK: u64 = 0xffff_0000_0000_0000;
 
 pub(crate) enum StagedInventoryInput {
+    OpenScreen(Arc<super::cluster_invsee::InventoryOpenSource>),
+    Mining {
+        position: pumpkin_cluster::protocol::BlockPos,
+        face: u8,
+        kind: pumpkin_cluster::block_action::BlockActionKind,
+        client_sequence: Option<i32>,
+    },
     Close {
         session: u64,
         token: u64,
@@ -94,6 +101,12 @@ pub(crate) enum StagedInventoryInput {
     ),
     JavaClick(pumpkin_protocol::java::server::play::SClickSlot),
     JavaCreative(pumpkin_protocol::java::server::play::SSetCreativeSlot),
+    #[cfg(feature = "cluster-e2e")]
+    FeatureCreativeSet {
+        cells: Vec<pumpkin_cluster::inventory::InventoryCell>,
+        token: [u8; 16],
+        submitted: tokio::sync::oneshot::Sender<Option<(pumpkin_cluster::time::TickStamp, pumpkin_cluster::identity::PlayerSeq)>>,
+    },
     SelectHotbar {
         slot: u8,
         origin: u64,
@@ -104,6 +117,10 @@ pub(crate) enum StagedInventoryInput {
         bedrock: bool,
     },
     PickEntity(i32),
+    Combat {
+        target: super::cluster_combat_directory::CombatClientTarget,
+        bedrock: bool,
+    },
     DropHeld {
         whole_stack: bool,
     },
@@ -132,6 +149,13 @@ pub(crate) struct BookPreflight {
 }
 
 enum BookPolicyResult {
+    BedrockInteractionApproved(Box<StagedInventoryInput>),
+    JavaClickApproved(pumpkin_protocol::java::server::play::SClickSlot),
+    RecipeApproved {
+        display_id: i32,
+        use_max: bool,
+        recipes: Arc<Vec<crate::server::recipe::DynamicRecipe>>,
+    },
     Approved {
         pages: Vec<String>,
         title: Option<String>,
@@ -174,6 +198,7 @@ pub(crate) enum StagedItemActionKind {
         hit: pumpkin_cluster::item_action::ClaimedHit,
     },
     UseOnActor {
+        observation: pumpkin_cluster::item_contact::ContactObservation,
         target: pumpkin_cluster::actor::ActorId,
         target_chunk: pumpkin_cluster::protocol::ChunkKey,
         hit: Option<[f32; 3]>,
@@ -210,6 +235,29 @@ pub(crate) fn stage_inventory_input(
     }
 }
 
+#[cfg(feature = "cluster-e2e")]
+pub(crate) fn stage_feature_loadout(
+    player: &crate::entity::player::Player,
+    cells: &[pumpkin_cluster::inventory::InventoryCell],
+    token: [u8; 16],
+) -> Result<tokio::sync::oneshot::Receiver<Option<(pumpkin_cluster::time::TickStamp, pumpkin_cluster::identity::PlayerSeq)>>, InventoryApplyError> {
+    let mut locations = std::collections::BTreeSet::new();
+    if cells.len() != 43 || cells.iter().any(|cell| !locations.insert(cell.loc)) {
+        return Err(InventoryApplyError::Rejected);
+    }
+    let expected = (0..36).map(|slot| InvLoc::new(INV_MAIN, slot))
+        .chain((0..4).map(|slot| InvLoc::new(pumpkin_cluster::inventory::INV_ARMOR, slot)))
+        .chain([InvLoc::new(pumpkin_cluster::inventory::INV_OFFHAND, 0), InvLoc::new(pumpkin_cluster::inventory::INV_CURSOR, 0), InvLoc::new(pumpkin_cluster::inventory::INV_SELECTED, 0)]);
+    if expected.into_iter().any(|loc| !locations.contains(&loc)) {
+        return Err(InventoryApplyError::Rejected);
+    }
+    let (submitted, receipt) = tokio::sync::oneshot::channel();
+    if !stage_inventory_input(player, StagedInventoryInput::FeatureCreativeSet { cells: cells.to_vec(), token, submitted }) {
+        return Err(InventoryApplyError::QueueFull);
+    }
+    Ok(receipt)
+}
+
 pub(crate) fn stage_bedrock_stack_requests(
     player: &crate::entity::player::Player,
     requests: Vec<pumpkin_protocol::bedrock::server::item_stack_request::ItemStackRequest>,
@@ -238,6 +286,14 @@ pub(crate) fn stage_bedrock_transaction(
     player: &crate::entity::player::Player,
     packet: pumpkin_protocol::bedrock::server::SInventoryTransaction,
 ) -> bool {
+    if let pumpkin_protocol::bedrock::server::inventory_transaction::TransactionData::UseItemOnEntity(data)
+        = &packet.transaction_data
+        && data.action_type.0 == 1
+    {
+        let Ok(entity_id) = i32::try_from(data.target_entity_runtime_id.0) else { return false; };
+        let Some(server) = player.world().server.upgrade() else { return false; };
+        return crate::net::java::play::attack::stage_cluster_attack(player, &server, entity_id, true);
+    }
     let request_id = packet.legacy_request_id;
     let rejected_block = match &packet.transaction_data {
         pumpkin_protocol::bedrock::server::inventory_transaction::TransactionData::UseItem(
@@ -266,6 +322,39 @@ pub(crate) fn stage_bedrock_transaction(
     false
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ActiveMiningInput {
+    position: pumpkin_cluster::protocol::BlockPos,
+    face: u8,
+    sequence: pumpkin_cluster::identity::PlayerSeq,
+}
+
+fn process_tracked_mining(
+    server: &Arc<Server>,
+    player: &Arc<crate::entity::player::Player>,
+    tick: pumpkin_cluster::time::TickStamp,
+    input_sequence: pumpkin_cluster::identity::PlayerSeq,
+    effective_frame: Option<(pumpkin_cluster::controller::ControllerFrame, f64)>,
+    position: pumpkin_cluster::protocol::BlockPos,
+    face: u8,
+    kind: pumpkin_cluster::block_action::BlockActionKind,
+    client_sequence: Option<i32>,
+    active: &mut Option<ActiveMiningInput>,
+) -> Result<(), InventoryApplyError> {
+    use pumpkin_cluster::block_action::BlockActionKind;
+    let result = process_mining(server, player, tick, input_sequence, effective_frame,
+        position, face, kind, client_sequence);
+    let survival = player.cluster_gid().is_some_and(|gid| {
+        server.cluster_actor_spatial.load().get(&gid).is_some_and(|actor| {
+            actor.truth.local.game_mode != pumpkin_util::GameMode::Creative as u8
+        })
+    });
+    *active = (result.is_ok() && survival && matches!(kind,
+        BlockActionKind::StartBreak | BlockActionKind::ContinueBreak | BlockActionKind::PredictBreak))
+        .then_some(ActiveMiningInput { position, face, sequence: input_sequence });
+    result
+}
+
 pub(crate) fn drain_inventory_inputs(
     server: &Arc<Server>,
     player: &Arc<crate::entity::player::Player>,
@@ -273,6 +362,7 @@ pub(crate) fn drain_inventory_inputs(
     sequence: &mut u16,
     effective_frame: Option<(pumpkin_cluster::controller::ControllerFrame, f64)>,
     preflight: &mut Option<BookPreflight>,
+    active_mining: &mut Option<ActiveMiningInput>,
 ) {
     if let Some(pending) = preflight.as_mut() {
         if !Arc::ptr_eq(&pending.player, player) {
@@ -286,6 +376,43 @@ pub(crate) fn drain_inventory_inputs(
             resync_inventory_screen(player);
         } else {
             match pending.result.try_recv() {
+                Ok(BookPolicyResult::BedrockInteractionApproved(input)) => {
+                    *preflight = None;
+                    match *input {
+                        StagedInventoryInput::BedrockStackRequests(requests) => crate::net::bedrock::play::item_stack_request::process_cluster_stack_requests(player, requests, tick, sequence),
+                        StagedInventoryInput::BedrockTransaction(packet) => {
+                            if process_bedrock_transaction(player, tick, packet, next_input_sequence(sequence), effective_frame).is_err() { resync_inventory_screen(player); }
+                        }
+                        _ => resync_inventory_screen(player),
+                    }
+                }
+                Ok(BookPolicyResult::JavaClickApproved(packet)) => {
+                    *preflight = None;
+                    if process_java_click(player, packet, tick, next_input_sequence(sequence))
+                        .is_err()
+                    {
+                        resync_inventory_screen(player);
+                    }
+                }
+                Ok(BookPolicyResult::RecipeApproved {
+                    display_id,
+                    use_max,
+                    recipes,
+                }) => {
+                    *preflight = None;
+                    if crate::net::java::play::place_recipe::process_cluster_place_recipe(
+                        player,
+                        tick,
+                        display_id,
+                        use_max,
+                        next_input_sequence(sequence),
+                        recipes,
+                    )
+                    .is_err()
+                    {
+                        resync_inventory_screen(player);
+                    }
+                }
                 Ok(BookPolicyResult::Approved { pages, title }) => {
                     let slot = pending.slot;
                     *preflight = None;
@@ -358,6 +485,53 @@ pub(crate) fn drain_inventory_inputs(
     }
     while let Some(input) = player.cluster_inventory_inputs.pop() {
         match input {
+            StagedInventoryInput::OpenScreen(open) => {
+                let input_sequence = next_input_sequence(sequence);
+                let result = (|| {
+                    let lease = super::cluster_world_owner::player_action_lease(server, player).ok_or(InventoryApplyError::TargetUnavailable)?;
+                    if open.lease != lease || open.screen.session.actor != lease.gid { return Err(InventoryApplyError::Rejected); }
+                    let intent = pumpkin_cluster::inventory::InventoryMutationIntent {
+                        actor: lease.gid.into(), tick, payload: pumpkin_cluster::inventory::InventoryIntentPayload::Gestures(Vec::new()),
+                        actor_chunk: player_chunk(player), screen_session: None, affected: open.screen.affected.clone(),
+                    };
+                    server.cluster_inventory_action_route_tx.load_full().ok_or(InventoryApplyError::TargetUnavailable)?
+                        .try_send(super::cluster_invsee::LocalInventoryAction { lease: Some(lease), open: Some(open), intent, origin: None, input_sequence: Some(input_sequence) })
+                        .map_err(|_| InventoryApplyError::QueueFull)
+                })();
+                if result.is_err() { resync_inventory_screen(player); }
+            }
+            StagedInventoryInput::Mining {
+                position,
+                face,
+                kind,
+                client_sequence,
+            } => {
+                if process_tracked_mining(
+                    server,
+                    player,
+                    tick,
+                    next_input_sequence(sequence),
+                    effective_frame,
+                    position,
+                    face,
+                    kind,
+                    client_sequence,
+                    active_mining,
+                )
+                .is_err()
+                {
+                    if let Some(actor) = player.cluster_gid() {
+                        let _ = publish_block_action_resolution(
+                            server,
+                            actor,
+                            position,
+                            None,
+                            client_sequence,
+                            false,
+                        );
+                    }
+                }
+            }
             StagedInventoryInput::Close { session, token } => {
                 let input_sequence = pumpkin_cluster::identity::PlayerSeq(*sequence);
                 if submit_screen_close(player, tick, session, token, input_sequence).is_err() {
@@ -371,11 +545,53 @@ pub(crate) fn drain_inventory_inputs(
                 }
             }
             StagedInventoryInput::BedrockStackRequests(requests) => {
+                if server.plugin_manager.has_handlers::<crate::plugin::api::events::inventory::inventory_interact::InventoryInteractEvent>() {
+                    *preflight = Some(start_bedrock_inventory_preflight(server, player, StagedInventoryInput::BedrockStackRequests(requests)));
+                    return;
+                }
                 crate::net::bedrock::play::item_stack_request::process_cluster_stack_requests(
                     player, requests, tick, sequence,
                 );
             }
+            StagedInventoryInput::Combat { target, bedrock } => {
+                let sequence = next_input_sequence(sequence);
+                if let Some(lease) = super::cluster_world_owner::player_action_lease(server, player)
+                {
+                    let claim = pumpkin_cluster::combat_action::AttackClaim {
+                        attacker: lease.gid,
+                        target: target.contact.actor(),
+                        target_chunk: target.contact.chunk,
+                        install_generation: player
+                            .cluster_owner_install_generation
+                            .load(Ordering::Acquire),
+                        sequence,
+                        tick,
+                        target_observation: target.contact,
+                        target_kind: target.kind,
+                        target_yaw: target.yaw,
+                        target_on_ground: target.on_ground,
+                        bedrock,
+                    };
+                    if super::cluster_world_owner::submit_action(
+                        server,
+                        pumpkin_cluster::canonical_action::ActionInput::Proposal(
+                            pumpkin_cluster::canonical_action::ActionProposal::combat(claim, lease),
+                        ),
+                    )
+                    .is_err()
+                    {
+                        player
+                            .cluster_inventory_dropped
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
             StagedInventoryInput::BedrockTransaction(packet) => {
+                if matches!(packet.transaction_data, pumpkin_protocol::bedrock::server::inventory_transaction::TransactionData::Normal(_))
+                    && server.plugin_manager.has_handlers::<crate::plugin::api::events::inventory::inventory_interact::InventoryInteractEvent>() {
+                    *preflight = Some(start_bedrock_inventory_preflight(server, player, StagedInventoryInput::BedrockTransaction(packet)));
+                    return;
+                }
                 let origin = bedrock_item_action_origin(packet.legacy_request_id.0);
                 let rejected_block = match &packet.transaction_data {
                     pumpkin_protocol::bedrock::server::inventory_transaction::TransactionData::UseItem(data)
@@ -421,15 +637,31 @@ pub(crate) fn drain_inventory_inputs(
                 }
             }
             StagedInventoryInput::BedrockBlockActions(actions) => {
-                process_bedrock_block_actions(player, tick, sequence, actions);
+                process_bedrock_block_actions(
+                    server,
+                    player,
+                    tick,
+                    sequence,
+                    effective_frame,
+                    actions,
+                    active_mining,
+                );
             }
             StagedInventoryInput::JavaClick(packet) => {
+                if server.plugin_manager.has_handlers::<crate::plugin::api::events::player::inventory_interact::InventoryClickEvent>()
+                    || server.plugin_manager.has_handlers::<crate::plugin::api::events::inventory::inventory_interact::InventoryInteractEvent>() {
+                    match start_java_click_preflight(server, player, packet) {
+                        Ok(pending) => { *preflight = Some(pending); return; }
+                        Err(_) => { resync_inventory_screen(player); continue; }
+                    }
+                }
                 if process_java_click(player, packet, tick, next_input_sequence(sequence)).is_err()
                 {
                     resync_inventory_screen(player);
                 }
             }
             StagedInventoryInput::JavaCreative(packet) => {
+                *active_mining = None;
                 if server
                     .plugin_manager
                     .has_handlers::<crate::plugin::api::events::inventory::inventory_creative::InventoryCreativeEvent>()
@@ -445,6 +677,32 @@ pub(crate) fn drain_inventory_inputs(
                 {
                     resync_inventory_screen(player);
                 }
+            }
+            #[cfg(feature = "cluster-e2e")]
+            StagedInventoryInput::FeatureCreativeSet { cells, token, submitted } => {
+                *active_mining = None;
+                let input_sequence = next_input_sequence(sequence);
+                let result = (|| {
+                    let actor = player.cluster_gid().ok_or(InventoryApplyError::TargetUnavailable)?;
+                    let target = InventoryTarget::Player(actor);
+                    let mut gestures = Vec::with_capacity(cells.len());
+                    for cell in cells {
+                        let destination = InventorySlotRef::new(target, cell.loc);
+                        if cell.loc.inv == pumpkin_cluster::inventory::INV_SELECTED {
+                            let selected = cell.item.checked_sub(1).and_then(|slot| u8::try_from(slot).ok()).filter(|slot| *slot < 9).ok_or(InventoryApplyError::Rejected)?;
+                            gestures.push(pumpkin_cluster::inventory::InventoryGesture::SelectHotbar { slot: destination, selected });
+                        } else {
+                            let destination_limit = if cell.is_empty() { 99 } else {
+                                ItemStack::new(1, pumpkin_data::item::Item::from_id(cell.item).ok_or(InventoryApplyError::Rejected)?).get_max_stack_size()
+                            };
+                            gestures.push(pumpkin_cluster::inventory::InventoryGesture::CreativeSet { destination, stack: cell, destination_limit });
+                        }
+                    }
+                    submit_gestures(player, tick, gestures, Some(u64::from_le_bytes(token[..8].try_into().map_err(|_| InventoryApplyError::Rejected)?)), Some(input_sequence))
+                })();
+                let accepted = result.is_ok();
+                let _ = submitted.send(accepted.then_some((tick, input_sequence)));
+                if !accepted { resync_inventory_screen(player); }
             }
             StagedInventoryInput::DropHeld { whole_stack } => {
                 if process_held_inventory_action(
@@ -539,25 +797,20 @@ pub(crate) fn drain_inventory_inputs(
             StagedInventoryInput::JavaPlaceRecipe {
                 display_id,
                 use_max,
-            } => {
-                if crate::net::java::play::place_recipe::process_cluster_place_recipe(
-                    player,
-                    tick,
-                    display_id,
-                    use_max,
-                    next_input_sequence(sequence),
-                )
-                .is_err()
-                {
-                    resync_inventory_screen(player);
+            } => match start_recipe_preflight(server, player, display_id, use_max) {
+                Ok(pending) => {
+                    *preflight = Some(pending);
+                    return;
                 }
-            }
+                Err(_) => resync_inventory_screen(player),
+            },
             StagedInventoryInput::JavaMenu(input) => {
                 if process_java_menu(player, tick, input, next_input_sequence(sequence)).is_err() {
                     resync_inventory_screen(player);
                 }
             }
             StagedInventoryInput::ItemAction { hand, kind, origin } => {
+                *active_mining = None;
                 let rejected_block = match &kind {
                     StagedItemActionKind::UseOnBlock { block, hit } => Some((*block, hit.face)),
                     _ => None,
@@ -581,6 +834,12 @@ pub(crate) fn drain_inventory_inputs(
                     send_item_action_response(player, origin, false);
                 }
             }
+        }
+    }
+    if let Some(active) = *active_mining {
+        if process_tracked_mining(server, player, tick, active.sequence, effective_frame, active.position,
+            active.face, pumpkin_cluster::block_action::BlockActionKind::ContinueBreak, None, active_mining).is_err() {
+            *active_mining = None;
         }
     }
     drain_pending_screen_close(player, tick, sequence);
@@ -607,24 +866,106 @@ pub(crate) fn stage_bedrock_block_actions(
     staged
 }
 
+pub(crate) fn stage_mining(
+    player: &crate::entity::player::Player,
+    position: pumpkin_cluster::protocol::BlockPos,
+    face: u8,
+    kind: pumpkin_cluster::block_action::BlockActionKind,
+    client_sequence: Option<i32>,
+) -> bool {
+    stage_inventory_input(
+        player,
+        StagedInventoryInput::Mining {
+            position,
+            face,
+            kind,
+            client_sequence,
+        },
+    )
+}
+
+fn process_mining(
+    server: &Arc<Server>,
+    player: &Arc<crate::entity::player::Player>,
+    tick: pumpkin_cluster::time::TickStamp,
+    input_sequence: pumpkin_cluster::identity::PlayerSeq,
+    effective_frame: Option<(pumpkin_cluster::controller::ControllerFrame, f64)>,
+    position: pumpkin_cluster::protocol::BlockPos,
+    face: u8,
+    mut kind: pumpkin_cluster::block_action::BlockActionKind,
+    client_sequence: Option<i32>,
+) -> Result<(), InventoryApplyError> {
+    let (frame, eye_height) = effective_frame.ok_or(InventoryApplyError::TargetUnavailable)?;
+    let lease = super::cluster_world_owner::player_action_lease(server, player)
+        .ok_or(InventoryApplyError::TargetUnavailable)?;
+    if frame.effective.actor != lease.gid
+        || frame.effective.tick != tick
+        || !eye_height.is_finite()
+        || !(0.0..=3.0).contains(&eye_height)
+        || face >= 6
+    {
+        return Err(InventoryApplyError::Rejected);
+    }
+    let spatial = server.cluster_actor_spatial.load();
+    let actor = &spatial
+        .get(&lease.gid)
+        .ok_or(InventoryApplyError::TargetUnavailable)?
+        .truth
+        .local;
+    if kind == pumpkin_cluster::block_action::BlockActionKind::StartBreak
+        && actor.game_mode == pumpkin_util::GameMode::Creative as u8
+    {
+        kind = pumpkin_cluster::block_action::BlockActionKind::CreativeBreak;
+    }
+    let actor_chunk = pumpkin_cluster::world_delta::chunk_of_block(
+        actor.world,
+        frame.effective.position[0].floor() as i32,
+        frame.effective.position[2].floor() as i32,
+    );
+    let intent = pumpkin_cluster::block_action::BlockActionIntent {
+        actor: lease.gid,
+        owner_install_generation: player
+            .cluster_owner_install_generation
+            .load(Ordering::Acquire),
+        tick,
+        actor_chunk,
+        target_chunk: pumpkin_cluster::world_delta::chunk_of_block(
+            actor.world,
+            position.x,
+            position.z,
+        ),
+        position,
+        face,
+        expected_block_state: None,
+        kind,
+        input_sequence: Some(input_sequence),
+        client_sequence,
+    };
+    let proposal = pumpkin_cluster::canonical_action::ActionProposal::block(
+        intent,
+        Some(lease),
+        frame,
+        eye_height,
+    );
+    super::cluster_world_owner::submit_action(
+        server,
+        pumpkin_cluster::canonical_action::ActionInput::Proposal(proposal),
+    )
+    .map_err(|_| InventoryApplyError::QueueFull)
+}
+
 fn process_bedrock_block_actions(
+    server: &Arc<Server>,
     player: &Arc<crate::entity::player::Player>,
     tick: pumpkin_cluster::time::TickStamp,
     sequence: &mut u16,
+    effective_frame: Option<(pumpkin_cluster::controller::ControllerFrame, f64)>,
     actions: Vec<pumpkin_protocol::bedrock::server::player_auth_input::PlayerBlockAction>,
+    active_mining: &mut Option<ActiveMiningInput>,
 ) {
-    use pumpkin_cluster::block_action::{BlockActionIntent, BlockActionKind};
+    use pumpkin_cluster::block_action::BlockActionKind;
     use pumpkin_protocol::bedrock::server::player_action::PlayerActionType;
 
-    let Some(server) = player.world().server.upgrade() else {
-        return;
-    };
-    let Some(actor) = player.cluster_gid() else {
-        return;
-    };
-    let actor_chunk = player_chunk(player);
-    let world = player.world();
-    let world_id = super::cluster_world_delta::world_id(&world);
     for action in actions {
         let kind = match PlayerActionType::try_from(action.action.0) {
             Ok(PlayerActionType::StartDestroyBlock) => BlockActionKind::StartBreak,
@@ -642,28 +983,26 @@ fn process_bedrock_block_actions(
             y: action.block_pos.0.y,
             z: action.block_pos.0.z,
         };
-        let target_chunk =
-            pumpkin_cluster::world_delta::chunk_of_block(world_id, position.x, position.z);
         let Ok(face) = u8::try_from(action.face.0) else {
             continue;
         };
-        let intent = BlockActionIntent {
-            actor: actor.into(),
+        if process_tracked_mining(
+            server,
+            player,
             tick,
-            actor_chunk,
-            target_chunk,
+            next_input_sequence(sequence),
+            effective_frame,
             position,
             face,
-            expected_block_state: None,
             kind,
-            input_sequence: Some(next_input_sequence(sequence)),
-            client_sequence: None,
-        };
-        if super::cluster_block_action::submit_block_action(&server, intent).is_err() {
-            player
-                .cluster_inventory_dropped
-                .fetch_add(1, Ordering::Relaxed);
-            let _ = publish_block_action_resolution(&server, actor, position, None, None, false);
+            None,
+            active_mining,
+        )
+        .is_err()
+        {
+            if let Some(actor) = player.cluster_gid() {
+                let _ = publish_block_action_resolution(server, actor, position, None, None, false);
+            }
         }
     }
 }
@@ -823,37 +1162,25 @@ fn bedrock_item_client_claim(
     })
 }
 
+pub(crate) fn actor_observation_for_entity_id(
+    player: &crate::entity::player::Player,
+    entity_id: i32,
+) -> Option<pumpkin_cluster::item_contact::ContactObservation> {
+    let world = player.world();
+    let server = world.server.upgrade()?;
+    let targets = server.cluster_combat_client_targets.load();
+    let contact = targets.get(&entity_id)?.contact.clone();
+    (contact.valid() && contact.world == super::cluster_world_delta::world_id(&world)
+        && server.cluster_peer_incarnations.load().get(&contact.owner.server) == Some(&contact.owner.generation))
+        .then_some(contact)
+}
+
 pub(crate) fn actor_for_entity_id(
     player: &crate::entity::player::Player,
     entity_id: i32,
-) -> Option<(
-    pumpkin_cluster::actor::ActorId,
-    pumpkin_cluster::protocol::ChunkKey,
-)> {
-    let world = player.world();
-    if let Some(target) = world.get_player_by_id(entity_id)
-        && let Some(gid) = target.cluster_gid()
-    {
-        return Some((
-            pumpkin_cluster::actor::ActorId::Player(gid),
-            player_chunk(&target),
-        ));
-    }
-    let server = world.server.upgrade()?;
-    let actor = super::cluster_entity_emit::actor_for_entity_id(&server, &world, entity_id)?;
-    let pumpkin_cluster::actor::ActorId::Entity(_) = actor else {
-        return None;
-    };
-    let entity = world.get_entity_by_id(entity_id)?;
-    let position = entity.get_entity().pos.load();
-    Some((
-        actor,
-        pumpkin_cluster::world_delta::chunk_of_block(
-            super::cluster_world_delta::world_id(&world),
-            position.x.floor() as i32,
-            position.z.floor() as i32,
-        ),
-    ))
+) -> Option<(pumpkin_cluster::actor::ActorId, pumpkin_cluster::protocol::ChunkKey)> {
+    let contact = actor_observation_for_entity_id(player, entity_id)?;
+    Some((contact.actor(), contact.chunk))
 }
 
 fn process_bedrock_transaction(
@@ -870,8 +1197,7 @@ fn process_bedrock_transaction(
     let origin = bedrock_item_action_origin(packet.legacy_request_id.0);
     match packet.transaction_data {
         TransactionData::Normal(_) => {
-            let mut gestures = Vec::new();
-            let mut conservation = std::collections::HashMap::<(u16, Vec<u8>), i32>::new();
+            let mut changes = Vec::new();
             for action in packet.actions {
                 if InventoryActionSource::from(action.source_type)
                     != InventoryActionSource::Container
@@ -879,7 +1205,7 @@ fn process_bedrock_transaction(
                     return Err(InventoryApplyError::Rejected);
                 }
                 let window_id = action.window_id.ok_or(InventoryApplyError::Rejected)?;
-                let (destination, actual) =
+                let (destination, _) =
                     bedrock_window_slot_state(player, window_id, action.inventory_slot)?;
                 let before_stack = crate::net::bedrock::play::descriptor_to_stack(&action.old_item);
                 let after_stack = crate::net::bedrock::play::descriptor_to_stack(&action.new_item);
@@ -887,32 +1213,24 @@ fn process_bedrock_transaction(
                     destination.loc,
                     &before_stack,
                 )?;
-                if before != actual {
-                    return Err(InventoryApplyError::Rejected);
-                }
                 let after = super::cluster_invsee::inventory_cell_from_item_stack(
                     destination.loc,
                     &after_stack,
                 )?;
-                if !before.is_empty() {
-                    *conservation
-                        .entry((before.item, before.nbt.clone()))
-                        .or_default() += i32::from(before.count);
-                }
-                if !after.is_empty() {
-                    *conservation
-                        .entry((after.item, after.nbt.clone()))
-                        .or_default() -= i32::from(after.count);
-                }
-                gestures.push(pumpkin_cluster::inventory::InventoryGesture::ExactSet {
-                    destination,
+                let limit = if destination.loc.inv == pumpkin_cluster::inventory::INV_ARMOR {
+                    1
+                } else {
+                    99
+                };
+                changes.push(pumpkin_cluster::inventory_claim::ClaimedSlotChange {
+                    slot: destination,
                     before,
                     after,
+                    limit,
                 });
             }
-            if conservation.values().any(|count| *count != 0) {
-                return Err(InventoryApplyError::Rejected);
-            }
+            let gestures = pumpkin_cluster::inventory_claim::decode_slot_changes(&changes)
+                .map_err(|_| InventoryApplyError::Rejected)?;
             submit_gestures(player, tick, gestures, None, Some(input_sequence))
         }
         TransactionData::Mismatch(_) => Err(InventoryApplyError::Rejected),
@@ -971,15 +1289,16 @@ fn process_bedrock_transaction(
             )?;
             let entity_id = i32::try_from(data.target_entity_runtime_id.0)
                 .map_err(|_| InventoryApplyError::Rejected)?;
-            let (target, target_chunk) = actor_for_entity_id(player, entity_id)
+            let observation = actor_observation_for_entity_id(player, entity_id)
                 .ok_or(InventoryApplyError::TargetUnavailable)?;
             submit_staged_item_action(
                 player,
                 tick,
                 0,
                 StagedItemActionKind::UseOnActor {
-                    target,
-                    target_chunk,
+                    target: observation.actor(),
+                    target_chunk: observation.chunk,
+                    observation,
                     hit: Some([
                         data.click_position.x,
                         data.click_position.y,
@@ -1098,6 +1417,10 @@ fn submit_staged_item_action(
         position.x.floor() as i32,
         position.z.floor() as i32,
     );
+    let target_observation = match &kind {
+        StagedItemActionKind::UseOnActor { observation, .. } => Some(observation.clone()),
+        _ => None,
+    };
     let kind = match kind {
         StagedItemActionKind::Use {
             claimed_yaw,
@@ -1132,6 +1455,7 @@ fn submit_staged_item_action(
             target_chunk,
             hit,
             interaction,
+            observation: _,
         } => pumpkin_cluster::item_action::ItemActionKind::UseOnActor {
             target,
             target_chunk,
@@ -1168,9 +1492,13 @@ fn submit_staged_item_action(
             },
         }
         .normalized(),
+        player
+            .cluster_owner_install_generation
+            .load(std::sync::atomic::Ordering::Acquire),
         origin,
         input_sequence,
         effective_frame,
+        target_observation,
     )
 }
 
@@ -1216,6 +1544,20 @@ pub(crate) fn stage_departure_screen_close_any(
             any: true,
         })
         .map_err(|_| InventoryApplyError::QueueFull)
+}
+
+pub(crate) fn stage_inventory_close_retry(
+    player: &crate::entity::player::Player,
+    session: Option<pumpkin_cluster::inventory::InventoryScreenSession>,
+    token: u64,
+) -> Result<(), InventoryApplyError> {
+    if token == 0 || session.is_some_and(|session| player.cluster_gid() != Some(session.actor)) {
+        return Err(InventoryApplyError::Rejected);
+    }
+    match session {
+        Some(session) => stage_screen_close(player, session.session, token, false),
+        None => stage_departure_screen_close_any(player, token),
+    }
 }
 
 fn drain_pending_screen_close(
@@ -1303,9 +1645,11 @@ fn submit_screen_close(
     if let Some(screen) = super::cluster_invsee::inventory_screen_snapshot(
         &server,
         pumpkin_cluster::inventory::InventoryScreenSession { actor, session },
-    ) && screen.slots.iter().any(
-        |slot| matches!(slot.slot.target, InventoryTarget::Virtual { kind, .. } if kind != 0x100),
-    ) {
+    ) && screen
+        .slots
+        .iter()
+        .any(|slot| slot.slot.target.is_screen_virtual())
+    {
         affected.extend(screen.affected);
     }
     affected.sort_unstable();
@@ -1416,6 +1760,203 @@ fn start_book_preflight(
     })
 }
 
+fn start_bedrock_inventory_preflight(
+    server: &Arc<Server>,
+    player: &Arc<crate::entity::player::Player>,
+    input: StagedInventoryInput,
+) -> BookPreflight {
+    let (send, result) = tokio::sync::oneshot::channel();
+    let policy_server = server.clone();
+    let policy_player = player.clone();
+    server.spawn_task(async move {
+        let mut event =
+            crate::plugin::api::events::inventory::inventory_interact::InventoryInteractEvent::new(
+                policy_player,
+            );
+        let decision = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            policy_server
+                .plugin_manager
+                .fire(&policy_server, &mut event),
+        )
+        .await;
+        let approved = if decision.is_err() {
+            BookPolicyResult::TimedOut
+        } else if event.cancelled {
+            BookPolicyResult::Cancelled
+        } else {
+            BookPolicyResult::BedrockInteractionApproved(Box::new(input))
+        };
+        let _ = send.send(approved);
+    });
+    BookPreflight {
+        player: player.clone(),
+        slot: 0,
+        session: player
+            .cluster_current_inventory_session
+            .load(Ordering::Acquire),
+        result,
+    }
+}
+
+fn start_java_click_preflight(
+    server: &Arc<Server>,
+    player: &Arc<crate::entity::player::Player>,
+    packet: pumpkin_protocol::java::server::play::SClickSlot,
+) -> Result<BookPreflight, InventoryApplyError> {
+    use pumpkin_data::screen::WindowType as Window;
+    use pumpkin_inventory::screen_handler::ClickType;
+    use pumpkin_protocol::java::server::play::SlotActionType as Mode;
+    let screen = current_screen_snapshot(player)?;
+    if packet.sync_id.0 != i32::from(screen.sync_id) {
+        return Err(InventoryApplyError::Rejected);
+    }
+    let windows = [
+        Window::Generic9x1,
+        Window::Generic9x2,
+        Window::Generic9x3,
+        Window::Generic9x4,
+        Window::Generic9x5,
+        Window::Generic9x6,
+        Window::Generic3x3,
+        Window::Crafter3x3,
+        Window::Anvil,
+        Window::Beacon,
+        Window::BlastFurnace,
+        Window::BrewingStand,
+        Window::Crafting,
+        Window::Enchantment,
+        Window::Furnace,
+        Window::Grindstone,
+        Window::Hopper,
+        Window::Lectern,
+        Window::Loom,
+        Window::Merchant,
+        Window::ShulkerBox,
+        Window::Smithing,
+        Window::Smoker,
+        Window::CartographyTable,
+        Window::Stonecutter,
+    ];
+    let window = if screen.session.session == 0 {
+        None
+    } else {
+        Some(
+            *windows
+                .get(usize::from(screen.window_kind))
+                .ok_or(InventoryApplyError::Rejected)?,
+        )
+    };
+    let clicked = if packet.slot < 0 {
+        None
+    } else {
+        Some(stack_from_effect(
+            &screen_slot_state(player, packet.slot as usize)?.1,
+        )?)
+    };
+    let cursor = stack_from_effect(&cursor_state(player)?.1)?;
+    let click = match packet.mode {
+        Mode::Pickup => {
+            if packet.button == 0 {
+                ClickType::Left
+            } else {
+                ClickType::Right
+            }
+        }
+        Mode::QuickMove => {
+            if packet.button == 0 {
+                ClickType::ShiftLeft
+            } else {
+                ClickType::ShiftRight
+            }
+        }
+        Mode::Swap => ClickType::NumberKey(packet.button as u8),
+        Mode::Clone => ClickType::Middle,
+        Mode::Throw => {
+            if packet.button == 0 {
+                ClickType::Drop
+            } else {
+                ClickType::ControlDrop
+            }
+        }
+        Mode::QuickCraft => match packet.button {
+            0 | 4 | 8 => ClickType::Left,
+            1 | 5 | 9 => ClickType::Right,
+            _ => ClickType::Middle,
+        },
+        Mode::PickupAll => ClickType::DoubleClick,
+    };
+    let mut event =
+        crate::plugin::api::events::player::inventory_interact::InventoryClickEvent::new(
+            player,
+            window,
+            click,
+            packet.slot,
+            packet.slot,
+            clicked,
+            Some(cursor),
+            if packet.mode == Mode::Swap {
+                i32::from(packet.button)
+            } else {
+                -1
+            },
+        );
+    let (send, result) = tokio::sync::oneshot::channel();
+    let policy_server = server.clone();
+    let policy_player = player.clone();
+    server.spawn_task(async move {
+        let decision = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            policy_server.plugin_manager.fire(&policy_server, &mut event).await;
+            if event.cancelled { return false; }
+            let mut interaction = crate::plugin::api::events::inventory::inventory_interact::InventoryInteractEvent::new(policy_player);
+            policy_server.plugin_manager.fire(&policy_server, &mut interaction).await;
+            !interaction.cancelled
+        }).await;
+        let approved = match decision { Ok(true) => BookPolicyResult::JavaClickApproved(packet), Ok(false) => BookPolicyResult::Cancelled, Err(_) => BookPolicyResult::TimedOut };
+        let _ = send.send(approved);
+    });
+    Ok(BookPreflight {
+        player: player.clone(),
+        slot: 0,
+        session: screen.session.session,
+        result,
+    })
+}
+
+fn start_recipe_preflight(
+    server: &Arc<Server>,
+    player: &Arc<crate::entity::player::Player>,
+    display_id: i32,
+    use_max: bool,
+) -> Result<BookPreflight, InventoryApplyError> {
+    if display_id < 0 {
+        return Err(InventoryApplyError::Rejected);
+    }
+    let recipes = server.recipe_manager.cluster_dynamic_recipes_snapshot();
+    let (send, result) = tokio::sync::oneshot::channel();
+    let policy_server = server.clone();
+    let policy_player = player.clone();
+    server.spawn_task(async move {
+        let mut event = crate::plugin::api::events::player::player_recipe_book_click::PlayerRecipeBookClickEvent::new(
+            policy_player, format!("display_{display_id}"), use_max,
+        );
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), policy_server.plugin_manager.fire(&policy_server, &mut event)).await;
+        let approved = if outcome.is_err() { BookPolicyResult::TimedOut }
+            else if event.cancelled { BookPolicyResult::Cancelled }
+            else { event.recipe_id.strip_prefix("display_").and_then(|value| value.parse::<i32>().ok()).filter(|id| *id >= 0)
+                .map_or(BookPolicyResult::Cancelled, |display_id| BookPolicyResult::RecipeApproved { display_id, use_max: event.make_all, recipes }) };
+        let _ = send.send(approved);
+    });
+    Ok(BookPreflight {
+        player: player.clone(),
+        slot: 0,
+        session: player
+            .cluster_current_inventory_session
+            .load(Ordering::Acquire),
+        result,
+    })
+}
+
 fn start_creative_preflight(
     server: &Arc<Server>,
     player: &Arc<crate::entity::player::Player>,
@@ -1424,9 +1965,7 @@ fn start_creative_preflight(
     if player.gamemode.load() != pumpkin_util::GameMode::Creative {
         return Err(InventoryApplyError::Rejected);
     }
-    let stack = packet
-        .clicked_item
-        .to_stack_for_version(&player.client.java_version());
+    let stack = packet.clicked_item.to_stack();
     if !stack.is_empty() && stack.item_count > stack.get_max_stack_size() {
         return Err(InventoryApplyError::Rejected);
     }
@@ -1577,50 +2116,24 @@ fn process_held_inventory_action(
     drop_whole_stack: Option<bool>,
     input_sequence: pumpkin_cluster::identity::PlayerSeq,
 ) -> Result<(), InventoryApplyError> {
-    use pumpkin_cluster::inventory::{InventoryGesture, InventoryRemovalKind};
-
-    let server = player
-        .world()
-        .server
-        .upgrade()
-        .ok_or(InventoryApplyError::TargetUnavailable)?;
-    let actor = player
-        .cluster_gid()
-        .ok_or(InventoryApplyError::TargetUnavailable)?;
-    let target = InventoryTarget::Player(actor);
-    let snapshot = super::cluster_invsee::inventory_snapshot(&server, target)
-        .ok_or(InventoryApplyError::TargetUnavailable)?;
-    let selected = snapshot
-        .cells
-        .iter()
-        .find(|cell| cell.loc == InvLoc::new(pumpkin_cluster::inventory::INV_SELECTED, 0))
-        .and_then(|cell| cell.item.checked_sub(1))
-        .and_then(|slot| u16::try_from(slot).ok())
-        .filter(|slot| *slot < 9)
-        .ok_or(InventoryApplyError::Rejected)?;
-    let held = InventorySlotRef::new(target, InvLoc::new(INV_MAIN, selected));
-    let gesture = if let Some(whole_stack) = drop_whole_stack {
-        let cell = snapshot
-            .cells
-            .iter()
-            .find(|cell| cell.loc == held.loc)
-            .cloned()
-            .unwrap_or_else(|| pumpkin_cluster::inventory::InventoryCell::empty(held.loc));
-        if cell.is_empty() {
-            return Ok(());
-        }
-        InventoryGesture::Remove {
-            source: held,
-            count: if whole_stack { cell.count } else { 1 },
-            kind: InventoryRemovalKind::Drop,
-        }
-    } else {
-        InventoryGesture::Swap {
-            first: held,
-            second: InventorySlotRef::new(target, InvLoc::new(INV_OFFHAND, 0)),
-            first_limit: 64,
-            second_limit: 64,
-        }
+    use pumpkin_cluster::inventory::{InventoryGesture, InventoryTransferCount};
+    let player_target = InventoryTarget::Player(
+        player
+            .cluster_gid()
+            .ok_or(InventoryApplyError::TargetUnavailable)?,
+    );
+    let gesture = match drop_whole_stack {
+        Some(whole_stack) => InventoryGesture::DropSelectedHand {
+            player: player_target,
+            count: if whole_stack {
+                InventoryTransferCount::All
+            } else {
+                InventoryTransferCount::Exact(1)
+            },
+        },
+        None => InventoryGesture::SwapSelectedHand {
+            player: player_target,
+        },
     };
     submit_gestures(player, tick, vec![gesture], None, Some(input_sequence))
 }
@@ -1931,15 +2444,9 @@ fn process_pick_item(
         return Err(InventoryApplyError::Rejected);
     }
     let selected_loc = InvLoc::new(pumpkin_cluster::inventory::INV_SELECTED, 0);
-    gestures.push(pumpkin_cluster::inventory::InventoryGesture::ExactSet {
-        destination: InventorySlotRef::new(target, selected_loc),
-        before: selected_cell,
-        after: pumpkin_cluster::inventory::InventoryCell {
-            loc: selected_loc,
-            item: u16::from(hotbar) + 1,
-            count: 1,
-            nbt: Vec::new(),
-        },
+    gestures.push(pumpkin_cluster::inventory::InventoryGesture::SelectHotbar {
+        slot: InventorySlotRef::new(target, selected_loc),
+        selected: hotbar,
     });
     submit_gestures(
         player,
@@ -1959,6 +2466,28 @@ pub const fn bedrock_stack_request_origin(request_id: i32) -> u64 {
     BEDROCK_STACK_REQUEST_TAG | request_id as u32 as u64
 }
 
+pub(crate) const fn canonical_inventory_origin(
+    origin: pumpkin_cluster::canonical_action::ClientOrigin,
+) -> Option<u64> {
+    match origin {
+        pumpkin_cluster::canonical_action::ClientOrigin::BedrockStackRequest { id, .. } => {
+            Some(bedrock_stack_request_origin(id))
+        }
+        _ => None,
+    }
+}
+
+pub(crate) const fn canonical_inventory_session(
+    origin: pumpkin_cluster::canonical_action::ClientOrigin,
+) -> Option<u64> {
+    match origin {
+        pumpkin_cluster::canonical_action::ClientOrigin::JavaClick { session, .. }
+        | pumpkin_cluster::canonical_action::ClientOrigin::BedrockStackRequest {
+            session, ..
+        } => Some(session),
+        _ => None,
+    }
+}
 const fn bedrock_stack_request_id(origin: u64) -> Option<i32> {
     if origin & ORIGIN_TAG_MASK == BEDROCK_STACK_REQUEST_TAG {
         Some(origin as u32 as i32)
@@ -1968,7 +2497,27 @@ const fn bedrock_stack_request_id(origin: u64) -> Option<i32> {
 }
 
 const fn java_click_origin(sync_id: i32, revision: i32) -> u64 {
-    JAVA_CLICK_TAG | ((sync_id as u32 as u64) << 16) | (revision as u16 as u64)
+    JAVA_CLICK_TAG | ((sync_id as u16 as u64) << 32) | revision as u32 as u64
+}
+
+pub(crate) fn inventory_client_origin(
+    origin: Option<u64>,
+    session: Option<pumpkin_cluster::inventory::InventoryScreenSession>,
+) -> pumpkin_cluster::canonical_action::ClientOrigin {
+    use pumpkin_cluster::canonical_action::ClientOrigin;
+    match origin {
+        Some(origin) if is_java_click_origin(origin) => ClientOrigin::JavaClick {
+            session: session.map_or((origin >> 32) as u16 as u64, |session| session.session),
+            state_id: origin as u32 as i32,
+        },
+        Some(origin) if bedrock_stack_request_id(origin).is_some() => {
+            ClientOrigin::BedrockStackRequest {
+                id: origin as u32 as i32,
+                session: session.map_or(0, |session| session.session),
+            }
+        }
+        _ => ClientOrigin::None,
+    }
 }
 
 const fn is_java_click_origin(origin: u64) -> bool {
@@ -1978,6 +2527,34 @@ const fn is_java_click_origin(origin: u64) -> bool {
 #[must_use]
 pub(crate) const fn java_item_action_origin(sequence: i32) -> u64 {
     JAVA_ITEM_ACTION_TAG | sequence as u32 as u64
+}
+
+pub(crate) fn item_client_origin(
+    origin: Option<u64>,
+) -> pumpkin_cluster::canonical_action::ClientOrigin {
+    use pumpkin_cluster::canonical_action::ClientOrigin;
+    match origin {
+        Some(value) if value & 0xffff_0000_0000_0000 == JAVA_ITEM_ACTION_TAG => {
+            ClientOrigin::JavaBlockSequence(value as u32 as i32)
+        }
+        Some(value) if value & 0xffff_0000_0000_0000 == BEDROCK_ITEM_ACTION_TAG => {
+            ClientOrigin::BedrockLegacyTransaction(value as u32 as i32)
+        }
+        _ => ClientOrigin::None,
+    }
+}
+
+pub(crate) fn canonical_item_origin(
+    origin: pumpkin_cluster::canonical_action::ClientOrigin,
+) -> Option<u64> {
+    use pumpkin_cluster::canonical_action::ClientOrigin;
+    match origin {
+        ClientOrigin::JavaBlockSequence(sequence) => Some(java_item_action_origin(sequence)),
+        ClientOrigin::BedrockLegacyTransaction(id) => {
+            Some(BEDROCK_ITEM_ACTION_TAG | id as u32 as u64)
+        }
+        _ => None,
+    }
 }
 
 const fn bedrock_item_action_origin(request_id: i32) -> Option<u64> {
@@ -2006,6 +2583,21 @@ pub(crate) fn publish_item_action_origin(
                 Some(hit.face),
             );
         }
+        resync_inventory_screen(&player);
+    }
+    send_item_action_response(&player, origin, accepted);
+}
+
+pub(crate) fn publish_item_origin_only(
+    server: &Server,
+    actor: GlobalPlayerId,
+    origin: Option<u64>,
+    accepted: bool,
+) {
+    let Some(player) = find_player(server, actor) else {
+        return;
+    };
+    if !accepted {
         resync_inventory_screen(&player);
     }
     send_item_action_response(&player, origin, accepted);
@@ -2557,20 +3149,19 @@ fn process_java_click(
         return submit_java_quick_craft(player, &packet, tick, input_sequence);
     }
 
-    let (cursor, cursor_cell, cursor_limit) = cursor_state(player)?;
+    let (cursor, _cursor_cell, cursor_limit) = cursor_state(player)?;
     let mut gestures = Vec::new();
     if packet.slot == -999 {
         if packet.mode != SlotActionType::Pickup || !matches!(packet.button, 0 | 1) {
             return Err(InventoryApplyError::Rejected);
         }
-        let count = if packet.button == 0 {
-            cursor_cell.count
-        } else {
-            1
-        };
-        gestures.push(InventoryGesture::Remove {
+        gestures.push(InventoryGesture::RemoveBy {
             source: cursor,
-            count,
+            count: if packet.button == 0 {
+                pumpkin_cluster::inventory::InventoryTransferCount::All
+            } else {
+                pumpkin_cluster::inventory::InventoryTransferCount::Exact(1)
+            },
             kind: InventoryRemovalKind::Drop,
         });
         return submit_gestures(
@@ -2582,47 +3173,56 @@ fn process_java_click(
         );
     }
     let screen_index = usize::try_from(packet.slot).map_err(|_| InventoryApplyError::Rejected)?;
+    let semantic_result_index = if screen.session.session == 0 { Some(0) } else {
+        use pumpkin_data::screen::WindowType;
+        match screen.window_kind {
+            kind if kind == WindowType::Crafting as u16 => Some(0),
+            kind if kind == WindowType::Merchant as u16 || kind == WindowType::CartographyTable as u16 => Some(2),
+            kind if kind == WindowType::Loom as u16 || kind == WindowType::Smithing as u16 => Some(3),
+            kind if kind == WindowType::Stonecutter as u16 => Some(1),
+            _ => None,
+        }
+    };
+    if semantic_result_index == Some(screen_index) {
+        let (repetitions, companion) = match packet.mode {
+            SlotActionType::Pickup if matches!(packet.button, 0 | 1) => (1, None),
+            SlotActionType::QuickMove if matches!(packet.button, 0 | 1) => {
+                let source = screen.slots.iter().find(|slot| usize::from(slot.screen_slot) == screen_index)
+                    .ok_or(InventoryApplyError::Rejected)?.slot;
+                let mut destinations = screen.slots.iter().filter_map(|slot| {
+                    (slot.slot.loc.inv == INV_MAIN && slot.slot.loc.slot < 36 && slot.limit != 0
+                        && matches!(slot.slot.target, InventoryTarget::Player(gid)
+                            | InventoryTarget::LeasedPlayer { player: gid, .. } if gid == screen.session.actor))
+                        .then_some((slot.slot, slot.limit))
+                }).collect::<Vec<_>>();
+                destinations.sort_unstable_by_key(|(slot, _)| *slot);
+                destinations.dedup_by_key(|(slot, _)| *slot);
+                if destinations.len() != 36 { return Err(InventoryApplyError::Rejected); }
+                (64, Some(vec![InventoryGesture::QuickMove { source, destinations }]))
+            }
+            _ => return Err(InventoryApplyError::Rejected),
+        };
+        return submit_menu_kind_with_companions(
+            player, tick, pumpkin_cluster::inventory::InventoryMenuKind::TakeDisplayedResult { repetitions },
+            companion, Some(java_click_origin(packet.sync_id.0, packet.revision.0)), Some(input_sequence),
+        );
+    }
     if unresolved_result_slot(&screen, screen_index) {
         return Err(InventoryApplyError::Rejected);
     }
-    let (clicked, clicked_cell, clicked_limit) = screen_slot_state(player, screen_index)?;
+    let (clicked, _clicked_cell, clicked_limit) = screen_slot_state(player, screen_index)?;
     match packet.mode {
         SlotActionType::Pickup => {
             if !matches!(packet.button, 0 | 1) {
                 return Err(InventoryApplyError::Rejected);
             }
-            let right = packet.button == 1;
-            if cursor_cell.is_empty() {
-                if clicked_cell.is_empty() {
-                    return Ok(());
-                }
-                gestures.push(InventoryGesture::Transfer {
-                    source: clicked,
-                    destination: cursor,
-                    count: if right {
-                        clicked_cell.count.div_ceil(2)
-                    } else {
-                        clicked_cell.count
-                    },
-                    destination_limit: cursor_limit,
-                });
-            } else if clicked_cell.is_empty()
-                || (clicked_cell.item == cursor_cell.item && clicked_cell.nbt == cursor_cell.nbt)
-            {
-                gestures.push(InventoryGesture::Transfer {
-                    source: cursor,
-                    destination: clicked,
-                    count: if right { 1 } else { cursor_cell.count },
-                    destination_limit: clicked_limit,
-                });
-            } else {
-                gestures.push(InventoryGesture::Swap {
-                    first: clicked,
-                    second: cursor,
-                    first_limit: clicked_limit,
-                    second_limit: cursor_limit,
-                });
-            }
+            gestures.push(InventoryGesture::ExchangeCursor {
+                slot: clicked,
+                cursor,
+                single: packet.button == 1,
+                slot_limit: clicked_limit,
+                cursor_limit,
+            });
         }
         SlotActionType::Swap => {
             let hotbar = match packet.button {
@@ -2656,29 +3256,23 @@ fn process_java_click(
             if !matches!(packet.button, 0 | 1) {
                 return Err(InventoryApplyError::Rejected);
             }
-            gestures.push(InventoryGesture::Remove {
+            gestures.push(InventoryGesture::RemoveBy {
                 source: clicked,
                 count: if packet.button == 0 {
-                    1
+                    pumpkin_cluster::inventory::InventoryTransferCount::Exact(1)
                 } else {
-                    clicked_cell.count
+                    pumpkin_cluster::inventory::InventoryTransferCount::All
                 },
                 kind: InventoryRemovalKind::Drop,
             });
         }
         SlotActionType::Clone => {
-            if player.gamemode.load() != pumpkin_util::GameMode::Creative
-                || clicked_cell.is_empty()
-                || !cursor_cell.is_empty()
-            {
+            if player.gamemode.load() != pumpkin_util::GameMode::Creative {
                 return Err(InventoryApplyError::Rejected);
             }
-            let mut stack = clicked_cell;
-            stack.loc = cursor.loc;
-            stack.count = clicked_limit;
-            gestures.push(InventoryGesture::CreativeSet {
+            gestures.push(InventoryGesture::CreativeClone {
+                source: clicked,
                 destination: cursor,
-                stack,
                 destination_limit: cursor_limit,
             });
         }
@@ -2702,9 +3296,6 @@ fn process_java_click(
             });
         }
         SlotActionType::PickupAll => {
-            if cursor_cell.is_empty() {
-                return Err(InventoryApplyError::Rejected);
-            }
             let (slot_count, _, _) = screen_slot_count(player);
             let mut sources = Vec::with_capacity(slot_count);
             for index in 0..slot_count {
@@ -2741,9 +3332,7 @@ fn process_java_creative(
     if player.gamemode.load() != pumpkin_util::GameMode::Creative {
         return Err(InventoryApplyError::Rejected);
     }
-    let stack = packet
-        .clicked_item
-        .to_stack_for_version(&player.client.java_version());
+    let stack = packet.clicked_item.to_stack();
     process_java_creative_stack(player, packet.slot, stack, tick, input_sequence)
 }
 
@@ -2911,8 +3500,8 @@ pub(crate) fn publish_cluster_screen_close(
             client.try_enqueue_packet(data);
         }
         crate::net::ClientPlatform::Bedrock(client) => {
-            let container_type = bedrock_window_type(window_kind)
-                .ok_or(InventoryApplyError::Rejected)?;
+            let container_type =
+                bedrock_window_type(window_kind).ok_or(InventoryApplyError::Rejected)?;
             let data = client
                 .serialize_packet(&SContainerClose {
                     container_id: sync_id,
@@ -2946,8 +3535,12 @@ pub(crate) fn publish_cluster_screen_open(
         .map(ItemStackSerializer::from)
         .collect::<Vec<_>>();
     let cursor = ItemStackSerializer::from(stack_from_effect(&screen.cursor)?);
-    let java_content =
-        CSetContainerContent::new(VarInt(screen.sync_id.into()), VarInt(0), &stacks, &cursor);
+    let java_content = CSetContainerContent::new(
+        VarInt(screen.sync_id.into()),
+        VarInt(screen.state_id),
+        &stacks,
+        &cursor,
+    );
     match player.client.as_ref() {
         crate::net::ClientPlatform::Java(client) => {
             let open = client
@@ -3019,6 +3612,43 @@ pub(crate) fn publish_session_zero_content(
         pumpkin_cluster::inventory::InventoryScreenSession { actor, session: 0 },
     )
     .ok_or(InventoryApplyError::TargetUnavailable)?;
+    publish_frozen_session_zero_content(player, &screen)
+}
+
+pub(crate) fn publish_bedrock_initial_inventory(server: &Server, player: &crate::entity::player::Player) -> bool {
+    let Some(packets) = prepare_initial_inventory(server, player) else { return false; };
+    for packet in packets { player.client.try_enqueue_packet(packet); }
+    !player.client.closed()
+}
+
+pub(crate) fn prepare_initial_inventory(server: &Server, player: &crate::entity::player::Player) -> Option<Vec<bytes::Bytes>> {
+    let lease = super::cluster_world_owner::player_action_lease(server, player)?;
+    let generation = player.cluster_owner_install_generation.load(Ordering::Acquire);
+    if !server.cluster_controller.installed_for_handoff(lease, generation) { return None; }
+    let screen = super::cluster_invsee::inventory_screen_snapshot(server,
+        pumpkin_cluster::inventory::InventoryScreenSession { actor: lease.gid, session: 0 })?;
+    if screen.slots.iter().any(|slot| matches!(slot.slot.target,
+        InventoryTarget::LeasedPlayer { player: gid, key, incarnation }
+        if gid != lease.gid || key != lease.key.0 || incarnation != lease.incarnation)) {
+        return None;
+    }
+    prepare_frozen_session_zero_content(player, &screen).ok()
+}
+
+fn publish_frozen_session_zero_content(
+    player: &crate::entity::player::Player,
+    screen: &pumpkin_cluster::inventory::InventoryScreenSnapshot,
+) -> Result<(), InventoryApplyError> {
+    let packets = prepare_frozen_session_zero_content(player, screen)?;
+    for packet in packets { player.client.try_enqueue_packet(packet); }
+    if player.client.closed() { return Err(InventoryApplyError::TargetUnavailable); }
+    Ok(())
+}
+
+fn prepare_frozen_session_zero_content(
+    player: &crate::entity::player::Player,
+    screen: &pumpkin_cluster::inventory::InventoryScreenSnapshot,
+) -> Result<Vec<bytes::Bytes>, InventoryApplyError> {
     let mut stacks = vec![
         ItemStackSerializer::from(ItemStack::EMPTY.clone());
         screen
@@ -3034,13 +3664,14 @@ pub(crate) fn publish_session_zero_content(
             ItemStackSerializer::from(stack_from_effect(&slot.cell)?);
     }
     let cursor = ItemStackSerializer::from(stack_from_effect(&screen.cursor)?);
-    let java_content = CSetContainerContent::new(VarInt(0), VarInt(0), &stacks, &cursor);
+    let java_content =
+        CSetContainerContent::new(VarInt(0), VarInt(screen.state_id), &stacks, &cursor);
     match player.client.as_ref() {
         crate::net::ClientPlatform::Java(client) => {
             let data = client
                 .serialize_packet(&java_content)
                 .map_err(|_| InventoryApplyError::Rejected)?;
-            client.try_enqueue_packet(data);
+            return Ok(vec![data]);
         }
         crate::net::ClientPlatform::Bedrock(client) => {
             use pumpkin_protocol::bedrock::client::inventory_content::CInventoryContent;
@@ -3066,10 +3697,32 @@ pub(crate) fn publish_session_zero_content(
             let data = client
                 .serialize_packet(&packet)
                 .map_err(|_| InventoryApplyError::Rejected)?;
-            client.try_enqueue_packet(data);
+            let mut packets = vec![data];
+            for (container_id, container_name, indices) in [
+                (120, ContainerName::Armor, vec![5, 6, 7, 8]),
+                (119, ContainerName::Offhand, vec![45]),
+            ] {
+                let packet = CInventoryContent {
+                    container_id: VarUInt(container_id),
+                    slots: indices.into_iter().map(|index| stacks.get(index)
+                        .map(|stack| NetworkItemStackDescriptor::from(&*stack.0))
+                        .ok_or(InventoryApplyError::Rejected)).collect::<Result<Vec<_>, _>>()?,
+                    full_container_name: FullContainerName { container_name, dynamic_id: None },
+                    storage_item: NetworkItemStackDescriptor::default(),
+                };
+                packets.push(client.serialize_packet(&packet).map_err(|_| InventoryApplyError::Rejected)?);
+            }
+            let cursor_stack = stack_from_effect(&screen.cursor)?;
+            let cursor_packet = CInventoryContent {
+                container_id: VarUInt(59),
+                slots: vec![NetworkItemStackDescriptor::from(&cursor_stack)],
+                full_container_name: FullContainerName { container_name: ContainerName::Cursor, dynamic_id: None },
+                storage_item: NetworkItemStackDescriptor::default(),
+            };
+            packets.push(client.serialize_packet(&cursor_packet).map_err(|_| InventoryApplyError::Rejected)?);
+            return Ok(packets);
         }
     }
-    Ok(())
 }
 
 pub(crate) fn resync_inventory_screen(player: &crate::entity::player::Player) {
@@ -3187,6 +3840,38 @@ pub(crate) fn publish_inventory_screen_deltas(
     Ok(())
 }
 
+pub(crate) fn publish_authoritative_inventory_correction(
+    server: &Server,
+    actor: GlobalPlayerId,
+    session: Option<u64>,
+    targets: &[InventoryTarget],
+) -> Result<(), InventoryApplyError> {
+    let player = find_player(server, actor).ok_or(InventoryApplyError::TargetUnavailable)?;
+    let current = player
+        .cluster_current_inventory_session
+        .load(Ordering::Acquire);
+    if session.is_some_and(|session| session != current) {
+        return Ok(());
+    }
+    let screen = super::cluster_invsee::inventory_screen_snapshot(
+        server,
+        InventoryScreenSession {
+            actor,
+            session: current,
+        },
+    )
+    .ok_or(InventoryApplyError::TargetUnavailable)?;
+    for slot in &screen.slots {
+        if targets.contains(&slot.slot.target) {
+            send_inventory_screen_slot(&player, &screen, slot)?;
+        }
+    }
+    if targets.contains(&InventoryTarget::Player(actor)) {
+        send_inventory_cursor(&player, &screen.cursor)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn publish_inventory_menu_effects(
     server: &Server,
     resolution: &InventoryResolution,
@@ -3283,7 +3968,7 @@ fn merchant_offers(
         .collect()
 }
 
-fn send_trade_presentation(
+pub(super) fn send_trade_presentation(
     server: &Server,
     player: &crate::entity::player::Player,
     sync_id: u8,
@@ -3302,9 +3987,9 @@ fn send_trade_presentation(
             presentation.regular_villager,
             presentation.can_restock,
         );
-        if let Ok(data) = client.serialize_packet(&packet) {
-            client.try_enqueue_packet(data);
-        }
+        let data = client.serialize_packet(&packet).map_err(|_| InventoryApplyError::Rejected)?;
+        client.try_enqueue_packet(data);
+        if client.is_closed() { return Err(InventoryApplyError::TargetUnavailable); }
         return Ok(());
     }
     send_bedrock_trade_presentation(server, player, sync_id, presentation, offers)
@@ -3443,7 +4128,7 @@ fn send_inventory_screen_slot(
             let serializer = ItemStackSerializer::from(stack);
             let packet = CSetContainerSlot::new(
                 screen.sync_id as i8,
-                0,
+                screen.state_id,
                 slot.screen_slot as i16,
                 &serializer,
             );
@@ -3451,6 +4136,9 @@ fn send_inventory_screen_slot(
                 .serialize_packet(&packet)
                 .map_err(|_| InventoryApplyError::Rejected)?;
             client.try_enqueue_packet(data);
+            if client.is_closed() {
+                return Err(InventoryApplyError::TargetUnavailable);
+            }
         }
         crate::net::ClientPlatform::Bedrock(client) => {
             use pumpkin_protocol::bedrock::client::inventory_slot::CInventorySlot;
@@ -3475,6 +4163,9 @@ fn send_inventory_screen_slot(
                 .serialize_packet(&packet)
                 .map_err(|_| InventoryApplyError::Rejected)?;
             client.try_enqueue_packet(data);
+            if client.is_closed() {
+                return Err(InventoryApplyError::TargetUnavailable);
+            }
         }
     }
     Ok(())
@@ -3492,6 +4183,9 @@ fn send_inventory_cursor(
                 .serialize_packet(&CSetCursorItem::new(&serializer))
                 .map_err(|_| InventoryApplyError::Rejected)?;
             client.try_enqueue_packet(data);
+            if client.is_closed() {
+                return Err(InventoryApplyError::TargetUnavailable);
+            }
         }
         crate::net::ClientPlatform::Bedrock(client) => {
             use pumpkin_protocol::bedrock::client::inventory_content::CInventoryContent;
@@ -3513,6 +4207,9 @@ fn send_inventory_cursor(
                 .serialize_packet(&packet)
                 .map_err(|_| InventoryApplyError::Rejected)?;
             client.try_enqueue_packet(data);
+            if client.is_closed() {
+                return Err(InventoryApplyError::TargetUnavailable);
+            }
         }
     }
     Ok(())
@@ -3648,10 +4345,20 @@ pub(crate) fn publish_inventory_origin(server: &Server, publication: &InventoryP
     let Some(client) = player.client.bedrock() else {
         return;
     };
-    let containers = bedrock_response_containers(server, &player, publication);
+    let stale_session = publication.session.is_some_and(|session| {
+        player
+            .cluster_current_inventory_session
+            .load(Ordering::Acquire)
+            != session
+    });
+    let containers = if stale_session {
+        Vec::new()
+    } else {
+        bedrock_response_containers(server, &player, publication)
+    };
     client.try_enqueue_client_packet(&CItemStackResponse {
         responses: vec![ItemStackResponseInfo {
-            result: u8::from(publication.resolution.result.is_err()),
+            result: u8::from(stale_session || publication.resolution.result.is_err()),
             client_request_id: VarInt(request_id),
             containers,
         }],

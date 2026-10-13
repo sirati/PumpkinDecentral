@@ -97,6 +97,7 @@ impl BlockMetadata for CarvedPumpkinBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for CarvedPumpkinBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut props = WallTorchLikeProperties::default(args.block);

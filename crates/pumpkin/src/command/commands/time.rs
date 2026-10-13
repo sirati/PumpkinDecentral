@@ -71,11 +71,15 @@ impl CommandExecutor for QueryExecutor {
         };
 
         let world = context.source.world();
-        let level_time = world
-            .level_time
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let level_time = if context.server().advanced_config.cluster.enabled {
+            world.cluster_environment_view.load().time.clone()
+        } else {
+            world
+                .level_time
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        };
 
         match self.mode {
             QueryMode::GameTime => {
@@ -148,6 +152,47 @@ impl CommandExecutor for ActionExecutor {
 
         let world = context.source.world();
         let server = context.server();
+
+        if server.advanced_config.cluster.enabled {
+            use crate::server::cluster_environment::TimeMutation;
+            let (mutation, result) = match self.action {
+                Action::Set(preset) => {
+                    let value = if let Some(preset) = preset {
+                        preset.to_ticks()
+                    } else {
+                        TimeArgumentType::get(context, "time")?
+                    };
+                    (TimeMutation::Set(value.into()), value)
+                }
+                Action::Add => {
+                    let value = TimeArgumentType::get(context, "time")?;
+                    (
+                        TimeMutation::Add(value.into()),
+                        wrap_time(
+                            world
+                                .cluster_environment_view
+                                .load()
+                                .time
+                                .time_of_day
+                                .saturating_add(value.into()),
+                        ),
+                    )
+                }
+                Action::Pause => (TimeMutation::Pause(true), 1),
+                Action::Resume => (TimeMutation::Pause(false), 1),
+                Action::Rate => (
+                    TimeMutation::Rate(FloatArgumentType::get(context, "rate")?),
+                    1,
+                ),
+            };
+            if !server.cluster_environment.time(world, mutation) {
+                return Err(crate::server::cluster_admin_apply::admin_busy_error());
+            }
+            context
+                .source
+                .send_feedback(TextComponent::text("World time change queued."), false);
+            return Ok(result);
+        }
 
         match self.action {
             Action::Set(preset) => {

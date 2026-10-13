@@ -21,6 +21,7 @@ impl ItemMetadata for BowItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for BowItem {
     fn normal_use(&self, _item: &Item, player: &Player) {
         // Check if player has arrows (or is in creative mode)

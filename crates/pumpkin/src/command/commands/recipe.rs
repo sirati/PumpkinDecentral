@@ -24,7 +24,7 @@ const PERMISSION: &str = "minecraft:command.recipe";
 static ERROR_RECIPE_NOT_FOUND: CommandErrorType<1> =
     CommandErrorType::new(translation::java::RECIPE_NOTFOUND, "Unknown recipe: %s");
 
-fn get_recipe_id(recipe: &DynamicRecipe) -> String {
+pub(crate) fn get_recipe_id(recipe: &DynamicRecipe) -> String {
     match recipe {
         DynamicRecipe::Crafting(crafting) => match crafting {
             pumpkin_protocol::codec::recipe::OwnedCraftingRecipe::Shaped {
@@ -59,7 +59,15 @@ impl SuggestionProvider for RecipeSuggestionProvider {
         mut builder: SuggestionsBuilder,
     ) -> SuggestionProviderResult {
         if let Some(server) = &context.source.server {
-            let recipes = server.recipe_manager.get_dynamic_recipes_internal();
+            let recipes = if server.advanced_config.cluster.enabled {
+                server
+                    .recipe_manager
+                    .cluster_dynamic_recipes_snapshot()
+                    .as_ref()
+                    .clone()
+            } else {
+                server.recipe_manager.get_dynamic_recipes_internal()
+            };
             for recipe in recipes {
                 let id = get_recipe_id(&recipe);
                 builder = builder.suggest(id);
@@ -69,12 +77,84 @@ impl SuggestionProvider for RecipeSuggestionProvider {
     }
 }
 
+fn queue_cluster_recipes(
+    context: &CommandContext,
+    all: bool,
+    granted: bool,
+) -> Option<CommandExecutorResult> {
+    let server = context
+        .source
+        .server
+        .as_ref()
+        .filter(|server| server.advanced_config.cluster.enabled)?;
+    let requested = if all {
+        "*".to_owned()
+    } else {
+        match context.get_argument::<Identifier>("recipe") {
+            Ok(id) => id.to_string(),
+            Err(error) => return Some(Err(error)),
+        }
+    };
+    let definitions = server.recipe_manager.cluster_dynamic_recipes_snapshot();
+    let ids = crate::server::cluster_advancements::recipe_displays(&definitions)
+        .into_keys()
+        .filter(|id| {
+            requested == "*"
+                || *id == requested
+                || id.strip_prefix("minecraft:") == Some(requested.as_str())
+        })
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Some(Err(
+            ERROR_RECIPE_NOT_FOUND.create_without_context(TextComponent::text(requested))
+        ));
+    }
+    let targets = match EntityArgumentType::get_entities(context, "targets") {
+        Ok(targets) => targets,
+        Err(error) => return Some(Err(error)),
+    };
+    let mut queued = 0;
+    for entity in targets {
+        let Some(target @ pumpkin_cluster::player_command_control::CommandTarget::Player { .. }) =
+            crate::server::cluster_player_commands::entity_target(server, entity.as_ref())
+        else {
+            continue;
+        };
+        for batch in ids.chunks(16) {
+            match crate::server::cluster_player_commands::submit_target(
+                server,
+                &context.source,
+                target.clone(),
+                pumpkin_cluster::player_command_control::PlayerCommandMutation::Recipes {
+                    ids: batch.to_vec(),
+                    granted,
+                },
+                Some(TextComponent::text("Recipe change applied")),
+            ) {
+                Ok(_) => queued += 1,
+                Err(error) => context.source.send_error(TextComponent::text(format!(
+                    "Recipe change could not be queued: {error:?}"
+                ))),
+            }
+        }
+    }
+    if queued != 0 {
+        context
+            .source
+            .send_feedback(TextComponent::text("Recipe change queued"), false);
+    }
+    Some(Ok(queued))
+}
+
 struct RecipeGiveExecutor {
     all: bool,
 }
 
 impl CommandExecutor for RecipeGiveExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
+        if let Some(result) = queue_cluster_recipes(context, self.all, true) {
+            return result;
+        }
         let targets = EntityArgumentType::get_players(context, "targets")?;
         let recipe_str = if self.all {
             "*".to_string()
@@ -146,6 +226,9 @@ struct RecipeTakeExecutor {
 
 impl CommandExecutor for RecipeTakeExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
+        if let Some(result) = queue_cluster_recipes(context, self.all, false) {
+            return result;
+        }
         let targets = EntityArgumentType::get_players(context, "targets")?;
         let recipe_str = if self.all {
             "*".to_string()

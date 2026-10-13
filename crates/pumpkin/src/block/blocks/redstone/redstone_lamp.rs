@@ -12,7 +12,17 @@ type RedstoneLampProperties = pumpkin_data::block_properties::RedstoneOreLikePro
 #[pumpkin_block("minecraft:redstone_lamp")]
 pub struct RedstoneLamp;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for RedstoneLamp {
+    fn placement_intent(
+        &self,
+        args: crate::block::PlacementIntentArgs<'_>,
+    ) -> Option<BlockStateId> {
+        let mut properties = RedstoneLampProperties::default(args.block);
+        properties.lit = args.world.receives_redstone_power(args.position);
+        Some(properties.to_state_id(args.block))
+    }
+
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut props = RedstoneLampProperties::default(args.block);
         props.lit = block_receives_redstone_power(args.world, args.position);
@@ -20,47 +30,70 @@ impl BlockBehaviour for RedstoneLamp {
     }
 
     fn on_neighbor_update(&self, args: OnNeighborUpdateArgs<'_>) {
-        {
-            let state = args.world.get_block_state(args.position);
-            let mut props = RedstoneLampProperties::from_state_id(state.id);
-            let is_lit = props.lit;
-            let is_receiving_power = block_receives_redstone_power(args.world, args.position);
-
-            if is_lit != is_receiving_power {
-                if is_lit {
-                    args.world.schedule_block_tick(
-                        args.block,
-                        *args.position,
-                        4,
-                        TickPriority::Normal,
-                    );
-                } else {
-                    props.lit = !props.lit;
-                    args.world.set_block_state(
-                        args.position,
-                        props.to_state_id(args.block),
-                        BlockFlags::NOTIFY_LISTENERS,
-                    );
-                }
-            }
-        }
+        crate::block::neighbor::apply_legacy_neighbor_intent(self, args);
     }
 
     fn on_scheduled_tick(&self, args: OnScheduledTickArgs<'_>) {
-        let state = args.world.get_block_state(args.position);
-        let props = RedstoneLampProperties::from_state_id(state.id);
-        let is_lit = props.lit;
-        let is_receiving_power = block_receives_redstone_power(args.world, args.position);
+        crate::block::neighbor::apply_legacy_scheduled_intent(self, args);
+    }
 
-        if is_lit && !is_receiving_power {
-            let block = args.world.get_block(args.position);
-            let mut props = RedstoneLampProperties::from_state_id(state.id);
-            props.lit = !props.lit;
-            args.world.set_block_state(
-                args.position,
-                props.to_state_id(block),
-                BlockFlags::NOTIFY_LISTENERS,
-            );
+    fn scheduled_tick_intent(
+        &self,
+        args: crate::block::ScheduledTickIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        use crate::block::neighbor::BlockCallbackEffect;
+        let state = args.world.get_block_state_id(args.position);
+        let mut props = RedstoneLampProperties::from_state_id(state);
+        if props.lit && !args.world.receives_redstone_power(args.position) {
+            props.lit = false;
+            Some(vec![BlockCallbackEffect::SetBlock {
+                position: *args.position,
+                state: props.to_state_id(args.block),
+                flags: BlockFlags::NOTIFY_LISTENERS,
+            }])
+        } else {
+            Some(Vec::new())
+        }
+    }
+
+    fn callback_intent(
+        &self,
+        args: crate::block::neighbor::BlockCallbackIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        use crate::block::neighbor::{BlockCallbackEffect, BlockCallbackEvent};
+        match args.event {
+            BlockCallbackEvent::Scheduled => {
+                self.scheduled_tick_intent(crate::block::ScheduledTickIntentArgs {
+                    world: args.world,
+                    block: args.block,
+                    position: args.position,
+                })
+            }
+            BlockCallbackEvent::Neighbor { .. } => {
+                let state = args.world.get_block_state_id(args.position);
+                let mut props = RedstoneLampProperties::from_state_id(state);
+                let powered = args.world.receives_redstone_power(args.position);
+                Some(if props.lit == powered {
+                    Vec::new()
+                } else if props.lit {
+                    vec![BlockCallbackEffect::ScheduleBlock {
+                        position: *args.position,
+                        block: args.block.id,
+                        delay: 4,
+                        priority: TickPriority::Normal,
+                    }]
+                } else {
+                    props.lit = true;
+                    vec![BlockCallbackEffect::SetBlock {
+                        position: *args.position,
+                        state: props.to_state_id(args.block),
+                        flags: BlockFlags::NOTIFY_LISTENERS,
+                    }]
+                })
+            }
+            BlockCallbackEvent::StateReplaced { .. }
+            | BlockCallbackEvent::Placed { .. }
+            | BlockCallbackEvent::Prepare { .. } => Some(Vec::new()),
         }
     }
 }

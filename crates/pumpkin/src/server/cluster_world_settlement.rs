@@ -460,6 +460,9 @@ fn action_dependencies(batch: &TickBatch) -> BTreeMap<SettlementId, BTreeSet<Chu
     let mut result = BTreeMap::new();
     for entry in TickFinish::from_batch(batch).chunks {
         for action in entry.actions {
+            if action.family & 0x80 != 0 {
+                continue;
+            }
             result
                 .entry(SettlementId {
                     tick: batch.tick,
@@ -489,19 +492,7 @@ fn primary_loads(
     directory: &pumpkin_cluster::chunks::Directory,
     primaries: &BTreeSet<ServerId>,
 ) -> HashMap<ServerId, u64> {
-    let mut loads = primaries
-        .iter()
-        .copied()
-        .map(|peer| (peer, 0_u64))
-        .collect::<HashMap<_, _>>();
-    for holders in directory.holders.values() {
-        for holder in holders {
-            if let Some(load) = loads.get_mut(&ServerId(*holder)) {
-                *load = load.saturating_add(1);
-            }
-        }
-    }
-    loads
+    primaries.iter().copied().map(|peer| (peer, directory.held_chunk_count(peer.0) as u64)).collect()
 }
 
 fn world_for(server: &Server, chunk: ChunkKey) -> Option<Arc<crate::world::World>> {
@@ -525,6 +516,37 @@ mod tests {
     use pumpkin_cluster::completion::ActionKey;
 
     #[test]
+    fn canonical_block_action_does_not_open_a_legacy_settlement() {
+        use pumpkin_cluster::canonical_action::{Action, ClientOrigin};
+        use pumpkin_cluster::identity::{GlobalPlayerId, PlayerSeq, PlayerSlot};
+        use pumpkin_cluster::protocol::{BlockPos, BreakBlockUpdate, ChunkKey, WorldId};
+        use pumpkin_cluster::time::TickStamp;
+
+        let world = WorldId::new(0, 0);
+        let actor_chunk = ChunkKey::new(world, 0, 0);
+        let block_chunk = ChunkKey::new(world, 1, 0);
+        let break_update = BreakBlockUpdate {
+            gid: GlobalPlayerId::new(ServerId(1), PlayerSlot(1)),
+            seq: PlayerSeq(7),
+            tick: TickStamp(21),
+            pos: BlockPos { x: 16, y: 64, z: 0 },
+            expected_old_state: 1,
+            actor_chunk,
+            chunk: block_chunk,
+        };
+        let mut batch = TickBatch::new(break_update.tick);
+        batch
+            .canonical_actions
+            .push(Action::from_break(&break_update, 1, 0, ClientOrigin::None));
+        assert!(action_dependencies(&batch).is_empty());
+
+        batch.break_block.push(break_update);
+        let dependencies = action_dependencies(&batch);
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies.values().next().unwrap().len(), 2);
+    }
+
+    #[test]
     fn settlement_publication_survives_outbound_backpressure() {
         let (sender, mut receiver) = mpsc::channel(1);
         let (drop_request, mut drops) = mpsc::channel(1);
@@ -539,6 +561,7 @@ mod tests {
         let id = SettlementId {
             tick: pumpkin_cluster::time::TickStamp(17),
             action: ActionKey {
+                incarnation: 0,
                 actor: pumpkin_cluster::actor::ActorId::Peer(ServerId(1)),
                 sequence: 4,
                 family: 6,

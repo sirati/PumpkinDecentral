@@ -107,6 +107,7 @@ impl WallMountedBlock for BellBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for BellBlock {
     fn can_place_at(&self, args: CanPlaceAtArgs<'_>) -> bool {
         if let Some(direction) = args.direction

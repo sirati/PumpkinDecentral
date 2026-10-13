@@ -13,6 +13,7 @@ impl ItemMetadata for BundleItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for BundleItem {
     fn normal_use(&self, _item: &Item, player: &Player) {
         let mut held_item = player.inventory.held_item();

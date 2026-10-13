@@ -61,6 +61,11 @@ struct GetExecutor {
 impl CommandExecutor for GetExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let target = EntityArgumentType::get_entity(context, ARG_TARGET)?;
+        if let Some(server) = context.source.server.as_ref().filter(|server| server.advanced_config.cluster.enabled) {
+            let attribute = AttributeArgumentType::get(context, ARG_ATTRIBUTE)?;
+            let scale = if self.has_scale { DoubleArgumentType::get(context, ARG_SCALE)? } else { 1.0 };
+            return cluster_query(context, server, target.as_ref(), &attribute, self.is_base, None, scale);
+        }
         let living = target
             .get_living_entity()
             .ok_or_else(|| FAILED_ENTITY_ERROR.create_without_context(target.get_name()))?;
@@ -129,6 +134,12 @@ struct BaseSetExecutor;
 impl CommandExecutor for BaseSetExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let target = EntityArgumentType::get_entity(context, ARG_TARGET)?;
+        if let Some(server) = context.source.server.as_ref().filter(|server| server.advanced_config.cluster.enabled) {
+            let attribute = AttributeArgumentType::get(context, ARG_ATTRIBUTE)?;
+            let value = DoubleArgumentType::get(context, ARG_VALUE)?;
+            return cluster_mutate(context, server, target.as_ref(), pumpkin_cluster::player_command_control::AttributeMutation::SetBase {
+                attribute: u16::from(attribute.id), value: value.to_bits() });
+        }
         let living = target
             .get_living_entity()
             .ok_or_else(|| FAILED_ENTITY_ERROR.create_without_context(target.get_name()))?;
@@ -176,6 +187,11 @@ struct BaseResetExecutor;
 impl CommandExecutor for BaseResetExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let target = EntityArgumentType::get_entity(context, ARG_TARGET)?;
+        if let Some(server) = context.source.server.as_ref().filter(|server| server.advanced_config.cluster.enabled) {
+            let attribute = AttributeArgumentType::get(context, ARG_ATTRIBUTE)?;
+            return cluster_mutate(context, server, target.as_ref(), pumpkin_cluster::player_command_control::AttributeMutation::SetBase {
+                attribute: u16::from(attribute.id), value: attribute.default_value.to_bits() });
+        }
         let living = target
             .get_living_entity()
             .ok_or_else(|| FAILED_ENTITY_ERROR.create_without_context(target.get_name()))?;
@@ -225,6 +241,19 @@ struct ModifierAddExecutor {
 impl CommandExecutor for ModifierAddExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let target = EntityArgumentType::get_entity(context, ARG_TARGET)?;
+        if let Some(server) = context.source.server.as_ref().filter(|server| server.advanced_config.cluster.enabled) {
+            let attribute = AttributeArgumentType::get(context, ARG_ATTRIBUTE)?;
+            let id = UuidArgumentType::get(context, ARG_UUID)?.to_string();
+            let _name = StringArgumentType::get(context, ARG_NAME)?;
+            let amount = DoubleArgumentType::get(context, ARG_VALUE)?.to_bits();
+            let operation = match self.operation {
+                ModifierOperation::Add => pumpkin_cluster::combat_action::CombatModifierOperation::Add,
+                ModifierOperation::MultiplyBase => pumpkin_cluster::combat_action::CombatModifierOperation::MultiplyBase,
+                ModifierOperation::MultiplyTotal => pumpkin_cluster::combat_action::CombatModifierOperation::MultiplyTotal,
+            };
+            return cluster_mutate(context, server, target.as_ref(), pumpkin_cluster::player_command_control::AttributeMutation::AddModifier(
+                pumpkin_cluster::combat_action::CombatAttributeModifier { attribute: u16::from(attribute.id), slot: 0, id, amount, operation }));
+        }
         let living = target
             .get_living_entity()
             .ok_or_else(|| FAILED_ENTITY_ERROR.create_without_context(target.get_name()))?;
@@ -293,6 +322,12 @@ struct ModifierRemoveExecutor;
 impl CommandExecutor for ModifierRemoveExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let target = EntityArgumentType::get_entity(context, ARG_TARGET)?;
+        if let Some(server) = context.source.server.as_ref().filter(|server| server.advanced_config.cluster.enabled) {
+            let attribute = AttributeArgumentType::get(context, ARG_ATTRIBUTE)?;
+            let id = UuidArgumentType::get(context, ARG_UUID)?.to_string();
+            return cluster_mutate(context, server, target.as_ref(), pumpkin_cluster::player_command_control::AttributeMutation::RemoveModifier {
+                attribute: u16::from(attribute.id), id });
+        }
         let living = target
             .get_living_entity()
             .ok_or_else(|| FAILED_ENTITY_ERROR.create_without_context(target.get_name()))?;
@@ -359,6 +394,11 @@ struct ModifierGetExecutor;
 impl CommandExecutor for ModifierGetExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let target = EntityArgumentType::get_entity(context, ARG_TARGET)?;
+        if let Some(server) = context.source.server.as_ref().filter(|server| server.advanced_config.cluster.enabled) {
+            let attribute = AttributeArgumentType::get(context, ARG_ATTRIBUTE)?;
+            let id = UuidArgumentType::get(context, ARG_UUID)?.to_string();
+            return cluster_query(context, server, target.as_ref(), &attribute, false, Some(&id), 1.0);
+        }
         let living = target
             .get_living_entity()
             .ok_or_else(|| FAILED_ENTITY_ERROR.create_without_context(target.get_name()))?;
@@ -499,4 +539,38 @@ pub fn register(dispatcher: &mut CommandDispatcher, registry: &PermissionRegistr
             ),
         ),
     );
+}
+
+fn cluster_query(context: &CommandContext, server: &crate::server::Server,
+    target: &dyn crate::entity::EntityBase, attribute: &Attributes, base_only: bool,
+    modifier: Option<&str>, scale: f64,
+) -> CommandExecutorResult {
+    let Some(state) = crate::server::cluster_attribute_commands::living(server, target) else {
+        context.source.send_error(TextComponent::text("Attribute target has no accepted living state")); return Ok(0);
+    };
+    let id = u16::from(attribute.id);
+    let Some(base) = state.combat.effective_attributes.get(&id).copied().map(f64::from_bits) else {
+        context.source.send_error(TextComponent::text("Target does not have that attribute")); return Ok(0);
+    };
+    let value = if let Some(modifier) = modifier {
+        let Some(value) = state.attribute_modifiers(id).into_iter().find(|value| value.attribute == id && value.id == modifier) else {
+            context.source.send_error(TextComponent::text("Target does not have that modifier")); return Ok(0);
+        };
+        f64::from_bits(value.amount)
+    } else if base_only { base } else { state.attribute(id, base) };
+    context.source.send_feedback(TextComponent::text(value.to_string()), false);
+    Ok((value * scale) as i32)
+}
+
+fn cluster_mutate(context: &CommandContext, server: &crate::server::Server,
+    target: &dyn crate::entity::EntityBase, mutation: pumpkin_cluster::player_command_control::AttributeMutation,
+) -> CommandExecutorResult {
+    let Some(target) = crate::server::cluster_player_commands::entity_target(server, target) else {
+        context.source.send_error(TextComponent::text("Attribute target has no current canonical identity")); return Ok(0);
+    };
+    match crate::server::cluster_player_commands::submit_target(server, &context.source, target,
+        pumpkin_cluster::player_command_control::PlayerCommandMutation::Attribute(mutation), Some(TextComponent::text("Attribute change applied"))) {
+        Ok(_) => Ok(1),
+        Err(error) => { context.source.send_error(TextComponent::text(format!("Attribute change could not be queued: {error:?}"))); Ok(0) }
+    }
 }

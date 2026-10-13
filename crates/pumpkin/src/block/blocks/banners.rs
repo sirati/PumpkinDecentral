@@ -15,6 +15,7 @@ use std::sync::Arc;
 #[pumpkin_block_from_tag("minecraft:banners")]
 pub struct BannerBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for BannerBlock {
     fn placed(&self, args: PlacedArgs<'_>) {
         {

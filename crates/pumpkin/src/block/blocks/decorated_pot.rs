@@ -17,6 +17,7 @@ use crate::block::{
 #[pumpkin_block("minecraft:decorated_pot")]
 pub struct DecoratedPotBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for DecoratedPotBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut props = DecoratedPotLikeProperties::from_state_id(args.block.default_state.id);

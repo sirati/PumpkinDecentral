@@ -317,7 +317,11 @@ impl NetherPortal {
         None
     }
 
-    pub fn get_on_axis(world: &World, pos: &BlockPos, axis: HorizontalAxis) -> Option<Self> {
+    pub fn get_on_axis(
+        world: &dyn pumpkin_world::world::BlockAccessor,
+        pos: &BlockPos,
+        axis: HorizontalAxis,
+    ) -> Option<Self> {
         let (block, state) = world.get_block_and_state(pos);
         if block == &Block::NETHER_PORTAL {
             let props = NetherPortalLikeProperties::from_state_id(state.id);
@@ -355,7 +359,7 @@ impl NetherPortal {
     }
 
     fn get_lower_cornor(
-        world: &World,
+        world: &dyn pumpkin_world::world::BlockAccessor,
         direction: BlockDirection,
         pos: &BlockPos,
         axis: HorizontalAxis,
@@ -378,7 +382,7 @@ impl NetherPortal {
     }
 
     fn get_width(
-        world: &World,
+        world: &dyn pumpkin_world::world::BlockAccessor,
         original_lower_corner: &BlockPos,
         negative_dir: BlockDirection,
         axis: HorizontalAxis,
@@ -402,7 +406,7 @@ impl NetherPortal {
     }
 
     fn get_height(
-        world: &World,
+        world: &dyn pumpkin_world::world::BlockAccessor,
         lower_corner: &BlockPos,
         negative_dir: BlockDirection,
         width: u32,
@@ -426,7 +430,7 @@ impl NetherPortal {
     }
 
     fn get_potential_height(
-        world: &World,
+        world: &dyn pumpkin_world::world::BlockAccessor,
         lower_corner: &BlockPos,
         negative_dir: BlockDirection,
         width: u32,
@@ -465,7 +469,7 @@ impl NetherPortal {
     }
 
     fn is_horizontal_frame_valid(
-        world: &World,
+        world: &dyn pumpkin_world::world::BlockAccessor,
         lower_corner: &BlockPos,
         dir: BlockDirection,
         width: u32,
@@ -548,9 +552,7 @@ impl NetherPortal {
         }
 
         let worldborder = world
-            .worldborder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .border_for_command();
 
         let mut best: Option<(PortalSearchResult, f64, i32)> = None;
 
@@ -617,9 +619,7 @@ impl NetherPortal {
         let min_y = world.min_y;
         let max_y = min_y + world.dimension.height - 1;
         let worldborder = world
-            .worldborder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .border_for_command();
 
         let top_y_limit = if world.dimension.has_ceiling {
             (min_y + world.dimension.logical_height - 1).min(max_y)

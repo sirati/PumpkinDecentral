@@ -1,6 +1,6 @@
 use crate::block::{
     BlockBehaviour, CanPlaceAtArgs, GetStateForNeighborUpdateArgs, OnPlaceArgs,
-    OnScheduledTickArgs, PathComputationType,
+    OnScheduledTickArgs, PathComputationType, ScheduledTickIntentArgs,
 };
 use pumpkin_data::{Block, BlockDirection, BlockState, BlockStateId};
 use pumpkin_macros::pumpkin_block;
@@ -12,14 +12,41 @@ use pumpkin_world::world::BlockFlags;
 #[pumpkin_block("minecraft:dirt_path")]
 pub struct DirtPathBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for DirtPathBlock {
+    fn callback_intent(
+        &self,
+        args: crate::block::neighbor::BlockCallbackIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        use crate::block::neighbor::BlockCallbackEvent;
+        match args.event {
+            BlockCallbackEvent::Scheduled => self.scheduled_tick_intent(ScheduledTickIntentArgs {
+                world: args.world,
+                block: args.block,
+                position: args.position,
+            }),
+            // These legacy hooks are the BlockBehaviour no-op defaults.
+            BlockCallbackEvent::StateReplaced { .. }
+            | BlockCallbackEvent::Placed { .. }
+            | BlockCallbackEvent::Prepare { .. }
+            | BlockCallbackEvent::Neighbor { .. } => Some(Vec::new()),
+        }
+    }
     fn on_scheduled_tick(&self, args: OnScheduledTickArgs<'_>) {
-        // TODO: push up entities
-        args.world.set_block_state(
-            args.position,
-            Block::DIRT.default_state.id,
-            BlockFlags::NOTIFY_ALL,
-        );
+        crate::block::neighbor::apply_legacy_scheduled_intent(self, args);
+    }
+
+    fn scheduled_tick_intent(
+        &self,
+        args: ScheduledTickIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        Some(vec![
+            crate::block::neighbor::BlockCallbackEffect::SetBlock {
+                position: *args.position,
+                state: Block::DIRT.default_state.id,
+                flags: BlockFlags::NOTIFY_ALL,
+            },
+        ])
     }
 
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {

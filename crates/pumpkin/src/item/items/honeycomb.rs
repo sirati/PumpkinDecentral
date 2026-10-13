@@ -26,6 +26,7 @@ impl ItemMetadata for HoneyCombItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for HoneyCombItem {
     fn use_on_block(
         &self,

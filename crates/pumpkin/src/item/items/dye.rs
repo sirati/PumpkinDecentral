@@ -24,6 +24,7 @@ impl ItemMetadata for DyeItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for DyeItem {
     fn use_on_entity(&self, item: &mut ItemStack, player: &Player, entity: Arc<dyn EntityBase>) {
         if let Some(sheep) = entity
@@ -44,6 +45,10 @@ impl ItemBehaviour for DyeItem {
             );
             item.decrement_unless_creative(player.gamemode.load(), 1);
         }
+    }
+
+    fn can_mine_intent(&self, game_mode: u8) -> Option<bool> {
+        Some(game_mode != GameMode::Creative as u8)
     }
 
     fn can_mine(&self, player: &Player) -> bool {

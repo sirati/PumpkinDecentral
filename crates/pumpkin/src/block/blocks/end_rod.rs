@@ -6,6 +6,7 @@ use pumpkin_macros::pumpkin_block;
 #[pumpkin_block("minecraft:end_rod")]
 pub struct EndRodBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for EndRodBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut props = EndRodLikeProperties::default(args.block);

@@ -26,7 +26,156 @@ type RepeaterProperties = pumpkin_data::block_properties::RepeaterLikeProperties
 #[pumpkin_block("minecraft:repeater")]
 pub struct RepeaterBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for RepeaterBlock {
+    fn placement_intent(
+        &self,
+        args: crate::block::PlacementIntentArgs<'_>,
+    ) -> Option<BlockStateId> {
+        if !RedstoneGateBlock::can_place_at(self, args.world, *args.position) {
+            return None;
+        }
+        let mut properties = RepeaterProperties::default(args.block);
+        properties.facing = args.facing.opposite();
+        let state = properties.to_state_id(args.block);
+        properties.locked = self.is_locked(args.world, *args.position, state, args.block);
+        Some(properties.to_state_id(args.block))
+    }
+
+    fn scheduled_tick_intent(
+        &self,
+        args: crate::block::ScheduledTickIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        use crate::block::neighbor::BlockCallbackEffect;
+        let state = args.world.get_block_state(args.position);
+        if state.id.to_block() != args.block
+            || self.is_locked(args.world, *args.position, state.id, args.block)
+        {
+            return Some(Vec::new());
+        }
+        let mut properties = RepeaterProperties::from_state_id(state.id);
+        let powered = Self::input_power(args.world, *args.position, state.id)? > 0;
+        if properties.powered && powered {
+            return Some(Vec::new());
+        }
+        properties.powered = !properties.powered;
+        let changed = properties.to_state_id(args.block);
+        let mut effects = vec![BlockCallbackEffect::SetBlock {
+            position: *args.position,
+            state: changed,
+            flags: BlockFlags::NOTIFY_LISTENERS,
+        }];
+        if properties.powered && !powered {
+            effects.push(BlockCallbackEffect::ScheduleBlock {
+                position: *args.position,
+                block: args.block.id,
+                delay: properties.delay * 2,
+                priority: TickPriority::VeryHigh,
+            });
+        }
+        effects.extend(Self::target_effects(*args.position, changed, args.block)?);
+        Some(effects)
+    }
+
+    fn callback_intent(
+        &self,
+        args: crate::block::neighbor::BlockCallbackIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        use crate::block::neighbor::{BlockCallbackEffect, BlockCallbackEvent};
+        match args.event {
+            BlockCallbackEvent::Scheduled => {
+                self.scheduled_tick_intent(crate::block::ScheduledTickIntentArgs {
+                    world: args.world,
+                    block: args.block,
+                    position: args.position,
+                })
+            }
+            BlockCallbackEvent::StateReplaced { old_state, moved } => {
+                if moved || args.world.get_block(args.position) == args.block {
+                    Some(Vec::new())
+                } else {
+                    Self::target_effects(*args.position, old_state, args.block)
+                }
+            }
+            BlockCallbackEvent::Placed { .. } => Self::target_effects(
+                *args.position,
+                args.world.get_block_state_id(args.position),
+                args.block,
+            ),
+            BlockCallbackEvent::Prepare { .. } => Some(Vec::new()),
+            BlockCallbackEvent::Neighbor { .. } => {
+                let state = args.world.get_block_state(args.position);
+                if state.id.to_block() != args.block {
+                    return Some(Vec::new());
+                }
+                if !RedstoneGateBlock::can_place_at(self, args.world, *args.position) {
+                    return Some(vec![BlockCallbackEffect::BreakBlock {
+                        position: *args.position,
+                        flags: BlockFlags::NOTIFY_ALL,
+                    }]);
+                }
+                if self.is_locked(args.world, *args.position, state.id, args.block) {
+                    return Some(Vec::new());
+                }
+                let properties = RepeaterProperties::from_state_id(state.id);
+                let powered = Self::input_power(args.world, *args.position, state.id)? > 0;
+                if properties.powered == powered
+                    || args
+                        .world
+                        .is_block_tick_scheduled(args.position, args.block)
+                {
+                    return Some(Vec::new());
+                }
+                let priority = if RedstoneGateBlock::is_target_not_aligned(
+                    self,
+                    args.world,
+                    *args.position,
+                    state,
+                    args.block,
+                ) {
+                    TickPriority::ExtremelyHigh
+                } else if properties.powered {
+                    TickPriority::VeryHigh
+                } else {
+                    TickPriority::High
+                };
+                Some(vec![BlockCallbackEffect::ScheduleBlock {
+                    position: *args.position,
+                    block: args.block.id,
+                    delay: properties.delay * 2,
+                    priority,
+                }])
+            }
+        }
+    }
+
+    fn normal_use_intent(
+        &self,
+        args: crate::block::NormalUseIntentArgs<'_>,
+    ) -> Option<(
+        BlockActionResult,
+        Vec<crate::block::neighbor::BlockCallbackEffect>,
+    )> {
+        if !args.can_modify_world {
+            return Some((BlockActionResult::Pass, Vec::new()));
+        }
+        let state = args.world.get_block_state_id(args.position);
+        let mut properties = RepeaterProperties::from_state_id(state);
+        properties.delay = if properties.delay == 4 {
+            1
+        } else {
+            properties.delay + 1
+        };
+        Some((
+            BlockActionResult::Success,
+            vec![crate::block::neighbor::BlockCallbackEffect::SetBlock {
+                position: *args.position,
+                state: properties.to_state_id(args.block),
+                flags: BlockFlags::NOTIFY_ALL,
+            }],
+        ))
+    }
+
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let state_id = RedstoneGateBlock::on_place(self, args.player, args.block);
 
@@ -179,7 +328,11 @@ impl RedstoneGateBlockProperties for RepeaterProperties {
 }
 
 impl RedstoneGateBlock<RepeaterProperties> for RepeaterBlock {
-    fn get_output_level(&self, _world: &World, _pos: BlockPos) -> u8 {
+    fn get_output_level(
+        &self,
+        _world: &dyn crate::block::RedstonePowerWorld,
+        _pos: BlockPos,
+    ) -> u8 {
         15
     }
 
@@ -217,6 +370,57 @@ impl RedstoneGateBlock<RepeaterProperties> for RepeaterBlock {
 }
 
 impl RepeaterBlock {
+    fn input_power(
+        world: &dyn crate::block::NeighborUpdateWorld,
+        position: BlockPos,
+        state: BlockStateId,
+    ) -> Option<u8> {
+        let facing = RepeaterProperties::from_state_id(state)
+            .facing
+            .to_block_direction();
+        let offset = facing.to_offset();
+        let source = BlockPos::new(
+            position.0.x.checked_add(offset.x)?,
+            position.0.y.checked_add(offset.y)?,
+            position.0.z.checked_add(offset.z)?,
+        );
+        let state = world.get_block_state(&source);
+        let power = world.get_directional_power(&source, facing);
+        Some(if state.id.to_block() == &Block::REDSTONE_WIRE {
+            power.max(
+                pumpkin_data::block_properties::RedstoneWireLikeProperties::from_state_id(state.id)
+                    .power,
+            )
+        } else {
+            power
+        })
+    }
+
+    fn target_effects(
+        position: BlockPos,
+        state: BlockStateId,
+        block: &Block,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        use crate::block::neighbor::BlockCallbackEffect;
+        let facing = RepeaterProperties::from_state_id(state).facing;
+        let offset = facing.opposite().to_block_direction().to_offset();
+        let front = BlockPos::new(
+            position.0.x.checked_add(offset.x)?,
+            position.0.y.checked_add(offset.y)?,
+            position.0.z.checked_add(offset.z)?,
+        );
+        Some(vec![
+            BlockCallbackEffect::NotifyNeighbor {
+                position: front,
+                source: block.id,
+            },
+            BlockCallbackEffect::NotifyNeighbors {
+                position: front,
+                except: Some(facing.to_block_direction()),
+            },
+        ])
+    }
+
     fn on_use(props: RepeaterProperties, world: &Arc<World>, block_pos: BlockPos, block: &Block) {
         let mut props = props;
         props.delay = if props.delay == 4 { 1 } else { props.delay + 1 };
@@ -226,7 +430,7 @@ impl RepeaterBlock {
 
     fn is_locked(
         &self,
-        world: &World,
+        world: &dyn crate::block::NeighborUpdateWorld,
         pos: BlockPos,
         state_id: BlockStateId,
         block: &Block,

@@ -17,7 +17,6 @@ use pumpkin_cluster::visual::drain_visual_bank;
 use tokio::sync::mpsc;
 
 use super::Server;
-use crate::net::java::JavaClient;
 
 const ORDER_SEED: u64 = 0;
 
@@ -128,14 +127,10 @@ fn staged_tick_batch(tick: TickStamp) -> Option<TickBatch> {
     let visual = drain_visual_bank();
     let transient = drain_transient_bank();
     let combat = drain_ordered_combat(ORDER_SEED, tick);
-    let break_block = JavaClient::drain_break_outbox();
-    let place_block = JavaClient::drain_place_outbox();
     let player_chunk_transition = PLAYER_CHUNK_TRANSITIONS.with_borrow_mut(core::mem::take);
     if visual.is_empty()
         && transient.is_empty()
         && combat.is_empty()
-        && break_block.is_empty()
-        && place_block.is_empty()
         && player_chunk_transition.is_empty()
     {
         return None;
@@ -146,12 +141,11 @@ fn staged_tick_batch(tick: TickStamp) -> Option<TickBatch> {
     batch.hit_player.extend(combat.hit_player);
     batch.hit_entity.extend(combat.hit_entity);
     batch.fire.extend(combat.fire);
-    batch.break_block = break_block;
-    batch.place_block = place_block;
     batch.player_chunk_transition = player_chunk_transition
         .into_iter()
         .map(|mut transition| {
             transition.tick = tick;
+            transition.snapshot.movement.tick = tick;
             transition
         })
         .collect();
@@ -212,6 +206,34 @@ fn route_family(
             route_player_updates!(break_anim);
         }
         StreamKind::PlayerWorld => {
+            for action in &batch.canonical_actions {
+                let ActorId::Player(gid) = action.id.actor else {
+                    continue;
+                };
+                let mut peers = action
+                    .stakeholders
+                    .iter()
+                    .filter_map(|stakeholder| match stakeholder {
+                        pumpkin_cluster::canonical_action::Stakeholder::Chunk(chunk) => {
+                            Some(*chunk)
+                        }
+                        pumpkin_cluster::canonical_action::Stakeholder::Player(player) => action
+                            .player_chunks
+                            .iter()
+                            .find_map(|(key, chunk)| (key == player).then_some(*chunk)),
+                    })
+                    .flat_map(&chunk_targets)
+                    .collect::<Vec<_>>();
+                peers.sort_unstable();
+                peers.dedup();
+                for peer in peers {
+                    routed
+                        .entry((peer, Some(gid)))
+                        .or_insert_with(|| TickBatch::new(batch.tick))
+                        .canonical_actions
+                        .push(action.clone());
+                }
+            }
             for update in &batch.break_block {
                 let mut peers = chunk_targets(update.actor_chunk);
                 peers.extend(chunk_targets(update.chunk));
@@ -294,6 +316,34 @@ fn route_family(
             }
         }
         StreamKind::EntityWorld => {
+            for action in &batch.canonical_actions {
+                if matches!(action.id.actor, ActorId::Player(_)) {
+                    continue;
+                }
+                let mut peers = action
+                    .stakeholders
+                    .iter()
+                    .filter_map(|stakeholder| match stakeholder {
+                        pumpkin_cluster::canonical_action::Stakeholder::Chunk(chunk) => {
+                            Some(*chunk)
+                        }
+                        pumpkin_cluster::canonical_action::Stakeholder::Player(player) => action
+                            .player_chunks
+                            .iter()
+                            .find_map(|(key, chunk)| (key == player).then_some(*chunk)),
+                    })
+                    .flat_map(&chunk_targets)
+                    .collect::<Vec<_>>();
+                peers.sort_unstable();
+                peers.dedup();
+                for peer in peers {
+                    routed
+                        .entry((peer, None))
+                        .or_insert_with(|| TickBatch::new(batch.tick))
+                        .canonical_actions
+                        .push(action.clone());
+                }
+            }
             for update in &batch.entity_chunk_transition {
                 let mut peers = chunk_targets(update.from);
                 peers.extend(chunk_targets(update.to));
@@ -487,6 +537,97 @@ mod tests {
 
     fn gid(server: u16, player: u16) -> pumpkin_cluster::identity::GlobalPlayerId {
         pumpkin_cluster::identity::GlobalPlayerId::new(ServerId(server), PlayerSlot(player))
+    }
+
+    #[test]
+    fn peer_world_action_reaches_each_affected_chunk_holder_once() {
+        use pumpkin_cluster::canonical_action::{
+            Action, ActionClass, ActionId, ActionKind, ChunkPart, ClientOrigin, Condition, Effect,
+            Expected, Stakeholder, Target, UndoProcedure, Value,
+        };
+
+        let tick = TickStamp(9);
+        let mut batch = TickBatch::new(tick);
+        let targets = [
+            Target::Chunk {
+                key: chunk(0, 0),
+                part: ChunkPart::Block(pumpkin_cluster::protocol::BlockPos { x: 0, y: 80, z: 0 }),
+                inventory: None,
+            },
+            Target::Chunk {
+                key: chunk(1, 0),
+                part: ChunkPart::Block(pumpkin_cluster::protocol::BlockPos { x: 16, y: 80, z: 0 }),
+                inventory: None,
+            },
+        ];
+        batch.canonical_actions.push(Action {
+            edit_authority: None,
+            id: ActionId {
+                actor: ActorId::Peer(ServerId(1)),
+                incarnation: 7,
+                sequence: 3,
+                family: 6,
+            },
+            tick,
+            class: ActionClass::Undoable,
+            chunk_transition: false,
+            actor_chunk: None,
+            player_leases: Vec::new(),
+            player_chunks: Vec::new(),
+            stakeholders: vec![
+                Stakeholder::Chunk(chunk(0, 0)),
+                Stakeholder::Chunk(chunk(1, 0)),
+            ],
+            dependencies: Vec::new(),
+            conditions: targets
+                .iter()
+                .map(|target| Condition {
+                    target: *target,
+                    expected: Expected::BlockState(0),
+                })
+                .collect(),
+            effects: targets
+                .iter()
+                .map(|target| Effect::Put {
+                    target: *target,
+                    value: Value::Block(1),
+                })
+                .collect(),
+            counterfactual_conditions: Vec::new(),
+            counterfactual_effects: Vec::new(),
+            semantic_intent: None,
+            factual_result: None,
+            undo: vec![UndoProcedure::RestoreWrittenTargets],
+            kind: ActionKind::World,
+            client_origin: ClientOrigin::None,
+            presentation: Vec::new(),
+        });
+        let routed = route_family(
+            &batch,
+            StreamKind::EntityWorld,
+            |_| Vec::new(),
+            |key| {
+                if key.x() == 0 { vec![2, 3] } else { vec![3, 4] }
+            },
+        );
+        assert_eq!(
+            routed.iter().map(|(peer, _, _)| peer.0).collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        assert!(routed.iter().all(|(_, actor, batch)| {
+            actor.is_none()
+                && batch.canonical_actions.len() == 1
+                && batch.canonical_actions[0].stakeholders.len() == 2
+        }));
+        assert!(
+            route_family(
+                &batch,
+                StreamKind::PlayerWorld,
+                |_| Vec::new(),
+                |_| vec![2, 3, 4]
+            )
+            .is_empty()
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ use crate::block::{
 #[pumpkin_block("minecraft:light")]
 pub struct LightBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for LightBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut props = if let BlockIsReplacing::Itself(state_id) = args.replacing {

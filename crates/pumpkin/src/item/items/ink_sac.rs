@@ -16,6 +16,7 @@ impl ItemMetadata for InkSacItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for InkSacItem {
     fn as_any(&self) -> &dyn std::any::Any {
         self

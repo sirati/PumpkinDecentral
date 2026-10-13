@@ -43,6 +43,7 @@ impl ScaffoldingBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for ScaffoldingBlock {
     fn can_place_at(&self, args: CanPlaceAtArgs<'_>) -> bool {
         Self::get_distance(args.block_accessor, args.position) < 7

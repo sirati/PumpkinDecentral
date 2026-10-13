@@ -23,6 +23,7 @@ impl ItemMetadata for GlassBottleItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for GlassBottleItem {
     fn normal_use(&self, _item: &Item, player: &Player) {
         let world = player.world();

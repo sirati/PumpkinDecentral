@@ -10,6 +10,7 @@ use pumpkin_world::world::BlockAccessor;
 #[pumpkin_block("minecraft:cactus_flower")]
 pub struct CactusFlowerBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for CactusFlowerBlock {
     fn can_place_at(&self, args: CanPlaceAtArgs<'_>) -> bool {
         <Self as PlantBlockBase>::can_place_at(self, args.block_accessor, args.position)

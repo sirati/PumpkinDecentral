@@ -57,17 +57,46 @@ const ERROR_SAME_DAMAGE_AMOUNT: CommandErrorType<0> = CommandErrorType::new(
     translation::java::COMMANDS_WORLDBORDER_DAMAGE_AMOUNT_FAILED,
 );
 
+fn ensure_border_source(source: &CommandSource) -> Result<(), CommandSyntaxError> {
+    let server = source.server();
+    if server.advanced_config.cluster.enabled {
+        let world = source.world();
+        let environment = world.cluster_environment_view.load();
+        if environment.snapshot.as_ref().is_none_or(|snapshot| {
+            Some(snapshot.issuer) != crate::server::cluster_world_rules::primary(server)
+        }) {
+            return Err(crate::server::cluster_admin_apply::admin_busy_error());
+        }
+    }
+    Ok(())
+}
+
+fn queue_border(
+    source: &CommandSource,
+    mutation: pumpkin_cluster::world_time::BorderMutation,
+) -> Result<bool, CommandSyntaxError> {
+    let server = source.server();
+    if !server.advanced_config.cluster.enabled {
+        return Ok(false);
+    }
+    if !server.cluster_environment.time(
+        source.world(),
+        pumpkin_cluster::world_time::EnvironmentMutation::Border(mutation),
+    ) {
+        return Err(crate::server::cluster_admin_apply::admin_busy_error());
+    }
+    Ok(true)
+}
+
 fn set_size(
     source: &CommandSource,
     distance: f64,
     time_in_ticks: i64,
 ) -> Result<i32, CommandSyntaxError> {
+    ensure_border_source(source)?;
     let world = source.world().clone();
     let (current, diff) = {
-        let mut border = world
-            .worldborder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut border = world.border_for_command();
         let current = border.new_diameter;
 
         if (current - distance).abs() < f64::EPSILON {
@@ -80,9 +109,14 @@ fn set_size(
             return Err(ERROR_TOO_BIG.create_without_context());
         }
 
-        let speed = (time_in_ticks > 0).then(|| time_in_ticks * 50); // ticks to milliseconds
+        let speed = (time_in_ticks > 0).then(|| time_in_ticks.saturating_mul(50)); // ticks to milliseconds
 
-        border.set_diameter(&world, distance, speed);
+        if !queue_border(
+            source,
+            pumpkin_cluster::world_time::BorderMutation::Diameter(distance, speed),
+        )? {
+            border.set_diameter(&world, distance, speed);
+        }
         (current, (distance - current) as i32)
     };
 
@@ -129,11 +163,9 @@ fn set_size(
 }
 
 fn set_center(source: &CommandSource, center: Vector2<f64>) -> Result<i32, CommandSyntaxError> {
+    ensure_border_source(source)?;
     let world = source.world().clone();
-    let mut border = world
-        .worldborder
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut border = world.border_for_command();
 
     if (border.center_x - center.x).abs() < f64::EPSILON
         && (border.center_z - center.y).abs() < f64::EPSILON
@@ -145,7 +177,12 @@ fn set_center(source: &CommandSource, center: Vector2<f64>) -> Result<i32, Comma
         return Err(ERROR_TOO_FAR_OUT.create_without_context());
     }
 
-    border.set_center(&world, center.x, center.y);
+    if !queue_border(
+        source,
+        pumpkin_cluster::world_time::BorderMutation::Center(center.x, center.y),
+    )? {
+        border.set_center(&world, center.x, center.y);
+    }
 
     source.send_feedback(
         TextComponent::translate_cross(
@@ -162,14 +199,10 @@ fn set_center(source: &CommandSource, center: Vector2<f64>) -> Result<i32, Comma
     Ok(0)
 }
 
-#[allow(clippy::unnecessary_wraps)]
 fn get_size(source: &CommandSource) -> Result<i32, CommandSyntaxError> {
+    ensure_border_source(source)?;
     let world = source.world().clone();
-    let size = world
-        .worldborder
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .new_diameter;
+    let size = world.border_for_command().new_diameter;
 
     source.send_feedback(
         TextComponent::translate_cross(
@@ -187,17 +220,20 @@ fn set_damage_amount(
     source: &CommandSource,
     damage_per_block: f32,
 ) -> Result<i32, CommandSyntaxError> {
+    ensure_border_source(source)?;
     let world = source.world().clone();
-    let mut border = world
-        .worldborder
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut border = world.border_for_command();
 
     if (border.damage_per_block - damage_per_block).abs() < f32::EPSILON {
         return Err(ERROR_SAME_DAMAGE_AMOUNT.create_without_context());
     }
 
-    border.set_damage_per_block(damage_per_block);
+    if !queue_border(
+        source,
+        pumpkin_cluster::world_time::BorderMutation::Damage(damage_per_block),
+    )? {
+        border.set_damage_per_block(&world, damage_per_block);
+    }
 
     source.send_feedback(
         TextComponent::translate_cross(
@@ -212,17 +248,20 @@ fn set_damage_amount(
 }
 
 fn set_damage_buffer(source: &CommandSource, distance: f32) -> Result<i32, CommandSyntaxError> {
+    ensure_border_source(source)?;
     let world = source.world().clone();
-    let mut border = world
-        .worldborder
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut border = world.border_for_command();
 
     if (border.buffer - distance).abs() < f32::EPSILON {
         return Err(ERROR_SAME_DAMAGE_BUFFER.create_without_context());
     }
 
-    border.set_damage_buffer(distance);
+    if !queue_border(
+        source,
+        pumpkin_cluster::world_time::BorderMutation::Buffer(distance),
+    )? {
+        border.set_damage_buffer(&world, distance);
+    }
 
     source.send_feedback(
         TextComponent::translate_cross(
@@ -237,17 +276,20 @@ fn set_damage_buffer(source: &CommandSource, distance: f32) -> Result<i32, Comma
 }
 
 fn set_warning_distance(source: &CommandSource, distance: i32) -> Result<i32, CommandSyntaxError> {
+    ensure_border_source(source)?;
     let world = source.world().clone();
-    let mut border = world
-        .worldborder
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut border = world.border_for_command();
 
     if border.warning_blocks == distance {
         return Err(ERROR_SAME_WARNING_DISTANCE.create_without_context());
     }
 
-    border.set_warning_distance(&world, distance);
+    if !queue_border(
+        source,
+        pumpkin_cluster::world_time::BorderMutation::WarningDistance(distance),
+    )? {
+        border.set_warning_distance(&world, distance);
+    }
 
     source.send_feedback(
         TextComponent::translate_cross(
@@ -262,17 +304,20 @@ fn set_warning_distance(source: &CommandSource, distance: i32) -> Result<i32, Co
 }
 
 fn set_warning_time(source: &CommandSource, ticks: i32) -> Result<i32, CommandSyntaxError> {
+    ensure_border_source(source)?;
     let world = source.world().clone();
-    let mut border = world
-        .worldborder
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut border = world.border_for_command();
 
     if border.warning_time == ticks {
         return Err(ERROR_SAME_WARNING_TIME.create_without_context());
     }
 
-    border.set_warning_delay(&world, ticks);
+    if !queue_border(
+        source,
+        pumpkin_cluster::world_time::BorderMutation::WarningTime(ticks),
+    )? {
+        border.set_warning_delay(&world, ticks);
+    }
 
     source.send_feedback(
         TextComponent::translate_cross(
@@ -300,14 +345,31 @@ impl CommandExecutor for SetSizeExecutor {
             0
         };
 
-        let target_distance = if self.is_add {
-            let current = context
+        if self.is_add && context.source.server().advanced_config.cluster.enabled {
+            ensure_border_source(&context.source)?;
+            let world = context.source.world();
+            let current = world.border_for_command().new_diameter;
+            let target = current + distance;
+            if target < 1.0 {
+                return Err(ERROR_TOO_SMALL.create_without_context());
+            }
+            if target > 5.999_997e7 {
+                return Err(ERROR_TOO_BIG.create_without_context());
+            }
+            queue_border(
+                &context.source,
+                pumpkin_cluster::world_time::BorderMutation::Add(
+                    distance,
+                    (time > 0).then(|| time.saturating_mul(50)),
+                ),
+            )?;
+            context
                 .source
-                .world()
-                .worldborder
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .new_diameter;
+                .send_feedback(TextComponent::text("World border change queued."), false);
+            return Ok(distance as i32);
+        }
+        let target_distance = if self.is_add {
+            let current = context.source.world().border_for_command().new_diameter;
             current + distance
         } else {
             distance

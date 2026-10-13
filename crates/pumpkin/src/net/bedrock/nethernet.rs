@@ -5,7 +5,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::Path as FsPath,
     sync::{
-        Arc, Mutex as StdMutex,
+        Arc,
         atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -37,7 +37,7 @@ use pumpkin_auth::p384::{
 use serde_json::{Value, json};
 use tokio::{
     net::TcpListener,
-    sync::{Mutex, OnceCell, RwLock, mpsc},
+    sync::{OnceCell, mpsc},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
@@ -96,7 +96,7 @@ where
 
 /// Accepts Bedrock `NetherNet` connections negotiated through Mojang's HTTP endpoint.
 pub struct NetherNetListener {
-    incoming: Mutex<mpsc::Receiver<IncomingSession>>,
+    incoming: crossbeam::queue::ArrayQueue<mpsc::Receiver<IncomingSession>>,
     local_addr: SocketAddr,
     state: EndpointState,
 }
@@ -159,14 +159,14 @@ impl NetherNetListener {
         info!("Bedrock NetherNet signaling is listening on {local_addr}");
         info!("Bedrock NetherNet ICE is listening on {ice_local_addr}");
         Ok(Self {
-            incoming: Mutex::new(receiver),
+            incoming: receiver_slot(receiver),
             local_addr,
             state,
         })
     }
 
     pub async fn accept(&self) -> Option<IncomingSession> {
-        self.incoming.lock().await.recv().await
+        receive_owned(&self.incoming, None).await
     }
 
     pub const fn local_addr(&self) -> SocketAddr {
@@ -273,7 +273,7 @@ async fn negotiate(
     state: &EndpointState,
     address: SocketAddr,
     offer: &str,
-    candidates: Option<mpsc::UnboundedReceiver<RTCIceCandidateInit>>,
+    candidates: Option<mpsc::Receiver<RTCIceCandidateInit>>,
 ) -> Result<(String, Arc<NetherNetSession>), String> {
     Box::pin(negotiate_inner(state, address, offer, candidates, None)).await
 }
@@ -292,7 +292,7 @@ async fn negotiate_inner(
     state: &EndpointState,
     address: SocketAddr,
     offer: &str,
-    candidates: Option<mpsc::UnboundedReceiver<RTCIceCandidateInit>>,
+    candidates: Option<mpsc::Receiver<RTCIceCandidateInit>>,
     advertised_ip: Option<IpAddr>,
 ) -> Result<(String, Arc<NetherNetSession>), String> {
     let signaling = if candidates.is_some() { "LAN" } else { "HTTP" };
@@ -320,7 +320,7 @@ async fn negotiate_inner(
 
     let gathering_notify = Arc::new(tokio::sync::Notify::new());
     let handler = Arc::new(NetherNetEventHandler {
-        session: Mutex::new(None),
+        session: arc_swap::ArcSwap::from_pointee(None),
         address,
         gathering_notify: gathering_notify.clone(),
     });
@@ -346,7 +346,7 @@ async fn negotiate_inner(
         address,
         state.incoming.clone(),
     ));
-    *handler.session.lock().await = Some(session.clone());
+    handler.session.store(Arc::new(Some(session.clone())));
 
     let offer = RTCSessionDescription::offer(offer).map_err(|error| error.to_string())?;
     peer.set_remote_description(offer)
@@ -386,8 +386,8 @@ async fn negotiate_inner(
         session.set_ice_route(
             state
                 .ice_router
-                .register(ufrag, internal, remote_candidates),
-        );
+                .register(ufrag, internal, remote_candidates)?,
+        )?;
         answer
     } else {
         answer
@@ -458,8 +458,55 @@ fn rtc_configuration(stun_servers: &[String]) -> RTCConfiguration {
     }
 }
 
+pub(super) fn receiver_slot<T>(
+    receiver: mpsc::Receiver<T>,
+) -> crossbeam::queue::ArrayQueue<mpsc::Receiver<T>> {
+    let slot = crossbeam::queue::ArrayQueue::new(1);
+    let _ = slot.push(receiver);
+    slot
+}
+
+struct ReceiverLease<'a, T> {
+    owner: &'a crossbeam::queue::ArrayQueue<mpsc::Receiver<T>>,
+    receiver: Option<mpsc::Receiver<T>>,
+}
+
+impl<'a, T> ReceiverLease<'a, T> {
+    fn take(owner: &'a crossbeam::queue::ArrayQueue<mpsc::Receiver<T>>) -> Option<Self> {
+        Some(Self {
+            owner,
+            receiver: Some(owner.pop()?),
+        })
+    }
+}
+
+impl<T> Drop for ReceiverLease<'_, T> {
+    fn drop(&mut self) {
+        if let Some(receiver) = self.receiver.take() {
+            if self.owner.push(receiver).is_err() {
+                warn!("NetherNet receiver ownership returned to occupied slot");
+            }
+        }
+    }
+}
+
+pub(super) async fn receive_owned<T>(
+    owner: &crossbeam::queue::ArrayQueue<mpsc::Receiver<T>>,
+    closed: Option<&CancellationToken>,
+) -> Option<T> {
+    let mut lease = ReceiverLease::take(owner)?;
+    let receiver = lease.receiver.as_mut()?;
+    tokio::select! {
+        packet = receiver.recv() => packet,
+        () = async {
+            if let Some(closed) = closed { closed.cancelled().await; }
+            else { std::future::pending::<()>().await; }
+        } => None,
+    }
+}
+
 struct NetherNetEventHandler {
-    session: Mutex<Option<Arc<NetherNetSession>>>,
+    session: arc_swap::ArcSwap<Option<Arc<NetherNetSession>>>,
     address: SocketAddr,
     gathering_notify: Arc<tokio::sync::Notify>,
 }
@@ -467,7 +514,7 @@ struct NetherNetEventHandler {
 #[async_trait]
 impl PeerConnectionEventHandler for NetherNetEventHandler {
     async fn on_data_channel(&self, channel: Arc<dyn DataChannel>) {
-        if let Some(session) = self.session.lock().await.as_ref() {
+        if let Some(session) = self.session.load_full().as_ref().as_ref() {
             let label = channel.label().await;
             let ordered = channel.ordered().await;
             let negotiated = channel.negotiated().await;
@@ -494,7 +541,7 @@ impl PeerConnectionEventHandler for NetherNetEventHandler {
             RTCPeerConnectionState::Failed
                 | RTCPeerConnectionState::Disconnected
                 | RTCPeerConnectionState::Closed
-        ) && let Some(session) = self.session.lock().await.as_ref()
+        ) && let Some(session) = self.session.load_full().as_ref().as_ref()
         {
             session.mark_closed();
         }
@@ -554,10 +601,9 @@ fn remove_component_two_candidates(sdp: &str) -> String {
 pub struct NetherNetSession {
     #[allow(dead_code)]
     peer: Arc<dyn PeerConnection>,
-    reliable: RwLock<Option<Arc<dyn DataChannel>>>,
-    unreliable: RwLock<Option<Arc<dyn DataChannel>>>,
-    fragments: Mutex<FragmentBuffer>,
-    packets: Mutex<mpsc::Receiver<Bytes>>,
+    reliable: arc_swap::ArcSwap<Option<Arc<dyn DataChannel>>>,
+    unreliable: arc_swap::ArcSwap<Option<Arc<dyn DataChannel>>>,
+    packets: crossbeam::queue::ArrayQueue<mpsc::Receiver<Bytes>>,
     packet_sender: mpsc::Sender<Bytes>,
     open_channels: AtomicU8,
     accepted: AtomicBool,
@@ -565,7 +611,7 @@ pub struct NetherNetSession {
     client_public_key: Option<PublicKey>,
     address: SocketAddr,
     incoming: mpsc::Sender<IncomingSession>,
-    ice_route: StdMutex<Option<Registration>>,
+    ice_route: crossbeam::queue::ArrayQueue<Registration>,
 }
 
 impl NetherNetSession {
@@ -578,10 +624,9 @@ impl NetherNetSession {
         let (packet_sender, packets) = mpsc::channel(4096);
         Self {
             peer,
-            reliable: RwLock::new(None),
-            unreliable: RwLock::new(None),
-            fragments: Mutex::new(FragmentBuffer::default()),
-            packets: Mutex::new(packets),
+            reliable: arc_swap::ArcSwap::from_pointee(None),
+            unreliable: arc_swap::ArcSwap::from_pointee(None),
+            packets: receiver_slot(packets),
             packet_sender,
             open_channels: AtomicU8::new(0),
             accepted: AtomicBool::new(false),
@@ -589,17 +634,17 @@ impl NetherNetSession {
             client_public_key,
             address,
             incoming,
-            ice_route: StdMutex::new(None),
+            ice_route: crossbeam::queue::ArrayQueue::new(1),
         }
     }
 
-    fn set_ice_route(&self, route: Registration) {
-        if !self.closed.is_cancelled() {
-            *self
-                .ice_route
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(route);
+    fn set_ice_route(&self, route: Registration) -> Result<(), String> {
+        if self.closed.is_cancelled() {
+            return Err("NetherNet session closed during ICE registration".into());
         }
+        self.ice_route
+            .push(route)
+            .map_err(|_| "NetherNet ICE route already registered".into())
     }
 
     async fn attach_channel(self: &Arc<Self>, channel: Arc<dyn DataChannel>) -> Result<(), String> {
@@ -617,7 +662,7 @@ impl NetherNetSession {
             protocol.is_empty() && !negotiated && max_packet_lifetime.is_none();
         let bit = match label.as_str() {
             RELIABLE_CHANNEL if ordered && has_default_parameters && max_retransmits.is_none() => {
-                *self.reliable.write().await = Some(channel.clone());
+                self.reliable.store(Arc::new(Some(channel.clone())));
                 1
             }
             UNRELIABLE_CHANNEL
@@ -625,7 +670,7 @@ impl NetherNetSession {
                     && has_default_parameters
                     && (max_retransmits.is_none() || max_retransmits == Some(0)) =>
             {
-                *self.unreliable.write().await = Some(channel.clone());
+                self.unreliable.store(Arc::new(Some(channel.clone())));
                 2
             }
             label => return Err(format!("invalid channel {label:?}")),
@@ -634,6 +679,7 @@ impl NetherNetSession {
         let session = self.clone();
         tokio::spawn(async move {
             let mut opened = false;
+            let mut fragments = FragmentBuffer::default();
             while let Some(event) = channel.poll().await {
                 match event {
                     DataChannelEvent::OnOpen => {
@@ -645,7 +691,9 @@ impl NetherNetSession {
                             opened = true;
                             session.channel_opened(bit).await;
                         }
-                        if let Err(error) = session.receive_segment(bit, msg.data.into()).await {
+                        if let Err(error) =
+                            session.receive_segment(bit, msg.data.into(), &mut fragments)
+                        {
                             warn!(
                                 "Invalid NetherNet message from {}: {error}",
                                 session.address
@@ -682,8 +730,7 @@ impl NetherNetSession {
             );
             if self
                 .incoming
-                .send((self.clone(), self.address))
-                .await
+                .try_send((self.clone(), self.address))
                 .is_err()
             {
                 self.close().await;
@@ -691,7 +738,12 @@ impl NetherNetSession {
         }
     }
 
-    async fn receive_segment(&self, channel: u8, data: Bytes) -> Result<(), String> {
+    fn receive_segment(
+        &self,
+        channel: u8,
+        data: Bytes,
+        fragments: &mut FragmentBuffer,
+    ) -> Result<(), String> {
         let (&remaining, payload) = data
             .split_first()
             .ok_or_else(|| "empty data-channel message".to_string())?;
@@ -703,31 +755,22 @@ impl NetherNetSession {
                 return Err("fragmented unreliable message".to_string());
             }
             self.packet_sender
-                .send(Bytes::copy_from_slice(payload))
-                .await
-                .map_err(|_| "connection is closed".to_string())?;
+                .try_send(Bytes::copy_from_slice(payload))
+                .map_err(|error| format!("NetherNet incoming packet queue unavailable: {error}"))?;
             return Ok(());
         }
 
-        let packet = {
-            let mut fragments = self.fragments.lock().await;
-            fragments.push(remaining, payload)?
-        };
+        let packet = fragments.push(remaining, payload)?;
         if let Some(packet) = packet {
             self.packet_sender
-                .send(packet)
-                .await
-                .map_err(|_| "connection is closed".to_string())?;
+                .try_send(packet)
+                .map_err(|error| format!("NetherNet incoming packet queue unavailable: {error}"))?;
         }
         Ok(())
     }
 
     pub async fn recv(&self) -> Option<Bytes> {
-        let mut packets = self.packets.lock().await;
-        tokio::select! {
-            () = self.closed.cancelled() => None,
-            packet = packets.recv() => packet,
-        }
+        receive_owned(&self.packets, Some(&self.closed)).await
     }
 
     pub async fn send(&self, data: Bytes) -> Result<(), String> {
@@ -736,8 +779,8 @@ impl NetherNetSession {
         }
         let channel = self
             .reliable
-            .read()
-            .await
+            .load_full()
+            .as_ref()
             .clone()
             .ok_or_else(|| "reliable channel is not open".to_string())?;
         let segment_count = data.len().div_ceil(MAX_FRAGMENT_SIZE).max(1);
@@ -765,8 +808,8 @@ impl NetherNetSession {
         }
         let channel = self
             .unreliable
-            .read()
-            .await
+            .load_full()
+            .as_ref()
             .clone()
             .ok_or_else(|| "unreliable channel is not open".to_string())?;
         let mut segment = BytesMut::with_capacity(data.len() + 1);
@@ -787,8 +830,8 @@ impl NetherNetSession {
     pub(super) async fn flush_reliable(&self, timeout: Duration) -> Result<(), String> {
         let channel = self
             .reliable
-            .read()
-            .await
+            .load_full()
+            .as_ref()
             .clone()
             .ok_or_else(|| "reliable channel is not open".to_string())?;
 
@@ -816,10 +859,7 @@ impl NetherNetSession {
         if !self.closed.is_cancelled() {
             trace!(address = %self.address, "NetherNet session closed");
             self.closed.cancel();
-            self.ice_route
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
+            self.ice_route.pop();
         }
     }
 
@@ -828,10 +868,7 @@ impl NetherNetSession {
             return;
         }
         self.closed.cancel();
-        self.ice_route
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
+        self.ice_route.pop();
         let _ = self.peer.close().await;
     }
 }
@@ -1073,6 +1110,29 @@ fn unix_time() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_receiver_future_preserves_subsequent_packets() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        let (sender, receiver) = mpsc::channel(1);
+        let owner = receiver_slot(receiver);
+        let closed = CancellationToken::new();
+        let mut pending = Box::pin(receive_owned(&owner, Some(&closed)));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(pending.as_mut().poll(&mut context), Poll::Pending));
+        drop(pending);
+        sender
+            .try_send(Bytes::from_static(b"after cancellation"))
+            .unwrap();
+        assert_eq!(
+            receive_owned(&owner, Some(&closed)).await.unwrap(),
+            b"after cancellation"[..]
+        );
+        closed.cancel();
+        assert!(receive_owned(&owner, Some(&closed)).await.is_none());
+    }
+
     use std::sync::atomic::AtomicUsize;
 
     #[test]

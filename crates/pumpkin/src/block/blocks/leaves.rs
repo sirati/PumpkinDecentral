@@ -51,6 +51,7 @@ pub fn update_distance(
     props
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for LeavesBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut props = OakLeavesLikeProperties::from_state_id(args.block.default_state.id);

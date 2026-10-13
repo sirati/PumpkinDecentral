@@ -442,7 +442,6 @@ impl AnvilScreenHandler {
         self.inventory.set_stack(2, calculation.result);
         self.send_content_updates();
     }
-
 }
 
 impl ScreenHandler for AnvilScreenHandler {

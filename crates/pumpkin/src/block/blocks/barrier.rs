@@ -8,6 +8,7 @@ use pumpkin_world::tick::TickPriority;
 #[pumpkin_block("minecraft:barrier")]
 pub struct BarrierBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for BarrierBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut props = BarrierLikeProperties::default(args.block);

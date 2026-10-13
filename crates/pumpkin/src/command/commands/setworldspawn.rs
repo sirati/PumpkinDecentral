@@ -79,7 +79,31 @@ impl CommandExecutor for SetWorldSpawnExecutor {
         new_info.spawn_yaw = new_yaw;
         new_info.spawn_pitch = new_pitch;
 
-        server.level_info.store(Arc::new(new_info));
+        if server.advanced_config.cluster.enabled {
+            if let Some(world) = server
+                .worlds
+                .load()
+                .iter()
+                .find(|value| value.uuid == world.uuid)
+            {
+                if !server.cluster_environment.time(
+                    world,
+                    pumpkin_cluster::world_time::EnvironmentMutation::Spawn(
+                        pumpkin_cluster::world_time::SpawnState {
+                            x: new_info.spawn_x,
+                            y: new_info.spawn_y,
+                            z: new_info.spawn_z,
+                            yaw: new_info.spawn_yaw,
+                            pitch: new_info.spawn_pitch,
+                        },
+                    ),
+                ) {
+                    return Err(crate::server::cluster_admin_apply::admin_busy_error());
+                }
+            }
+        } else {
+            server.level_info.store(Arc::new(new_info));
+        }
 
         context.source.send_feedback(
             TextComponent::translate_cross(

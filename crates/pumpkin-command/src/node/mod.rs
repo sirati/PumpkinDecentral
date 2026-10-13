@@ -33,6 +33,10 @@ pub type CommandExecutorResult = Result<i32, CommandSyntaxError>;
 pub trait CommandExecutor<S: CommandSource = DummySource>: Sync + Send {
     /// Executes this executor for a command.
     fn execute(&self, context: &CommandContext<S>) -> CommandExecutorResult;
+
+    fn execute_outcome(&self, context: &CommandContext<S>) -> Result<crate::deferred::CommandExecution, CommandSyntaxError> {
+        self.execute(context).map(crate::deferred::CommandExecution::Complete)
+    }
 }
 
 impl<F, S: CommandSource> CommandExecutor<S> for F
@@ -54,6 +58,15 @@ pub type RedirectModifierResult<S = DummySource> = Result<Vec<Arc<S>>, CommandSy
 pub type RedirectModifierExecutor<S = DummySource> =
     dyn Fn(&CommandContext<S>) -> RedirectModifierResult<S> + Send + Sync;
 
+pub enum RedirectOutcome<S: CommandSource = DummySource> {
+    Sources(Vec<Arc<S>>),
+    Deferred(crate::deferred::DeferredCommandToken),
+}
+
+pub type RedirectOutcomeExecutor<S = DummySource> =
+    dyn Fn(&CommandContext<S>) -> Result<RedirectOutcome<S>, CommandSyntaxError> + Send + Sync;
+
+
 /// A function that returns a new collection of sources from a given context.
 #[derive(Clone)]
 pub enum RedirectModifier<S: CommandSource = DummySource> {
@@ -63,6 +76,7 @@ pub enum RedirectModifier<S: CommandSource = DummySource> {
     /// Returns multiple [`CommandSource`]s from one context via
     /// custom behavior.
     Custom(Arc<RedirectModifierExecutor<S>>),
+    CustomOutcome(Arc<RedirectOutcomeExecutor<S>>),
 }
 
 impl<S: CommandSource> RedirectModifier<S> {
@@ -72,6 +86,18 @@ impl<S: CommandSource> RedirectModifier<S> {
         match self {
             Self::KeepSource => Ok(vec![command_context.source.clone()]),
             Self::Custom(function) => function(command_context),
+            Self::CustomOutcome(function) => function(command_context).map(|outcome| match outcome {
+                RedirectOutcome::Sources(sources) => sources,
+                RedirectOutcome::Deferred(_) => Vec::new(),
+            }),
+        }
+    }
+
+    pub fn outcome(&self, command_context: &CommandContext<S>) -> Result<RedirectOutcome<S>, CommandSyntaxError> {
+        match self {
+            Self::KeepSource => Ok(RedirectOutcome::Sources(vec![command_context.source.clone()])),
+            Self::Custom(function) => function(command_context).map(RedirectOutcome::Sources),
+            Self::CustomOutcome(function) => function(command_context),
         }
     }
 }

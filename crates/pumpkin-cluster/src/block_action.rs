@@ -18,6 +18,7 @@ pub enum BlockActionKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockActionIntent {
     pub actor: GlobalPlayerId,
+    pub owner_install_generation: u64,
     pub tick: TickStamp,
     pub actor_chunk: ChunkKey,
     pub target_chunk: ChunkKey,
@@ -29,11 +30,19 @@ pub struct BlockActionIntent {
     pub client_sequence: Option<i32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BlockUseClaim {
+    pub intent: BlockActionIntent,
+    pub effective_frame: crate::controller::ControllerFrame,
+    pub eye_height: f64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MiningEvidence {
     pub block_state: u16,
     pub tool_revision: u64,
     pub speed_milli_per_tick: u32,
+    pub speed_fraction_millionths: u32,
     pub can_break: bool,
     pub creative: bool,
     pub predicted_threshold_milli: u32,
@@ -47,6 +56,7 @@ pub struct MiningSession {
     pub start_tick: TickStamp,
     pub last_tick: TickStamp,
     pub progress_milli: u32,
+    pub progress_fraction_millionths: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +75,10 @@ pub struct MiningSessions {
 }
 
 impl MiningSessions {
+    pub fn retire(&mut self, actor: GlobalPlayerId) {
+        self.active.remove(&actor);
+    }
+
     pub fn apply(&mut self, intent: BlockActionIntent, evidence: MiningEvidence) -> MiningDecision {
         if intent.kind == BlockActionKind::AbortBreak {
             return if self.active.remove(&intent.actor).is_some() {
@@ -73,7 +87,8 @@ impl MiningSessions {
                 MiningDecision::Ignored
             };
         }
-        if !evidence.can_break
+        if evidence.speed_fraction_millionths >= 1_000_000
+            || !evidence.can_break
             || evidence.block_state == 0
             || intent
                 .expected_block_state
@@ -105,6 +120,7 @@ impl MiningSessions {
                     start_tick: intent.tick,
                     last_tick: intent.tick,
                     progress_milli: progress,
+                    progress_fraction_millionths: evidence.speed_fraction_millionths,
                 },
             );
             return MiningDecision::Started {
@@ -126,9 +142,13 @@ impl MiningSessions {
                 return MiningDecision::Rejected;
             }
             let elapsed = u32::from(intent.tick.0.wrapping_sub(session.last_tick.0));
+            let fraction = u64::from(session.progress_fraction_millionths)
+                + u64::from(evidence.speed_fraction_millionths) * u64::from(elapsed);
             session.progress_milli = session
                 .progress_milli
-                .saturating_add(evidence.speed_milli_per_tick.saturating_mul(elapsed));
+                .saturating_add(evidence.speed_milli_per_tick.saturating_mul(elapsed))
+                .saturating_add((fraction / 1_000_000).min(u64::from(u32::MAX)) as u32);
+            session.progress_fraction_millionths = (fraction % 1_000_000) as u32;
             session.last_tick = intent.tick;
         }
         let threshold = if intent.kind == BlockActionKind::PredictBreak {
@@ -174,6 +194,7 @@ mod tests {
         let world = WorldId::new(0, 1);
         BlockActionIntent {
             actor: GlobalPlayerId::new(ServerId(1), PlayerSlot(2)),
+            owner_install_generation: 1,
             tick: TickStamp(tick),
             actor_chunk: ChunkKey::new(world, 0, 0),
             target_chunk: ChunkKey::new(world, 0, 0),
@@ -191,6 +212,7 @@ mod tests {
             block_state: 42,
             tool_revision: 7,
             speed_milli_per_tick: 200,
+            speed_fraction_millionths: 0,
             can_break: true,
             creative: false,
             predicted_threshold_milli: 650,
@@ -278,6 +300,23 @@ mod tests {
         assert_eq!(
             sessions.apply(intent(u16::MAX, BlockActionKind::StopBreak), evidence()),
             MiningDecision::Rejected
+        );
+    }
+    #[test]
+    fn slow_mining_accumulates_fractional_progress_across_tick_wrap() {
+        let mut sessions = MiningSessions::default();
+        let mut slow = evidence();
+        slow.speed_milli_per_tick = 0;
+        slow.speed_fraction_millionths = 500_000;
+        assert_eq!(
+            sessions.apply(intent(65000, BlockActionKind::StartBreak), slow),
+            MiningDecision::Started { stage: 0 }
+        );
+        assert_eq!(
+            sessions.apply(intent(1463, BlockActionKind::StopBreak), slow),
+            MiningDecision::Broken {
+                expected_block_state: 42
+            }
         );
     }
 }

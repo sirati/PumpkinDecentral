@@ -15,6 +15,7 @@ use crate::block::{BlockBehaviour, NormalUseArgs, OnPlaceArgs, PlacedArgs, UseWi
 #[pumpkin_block("minecraft:vault")]
 pub struct VaultBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for VaultBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut props = LadderLikeProperties::default(args.block);

@@ -79,7 +79,9 @@ impl PlayerInventory {
     }
 
     pub fn publish_cluster_snapshot(&self, snapshot: ClusterPlayerInventorySnapshot) -> bool {
-        if snapshot.stacks.len() != Self::OFF_HAND_SLOT + 1 || snapshot.selected_slot >= Self::HOTBAR_SIZE as u8 {
+        if snapshot.stacks.len() != Self::OFF_HAND_SLOT + 1
+            || snapshot.selected_slot >= Self::HOTBAR_SIZE as u8
+        {
             return false;
         }
         self.cluster_snapshot.store(Some(Arc::new(snapshot)));
@@ -692,9 +694,10 @@ impl PlayerInventory {
 
     /// Gets the currently selected hotbar slot index.
     pub fn get_selected_slot(&self) -> u8 {
-        self.cluster_snapshot
-            .load_full()
-            .map_or_else(|| self.selected_slot.load(Ordering::Relaxed), |snapshot| snapshot.selected_slot)
+        self.cluster_snapshot.load_full().map_or_else(
+            || self.selected_slot.load(Ordering::Relaxed),
+            |snapshot| snapshot.selected_slot,
+        )
     }
 }
 

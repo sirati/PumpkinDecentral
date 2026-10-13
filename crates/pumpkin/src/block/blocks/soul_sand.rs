@@ -5,6 +5,7 @@ use crate::block::{BlockBehaviour, PathComputationType};
 #[pumpkin_block("minecraft:soul_sand")]
 pub struct SoulSandBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for SoulSandBlock {
     fn is_pathfindable(
         &self,

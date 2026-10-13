@@ -21,6 +21,7 @@ type FarmlandProperties = FarmlandLikeProperties;
 #[pumpkin_block("minecraft:farmland")]
 pub struct FarmlandBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for FarmlandBlock {
     fn on_scheduled_tick(&self, args: OnScheduledTickArgs<'_>) {
         // TODO: push up entities

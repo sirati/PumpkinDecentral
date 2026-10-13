@@ -103,8 +103,8 @@ impl CommandExecutor for TeamAddExecutor {
 
         let mut scoreboard = world
             .scoreboard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .edit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
 
         if scoreboard.get_teams().contains_key(&team_name_owned) {
             return Err(DUPLICATE_TEAM_ERROR.create_without_context());
@@ -116,6 +116,7 @@ impl CommandExecutor for TeamAddExecutor {
             options: 0,
             nametag_visibility: NameTagVisibility::Always,
             collision_rule: CollisionRule::Always,
+            death_message_visibility: "always".into(),
             color: NamedColor::White,
             player_prefix: TextComponent::empty(),
             player_suffix: TextComponent::empty(),
@@ -123,6 +124,10 @@ impl CommandExecutor for TeamAddExecutor {
         };
 
         scoreboard.add_team(&world, new_team);
+
+        scoreboard
+            .commit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
 
         context.source.send_feedback(
             TextComponent::translate_cross(
@@ -148,8 +153,8 @@ impl CommandExecutor for TeamRemoveExecutor {
 
         let mut scoreboard = world
             .scoreboard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .edit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
 
         let Some(team) = scoreboard.get_teams().get(&team_name_owned) else {
             return Err(
@@ -160,6 +165,10 @@ impl CommandExecutor for TeamRemoveExecutor {
         let team_display_name = team.display_name.clone();
 
         scoreboard.remove_team(&world, &team_name_owned);
+
+        scoreboard
+            .commit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
 
         context.source.send_feedback(
             TextComponent::translate_cross(
@@ -185,8 +194,8 @@ impl CommandExecutor for TeamEmptyExecutor {
 
         let mut scoreboard = world
             .scoreboard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .edit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
 
         let Some(team) = scoreboard.get_teams().get(&team_name_owned) else {
             return Err(
@@ -204,6 +213,10 @@ impl CommandExecutor for TeamEmptyExecutor {
         for player in &players_to_remove {
             scoreboard.remove_player_from_team(&world, &team_name_owned, player);
         }
+
+        scoreboard
+            .commit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
 
         context.source.send_feedback(
             TextComponent::translate_cross(
@@ -231,16 +244,34 @@ impl CommandExecutor for TeamJoinExecutor {
 
         let entity_names = if self.has_members {
             let targets = EntityArgumentType::get_optional_entities(context, ARG_MEMBERS)?;
-            if targets.is_empty() {
+            let remote_name = context
+                .get_argument::<crate::command::argument_types::entity_selector::EntitySelector>(
+                    ARG_MEMBERS,
+                )
+                .ok()
+                .and_then(|selector| selector.player_name.as_ref())
+                .and_then(|name| {
+                    let directory = crate::server::cluster_presence::admin_directory_snapshot(
+                        context.source.server(),
+                    );
+                    directory
+                        .locate_by_name(name)
+                        .and_then(|gid| directory.player_name(&gid).cloned())
+                });
+            if targets.is_empty() && remote_name.is_none() {
                 return Err(
                     crate::command::argument_types::entity::NO_ENTITIES_ERROR_TYPE
                         .create_without_context(),
                 );
             }
-            targets
-                .into_iter()
-                .map(|e| e.get_scoreboard_name())
-                .collect::<Vec<_>>()
+            if targets.is_empty() {
+                remote_name.into_iter().collect::<Vec<_>>()
+            } else {
+                targets
+                    .into_iter()
+                    .map(|e| e.get_scoreboard_name())
+                    .collect::<Vec<_>>()
+            }
         } else {
             let sender_name = context.source.name.clone();
             vec![sender_name]
@@ -252,8 +283,8 @@ impl CommandExecutor for TeamJoinExecutor {
 
         let mut scoreboard = world
             .scoreboard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .edit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
 
         let Some(team) = scoreboard.get_teams().get(&team_name_owned) else {
             return Err(
@@ -284,6 +315,10 @@ impl CommandExecutor for TeamJoinExecutor {
             )
         };
 
+        scoreboard
+            .commit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
+
         context.source.send_feedback(msg, true);
 
         Ok(count as i32)
@@ -298,16 +333,34 @@ impl CommandExecutor for TeamLeaveExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let entity_names = if self.has_members {
             let targets = EntityArgumentType::get_optional_entities(context, ARG_MEMBERS)?;
-            if targets.is_empty() {
+            let remote_name = context
+                .get_argument::<crate::command::argument_types::entity_selector::EntitySelector>(
+                    ARG_MEMBERS,
+                )
+                .ok()
+                .and_then(|selector| selector.player_name.as_ref())
+                .and_then(|name| {
+                    let directory = crate::server::cluster_presence::admin_directory_snapshot(
+                        context.source.server(),
+                    );
+                    directory
+                        .locate_by_name(name)
+                        .and_then(|gid| directory.player_name(&gid).cloned())
+                });
+            if targets.is_empty() && remote_name.is_none() {
                 return Err(
                     crate::command::argument_types::entity::NO_ENTITIES_ERROR_TYPE
                         .create_without_context(),
                 );
             }
-            targets
-                .into_iter()
-                .map(|e| e.get_scoreboard_name())
-                .collect::<Vec<_>>()
+            if targets.is_empty() {
+                remote_name.into_iter().collect::<Vec<_>>()
+            } else {
+                targets
+                    .into_iter()
+                    .map(|e| e.get_scoreboard_name())
+                    .collect::<Vec<_>>()
+            }
         } else {
             let sender_name = context.source.name.clone();
             vec![sender_name]
@@ -318,8 +371,8 @@ impl CommandExecutor for TeamLeaveExecutor {
 
         let mut scoreboard = world
             .scoreboard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .edit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
 
         let mut removed_count = 0;
         for name in &entity_names {
@@ -350,6 +403,10 @@ impl CommandExecutor for TeamLeaveExecutor {
             )
         };
 
+        scoreboard
+            .commit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
+
         context.source.send_feedback(msg, true);
 
         Ok(count)
@@ -370,10 +427,7 @@ impl CommandExecutor for TeamListExecutor {
             None
         };
 
-        let scoreboard = world
-            .scoreboard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let scoreboard = world.scoreboard.snapshot();
 
         if let Some(team_name) = team_name {
             let Some(team) = scoreboard.get_teams().get(&team_name) else {
@@ -459,8 +513,8 @@ impl CommandExecutor for TeamModifyColorResetExecutor {
 
         let mut scoreboard = world
             .scoreboard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .edit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
 
         let Some(team) = scoreboard.get_teams().get(&team_name_owned) else {
             return Err(
@@ -476,6 +530,10 @@ impl CommandExecutor for TeamModifyColorResetExecutor {
         team.color = NamedColor::White;
         let team_display_name = team.display_name.clone();
         scoreboard.update_team(&world, team);
+
+        scoreboard
+            .commit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
 
         context.source.send_feedback(
             TextComponent::translate_cross(
@@ -502,8 +560,8 @@ impl CommandExecutor for TeamModifyColorExecutor {
 
         let mut scoreboard = world
             .scoreboard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .edit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
 
         let Some(team) = scoreboard.get_teams().get(&team_name_owned) else {
             return Err(
@@ -519,6 +577,10 @@ impl CommandExecutor for TeamModifyColorExecutor {
         team.color = new_color;
         let team_display_name = team.display_name.clone();
         scoreboard.update_team(&world, team);
+
+        scoreboard
+            .commit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
 
         context.source.send_feedback(
             TextComponent::translate_cross(
@@ -546,8 +608,8 @@ impl CommandExecutor for TeamModifyDisplayNameExecutor {
 
         let mut scoreboard = world
             .scoreboard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .edit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
 
         let Some(team) = scoreboard.get_teams().get(&team_name_owned) else {
             return Err(
@@ -564,6 +626,10 @@ impl CommandExecutor for TeamModifyDisplayNameExecutor {
         team.display_name = new_display_name.clone();
         let team_display_name = team.display_name.clone();
         scoreboard.update_team(&world, team);
+
+        scoreboard
+            .commit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
 
         context.source.send_feedback(
             TextComponent::translate_cross(
@@ -591,8 +657,8 @@ impl CommandExecutor for TeamModifyPrefixExecutor {
 
         let mut scoreboard = world
             .scoreboard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .edit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
 
         let Some(team) = scoreboard.get_teams().get(&team_name_owned) else {
             return Err(
@@ -605,6 +671,10 @@ impl CommandExecutor for TeamModifyPrefixExecutor {
         team.player_prefix = new_prefix.clone();
         let team_display_name = team.display_name.clone();
         scoreboard.update_team(&world, team);
+
+        scoreboard
+            .commit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
 
         context.source.send_feedback(
             TextComponent::translate_cross(
@@ -632,8 +702,8 @@ impl CommandExecutor for TeamModifySuffixExecutor {
 
         let mut scoreboard = world
             .scoreboard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .edit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
 
         let Some(team) = scoreboard.get_teams().get(&team_name_owned) else {
             return Err(
@@ -646,6 +716,10 @@ impl CommandExecutor for TeamModifySuffixExecutor {
         team.player_suffix = new_suffix.clone();
         let team_display_name = team.display_name.clone();
         scoreboard.update_team(&world, team);
+
+        scoreboard
+            .commit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
 
         context.source.send_feedback(
             TextComponent::translate_cross(
@@ -672,8 +746,8 @@ impl CommandExecutor for TeamModifyFriendlyFireExecutor {
 
         let mut scoreboard = world
             .scoreboard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .edit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
 
         let Some(team) = scoreboard.get_teams().get(&team_name_owned) else {
             return Err(
@@ -705,6 +779,10 @@ impl CommandExecutor for TeamModifyFriendlyFireExecutor {
             translation::java::COMMANDS_TEAM_OPTION_FRIENDLYFIRE_DISABLED
         };
 
+        scoreboard
+            .commit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
+
         context.source.send_feedback(
             TextComponent::translate_cross(key, key, [team_display_name]),
             true,
@@ -726,8 +804,8 @@ impl CommandExecutor for TeamModifySeeFriendlyInvisiblesExecutor {
 
         let mut scoreboard = world
             .scoreboard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .edit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
 
         let Some(team) = scoreboard.get_teams().get(&team_name_owned) else {
             return Err(
@@ -759,6 +837,10 @@ impl CommandExecutor for TeamModifySeeFriendlyInvisiblesExecutor {
             translation::java::COMMANDS_TEAM_OPTION_SEEFRIENDLYINVISIBLES_DISABLED
         };
 
+        scoreboard
+            .commit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
+
         context.source.send_feedback(
             TextComponent::translate_cross(key, key, [team_display_name]),
             true,
@@ -782,8 +864,8 @@ impl CommandExecutor for TeamModifyNametagVisibilityExecutor {
 
         let mut scoreboard = world
             .scoreboard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .edit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
 
         let Some(team) = scoreboard.get_teams().get(&team_name_owned) else {
             return Err(
@@ -820,6 +902,10 @@ impl CommandExecutor for TeamModifyNametagVisibilityExecutor {
         let team_display_name = team.display_name.clone();
         scoreboard.update_team(&world, team);
 
+        scoreboard
+            .commit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
+
         context.source.send_feedback(
             TextComponent::translate_cross(
                 translation::java::COMMANDS_TEAM_OPTION_NAMETAGVISIBILITY_SUCCESS,
@@ -847,10 +933,10 @@ impl CommandExecutor for TeamModifyDeathMessageVisibilityExecutor {
         let team_name_owned = team_name.to_string();
         let value = self.value;
 
-        let scoreboard = world
+        let mut scoreboard = world
             .scoreboard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .edit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
 
         let Some(team) = scoreboard.get_teams().get(&team_name_owned) else {
             return Err(
@@ -859,6 +945,13 @@ impl CommandExecutor for TeamModifyDeathMessageVisibilityExecutor {
         };
 
         let team_display_name = team.display_name.clone();
+        let mut team = team.clone();
+        team.death_message_visibility = value.to_owned();
+        scoreboard.update_team(&world, team);
+
+        scoreboard
+            .commit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
 
         context.source.send_feedback(
             TextComponent::translate_cross(
@@ -887,8 +980,8 @@ impl CommandExecutor for TeamModifyCollisionRuleExecutor {
 
         let mut scoreboard = world
             .scoreboard
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .edit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
 
         let Some(team) = scoreboard.get_teams().get(&team_name_owned) else {
             return Err(
@@ -918,6 +1011,10 @@ impl CommandExecutor for TeamModifyCollisionRuleExecutor {
 
         let team_display_name = team.display_name.clone();
         scoreboard.update_team(&world, team);
+
+        scoreboard
+            .commit()
+            .map_err(crate::world::scoreboard::ScoreboardBusy::command_error)?;
 
         context.source.send_feedback(
             TextComponent::translate_cross(

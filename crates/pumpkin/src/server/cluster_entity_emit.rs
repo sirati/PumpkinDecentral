@@ -162,7 +162,7 @@ thread_local! {
     static POS_READY: RefCell<Vec<EntityPosUpdate>> = const { RefCell::new(Vec::new()) };
     static LAST_VISUAL: RefCell<HashMap<i32, (EntityVisualState, u16)>> =
         RefCell::new(HashMap::new());
-    static LAST_ENTITY_CHUNKS: RefCell<HashMap<(i32, u32), ChunkKey>> =
+    static LAST_ENTITY_CHUNKS: RefCell<HashMap<(i32, u64), ChunkKey>> =
         RefCell::new(HashMap::new());
 }
 

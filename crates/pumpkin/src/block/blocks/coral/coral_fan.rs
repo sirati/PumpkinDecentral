@@ -45,6 +45,7 @@ impl BlockMetadata for CoralFanBlock {
 pub type CoralWallFanLikeProperties = LadderLikeProperties;
 pub type CoralFanLikeProperties = MangroveRootsLikeProperties;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for CoralFanBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         if args.direction == BlockDirection::Down {

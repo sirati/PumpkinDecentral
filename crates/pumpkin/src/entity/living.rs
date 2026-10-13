@@ -45,8 +45,8 @@ use pumpkin_data::attributes::Attributes;
 use pumpkin_data::data_component_impl::Operation;
 use pumpkin_data::data_component_impl::food::{ConsumableImpl, ConsumeEffect};
 use pumpkin_data::data_component_impl::{
-    AttributeModifiersImpl, BlocksAttacksImpl, DeathProtectionImpl, EnchantmentsImpl,
-    EquipmentSlot, EquippableImpl, FoodImpl,
+    AttributeModifiersImpl, BlocksAttacksImpl, DeathProtectionImpl, EquipmentSlot, EquippableImpl,
+    FoodImpl,
 };
 use pumpkin_data::effect::StatusEffect;
 use pumpkin_data::entity::{EntityPose, EntityStatus, EntityType};
@@ -2803,27 +2803,38 @@ impl LivingEntity {
         }
     }
 
-    pub fn read_living_nbt_non_mut(&self, nbt: &NbtCompound) {
-        self.health.store(nbt.get_float("Health").unwrap_or(20.0));
-
-        if let Some(equipment) = nbt.get_compound("equipment") {
-            let mut guard = self
-                .entity_equipment
-                .lock()
+    pub(crate) fn read_living_nbt_off_registry(&mut self, nbt: &NbtCompound) {
+        let max_abs = self
+            .attributes
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&Attributes::MAX_ABSORPTION.id)
+            .map_or(
+                Attributes::MAX_ABSORPTION.default_value,
+                AttributeInstance::value,
+            ) as f32;
+        self.read_living_nbt_scalars(nbt, max_abs);
+        if let Some(effects) = nbt.get_list("active_effects") {
+            let owned = self
+                .active_effects
+                .get_mut()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for (name, tag) in &equipment.child_tags {
-                if let Some(slot) = EquipmentSlot::get_from_name(name)
-                    && let Some(compound) = tag.extract_compound()
-                    && let Some(stack) = ItemStack::read_item_stack(compound)
+            for tag in effects {
+                if let NbtTag::Compound(compound) = tag
+                    && let Some(mut effect) = Effect::create_from_nbt(&mut compound.clone())
                 {
-                    guard.put(slot, stack);
+                    effect.blend = true;
+                    owned.insert(effect.effect_type, effect);
                 }
             }
         }
+    }
+
+    fn read_living_nbt_scalars(&self, nbt: &NbtCompound, max_abs: f32) {
+        self.health.store(nbt.get_float("Health").unwrap_or(20.0));
 
         // Clamp any persisted absorption to the entity's configured max
         let raw_abs = nbt.get_float("AbsorptionAmount").unwrap_or(0.0);
-        let max_abs = self.get_attribute_value(&Attributes::MAX_ABSORPTION) as f32;
         let clamped_abs = raw_abs.max(0.0).min(max_abs);
         self.absorption.store(clamped_abs);
 
@@ -2847,6 +2858,27 @@ impl LivingEntity {
         self.entity
             .fall_flying
             .store(nbt.get_bool("FallFlying").unwrap_or(false), Relaxed);
+    }
+
+    pub fn read_living_nbt_non_mut(&self, nbt: &NbtCompound) {
+        self.read_living_nbt_scalars(
+            nbt,
+            self.get_attribute_value(&Attributes::MAX_ABSORPTION) as f32,
+        );
+        if let Some(equipment) = nbt.get_compound("equipment") {
+            let mut guard = self
+                .entity_equipment
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (name, tag) in &equipment.child_tags {
+                if let Some(slot) = EquipmentSlot::get_from_name(name)
+                    && let Some(compound) = tag.extract_compound()
+                    && let Some(stack) = ItemStack::read_item_stack(compound)
+                {
+                    guard.put(slot, stack);
+                }
+            }
+        }
         {
             let nbt_effects = nbt.get_list("active_effects");
             if let Some(nbt_effects) = nbt_effects {
@@ -2886,33 +2918,22 @@ impl LivingEntity {
             return damage;
         }
 
-        let mut armor = 0.0f32;
-        let mut toughness = 0.0f32;
-        {
+        let (armor, toughness) = {
             let equipment_lock = self
                 .entity_equipment
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for slot in [
-                EquipmentSlot::HEAD,
-                EquipmentSlot::CHEST,
-                EquipmentSlot::LEGS,
-                EquipmentSlot::FEET,
-            ] {
-                if let Some(stack) = equipment_lock.equipment.get(&slot)
-                    && !stack.is_empty()
-                    && let Some(modifiers) = stack.get_data_component::<AttributeModifiersImpl>()
-                {
-                    for modifier in modifiers.attribute_modifiers.iter() {
-                        if modifier.r#type == &Attributes::ARMOR {
-                            armor += modifier.amount as f32;
-                        } else if modifier.r#type == &Attributes::ARMOR_TOUGHNESS {
-                            toughness += modifier.amount as f32;
-                        }
-                    }
-                }
-            }
-        }
+            crate::entity::combat::armor_attributes(
+                [
+                    EquipmentSlot::HEAD,
+                    EquipmentSlot::CHEST,
+                    EquipmentSlot::LEGS,
+                    EquipmentSlot::FEET,
+                ]
+                .iter()
+                .filter_map(|slot| equipment_lock.equipment.get(slot)),
+            )
+        };
 
         let breach_level = attacker
             .and_then(|att| {
@@ -2976,56 +2997,23 @@ impl LivingEntity {
             return damage;
         }
 
-        let is_fire_damage = damage_type.has_tag(&tag::DamageType::MINECRAFT_IS_FIRE);
-        let mut epf = 0.0f32;
-        {
+        let epf = {
             let equipment_lock = self
                 .entity_equipment
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for slot in [
-                EquipmentSlot::HEAD,
-                EquipmentSlot::CHEST,
-                EquipmentSlot::LEGS,
-                EquipmentSlot::FEET,
-            ] {
-                if let Some(stack) = equipment_lock.equipment.get(&slot)
-                    && !stack.is_empty()
-                    && let Some(enchantments) = stack.get_data_component::<EnchantmentsImpl>()
-                {
-                    for (enchantment, level) in enchantments.enchantment.iter() {
-                        let enc = *enchantment;
-                        let lvl = *level as f32;
-                        if enc == &Enchantment::PROTECTION {
-                            if !damage_type
-                                .has_tag(&tag::DamageType::MINECRAFT_BYPASSES_INVULNERABILITY)
-                                && damage_type != &DamageType::STARVE
-                                && damage_type != &DamageType::GENERIC_KILL
-                                && damage_type != &DamageType::OUT_OF_WORLD
-                            {
-                                epf += lvl;
-                            }
-                        } else if enc == &Enchantment::FIRE_PROTECTION {
-                            if is_fire_damage {
-                                epf += lvl * 2.0;
-                            }
-                        } else if enc == &Enchantment::BLAST_PROTECTION {
-                            if damage_type.has_tag(&tag::DamageType::MINECRAFT_IS_EXPLOSION) {
-                                epf += lvl * 2.0;
-                            }
-                        } else if enc == &Enchantment::PROJECTILE_PROTECTION {
-                            if damage_type.has_tag(&tag::DamageType::MINECRAFT_IS_PROJECTILE) {
-                                epf += lvl * 2.0;
-                            }
-                        } else if enc == &Enchantment::FEATHER_FALLING
-                            && damage_type.has_tag(&tag::DamageType::MINECRAFT_IS_FALL)
-                        {
-                            epf += lvl * 3.0;
-                        }
-                    }
-                }
-            }
-        }
+            crate::entity::combat::protection_factor(
+                [
+                    EquipmentSlot::HEAD,
+                    EquipmentSlot::CHEST,
+                    EquipmentSlot::LEGS,
+                    EquipmentSlot::FEET,
+                ]
+                .iter()
+                .filter_map(|slot| equipment_lock.equipment.get(slot)),
+                damage_type,
+            )
+        };
 
         if epf > 0.0 {
             damage = CombatRules::get_damage_after_magic_absorb(damage, epf);
@@ -3248,16 +3236,18 @@ impl LivingEntity {
 
         // Apply hurt cooldown logic
         let last_damage = self.last_damage_taken.load();
-        let (damage_amount, play_sound) =
-            if self.hurt_cooldown.load(Relaxed) > 10 && !bypasses_cooldown_protection {
-                if effective_amount <= last_damage {
-                    return false;
-                }
-                (effective_amount - last_damage, false)
-            } else {
-                self.hurt_cooldown.store(20, Relaxed);
-                (effective_amount, self.health.load() > effective_amount)
-            };
+        let Some(hurt) = crate::entity::combat::resolve_hurt_cooldown(
+            effective_amount,
+            last_damage,
+            self.hurt_cooldown.load(Relaxed),
+            self.health.load(),
+            bypasses_cooldown_protection,
+        ) else {
+            return false;
+        };
+        self.hurt_cooldown.store(hurt.cooldown, Relaxed);
+        let damage_amount = hurt.damage;
+        let play_sound = hurt.play_sound;
 
         // Finalize state
         self.last_damage_taken.store(amount);
@@ -3941,7 +3931,7 @@ fn push_unique_attribute(touched: &mut Vec<Attributes>, attr: &Attributes) {
     }
 }
 
-const fn attribute_modifier_slot_matches(
+pub(crate) const fn attribute_modifier_slot_matches(
     modifier_slot: &AttributeModifierSlot,
     equipment_slot: &EquipmentSlot,
 ) -> bool {

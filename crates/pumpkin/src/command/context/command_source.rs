@@ -52,6 +52,7 @@ pub struct CommandSource {
     pub world: Option<Arc<World>>,
     pub entity: Option<Arc<dyn EntityBase>>,
     pub position: Vector3<f64>,
+    pub position_known: [bool; 3],
     pub rotation: Vector2<f32>,
     pub name: String,
     pub display_name: TextComponent,
@@ -79,6 +80,7 @@ impl CommandSource {
             world: None,
             entity: None,
             position: Vector3::default(),
+            position_known: [false; 3],
             rotation: Vector2::default(),
             name: String::new(),
             display_name: TextComponent::empty(),
@@ -101,11 +103,22 @@ impl CommandSource {
         display_name: TextComponent,
         server: Arc<Server>,
     ) -> Self {
+        let position_known =
+            if matches!(&output, CommandSender::Lobby(_) | CommandSender::PreJoin(_))
+                || output
+                    .as_player()
+                    .is_some_and(|player| player.is_in_cluster_lobby())
+            {
+                [false; 3]
+            } else {
+                [true; 3]
+            };
         Self {
             output,
             world: Some(world),
             entity,
             position,
+            position_known,
             rotation,
             name,
             display_name,
@@ -125,6 +138,7 @@ impl CommandSource {
             world: self.world,
             entity: self.entity,
             position: self.position,
+            position_known: self.position_known,
             rotation: self.rotation,
             name: self.name,
             display_name: self.display_name,
@@ -144,6 +158,7 @@ impl CommandSource {
             world: Some(world),
             entity: self.entity,
             position: self.position,
+            position_known: self.position_known,
             rotation: self.rotation,
             name: self.name,
             display_name: self.display_name,
@@ -165,6 +180,7 @@ impl CommandSource {
             world: self.world,
             entity: Some(entity),
             position: self.position,
+            position_known: self.position_known,
             rotation: self.rotation,
             name,
             display_name,
@@ -184,6 +200,7 @@ impl CommandSource {
             world: self.world,
             entity: self.entity,
             position,
+            position_known: self.position_known,
             rotation: self.rotation,
             name: self.name,
             display_name: self.display_name,
@@ -203,6 +220,7 @@ impl CommandSource {
             world: self.world,
             entity: self.entity,
             position: self.position,
+            position_known: self.position_known,
             rotation,
             name: self.name,
             display_name: self.display_name,
@@ -230,6 +248,7 @@ impl CommandSource {
             world: self.world,
             entity: self.entity,
             position: self.position,
+            position_known: self.position_known,
             rotation: self.rotation,
             name: self.name,
             display_name: self.display_name,
@@ -249,6 +268,7 @@ impl CommandSource {
             world: self.world,
             entity: self.entity,
             position: self.position,
+            position_known: self.position_known,
             rotation: self.rotation,
             name: self.name,
             display_name: self.display_name,
@@ -268,6 +288,7 @@ impl CommandSource {
             world: self.world,
             entity: self.entity,
             position: self.position,
+            position_known: self.position_known,
             rotation: self.rotation,
             name: self.name,
             display_name: self.display_name,
@@ -474,8 +495,38 @@ impl pumpkin_command::source::CommandSource for CommandSource {
         self.send_error(error);
     }
 
+    fn reserve_deferred_terminal(
+        &self,
+        token: pumpkin_command::deferred::DeferredCommandToken,
+    ) -> Result<
+        Option<Box<dyn pumpkin_command::deferred::DeferredCompletionTerminal>>,
+        pumpkin_command::deferred::DeferredCompletionUnavailable,
+    > {
+        self.command_result_taker.reserve_deferred_terminal(token)
+    }
+
+    fn deferred_completion_readiness(
+        &self,
+        token: pumpkin_command::deferred::DeferredCommandToken,
+    ) -> pumpkin_command::deferred::CompletionReadiness {
+        self.command_result_taker
+            .deferred_completion_readiness(token)
+    }
+
     fn call_result(&self, result: ReturnValue) {
         self.command_result_taker.call(result);
+    }
+
+    fn call_deferred_result(
+        &self,
+        token: pumpkin_command::deferred::DeferredCommandToken,
+        result: ReturnValue,
+    ) {
+        self.command_result_taker.call_deferred(token, result);
+    }
+
+    fn complete_deferred_branch(&self, token: pumpkin_command::deferred::DeferredCommandToken) {
+        self.command_result_taker.complete_deferred_branch(token);
     }
 
     fn has_permission(&self, permission: &str) -> bool {

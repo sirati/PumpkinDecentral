@@ -36,18 +36,55 @@ impl BedrockClient {
                     | PlayerAction::AbortDestroyBlock
             )
         {
-            player.client.try_kick(
-                crate::net::DisconnectReason::Unknown,
-                &pumpkin_util::text::TextComponent::text("Block action could not be verified"),
+            let kind = match packet.action {
+                PlayerAction::StartDestroyBlock => {
+                    pumpkin_cluster::block_action::BlockActionKind::StartBreak
+                }
+                PlayerAction::CreativeDestroyBlock => {
+                    pumpkin_cluster::block_action::BlockActionKind::CreativeBreak
+                }
+                PlayerAction::ContinueDestroyBlock | PlayerAction::CrackBlock => {
+                    pumpkin_cluster::block_action::BlockActionKind::ContinueBreak
+                }
+                PlayerAction::PredictDestroyBlock => {
+                    pumpkin_cluster::block_action::BlockActionKind::PredictBreak
+                }
+                PlayerAction::StopDestroyBlock => {
+                    pumpkin_cluster::block_action::BlockActionKind::StopBreak
+                }
+                PlayerAction::AbortDestroyBlock => {
+                    pumpkin_cluster::block_action::BlockActionKind::AbortBreak
+                }
+                _ => return,
+            };
+            let Some(actor) = player.cluster_gid() else {
+                return;
+            };
+            let position = pumpkin_cluster::protocol::BlockPos {
+                x: packet.block_position.0.x,
+                y: packet.block_position.0.y,
+                z: packet.block_position.0.z,
+            };
+            let face = match u8::try_from(packet.face.0) {
+                Ok(face) => face,
+                Err(_) if kind == pumpkin_cluster::block_action::BlockActionKind::AbortBreak => 0,
+                Err(_) => {
+                    let _ =
+                        crate::server::cluster_inventory_protocol::publish_block_action_resolution(
+                            server, actor, position, None, None, false,
+                        );
+                    return;
+                }
+            };
+            crate::server::cluster_inventory_protocol::stage_mining(
+                player, position, face, kind, None,
             );
             return;
         }
         if server.advanced_config.cluster.enabled && matches!(packet.action, PlayerAction::Respawn)
         {
-            player.client.try_kick(
-                crate::net::DisconnectReason::Unknown,
-                &pumpkin_util::text::TextComponent::text("Respawn could not be verified"),
-            );
+            crate::server::cluster_controller::submit_patch(server, player,
+                crate::server::cluster_controller::ControllerPatch::Respawn);
             return;
         }
 

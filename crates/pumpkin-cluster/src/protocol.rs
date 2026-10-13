@@ -96,7 +96,7 @@ pub struct BlockPos {
 pub struct EntityRef {
     pub origin: ServerId,
     pub local_id: i32,
-    pub generation: u32,
+    pub generation: u64,
     pub chunk: ChunkKey,
 }
 
@@ -104,7 +104,7 @@ pub struct EntityRef {
 pub struct GlobalEntityId {
     pub origin: ServerId,
     pub local_id: i32,
-    pub generation: u32,
+    pub generation: u64,
 }
 
 impl From<EntityRef> for GlobalEntityId {
@@ -136,6 +136,8 @@ impl EntityRef {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PosUpdate {
     pub gid: GlobalPlayerId,
+    pub incarnation: u64,
+    pub spatial_epoch: crate::canonical_action::SpatialEpoch,
     pub seq: PlayerSeq,
     pub tick: TickStamp,
     pub world: WorldId,
@@ -193,11 +195,15 @@ pub enum PlayerBoundaryUpdate {
     Enter(PlayerReplicaSnapshot),
     Leave {
         gid: GlobalPlayerId,
+        incarnation: u64,
+        seq: PlayerSeq,
         tick: TickStamp,
         chunk: ChunkKey,
     },
     Transition {
         gid: GlobalPlayerId,
+        incarnation: u64,
+        seq: PlayerSeq,
         tick: TickStamp,
         from: ChunkKey,
         to: ChunkKey,
@@ -208,6 +214,7 @@ pub enum PlayerBoundaryUpdate {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct PlayerChunkTransition {
     pub gid: GlobalPlayerId,
+    pub incarnation: u64,
     pub seq: PlayerSeq,
     pub tick: TickStamp,
     pub from: ChunkKey,
@@ -544,6 +551,8 @@ impl FireProjectileUpdate {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TickBatch {
     pub tick: TickStamp,
+    #[serde(deserialize_with = "crate::bounded_vec::deserialize")]
+    pub canonical_actions: Vec<crate::canonical_action::Action>,
     pub pos: Vec<PosUpdate>,
     pub equipment: Vec<EquipmentUpdate>,
     pub held: Vec<HeldUpdate>,
@@ -580,7 +589,8 @@ impl TickBatch {
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.pos.is_empty()
+        self.canonical_actions.is_empty()
+            && self.pos.is_empty()
             && self.equipment.is_empty()
             && self.held.is_empty()
             && self.sneak.is_empty()
@@ -607,7 +617,8 @@ impl TickBatch {
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.pos.len()
+        self.canonical_actions.len()
+            + self.pos.len()
             + self.equipment.len()
             + self.held.len()
             + self.sneak.len()

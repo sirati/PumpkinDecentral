@@ -18,6 +18,7 @@ use crate::block::{
 #[pumpkin_block("minecraft:chorus_plant")]
 pub struct ChorusPlantBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for ChorusPlantBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         // Compute all 6 face connections immediately so the placed block visually connects to its neighbors.

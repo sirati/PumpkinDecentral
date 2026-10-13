@@ -58,6 +58,7 @@ impl ScreenHandlerFactory for EnderChestScreenFactory {
 #[pumpkin_block("minecraft:ender_chest")]
 pub struct EnderChestBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for EnderChestBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut props = LadderLikeProperties::default(args.block);

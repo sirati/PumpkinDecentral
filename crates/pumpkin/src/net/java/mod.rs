@@ -75,6 +75,61 @@ use crate::net::{
 use crate::plugin::api::events::world::chunk_send::ChunkSend;
 use crate::{error::PumpkinError, server::Server};
 
+struct JavaClientSeed {
+    id: u64,
+    server_address: String,
+    address: SocketAddr,
+    connection_state: AtomicCell<ConnectionState>,
+    close_token: CancellationToken,
+    compression_enabled: bool,
+    version: AtomicCell<JavaMinecraftVersion>,
+    brand: Option<String>,
+    packet_limiter: PacketRateLimiter,
+}
+
+#[cfg(feature = "cluster-e2e")]
+pub(crate) struct JavaOfflineSink {
+    normal: Receiver<OutgoingPacket>,
+    priority: Receiver<OutgoingPacket>,
+    pending_bytes: Arc<AtomicUsize>,
+    encoder: TCPNetworkEncoder<tokio::io::Sink>,
+    frame: Vec<u8>,
+}
+
+#[cfg(feature = "cluster-e2e")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct JavaOfflineDrain {
+    pub packets: usize,
+    pub payload_bytes: usize,
+    pub framed_bytes: usize,
+    pub queued_packets: usize,
+    pub queued_payload_bytes: usize,
+}
+
+#[cfg(feature = "cluster-e2e")]
+impl JavaOfflineSink {
+    pub(crate) fn drain(&mut self, limit: usize) -> Result<JavaOfflineDrain, PacketEncodeError> {
+        let mut result = JavaOfflineDrain { queued_packets: self.normal.len() + self.priority.len(),
+            queued_payload_bytes: self.pending_bytes.load(Ordering::Acquire), ..Default::default() };
+        for _ in 0..limit {
+            let packet = match self.priority.try_recv().or_else(|_| self.normal.try_recv()) {
+                Ok(packet) => packet,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            };
+            self.frame.clear();
+            if packet.preframed { self.frame.extend_from_slice(&packet.data); }
+            else { self.encoder.frame_packet(&packet.data, &mut self.frame)?; }
+            result.packets += 1;
+            result.payload_bytes += packet.data.len();
+            result.framed_bytes += self.frame.len();
+            decrement_pending_bytes(&self.pending_bytes, packet.data.len());
+            if let Some(completion) = packet.completion { let _ = completion.send(()); }
+        }
+        Ok(result)
+    }
+}
+
+
 pub struct JavaClient {
     pub id: u64,
     pub version: AtomicCell<JavaMinecraftVersion>,
@@ -260,8 +315,23 @@ impl JavaClient {
         let mut payload = &packet.payload[..];
         if packet.id == SConfirmTeleport::to_id(version) {
             let confirmation = SConfirmTeleport::read(&mut payload, &version)?;
-            if let Some(player) = player {
+            let attached = self.player.load_full();
+            let promoted = (confirmation.teleport_id.0
+                != crate::server::cluster_lobby::LOBBY_TELEPORT_ID)
+                .then(|| attached.as_ref().as_deref())
+                .flatten();
+            if let Some(player) = player.or(promoted) {
                 self.handle_confirm_teleport(player, &confirmation);
+                #[cfg(feature = "cluster-e2e")]
+                if confirmation.teleport_id.0 != crate::server::cluster_lobby::LOBBY_TELEPORT_ID
+                    && let Some(server) = player.world().server.upgrade()
+                {
+                    crate::server::cluster_test_handoff::confirmed(
+                        &server,
+                        player,
+                        confirmation.teleport_id.0,
+                    );
+                }
             }
         } else if packet.id == pumpkin_protocol::java::server::play::SKeepAlive::to_id(version) {
             let response =
@@ -310,45 +380,54 @@ impl JavaClient {
         TCPNetworkDecoder<BufReader<OwnedReadHalf>>,
         TCPNetworkEncoder<BufWriter<OwnedWriteHalf>>,
     ) {
+        let seed = JavaClientSeed {
+            id: pending.id, server_address: pending.server_address, address: pending.address,
+            connection_state: pending.connection_state, close_token: pending.close_token,
+            compression_enabled: pending.compression_enabled, version: pending.version,
+            brand: pending.brand, packet_limiter: pending.packet_limiter,
+        };
+        (Self::from_seed(seed, gameprofile, config), pending.network_reader, pending.network_writer)
+    }
+
+    fn from_seed(seed: JavaClientSeed, gameprofile: GameProfile, config: PlayerConfig) -> Self {
         let (send, recv) = tokio::sync::mpsc::channel(4096);
         let (priority_send, priority_recv) = tokio::sync::mpsc::channel(256);
-        let network_reader = pending.network_reader;
-        let network_writer = pending.network_writer;
+        Self {
+            id: seed.id, gameprofile, config: ArcSwap::from_pointee(config),
+            server_address: seed.server_address, address: seed.address,
+            connection_state: seed.connection_state, close_token: seed.close_token,
+            tasks: TaskTracker::new(), rt_handle: tokio::runtime::Handle::current(),
+            outgoing_packet_queue_send: send, outgoing_packet_queue_recv: Some(recv),
+            outgoing_packet_priority_send: priority_send, outgoing_packet_priority_recv: Some(priority_recv),
+            pending_bytes: Arc::new(AtomicUsize::new(0)), compression_enabled: seed.compression_enabled,
+            version: seed.version, brand: ArcSwap::from_pointee(seed.brand), player: ArcSwap::from_pointee(None),
+            cluster_lobby_request: AtomicU8::new(0), cluster_lobby_notify: tokio::sync::Notify::new(),
+            wait_for_keep_alive: AtomicBool::new(false), received_movement_this_tick: AtomicBool::new(false),
+            keep_alive_id: AtomicCell::new(0), last_keep_alive_time: AtomicCell::new(Instant::now()),
+            last_packet_time: AtomicCell::new(Instant::now()), pending_keep_alives: ArcSwap::from_pointee(Vec::new()),
+            packet_sequence: AtomicI32::new(-1), packet_limiter: seed.packet_limiter,
+        }
+    }
 
-        (
-            Self {
-                id: pending.id,
-                gameprofile,
-                config: ArcSwap::from_pointee(config),
-                server_address: pending.server_address,
-                address: pending.address,
-                connection_state: pending.connection_state,
-                close_token: pending.close_token,
-                tasks: TaskTracker::new(),
-                rt_handle: tokio::runtime::Handle::current(),
-                outgoing_packet_queue_send: send,
-                outgoing_packet_queue_recv: Some(recv),
-                outgoing_packet_priority_send: priority_send,
-                outgoing_packet_priority_recv: Some(priority_recv),
-                pending_bytes: Arc::new(AtomicUsize::new(0)),
-                compression_enabled: pending.compression_enabled,
-                version: pending.version,
-                brand: ArcSwap::from_pointee(pending.brand),
-                player: ArcSwap::from_pointee(None),
-                cluster_lobby_request: AtomicU8::new(0),
-                cluster_lobby_notify: tokio::sync::Notify::new(),
-                wait_for_keep_alive: AtomicBool::new(false),
-                received_movement_this_tick: AtomicBool::new(false),
-                keep_alive_id: AtomicCell::new(0),
-                last_keep_alive_time: AtomicCell::new(Instant::now()),
-                last_packet_time: AtomicCell::new(Instant::now()),
-                pending_keep_alives: ArcSwap::from_pointee(Vec::new()),
-                packet_sequence: AtomicI32::new(-1),
-                packet_limiter: pending.packet_limiter,
-            },
-            network_reader,
-            network_writer,
-        )
+    #[cfg(feature = "cluster-e2e")]
+    pub(crate) fn offline(
+        id: u64, gameprofile: GameProfile, config: PlayerConfig, version: JavaMinecraftVersion,
+        compression: Option<(pumpkin_protocol::CompressionThreshold, pumpkin_protocol::CompressionLevel)>,
+    ) -> (Self, JavaOfflineSink) {
+        let mut client = Self::from_seed(JavaClientSeed {
+            id, server_address: String::new(), address: SocketAddr::from(([127, 0, 0, 1], 0)),
+            connection_state: AtomicCell::new(ConnectionState::Play), close_token: CancellationToken::new(),
+            compression_enabled: compression.is_some(), version: AtomicCell::new(version), brand: None,
+            packet_limiter: PacketRateLimiter::new(false, 0.0, 0.0),
+        }, gameprofile, config);
+        let mut encoder = TCPNetworkEncoder::new(tokio::io::sink());
+        if let Some(compression) = compression { encoder.set_compression(compression); }
+        let sink = JavaOfflineSink {
+            normal: client.outgoing_packet_queue_recv.take().expect("new client normal queue"),
+            priority: client.outgoing_packet_priority_recv.take().expect("new client priority queue"),
+            pending_bytes: client.pending_bytes.clone(), encoder, frame: Vec::new(),
+        };
+        (client, sink)
     }
 
     pub fn set_player(&self, player: Arc<Player>) {
@@ -530,6 +609,35 @@ impl JavaClient {
     where
         F: Future,
     {
+        self.progress_lobby_join(session, server, network_reader, join, false)
+            .await
+    }
+
+    pub(crate) async fn progress_lobby_until_session_idle(
+        &self,
+        session: &mut crate::server::cluster_lobby::LobbySession,
+        server: &Arc<Server>,
+        network_reader: &mut TCPNetworkDecoder<BufReader<OwnedReadHalf>>,
+    ) -> bool {
+        self.progress_lobby_join(
+            session,
+            server,
+            network_reader,
+            std::future::ready(()),
+            true,
+        )
+        .await
+        .is_some()
+    }
+
+    async fn progress_lobby_join<F: Future>(
+        &self,
+        session: &mut crate::server::cluster_lobby::LobbySession,
+        server: &Arc<Server>,
+        network_reader: &mut TCPNetworkDecoder<BufReader<OwnedReadHalf>>,
+        join: F,
+        until_session_idle: bool,
+    ) -> Option<F::Output> {
         let keep_alive_time = server.advanced_config.networking.java.keep_alive_time;
         let mut keep_alive_interval =
             tokio::time::interval(std::time::Duration::from_secs(keep_alive_time.max(1)));
@@ -537,8 +645,11 @@ impl JavaClient {
         keep_alive_interval.tick().await;
         tokio::pin!(join);
         loop {
+            if until_session_idle {
+                session.poll_virtual_events(server);
+            }
             tokio::select! {
-                result = &mut join => return Some(result),
+                result = &mut join, if !until_session_idle || session.session_work_complete() => return Some(result),
                 _ = progress_interval.tick() => session.poll_virtual_events(server),
                 _ = keep_alive_interval.tick() => {
                     if self.wait_for_keep_alive.load(Ordering::Relaxed) {
@@ -699,6 +810,11 @@ impl JavaClient {
     #[allow(clippy::unused_async)]
     pub async fn enqueue_packet_data(&self, packet_data: Bytes) {
         self.try_enqueue_packet_data(packet_data);
+    }
+
+    pub(crate) fn try_enqueue_packet_burst(&self, packets: Vec<Bytes>) -> Result<(), Vec<Bytes>> {
+        if self.is_closed() { return Err(packets); }
+        super::try_enqueue_packet_burst(&self.outgoing_packet_queue_send, &self.pending_bytes, packets, OutgoingPacket::normal)
     }
 
     pub fn try_enqueue_packet(&self, packet_data: Bytes) {
@@ -1120,6 +1236,9 @@ impl JavaClient {
             return Ok(());
         }
 
+        use play::session::PlaySessionPacket;
+        let mut session_packet = play::session::decode(packet, version)?;
+
         let mut payload = &packet.payload[..];
         match packet.id {
             id if id == SChangeGameMode::to_id(version) => {
@@ -1129,7 +1248,9 @@ impl JavaClient {
                 );
             }
             id if id == SChatAck::to_id(version) => {
-                let packet = SChatAck::read(&mut payload, &version)?;
+                let Some(PlaySessionPacket::ChatAck(packet)) = session_packet.take() else {
+                    return Ok(());
+                };
                 if server.advanced_config.cluster.enabled {
                     if server.basic_config.allow_chat_reports
                         && crate::server::cluster_session_ingress::stage(
@@ -1150,7 +1271,9 @@ impl JavaClient {
                 self.handle_chat_ack(player, &packet);
             }
             id if id == SChatCommand::to_id(version) => {
-                let packet = SChatCommand::read(&mut payload, &version)?;
+                let Some(PlaySessionPacket::Command(packet)) = session_packet.take() else {
+                    return Ok(());
+                };
                 let cmd = packet.command.to_string();
                 if server.advanced_config.cluster.enabled {
                     if crate::server::cluster_session_ingress::stage(
@@ -1184,15 +1307,10 @@ impl JavaClient {
                 });
             }
             id if id == SChatCommandSigned::to_id(version) => {
-                let mut signed_payload = payload;
-                let cmd =
-                    if let Ok(signed) = SChatCommandSigned::read(&mut signed_payload, &version) {
-                        signed.command.to_string()
-                    } else {
-                        SChatCommand::read(&mut payload, &version)?
-                            .command
-                            .to_string()
-                    };
+                let Some(PlaySessionPacket::SignedCommand(command)) = session_packet.take() else {
+                    return Ok(());
+                };
+                let cmd = command.to_string();
                 if server.advanced_config.cluster.enabled {
                     if crate::server::cluster_session_ingress::stage(
                         player,
@@ -1225,7 +1343,9 @@ impl JavaClient {
                 });
             }
             id if id == SChatMessage::to_id(version) => {
-                let packet = SChatMessage::read(&mut payload, &version)?;
+                let Some(PlaySessionPacket::Chat(packet)) = session_packet.take() else {
+                    return Ok(());
+                };
                 if server.advanced_config.cluster.enabled {
                     if let Some(command) = packet.message.strip_prefix('/') {
                         if crate::server::cluster_session_ingress::stage(
@@ -1328,11 +1448,37 @@ impl JavaClient {
                 });
             }
             id if id == SClientInformationPlay::to_id(version) => {
-                self.handle_client_information(
-                    server,
-                    player,
-                    &SClientInformationPlay::read(&mut payload, &version)?,
-                );
+                let Some(PlaySessionPacket::Settings(packet)) = session_packet.take() else {
+                    return Ok(());
+                };
+                if server.advanced_config.cluster.enabled {
+                    let config = match play::session::player_config(&packet, server) {
+                        Ok(config) => config,
+                        Err(reason) => {
+                            player.client.try_kick(
+                                crate::net::DisconnectReason::Kicked,
+                                &TextComponent::text(reason),
+                            );
+                            return Ok(());
+                        }
+                    };
+                    if crate::server::cluster_session_ingress::stage(
+                        player,
+                        crate::server::cluster_session_ingress::StagedSessionInput::Settings {
+                            config,
+                            received_at: Instant::now(),
+                        },
+                    )
+                    .is_err()
+                    {
+                        player.client.try_kick(
+                            crate::net::DisconnectReason::Kicked,
+                            &TextComponent::text("Cluster session queue is full"),
+                        );
+                    }
+                    return Ok(());
+                }
+                self.handle_client_information(server, player, &packet);
             }
             id if id == SClientCommand::to_id(version) => {
                 self.handle_client_status(player, &SClientCommand::read(&mut payload, &version)?);
@@ -1544,11 +1690,10 @@ impl JavaClient {
                 self.handle_use_item(player, &SUseItem::read(&mut payload, &version)?, server);
             }
             id if id == SCommandSuggestion::to_id(version) => {
-                self.handle_command_suggestion(
-                    player,
-                    &SCommandSuggestion::read(&mut payload, &version)?,
-                    server,
-                );
+                let Some(PlaySessionPacket::Suggestions(packet)) = session_packet.take() else {
+                    return Ok(());
+                };
+                self.handle_command_suggestion(player, &packet, server);
             }
             id if id == SCloseContainer::to_id(version) => {
                 let packet = SCloseContainer::read(&mut payload, &version)?;
@@ -1558,7 +1703,9 @@ impl JavaClient {
                 self.handle_chunk_batch(player, &SChunkBatch::read(&mut payload, &version)?);
             }
             id if id == SPlayerSession::to_id(version) => {
-                let session = SPlayerSession::read(&mut payload, &version)?;
+                let Some(PlaySessionPacket::Session(session)) = session_packet.take() else {
+                    return Ok(());
+                };
                 if server.advanced_config.cluster.enabled {
                     if server.basic_config.allow_chat_reports
                         && crate::server::cluster_session_ingress::stage(
@@ -1591,7 +1738,27 @@ impl JavaClient {
                 });
             }
             id if id == SCustomPayload::to_id(version) => {
-                let payload = SCustomPayload::read(&mut payload, &version)?;
+                let Some(PlaySessionPacket::Payload(payload)) = session_packet.take() else {
+                    return Ok(());
+                };
+                if server.advanced_config.cluster.enabled {
+                    if crate::server::cluster_session_ingress::stage(
+                        player,
+                        crate::server::cluster_session_ingress::StagedSessionInput::Payload {
+                            channel: payload.channel.to_string(),
+                            data: Bytes::copy_from_slice(payload.data),
+                            received_at: Instant::now(),
+                        },
+                    )
+                    .is_err()
+                    {
+                        player.client.try_kick(
+                            crate::net::DisconnectReason::Kicked,
+                            &TextComponent::text("Cluster session queue is full"),
+                        );
+                    }
+                    return Ok(());
+                }
                 self.handle_play_custom_payload(server, player, payload.channel, payload.data);
             }
             id if id == SRecipeBookChangeSettings::to_id(version) => {
@@ -1630,10 +1797,27 @@ impl JavaClient {
             id if id
                 == pumpkin_protocol::java::server::play::SCustomClickAction::to_id(version) =>
             {
-                let packet = pumpkin_protocol::java::server::play::SCustomClickAction::read(
-                    &mut payload,
-                    &version,
-                )?;
+                let Some(PlaySessionPacket::Dialog(packet)) = session_packet.take() else {
+                    return Ok(());
+                };
+                if server.advanced_config.cluster.enabled {
+                    if crate::server::cluster_session_ingress::stage(
+                        player,
+                        crate::server::cluster_session_ingress::StagedSessionInput::Dialog {
+                            action_id: packet.action_id.to_string(),
+                            payload: packet.payload.map(Bytes::copy_from_slice),
+                            received_at: Instant::now(),
+                        },
+                    )
+                    .is_err()
+                    {
+                        player.client.try_kick(
+                            crate::net::DisconnectReason::Kicked,
+                            &TextComponent::text("Cluster session queue is full"),
+                        );
+                    }
+                    return Ok(());
+                }
                 let mut event = crate::plugin::api::events::dialog::dialog_click_action::DialogClickActionEvent::new(
                     player.clone(),
                     packet.action_id.to_string(),
@@ -1663,14 +1847,34 @@ impl JavaClient {
                 );
             }
             id if id == SPlayResourcePack::to_id(version) => {
-                self.handle_play_resource_pack_response(
-                    server,
-                    player,
-                    &SPlayResourcePack::read(&mut payload, &version)?,
-                );
+                let Some(PlaySessionPacket::ResourcePack(packet)) = session_packet.take() else {
+                    return Ok(());
+                };
+                if server.advanced_config.cluster.enabled {
+                    if crate::server::cluster_session_ingress::stage(
+                        player,
+                        crate::server::cluster_session_ingress::StagedSessionInput::ResourcePack {
+                            uuid: packet.uuid,
+                            result: packet.result,
+                            received_at: Instant::now(),
+                        },
+                    )
+                    .is_err()
+                    {
+                        player.client.try_kick(
+                            crate::net::DisconnectReason::Kicked,
+                            &TextComponent::text("Cluster session queue is full"),
+                        );
+                    }
+                    return Ok(());
+                }
+                self.handle_play_resource_pack_response(server, player, &packet);
             }
             id if id == SPlayPong::to_id(version) => {
-                self.handle_play_pong(player, &SPlayPong::read(&mut payload, &version)?);
+                let Some(PlaySessionPacket::Pong(packet)) = session_packet.take() else {
+                    return Ok(());
+                };
+                self.handle_play_pong(player, &packet);
             }
             id if id == SLockDifficulty::to_id(version) => {
                 self.handle_lock_difficulty(
@@ -1750,5 +1954,31 @@ impl JavaClient {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "cluster-e2e"))]
+mod offline_sink_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn production_queue_drains_bounded_frames_and_releases_pending_bytes() {
+        let profile = GameProfile { id: uuid::Uuid::from_u128(1), name: "benchmark".into(),
+            properties: ArcSwap::from_pointee(Vec::new()), profile_actions: None };
+        let (client, mut sink) = JavaClient::offline(1, profile, PlayerConfig::default(),
+            pumpkin_data::packet::CURRENT_MC_VERSION, None);
+        for id in 0..3 { client.try_send_packet(&pumpkin_protocol::java::client::play::CKeepAlive::new(id)); }
+        let first = sink.drain(2).unwrap();
+        assert_eq!(first.queued_packets, 3);
+        assert_eq!(first.packets, 2);
+        assert!(first.framed_bytes > first.payload_bytes);
+        assert!(client.pending_bytes.load(Ordering::Acquire) > 0);
+        let second = sink.drain(2).unwrap();
+        assert_eq!(second.queued_packets, 1);
+        assert_eq!(second.packets, 1);
+        assert_eq!(first.payload_bytes + second.payload_bytes, first.queued_payload_bytes);
+        assert_eq!(client.pending_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(sink.drain(2).unwrap().packets, 0);
+        assert!(!client.is_closed());
     }
 }

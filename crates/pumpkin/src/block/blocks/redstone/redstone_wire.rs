@@ -27,6 +27,7 @@ type RedstoneWireProperties = RedstoneWireLikeProperties;
 #[pumpkin_block("minecraft:redstone_wire")]
 pub struct RedstoneWireBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for RedstoneWireBlock {
     fn can_place_at(&self, args: CanPlaceAtArgs<'_>) -> bool {
         can_survive(args.block_accessor, args.position)
@@ -409,7 +410,7 @@ fn update_neighbors_of_neighboring_wires(world: &Arc<World>, pos: &BlockPos) {
 // ---------------------------------------------------------------------------
 
 pub fn get_connection_state(
-    world: &World,
+    world: &dyn crate::block::NeighborUpdateWorld,
     state: RedstoneWireProperties,
     pos: &BlockPos,
 ) -> RedstoneWireProperties {
@@ -447,7 +448,7 @@ pub fn get_connection_state(
 }
 
 fn get_missing_connections(
-    world: &World,
+    world: &dyn crate::block::NeighborUpdateWorld,
     mut state: RedstoneWireProperties,
     pos: &BlockPos,
 ) -> RedstoneWireProperties {
@@ -465,7 +466,7 @@ fn get_missing_connections(
 }
 
 fn get_connecting_side(
-    world: &World,
+    world: &dyn crate::block::NeighborUpdateWorld,
     pos: &BlockPos,
     direction: BlockDirection,
     can_connect_up: bool,
@@ -498,7 +499,7 @@ fn get_connecting_side(
 }
 
 fn should_connect_to(
-    world: &World,
+    world: &dyn crate::block::NeighborUpdateWorld,
     block: &Block,
     state: &BlockState,
     direction: Option<BlockDirection>,
@@ -517,7 +518,7 @@ fn should_connect_to(
         let observer_facing = observer_props.facing;
         return direction.is_some_and(|dir| dir.to_facing() == observer_facing);
     }
-    direction.is_some_and(|dir| world.block_registry.emits_redstone_power(block, state, dir))
+    direction.is_some_and(|dir| world.emits_redstone_power(block, state, dir))
 }
 
 fn is_trapdoor(block: &Block) -> bool {

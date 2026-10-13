@@ -25,7 +25,7 @@ use super::cluster_entity_emit::{ENTITY_POS_MAGIC, EntityPosDatagram};
 use crate::entity::EntityBase;
 use crate::entity::cluster_entity_replica::RemoteEntityReplica;
 
-type EntityReplicaKey = (ServerId, i32, u32);
+type EntityReplicaKey = (ServerId, i32, u64);
 type EntityReplicas = HashMap<EntityReplicaKey, Arc<RemoteEntityReplica>>;
 
 fn replica_key(entity: EntityRef) -> EntityReplicaKey {

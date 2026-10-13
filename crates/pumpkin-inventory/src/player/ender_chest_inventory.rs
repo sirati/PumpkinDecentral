@@ -10,9 +10,9 @@
 //! Ender chests track when players open and close them to properly
 //! manage the viewer count for animation purposes.
 
+use arc_swap::ArcSwapOption;
 use std::any::Any;
 use std::sync::{Arc, RwLock};
-use arc_swap::ArcSwapOption;
 
 use crate::{
     inventory::{Clearable, Inventory},
@@ -113,7 +113,10 @@ impl Inventory for EnderChestInventory {
 
     fn get_stack(&self, slot: usize) -> ItemStack {
         if let Some(snapshot) = self.cluster_snapshot.load_full() {
-            return snapshot.get(slot).cloned().unwrap_or_else(|| ItemStack::EMPTY.clone());
+            return snapshot
+                .get(slot)
+                .cloned()
+                .unwrap_or_else(|| ItemStack::EMPTY.clone());
         }
         let items = self
             .items

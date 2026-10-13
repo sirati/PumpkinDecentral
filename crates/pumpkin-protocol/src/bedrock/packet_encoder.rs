@@ -11,6 +11,7 @@ use crate::{
 
 /// Encoder: Server -> Client
 /// Supports Zlib compression.
+#[derive(Clone)]
 pub struct BedrockBatchEncoder {
     // compression and compression threshold
     compression: Option<(CompressionThreshold, CompressionLevel)>,
@@ -131,6 +132,30 @@ mod tests {
     use super::*;
     use crate::bedrock::packet_decoder::BedrockBatchDecoder;
     use std::io::Cursor;
+
+    #[tokio::test]
+    async fn encoder_configuration_snapshot_remains_valid_after_compression_change() {
+        let prior = BedrockBatchEncoder::new();
+        let mut current = prior.clone();
+        current.set_compression((256, 6));
+        let payload = b"immutable encoder snapshot";
+        for (encoder, compressed) in [(&prior, false), (&current, true)] {
+            let mut bytes = Vec::new();
+            encoder
+                .write_game_packet(1, SubClient::Main, SubClient::Main, payload, &mut bytes)
+                .unwrap();
+            let mut decoder = BedrockBatchDecoder::new();
+            if compressed {
+                decoder.set_compression(256);
+            }
+            let decoded = decoder.get_packet_payload(bytes).await.unwrap();
+            let packet = decoder.get_game_packet(&mut Cursor::new(decoded)).unwrap();
+            assert_eq!(packet.id, 1);
+            assert_eq!(packet.payload.as_ref(), payload);
+        }
+        assert!(prior.compression.is_none());
+        assert_eq!(current.compression, Some((256, 6)));
+    }
 
     #[tokio::test]
     async fn bedrock_compression_cycle() -> Result<(), Box<dyn std::error::Error>> {

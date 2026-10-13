@@ -50,7 +50,7 @@ impl JavaClient {
             match current_val {
                 GameRuleValue::Int(_) => {
                     if let Ok(val) = entry.value.parse::<i64>() {
-                        player.world().set_game_rule(rule, GameRuleValue::Int(val));
+                        if !player.world().set_game_rule(rule, GameRuleValue::Int(val)) {continue;}
                         info!(
                             "Player {} set gamerule {} to {}",
                             player.gameprofile.name, key, val
@@ -64,7 +64,7 @@ impl JavaClient {
                 }
                 GameRuleValue::Bool(_) => {
                     if let Ok(val) = entry.value.parse::<bool>() {
-                        player.world().set_game_rule(rule, GameRuleValue::Bool(val));
+                        if !player.world().set_game_rule(rule, GameRuleValue::Bool(val)) {continue;}
                         info!(
                             "Player {} set gamerule {} to {}",
                             player.gameprofile.name, key, val

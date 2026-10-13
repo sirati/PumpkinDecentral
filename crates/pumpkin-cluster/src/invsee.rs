@@ -57,8 +57,85 @@ impl InvseeSlot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InventoryPreviewAuthority {
+    pub provider: crate::realm_completion::PeerGeneration,
+    pub cut: crate::time::TickStamp,
+    pub frontiers: Vec<(
+        crate::action_graph::InventoryRealmId,
+        crate::action_graph::PlayerInventoryGroundFrontier,
+    )>,
+    pub living: crate::canonical_action::Cell,
+    pub living_ground_anchor: crate::action_graph::GroundAnchor,
+    pub inventory_cells:
+        std::collections::BTreeMap<crate::inventory::InvLoc, crate::canonical_action::Cell>,
+}
+
+impl InventoryPreviewAuthority {
+    pub fn is_valid(
+        &self,
+        lease: crate::canonical_action::LivePlayerLease,
+        affected: &[crate::protocol::ChunkKey],
+    ) -> bool {
+        use crate::action_graph::InventoryRealmId;
+        matches!(&self.living.value, crate::canonical_action::Value::Living(living)
+            if living.combat.equipment.is_valid() && living.avatar.as_ref().is_some_and(|avatar| avatar.is_valid() && affected.first().is_some_and(|chunk| avatar.world == chunk.world)))
+            && !self.living_ground_anchor.settled_through.is_after(self.cut)
+            && self.living_ground_anchor.value.as_ref().is_some_and(|cell| matches!(&cell.value,
+                crate::canonical_action::Value::Living(living) if living.avatar.as_ref().is_some_and(|avatar| avatar.is_valid()
+                    && affected.first().is_some_and(|chunk| avatar.world == chunk.world))))
+            && self.provider.server == lease.gid.server && self.provider.generation != 0
+            && self.inventory_cells.len() == 43 && self.inventory_cells.iter().all(|(loc, cell)| {
+                matches!(&cell.value, crate::canonical_action::Value::Inventory(value) if value.loc == *loc
+                    && value.count <= crate::inventory::INV_MAX_STACK
+                    && value.nbt.len() <= INVSEE_MAX_SLOT_NBT_BYTES
+                    && ((value.item == 0 && value.count == 0 && value.nbt.is_empty())
+                        || (value.item != 0 && value.count != 0))
+                    && match loc.inv {
+                        crate::inventory::INV_MAIN => loc.slot < 36,
+                        crate::inventory::INV_ARMOR => loc.slot < 4,
+                        crate::inventory::INV_OFFHAND | crate::inventory::INV_CURSOR | crate::inventory::INV_SELECTED => loc.slot == 0,
+                        _ => false,
+                    })
+            })
+            && affected.len() == 1 && self.frontiers.len() == 4
+            && [crate::inventory::INV_MAIN, crate::inventory::INV_ARMOR, crate::inventory::INV_OFFHAND, crate::inventory::INV_SELECTED]
+                .into_iter().all(|inv| self.frontiers.iter().filter(|(realm, frontier)| {
+                    *realm == InventoryRealmId::Player(inv) && frontier.lease == lease
+                        && frontier.accepted_chunk == affected[0] && !frontier.settled_through.is_after(self.cut)
+                }).count() == 1)
+    }
+
+    pub fn matches_projection(&self, snapshot: &InventorySnapshot) -> bool {
+        use crate::inventory::{INV_ARMOR, INV_MAIN, INV_OFFHAND, INV_SELECTED, InvLoc};
+        let mut seen = std::collections::BTreeSet::new();
+        if !snapshot.slots.iter().all(|slot| {
+            let loc = match slot.index {
+                0..=35 => InvLoc::new(INV_MAIN, slot.index),
+                36..=39 => InvLoc::new(INV_ARMOR, slot.index - 36),
+                40 => InvLoc::new(INV_OFFHAND, 0),
+                _ => return false,
+            };
+            seen.insert(loc) && self.inventory_cells.get(&loc).is_some_and(|cell| {
+                matches!(&cell.value, crate::canonical_action::Value::Inventory(value)
+                    if value.item == slot.item_id && value.count == slot.count && value.nbt == slot.nbt)
+            })
+        }) { return false; }
+        self.inventory_cells.iter().all(|(loc, cell)| {
+            if !matches!(loc.inv, INV_MAIN | INV_ARMOR | INV_OFFHAND) || seen.contains(loc) { return true; }
+            matches!(&cell.value, crate::canonical_action::Value::Inventory(value) if value.is_empty())
+        }) && snapshot.selected < 9 && self.inventory_cells.get(&InvLoc::new(INV_SELECTED, 0)).is_some_and(|cell| {
+            matches!(&cell.value, crate::canonical_action::Value::Inventory(value)
+                if value.item == u16::from(snapshot.selected) + 1 && value.count == 1 && value.nbt.is_empty())
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InventorySnapshot {
     pub target: GlobalPlayerId,
+    pub incarnation: u64,
+    pub lease: Option<crate::canonical_action::LivePlayerLease>,
+    pub authority: Option<InventoryPreviewAuthority>,
     pub owner_name: String,
     pub revision: u64,
     pub selected: u8,
@@ -80,6 +157,9 @@ impl InventorySnapshot {
         capped_slots.truncate(INVSEE_MAX_SLOTS);
         Self {
             target,
+            incarnation: 0,
+            lease: None,
+            authority: None,
             owner_name: capped_name,
             revision,
             selected,
@@ -93,6 +173,25 @@ impl InventorySnapshot {
         affected.sort_unstable();
         affected.dedup();
         self.affected = affected;
+        self
+    }
+
+    #[must_use]
+    pub fn with_incarnation(mut self, incarnation: u64) -> Self {
+        self.incarnation = incarnation;
+        self
+    }
+
+    #[must_use]
+    pub fn with_lease(mut self, lease: crate::canonical_action::LivePlayerLease) -> Self {
+        self.incarnation = lease.incarnation;
+        self.lease = Some(lease);
+        self
+    }
+
+    #[must_use]
+    pub fn with_authority(mut self, authority: InventoryPreviewAuthority) -> Self {
+        self.authority = Some(authority);
         self
     }
 
@@ -484,6 +583,17 @@ fn valid_control(message: &InvseeControl) -> bool {
         InvseeControl::Response(response) => match &response.outcome {
             InvseeOutcome::Found(snapshot) => {
                 snapshot.owner_name.chars().count() <= INVSEE_MAX_NAME_CHARS
+                    && snapshot.lease.is_none_or(|lease| {
+                        lease.gid == snapshot.target
+                            && lease.incarnation != 0
+                            && lease.incarnation == snapshot.incarnation
+                    })
+                    && snapshot.authority.as_ref().is_none_or(|authority| {
+                        snapshot
+                            .lease
+                            .is_some_and(|lease| authority.is_valid(lease, &snapshot.affected))
+                            && authority.matches_projection(snapshot)
+                    })
                     && snapshot.slots.len() <= INVSEE_MAX_SLOTS
                     && snapshot.slots.iter().all(valid_slot)
             }

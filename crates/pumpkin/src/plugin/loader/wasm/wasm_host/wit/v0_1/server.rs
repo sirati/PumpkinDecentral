@@ -1648,7 +1648,11 @@ impl pumpkin::plugin::server::HostWhitelistManager for PluginHostState {
             .server
             .as_ref()
             .ok_or_else(|| wasmtime::Error::msg("Server not available"))?;
-        Ok(server.white_list.load(std::sync::atomic::Ordering::Relaxed))
+        Ok(if server.advanced_config.cluster.enabled {
+            server.cluster_access_policy.snapshot().enabled
+        } else {
+            server.white_list.load(std::sync::atomic::Ordering::Relaxed)
+        })
     }
 
     async fn is_whitelisted(

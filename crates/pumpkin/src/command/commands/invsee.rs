@@ -544,6 +544,21 @@ fn open_cluster_invsee_view(
         InventoryTarget,
     };
 
+    if snapshot.incarnation == 0
+        || snapshot.lease.is_none_or(|lease| {
+            lease.gid != snapshot.target
+                || lease.incarnation != snapshot.incarnation
+                || lease.incarnation == 0
+        })
+        || snapshot.authority.as_ref().is_none_or(|authority| {
+            snapshot
+                .lease
+                .is_none_or(|lease| !authority.is_valid(lease, &snapshot.affected))
+        })
+    {
+        return Err(pumpkin_cluster::inventory::InventoryApplyError::Rejected);
+    }
+
     let server = viewer
         .world()
         .server
@@ -658,12 +673,16 @@ fn open_cluster_invsee_view(
     let screen = InventoryScreenSnapshot {
         session,
         sync_id,
+        state_id: 0,
         window_kind: WindowType::Generic9x5 as u16,
         container_slots: CONTAINER_SIZE as u16,
         slots,
         cursor,
         affected,
         preview: Some(preview),
+        preview_incarnation: Some(snapshot.incarnation),
+        preview_lease: snapshot.lease,
+        preview_authority: snapshot.authority.clone(),
     };
     viewer
         .cluster_current_inventory_session
@@ -704,8 +723,9 @@ fn open_cluster_invsee_view(
         );
         return Err(pumpkin_cluster::inventory::InventoryApplyError::TargetUnavailable);
     }
-    let submitted = cluster_invsee::open_inventory_screen_with_presentation(
+    let submitted = cluster_invsee::open_inventory_screen_for_lease(
         &server,
+        crate::server::cluster_world_owner::player_action_lease(&server, viewer).ok_or(pumpkin_cluster::inventory::InventoryApplyError::TargetUnavailable)?,
         screen,
         None,
         Some(cluster_invsee::ClusterScreenPresentation {

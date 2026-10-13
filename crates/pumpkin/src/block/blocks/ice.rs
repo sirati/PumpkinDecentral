@@ -62,7 +62,37 @@ impl BlockMetadata for IceBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for IceBlock {
+    fn player_broken_intent(
+        &self,
+        args: crate::block::neighbor::PlayerBrokenIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        if args.context.creative || args.context.silk_touch || args.context.water_evaporates {
+            return Some(Vec::new());
+        }
+        let below = args.world.get_block_state_id(&args.position.down());
+        if blocks_movement(below.to_state(), below.to_block_id())
+            || below.to_state().is_liquid()
+            || below.to_state().is_solid()
+        {
+            Some(vec![
+                crate::block::neighbor::BlockCallbackEffect::FluidTransition(
+                    crate::block::fluid::owned::FluidWrite {
+                        position: *args.position,
+                        before: BlockStateId::AIR,
+                        after: Block::WATER.default_state.id,
+                        replace_with_drops: false,
+                        delay: Some(5),
+                        fizz: false,
+                    },
+                ),
+            ])
+        } else {
+            Some(Vec::new())
+        }
+    }
+
     fn broken(&self, args: BrokenArgs<'_>) {
         {
             let held_item = args.player.inventory().held_item();
@@ -111,7 +141,15 @@ impl BlockMetadata for FrostedIceBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for FrostedIceBlock {
+    fn player_broken_intent(
+        &self,
+        args: crate::block::neighbor::PlayerBrokenIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        IceBlock.player_broken_intent(args)
+    }
+
     fn placed(&self, args: PlacedArgs<'_>) {
         {
             let delay = rand::rng().random_range(60..=120);

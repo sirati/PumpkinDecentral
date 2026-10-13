@@ -518,9 +518,88 @@ struct OnlyAdvancementCriterionExecutor {
     action: Action,
 }
 
+fn queue_cluster_advancements(
+    context: &CommandContext,
+    action: Action,
+    advancements: &[&Advancement],
+    criterion: Option<String>,
+) -> Option<CommandExecutorResult> {
+    let server = context
+        .source
+        .server
+        .as_ref()
+        .filter(|server| server.advanced_config.cluster.enabled)?;
+    let targets = match EntityArgumentType::get_entities(context, ARG_TARGETS) {
+        Ok(targets) => targets,
+        Err(error) => return Some(Err(error)),
+    };
+    let achieved_millis = match std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+    {
+        Some(value) => value,
+        None => {
+            context
+                .source
+                .send_error(TextComponent::text("Advancement capture clock is invalid"));
+            return Some(Ok(0));
+        }
+    };
+    let ids = advancements
+        .iter()
+        .map(|advancement| advancement.id.to_string())
+        .collect::<Vec<_>>();
+    let mut queued = 0;
+    for entity in targets {
+        let Some(target @ pumpkin_cluster::player_command_control::CommandTarget::Player { .. }) =
+            crate::server::cluster_player_commands::entity_target(server, entity.as_ref())
+        else {
+            context.source.send_error(TextComponent::text(
+                "Advancement target has no current canonical player identity",
+            ));
+            continue;
+        };
+        for batch in ids.chunks(2) {
+            let mutation =
+                pumpkin_cluster::player_command_control::PlayerCommandMutation::Advancements {
+                    ids: batch.to_vec(),
+                    criterion: criterion.clone(),
+                    granted: matches!(action, Action::Grant),
+                    achieved_millis,
+                };
+            match crate::server::cluster_player_commands::submit_target(
+                server,
+                &context.source,
+                target.clone(),
+                mutation,
+                Some(TextComponent::text("Advancement change applied")),
+            ) {
+                Ok(_) => queued += 1,
+                Err(error) => context.source.send_error(TextComponent::text(format!(
+                    "Advancement change could not be queued: {error:?}"
+                ))),
+            }
+        }
+    }
+    if queued != 0 {
+        context
+            .source
+            .send_feedback(TextComponent::text("Advancement change queued"), false);
+    }
+    Some(Ok(queued))
+}
+
 impl CommandExecutor for OnlyAdvancementCriterionExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let action = self.action;
+        let advancement = ResourceKeyArgument::get_advancement(context, ARG_ADVANCEMENT)?;
+        let criterion = StringArgumentType::get(context, ARG_CRITERION)?;
+        if let Some(result) =
+            queue_cluster_advancements(context, action, &[advancement], Some(criterion.to_owned()))
+        {
+            return result;
+        }
         perform_criterion(
             &context.source,
             &EntityArgumentType::get_players(context, ARG_TARGETS)?,
@@ -541,6 +620,13 @@ impl CommandExecutor for AdvancementExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let action = self.action;
         let mode = self.mode;
+        let selected = get_advancements(
+            ResourceKeyArgument::get_advancement(context, ARG_ADVANCEMENT)?,
+            mode,
+        );
+        if let Some(result) = queue_cluster_advancements(context, action, &selected, None) {
+            return result;
+        }
         perform_and_show(
             &context.source,
             &EntityArgumentType::get_players(context, ARG_TARGETS)?,
@@ -582,6 +668,11 @@ impl CommandExecutor for EveryAdvancementExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let action = self.action;
         let show_advancement = self.show_advancement;
+        if let Some(result) =
+            queue_cluster_advancements(context, action, &Advancement::get_advancements_list(), None)
+        {
+            return result;
+        }
         perform(
             &context.source,
             &EntityArgumentType::get_players(context, ARG_TARGETS)?,

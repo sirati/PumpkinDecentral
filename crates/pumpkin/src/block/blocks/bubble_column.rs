@@ -160,6 +160,7 @@ fn bubble_column_velocity(
     )
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for BubbleColumnBlock {
     fn on_entity_collision(&self, args: OnEntityCollisionArgs<'_>) {
         {

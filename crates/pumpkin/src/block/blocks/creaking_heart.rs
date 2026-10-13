@@ -37,6 +37,7 @@ impl CreakingHeartBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for CreakingHeartBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut props = CreakingHeartLikeProperties::from_state_id(args.block.default_state.id);

@@ -377,26 +377,19 @@ impl ItemEntity {
             .ok();
     }
 
-    fn apply_fluid_drag_or_gravity(&self, mut velo: Vector3<f64>) -> Vector3<f64> {
+    fn apply_fluid_drag_or_gravity(&self, velo: Vector3<f64>) -> Vector3<f64> {
+        use pumpkin_util::math::item_motion::{ItemMedium, apply_item_drag};
         let entity = &self.entity;
-
-        if entity.touching_water.load(Ordering::SeqCst) && entity.water_height.load() > 0.1 {
-            velo.x *= 0.99;
-            velo.z *= 0.99;
-            if velo.y < 0.06 {
-                velo.y += 5.0e-4;
-            }
+        let medium = if entity.touching_water.load(Ordering::SeqCst)
+            && entity.water_height.load() > 0.1
+        {
+            ItemMedium::Water
         } else if entity.touching_lava.load(Ordering::SeqCst) && entity.lava_height.load() > 0.1 {
-            velo.x *= 0.95;
-            velo.z *= 0.95;
-            if velo.y < 0.06 {
-                velo.y += 5.0e-4;
-            }
+            ItemMedium::Lava
         } else {
-            velo.y -= <Self as EntityBase>::get_gravity(self);
-        }
-
-        velo
+            ItemMedium::Air
+        };
+        apply_item_drag(velo, medium, <Self as EntityBase>::get_gravity(self))
     }
 
     fn update_no_physics_and_push_out(&self) {
@@ -423,19 +416,19 @@ impl ItemEntity {
     fn should_tick_move(&self, move_velo: Vector3<f64>) -> Option<bool> {
         let entity = &self.entity;
 
-        let mut tick_move = !entity.on_ground.load(Ordering::SeqCst)
-            || move_velo.horizontal_length_squared() > 1.0e-5;
-
-        if !tick_move {
-            let Ok(item_age) = i32::try_from(self.item_age.load(Ordering::Relaxed)) else {
-                entity.remove();
-                return None;
-            };
-
-            tick_move = (item_age + entity.entity_id) % 4 == 0;
+        let on_ground = entity.on_ground.load(Ordering::SeqCst);
+        let age = self.item_age.load(Ordering::Relaxed);
+        let moving = !on_ground || move_velo.horizontal_length_squared() > 1.0e-5;
+        if !moving && age > i32::MAX as u32 {
+            entity.remove();
+            return None;
         }
-
-        Some(tick_move)
+        Some(pumpkin_util::math::item_motion::item_movement_due(
+            age,
+            entity.entity_id,
+            on_ground,
+            move_velo,
+        ))
     }
 
     fn move_and_apply_friction(&self, caller: &dyn EntityBase, move_velo: Vector3<f64>) {
@@ -444,22 +437,17 @@ impl ItemEntity {
         entity.move_entity(caller, move_velo);
         entity.tick_block_collisions(caller);
 
-        let mut friction = 0.98;
         let on_ground = entity.on_ground.load(Ordering::SeqCst);
-
-        let mut velo = entity.velocity.load();
-        if on_ground {
+        let slipperiness = on_ground.then(|| {
             let block_affecting_velo = entity.get_block_with_y_offset(0.999_999).1;
-            friction *= f64::from(block_affecting_velo.slipperiness) * 0.98;
-        }
-
-        velo = velo.multiply(friction, 0.98, friction);
-
-        if on_ground && velo.y < 0.0 {
-            velo.y = 0.0;
-        }
-
-        entity.velocity.store(velo);
+            f64::from(block_affecting_velo.slipperiness)
+        });
+        entity
+            .velocity
+            .store(pumpkin_util::math::item_motion::apply_item_friction(
+                entity.velocity.load(),
+                slipperiness,
+            ));
     }
 
     fn process_age_and_merge(&self) -> bool {
@@ -536,6 +524,9 @@ impl ItemEntity {
 
 impl EntityBase for ItemEntity {
     fn tick(&self, caller: &dyn EntityBase, _server: &Server) {
+        if _server.advanced_config.cluster.enabled {
+            return;
+        }
         let entity = &self.entity;
         self.decrement_pickup_delay();
 
@@ -582,6 +573,16 @@ impl EntityBase for ItemEntity {
         _source: Option<&dyn EntityBase>,
         _cause: Option<&dyn EntityBase>,
     ) -> bool {
+        if self
+            .entity
+            .world
+            .load()
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            return false;
+        }
         // Check if entity is fire_immune
         let is_fire_damage = damage_type == DamageType::IN_FIRE
             || damage_type == DamageType::ON_FIRE
@@ -607,6 +608,16 @@ impl EntityBase for ItemEntity {
     }
 
     fn on_player_collision(&self, player: &Arc<Player>) {
+        if self
+            .entity
+            .world
+            .load()
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            return;
+        }
         if self.pickup_delay.load(Ordering::Relaxed) > 0
             || player.living_entity.health.load() <= 0.0
             || player.is_spectator()

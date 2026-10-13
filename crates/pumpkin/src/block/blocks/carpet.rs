@@ -11,6 +11,7 @@ use pumpkin_world::world::{BlockAccessor, BlockFlags};
 #[pumpkin_block_from_tag("minecraft:wool_carpets")]
 pub struct CarpetBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for CarpetBlock {
     fn can_place_at(&self, args: CanPlaceAtArgs<'_>) -> bool {
         can_place_at(args.block_accessor, args.position)
@@ -28,16 +29,28 @@ impl BlockBehaviour for CarpetBlock {
     }
 
     fn on_scheduled_tick(&self, args: OnScheduledTickArgs<'_>) {
-        if !can_place_at(args.world.as_ref(), args.position) {
-            args.world
-                .break_block(args.position, None, BlockFlags::empty());
-        }
+        crate::block::neighbor::apply_legacy_scheduled_intent(self, args);
+    }
+
+    fn callback_intent(
+        &self,
+        args: crate::block::neighbor::BlockCallbackIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        crate::block::neighbor::support_callback_intent(self, args)
+    }
+
+    fn scheduled_tick_intent(
+        &self,
+        args: crate::block::ScheduledTickIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        crate::block::neighbor::support_tick_intent(args, can_place_at)
     }
 }
 
 #[pumpkin_block("minecraft:moss_carpet")]
 pub struct MossCarpetBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for MossCarpetBlock {
     fn can_place_at(&self, args: CanPlaceAtArgs<'_>) -> bool {
         can_place_at(args.block_accessor, args.position)
@@ -55,16 +68,28 @@ impl BlockBehaviour for MossCarpetBlock {
     }
 
     fn on_scheduled_tick(&self, args: OnScheduledTickArgs<'_>) {
-        if !can_place_at(args.world.as_ref(), args.position) {
-            args.world
-                .break_block(args.position, None, BlockFlags::empty());
-        }
+        crate::block::neighbor::apply_legacy_scheduled_intent(self, args);
+    }
+
+    fn callback_intent(
+        &self,
+        args: crate::block::neighbor::BlockCallbackIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        crate::block::neighbor::support_callback_intent(self, args)
+    }
+
+    fn scheduled_tick_intent(
+        &self,
+        args: crate::block::ScheduledTickIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        crate::block::neighbor::support_tick_intent(args, can_place_at)
     }
 }
 
 #[pumpkin_block("minecraft:pale_moss_carpet")]
 pub struct PaleMossCarpetBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for PaleMossCarpetBlock {
     fn can_place_at(&self, args: CanPlaceAtArgs<'_>) -> bool {
         can_place_at(args.block_accessor, args.position)
@@ -82,10 +107,21 @@ impl BlockBehaviour for PaleMossCarpetBlock {
     }
 
     fn on_scheduled_tick(&self, args: OnScheduledTickArgs<'_>) {
-        if !can_place_at(args.world.as_ref(), args.position) {
-            args.world
-                .break_block(args.position, None, BlockFlags::empty());
-        }
+        crate::block::neighbor::apply_legacy_scheduled_intent(self, args);
+    }
+
+    fn callback_intent(
+        &self,
+        args: crate::block::neighbor::BlockCallbackIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        crate::block::neighbor::support_callback_intent(self, args)
+    }
+
+    fn scheduled_tick_intent(
+        &self,
+        args: crate::block::ScheduledTickIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        crate::block::neighbor::support_tick_intent(args, can_place_at)
     }
 }
 

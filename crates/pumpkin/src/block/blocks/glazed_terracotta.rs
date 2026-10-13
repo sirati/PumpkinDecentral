@@ -6,6 +6,7 @@ use pumpkin_macros::pumpkin_block_from_tag;
 #[pumpkin_block_from_tag("minecraft:glazed_terracotta")]
 pub struct GlazedTerracottaBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for GlazedTerracottaBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut prop = WallTorchLikeProperties::default(args.block);

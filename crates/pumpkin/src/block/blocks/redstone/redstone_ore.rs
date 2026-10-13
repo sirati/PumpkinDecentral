@@ -27,6 +27,7 @@ impl RedstoneOreBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for RedstoneOreBlock {
     fn normal_use(&self, args: NormalUseArgs<'_>) -> BlockActionResult {
         let state = args.world.get_block_state(args.position);
@@ -56,5 +57,31 @@ impl BlockBehaviour for RedstoneOreBlock {
                 BlockFlags::NOTIFY_ALL,
             );
         }
+    }
+
+    fn random_tick_intent(
+        &self,
+        args: crate::block::RandomTickIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        let state = args.world.get_block_state_id(args.position);
+        let mut properties = RedstoneOreLikeProperties::from_state_id(state);
+        if !properties.lit {
+            return Some(Vec::new());
+        }
+        properties.lit = false;
+        Some(vec![
+            crate::block::neighbor::BlockCallbackEffect::SetBlock {
+                position: *args.position,
+                state: properties.to_state_id(args.block),
+                flags: BlockFlags::NOTIFY_ALL,
+            },
+        ])
+    }
+
+    fn callback_intent(
+        &self,
+        _args: crate::block::neighbor::BlockCallbackIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        Some(Vec::new())
     }
 }

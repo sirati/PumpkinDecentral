@@ -27,6 +27,10 @@ pub enum AdvancementTrigger {
 impl Player {
     #[allow(clippy::collapsible_if, clippy::too_many_lines)]
     pub fn trigger_advancement(&self, trigger: AdvancementTrigger) {
+        if self.world().server.upgrade().is_some_and(|server| server.advanced_config.cluster.enabled) {
+            tracing::debug!(player = %self.gameprofile.id, "legacy gameplay advancement trigger excluded from cluster source");
+            return;
+        }
         use pumpkin_data::advancement::Advancement;
         use pumpkin_data::item::Item;
 

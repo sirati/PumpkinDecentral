@@ -23,6 +23,7 @@ impl BlockMetadata for CoralPlantBlock {
 }
 pub type CoralPlantLikeProperties = MangroveRootsLikeProperties;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for CoralPlantBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut props = CoralPlantLikeProperties::default(args.block);

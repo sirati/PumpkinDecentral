@@ -6,6 +6,7 @@ use pumpkin_macros::pumpkin_block;
 #[pumpkin_block("minecraft:iron_chain")]
 pub struct ChainBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for ChainBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut props =

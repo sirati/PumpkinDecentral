@@ -1,7 +1,6 @@
 use crate::block::{
     BlockBehaviour, GetStateForNeighborUpdateArgs, OnPlaceArgs, PathComputationType,
 };
-use crate::world::World;
 use pumpkin_data::block_properties::HorizontalFacing;
 use pumpkin_data::tag::Taggable;
 use pumpkin_data::{Block, BlockDirection, BlockState, BlockStateId, HorizontalFacingExt, tag};
@@ -14,6 +13,7 @@ type FenceProperties = pumpkin_data::block_properties::OakFenceLikeProperties;
 #[pumpkin_block_from_tag("minecraft:fences")]
 pub struct FenceBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for FenceBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut fence_props = FenceProperties::default(args.block);
@@ -37,7 +37,7 @@ impl BlockBehaviour for FenceBlock {
 
 pub fn compute_fence_state(
     mut fence_props: FenceProperties,
-    world: &World,
+    world: &dyn pumpkin_world::world::BlockAccessor,
     block: &Block,
     block_pos: &BlockPos,
 ) -> BlockStateId {

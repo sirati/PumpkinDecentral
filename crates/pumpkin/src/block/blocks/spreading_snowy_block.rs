@@ -56,6 +56,77 @@ impl SnowyBlock {
 pub struct SpreadingSnowyBlock;
 
 impl SpreadingSnowyBlock {
+    pub fn random_tick_intent(
+        args: crate::block::RandomTickIntentArgs<'_>,
+        base: &'static Block,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        use crate::block::neighbor::BlockCallbackEffect;
+        use pumpkin_util::random::RandomImpl;
+        let above = args.position.up();
+        let state = args.world.get_block_state(args.position);
+        let above_state = args.world.get_block_state(&above);
+        let full_fluid = (above_state.id.to_block() == &Block::WATER
+            || above_state.id.to_block() == &Block::LAVA)
+            && WaterLikeProperties::from_state_id(above_state.id).level == 0
+            || above_state.id.is_waterlogged();
+        if !Self::can_stay_alive_with_above(state, above_state, full_fluid) {
+            return Some(vec![BlockCallbackEffect::SetBlock {
+                position: *args.position,
+                state: base.default_state.id,
+                flags: BlockFlags::NOTIFY_ALL,
+            }]);
+        }
+        if args.world.get_raw_brightness(&above, args.ambient_darkness) < 9 {
+            return Some(Vec::new());
+        }
+        let mut effects = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let target = BlockPos::new(
+                args.position
+                    .0
+                    .x
+                    .checked_add(args.random.next_bounded_i32(3) - 1)?,
+                args.position
+                    .0
+                    .y
+                    .checked_add(args.random.next_bounded_i32(5) - 3)?,
+                args.position
+                    .0
+                    .z
+                    .checked_add(args.random.next_bounded_i32(3) - 1)?,
+            );
+            if args.world.get_block(&target) != base {
+                continue;
+            }
+            let above = target.up();
+            let above_state = args.world.get_block_state(&above);
+            let water =
+                above_state.id.to_block() == &Block::WATER || above_state.id.is_waterlogged();
+            let full_fluid = (above_state.id.to_block() == &Block::WATER
+                || above_state.id.to_block() == &Block::LAVA)
+                && WaterLikeProperties::from_state_id(above_state.id).level == 0
+                || above_state.id.is_waterlogged();
+            if water
+                || !Self::can_stay_alive_with_above(
+                    args.block.default_state,
+                    above_state,
+                    full_fluid,
+                )
+            {
+                continue;
+            }
+            let mut properties =
+                GrassBlockLikeProperties::from_state_id(args.block.default_state.id);
+            properties.snowy = SnowyBlock::is_snowy_setting(above_state);
+            effects.push(BlockCallbackEffect::SetBlock {
+                position: target,
+                state: properties.to_state_id(args.block),
+                flags: BlockFlags::NOTIFY_ALL,
+            });
+        }
+        Some(effects)
+    }
+
     #[must_use]
     pub fn is_full_fluid(world: &World, pos: &BlockPos) -> bool {
         let state = world.get_block_state(pos);
@@ -166,6 +237,7 @@ impl BlockMetadata for PodzolBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for PodzolBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         SnowyBlock::on_place(args.block, args.world, args.position)
@@ -188,7 +260,15 @@ impl BlockMetadata for MyceliumBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for MyceliumBlock {
+    fn random_tick_intent(
+        &self,
+        args: crate::block::RandomTickIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        SpreadingSnowyBlock::random_tick_intent(args, &Block::DIRT)
+    }
+
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         SnowyBlock::on_place(args.block, args.world, args.position)
     }

@@ -1298,7 +1298,9 @@ fn deserialize_item_stack_template(
             .checked_add(byte_len)
             .ok_or_else(|| ReadingError::Message("Component byte length overflow".into()))?;
         if component_bytes > MAX_TEMPLATE_BYTES {
-            return Err(ReadingError::Message("ItemStackTemplate patch too large".into()));
+            return Err(ReadingError::Message(
+                "ItemStackTemplate patch too large".into(),
+            ));
         }
         let mut bytes = vec![0_u8; byte_len];
         seq.read_bytes_to_buf(&mut bytes)?;
@@ -1319,7 +1321,9 @@ fn deserialize_item_stack_template(
 
     let item = pumpkin_data::item::Item::from_id(item_id)
         .ok_or_else(|| ReadingError::Message("Unknown ItemStackTemplate item".into()))?;
-    Ok(pumpkin_data::item_stack::ItemStack::new_with_component(count, item, patch))
+    Ok(pumpkin_data::item_stack::ItemStack::new_with_component(
+        count, item, patch,
+    ))
 }
 
 fn serialize_item_stack_template(
@@ -2855,6 +2859,12 @@ mod use_remainder_tests {
         let result = decoded.remainder_stack().unwrap();
         assert_eq!(result.item.id, Item::GLASS_BOTTLE.id);
         assert_eq!(result.item_count, 2);
-        assert_eq!(result.get_data_component::<MaxStackSizeImpl>().unwrap().size, 16);
+        assert_eq!(
+            result
+                .get_data_component::<MaxStackSizeImpl>()
+                .unwrap()
+                .size,
+            16
+        );
     }
 }

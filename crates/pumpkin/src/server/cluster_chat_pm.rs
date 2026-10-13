@@ -21,7 +21,6 @@ use super::Server;
 use super::cluster_chat_out;
 use crate::command::context::command_context::CommandContext;
 use crate::entity::EntityBase;
-use crate::entity::player::Player;
 
 const UNASSIGNED_SENDER_SLOT: u16 = u16::MAX;
 
@@ -246,32 +245,256 @@ pub fn send_private_from_command(
     Some(1)
 }
 
-/// Fans out a team message from a `/teammsg`-style command to the rest of the cluster.
-///
-/// Returns the number of peer servers the message was queued for.
-#[must_use]
-pub fn broadcast_team_from_player(
+fn sender_identity_matches(
+    entry: &pumpkin_cluster::presence::RemotePlayerEntry,
+    source: pumpkin_cluster::realm_completion::PeerGeneration,
+    uuid: [u8; 16],
+    session: u64,
+    name: &str,
+) -> bool {
+    entry.source == Some(source)
+        && entry.uuid == uuid
+        && entry.session == session
+        && entry.name == name
+}
+
+pub fn capture_team_message(
     server: &Server,
-    player: &Player,
-    team_name: &str,
+    world: &crate::world::World,
+    team: &crate::world::scoreboard::Team,
+    sender: GlobalPlayerId,
+    sender_uuid: [u8; 16],
+    sender_session: u64,
+    sender_name: String,
+    sender_display: TextComponent,
     body: &str,
-) -> u64 {
-    if team_name.is_empty() {
-        return 0;
-    }
+) -> Option<TeamChatBroadcast> {
     let local = ServerId(server.advanced_config.cluster.server_id);
-    let sender = player
-        .cluster_gid()
-        .unwrap_or(GlobalPlayerId::new(local, PlayerSlot(0)));
+    if sender.server != local || !team.players.contains(&sender_name) {
+        return None;
+    }
+    let source = pumpkin_cluster::realm_completion::PeerGeneration {
+        server: local,
+        generation: *server.cluster_peer_incarnations.load().get(&local)?,
+    };
+    let presence = server.cluster_presence.snapshot();
+    if !sender_identity_matches(
+        presence.entries.get(&sender)?,
+        source,
+        sender_uuid,
+        sender_session,
+        &sender_name,
+    ) {
+        return None;
+    }
+    let mut recipients: Vec<_> = presence
+        .entries
+        .values()
+        .filter(|entry| team.players.contains(&entry.name))
+        .map(|entry| entry.uuid)
+        .collect();
+    recipients.push(sender_uuid);
+    recipients.sort_unstable();
+    recipients.dedup();
     let broadcast = TeamChatBroadcast::new(
         sender,
-        player.gameprofile.name.clone(),
-        team_name.to_string(),
-        body.to_string(),
+        sender_name,
+        super::cluster_world_delta::world_id(world),
+        team.name.clone(),
+        body.into(),
+        source,
+        sender_uuid,
+        sender_session,
+        recipients,
+        serde_json::to_string(&team.display_name.clone().color_named(team.color)).ok()?,
+        serde_json::to_string(&sender_display).ok()?,
     );
-    let sent = cluster_chat_out::broadcast_team_chat(server, &broadcast);
-    if sent > 0 {
-        debug!(team = team_name, peers = sent, "cluster team chat sent");
+    broadcast.valid().then_some(broadcast)
+}
+
+pub fn broadcast_team(server: &Server, broadcast: &TeamChatBroadcast) -> bool {
+    if !broadcast.valid() {
+        return false;
     }
-    sent
+    server.cluster_connected_peers.load().is_empty()
+        || cluster_chat_out::broadcast_team_chat(server, broadcast) > 0
+}
+
+pub fn deliver_team_frozen(server: &Server, broadcast: &TeamChatBroadcast) -> i32 {
+    if !broadcast.valid() {
+        return 0;
+    }
+    let Ok(team_display) = serde_json::from_str::<TextComponent>(&broadcast.team_display_json)
+    else {
+        return 0;
+    };
+    let Ok(sender_display) = serde_json::from_str::<TextComponent>(&broadcast.sender_display_json)
+    else {
+        return 0;
+    };
+    let worlds = server.worlds.load();
+    let Some(world) = worlds
+        .iter()
+        .find(|world| super::cluster_world_delta::world_id(world) == broadcast.world)
+    else {
+        return 0;
+    };
+    let render = |uuid| {
+        let translation = if uuid == broadcast.sender_uuid {
+            pumpkin_data::translation::java::CHAT_TYPE_TEAM_SENT
+        } else {
+            pumpkin_data::translation::java::CHAT_TYPE_TEAM_TEXT
+        };
+        TextComponent::translate_cross(
+            translation,
+            translation,
+            [
+                team_display.clone(),
+                sender_display.clone(),
+                TextComponent::text(broadcast.body.clone()),
+            ],
+        )
+    };
+    let mut delivered = HashSet::new();
+    let mut count = 0;
+    for player in world.players.load().iter() {
+        let uuid = *player.gameprofile.id.as_bytes();
+        if broadcast.recipients.binary_search(&uuid).is_ok() && delivered.insert(uuid) {
+            player.send_system_message(&render(uuid));
+            count += 1;
+        }
+    }
+    if world.uuid
+        == server
+            .get_world_from_dimension(&pumpkin_data::dimension::Dimension::OVERWORLD)
+            .uuid
+    {
+        let presence = server.cluster_presence.snapshot();
+        let local = ServerId(server.advanced_config.cluster.server_id);
+        for entry in presence.entries.values() {
+            if entry.in_lobby
+                && entry.gid.server == local
+                && broadcast.recipients.binary_search(&entry.uuid).is_ok()
+                && !delivered.contains(&entry.uuid)
+                && server.cluster_lobby_directory.route_message_identity(
+                    entry.gid,
+                    entry.uuid,
+                    entry.session,
+                    &render(entry.uuid),
+                )
+            {
+                delivered.insert(entry.uuid);
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+pub fn deliver_team_local(
+    server: &Server,
+    world: &crate::world::World,
+    team: &crate::world::scoreboard::Team,
+    sender_name: &str,
+    sender_display: TextComponent,
+    body: &str,
+) -> i32 {
+    let team_display = team.display_name.clone().color_named(team.color);
+    let message = TextComponent::text(body.to_owned());
+    let mut recipients = 0;
+    let mut delivered = HashSet::new();
+    for player in world.players.load().iter() {
+        if !team.players.contains(&player.gameprofile.name) {
+            continue;
+        }
+        let translation = if player.gameprofile.name == sender_name {
+            pumpkin_data::translation::java::CHAT_TYPE_TEAM_SENT
+        } else {
+            pumpkin_data::translation::java::CHAT_TYPE_TEAM_TEXT
+        };
+        let msg = TextComponent::translate_cross(
+            translation,
+            translation,
+            [
+                team_display.clone(),
+                sender_display.clone(),
+                message.clone(),
+            ],
+        );
+        player.send_system_message(&msg);
+        delivered.insert(player.gameprofile.name.clone());
+        recipients += 1;
+    }
+    if world.uuid
+        == server
+            .get_world_from_dimension(&pumpkin_data::dimension::Dimension::OVERWORLD)
+            .uuid
+    {
+        for name in &team.players {
+            if delivered.contains(name) {
+                continue;
+            }
+            let translation = if name == sender_name {
+                pumpkin_data::translation::java::CHAT_TYPE_TEAM_SENT
+            } else {
+                pumpkin_data::translation::java::CHAT_TYPE_TEAM_TEXT
+            };
+            let msg = TextComponent::translate_cross(
+                translation,
+                translation,
+                [
+                    team_display.clone(),
+                    sender_display.clone(),
+                    message.clone(),
+                ],
+            );
+            if server.cluster_lobby_directory.route_message(name, &msg) {
+                recipients += 1;
+            }
+        }
+    }
+    recipients
+}
+
+#[cfg(test)]
+mod team_identity_tests {
+    use super::*;
+    use pumpkin_cluster::presence::RemotePlayerEntry;
+    use pumpkin_cluster::realm_completion::PeerGeneration;
+
+    #[test]
+    fn source_capture_requires_one_exact_accepted_sender_identity() {
+        let source = PeerGeneration {
+            server: ServerId(2),
+            generation: 12,
+        };
+        let gid = GlobalPlayerId::new(source.server, PlayerSlot(7));
+        let mut entry = RemotePlayerEntry::new(gid, [1; 16], "Alice".into(), vec![], 0, true, true);
+        entry.source = Some(source);
+        entry.session = 17;
+        assert!(sender_identity_matches(
+            &entry, source, [1; 16], 17, "Alice"
+        ));
+        assert!(!sender_identity_matches(
+            &entry, source, [2; 16], 17, "Alice"
+        ));
+        assert!(!sender_identity_matches(
+            &entry, source, [1; 16], 18, "Alice"
+        ));
+        assert!(!sender_identity_matches(
+            &entry,
+            PeerGeneration {
+                generation: 13,
+                ..source
+            },
+            [1; 16],
+            17,
+            "Alice"
+        ));
+        assert!(!sender_identity_matches(&entry, source, [1; 16], 17, "Bob"));
+        entry.session = 18;
+        assert!(!sender_identity_matches(
+            &entry, source, [1; 16], 17, "Alice"
+        ));
+    }
 }

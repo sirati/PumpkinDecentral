@@ -14,6 +14,7 @@ use std::sync::Arc;
 #[pumpkin_block_from_tag("minecraft:wooden_shelves")]
 pub struct ShelfBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for ShelfBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut properties = AcaciaShelfLikeProperties::default(args.block);

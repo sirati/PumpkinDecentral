@@ -176,9 +176,14 @@ fn serialize_item_cost_with_id(
     Ok(())
 }
 
-fn read_component_id(read: &mut impl NetworkReadExt) -> Result<DataComponent, ReadingError> {
+fn read_component_id_for_version(
+    read: &mut impl NetworkReadExt,
+    version: &JavaMinecraftVersion,
+) -> Result<DataComponent, ReadingError> {
     let id_val = read.get_var_int()?.0;
-    let id_u8 = id_val
+    let raw_id = u32::try_from(id_val)
+        .map_err(|_| ReadingError::Message(format!("Invalid component ID: {id_val}")))?;
+    let id_u8 = remap_data_component_type_id_from_version(raw_id, *version)
         .try_into()
         .map_err(|_| ReadingError::Message(format!("Invalid component ID: {id_val}")))?;
     DataComponent::try_from_id(id_u8)
@@ -243,8 +248,9 @@ fn decode_component(
 
 fn read_length_prefixed_component(
     read: &mut impl NetworkReadExt,
+    version: &JavaMinecraftVersion,
 ) -> Result<(DataComponent, Box<dyn DataComponentImpl>), ReadingError> {
-    let id = read_component_id(read)?;
+    let id = read_component_id_for_version(read, version)?;
     let byte_len = read.get_var_int()?.0;
     let byte_len: usize = byte_len
         .try_into()
@@ -271,12 +277,22 @@ impl ItemStackSerializer<'_> {
     pub fn read(
         read: &mut impl NetworkReadExt,
     ) -> Result<ItemStackSerializer<'static>, ReadingError> {
+        Self::read_versioned(read, &JavaMinecraftVersion::V_26_2)
+    }
+
+    fn read_versioned(
+        read: &mut impl NetworkReadExt,
+        version: &JavaMinecraftVersion,
+    ) -> Result<ItemStackSerializer<'static>, ReadingError> {
         const MAX_COMPONENTS: i32 = 256;
 
         let item_count = read.get_var_int()?;
         if item_count.0 == 0 {
             return Ok(ItemStackSerializer(Cow::Borrowed(ItemStack::EMPTY)));
         }
+
+        let item_count_u8 = u8::try_from(item_count.0)
+            .map_err(|_| ReadingError::Message("Invalid item count!".into()))?;
 
         let item_id = read.get_var_int()?;
         let num_to_add = read.get_var_int()?.0;
@@ -299,9 +315,7 @@ impl ItemStackSerializer<'_> {
         let mut patch = Vec::with_capacity((num_to_add + num_to_remove) as usize);
 
         for _ in 0..num_to_add {
-            let id_val = read.get_var_int()?.0;
-            let id = DataComponent::try_from_id(id_val as u8)
-                .ok_or_else(|| ReadingError::Message(format!("Unknown component ID: {id_val}")))?;
+            let id = read_component_id_for_version(read, version)?;
 
             let component_impl = if id == DataComponent::CustomData {
                 CustomDataImpl::deserialize(read)?.to_dyn()
@@ -312,10 +326,7 @@ impl ItemStackSerializer<'_> {
         }
 
         for _ in 0..num_to_remove {
-            let id_val = read.get_var_int()?.0;
-            let id = DataComponent::try_from_id(id_val as u8)
-                .ok_or_else(|| ReadingError::Message("Unknown component ID".into()))?;
-            patch.push((id, None));
+            patch.push((read_component_id_for_version(read, version)?, None));
         }
 
         let item_id_u16: u16 = item_id
@@ -325,8 +336,9 @@ impl ItemStackSerializer<'_> {
 
         Ok(ItemStackSerializer(Cow::Owned(
             ItemStack::new_with_component(
-                item_count.0 as u8,
-                Item::from_id(item_id_u16).unwrap_or(&Item::AIR),
+                item_count_u8,
+                Item::from_id(remap_item_id_from_version(item_id_u16, *version))
+                    .unwrap_or(&Item::AIR),
                 patch,
             ),
         )))
@@ -337,14 +349,7 @@ impl ItemStackSerializer<'_> {
         version: &JavaMinecraftVersion,
     ) -> Result<ItemStackSerializer<'static>, ReadingError> {
         if *version >= JavaMinecraftVersion::V_1_20_5 {
-            let serializer = Self::read(read)?;
-            if *version < JavaMinecraftVersion::V_26_2 {
-                Ok(ItemStackSerializer(Cow::Owned(
-                    serializer.to_stack_for_version(version),
-                )))
-            } else {
-                Ok(serializer)
-            }
+            Self::read_versioned(read, version)
         } else if *version >= JavaMinecraftVersion::V_1_13_2 {
             let present = read.get_bool()?;
             if !present {
@@ -394,14 +399,7 @@ impl ItemStackSerializer<'_> {
         version: &JavaMinecraftVersion,
     ) -> Result<ItemStackSerializer<'static>, ReadingError> {
         if *version >= JavaMinecraftVersion::V_1_21_5 {
-            let serializer = Self::read_length_prefixed_optional(read)?;
-            if *version < JavaMinecraftVersion::V_26_2 {
-                Ok(ItemStackSerializer(Cow::Owned(
-                    serializer.to_stack_for_version(version),
-                )))
-            } else {
-                Ok(serializer)
-            }
+            Self::read_length_prefixed_versioned(read, version)
         } else {
             Self::read_with_version(read, version)
         }
@@ -512,6 +510,13 @@ impl ItemStackSerializer<'_> {
     pub fn read_length_prefixed_optional(
         read: &mut impl NetworkReadExt,
     ) -> Result<ItemStackSerializer<'static>, ReadingError> {
+        Self::read_length_prefixed_versioned(read, &JavaMinecraftVersion::V_26_2)
+    }
+
+    fn read_length_prefixed_versioned(
+        read: &mut impl NetworkReadExt,
+        version: &JavaMinecraftVersion,
+    ) -> Result<ItemStackSerializer<'static>, ReadingError> {
         const MAX_COMPONENTS: i32 = 256;
 
         let item_count = read.get_var_int()?;
@@ -544,12 +549,12 @@ impl ItemStackSerializer<'_> {
         let mut patch = Vec::with_capacity(total_components as usize);
 
         for _ in 0..num_to_add {
-            let (id, component_impl) = read_length_prefixed_component(read)?;
+            let (id, component_impl) = read_length_prefixed_component(read, version)?;
             patch.push((id, Some(component_impl)));
         }
 
         for _ in 0..num_to_remove {
-            patch.push((read_component_id(read)?, None));
+            patch.push((read_component_id_for_version(read, version)?, None));
         }
 
         let item_id_u16 = item_id
@@ -560,7 +565,8 @@ impl ItemStackSerializer<'_> {
         Ok(ItemStackSerializer(Cow::Owned(
             ItemStack::new_with_component(
                 item_count_u8,
-                Item::from_id(item_id_u16).unwrap_or(&Item::AIR),
+                Item::from_id(remap_item_id_from_version(item_id_u16, *version))
+                    .unwrap_or(&Item::AIR),
                 patch,
             ),
         )))
@@ -677,29 +683,6 @@ impl ItemStackSerializer<'_> {
     #[must_use]
     pub fn to_stack(self) -> ItemStack {
         self.0.into_owned()
-    }
-
-    #[must_use]
-    pub fn to_stack_for_version(self, version: &JavaMinecraftVersion) -> ItemStack {
-        let mut stack = self.0.into_owned();
-        if stack.is_empty() {
-            return stack;
-        }
-
-        let remapped_item_id = remap_item_id_from_version(stack.item.id, *version);
-        stack.item = Item::from_id(remapped_item_id).unwrap_or(&Item::AIR);
-
-        let mut patch = Vec::with_capacity(stack.patch.len());
-        for (comp_id, comp_data) in stack.patch {
-            let remapped_comp_id =
-                remap_data_component_type_id_from_version(u32::from(comp_id.to_id()), *version);
-            if let Some(target_comp) = DataComponent::try_from_id(remapped_comp_id as u8) {
-                patch.push((target_comp, comp_data));
-            }
-        }
-        stack.patch = patch;
-
-        stack
     }
 }
 
@@ -908,5 +891,58 @@ impl From<Option<ItemStack>> for ItemStackOptionalTemplateSerializer<'_> {
             || ItemStackOptionalTemplateSerializer(Cow::Borrowed(ItemStack::EMPTY)),
             ItemStackOptionalTemplateSerializer::from,
         )
+    }
+}
+
+#[cfg(test)]
+mod versioned_component_tests {
+    use super::*;
+
+    #[test]
+    fn component_ids_are_mapped_before_payload_decoding() {
+        for version in [
+            JavaMinecraftVersion::V_1_20_5,
+            JavaMinecraftVersion::V_1_21,
+            JavaMinecraftVersion::V_1_21_5,
+            JavaMinecraftVersion::V_26_1,
+            JavaMinecraftVersion::V_26_2,
+        ] {
+            let mut stack = ItemStack::new(2, &Item::STONE);
+            stack.set_custom_name("alpha".to_owned());
+            stack.patch.push((DataComponent::CustomData, None));
+            let serializer = ItemStackSerializer::from(stack);
+            for length_prefixed in [false, true] {
+                let mut bytes = Vec::new();
+                if length_prefixed {
+                    serializer
+                        .write_length_prefixed_with_version(&mut bytes, &version)
+                        .unwrap();
+                } else {
+                    serializer.write_with_version(&mut bytes, &version).unwrap();
+                }
+                bytes.push(127);
+                let mut cursor = Cursor::new(bytes);
+                let decoded = if length_prefixed {
+                    ItemStackSerializer::read_length_prefixed_versioned(&mut cursor, &version)
+                } else {
+                    ItemStackSerializer::read_with_version(&mut cursor, &version)
+                }
+                .unwrap()
+                .to_stack();
+                assert_eq!(decoded.item.id, Item::STONE.id);
+                assert_eq!(decoded.item_count, 2);
+                assert_eq!(
+                    decoded.get_custom_name().unwrap().clone().get_text(),
+                    "alpha"
+                );
+                assert!(
+                    decoded
+                        .patch
+                        .iter()
+                        .any(|(id, value)| *id == DataComponent::CustomData && value.is_none())
+                );
+                assert_eq!(cursor.get_u8().unwrap(), 127);
+            }
+        }
     }
 }

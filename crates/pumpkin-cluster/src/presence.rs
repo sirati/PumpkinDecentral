@@ -8,7 +8,7 @@ use crate::protocol::StreamKind;
 
 pub const PRESENCE_MAX_NAME_LEN: usize = 16;
 
-pub const PRESENCE_MAX_ENTRIES: usize = 4096;
+pub const PRESENCE_MAX_ENTRIES: usize = 131_072;
 
 pub const PRESENCE_MAX_PROPERTIES: usize = 4;
 
@@ -57,6 +57,7 @@ pub struct PresenceLogin {
     pub properties: Vec<PresenceProperty>,
     pub in_lobby: bool,
     pub listed: bool,
+    pub native_skin: bool,
 }
 
 impl PresenceLogin {
@@ -75,7 +76,14 @@ impl PresenceLogin {
             properties: sanitize_presence_properties(properties),
             in_lobby,
             listed: true,
+            native_skin: false,
         }
+    }
+
+    #[must_use]
+    pub fn with_native_skin(mut self, native_skin: bool) -> Self {
+        self.native_skin = native_skin;
+        self
     }
 
     #[must_use]
@@ -85,15 +93,26 @@ impl PresenceLogin {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DepartureAnnouncement {
+    Standard,
+    Suppressed,
+    CustomJson(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PresenceLogout {
     pub gid: GlobalPlayerId,
+    pub announcement: DepartureAnnouncement,
 }
 
 impl PresenceLogout {
     #[must_use]
     pub const fn new(gid: GlobalPlayerId) -> Self {
-        Self { gid }
+        Self {
+            gid,
+            announcement: DepartureAnnouncement::Standard,
+        }
     }
 }
 
@@ -169,7 +188,16 @@ pub fn sanitize_presence_properties(properties: Vec<PresenceProperty>) -> Vec<Pr
         .collect()
 }
 
+fn valid_announcement(message: &PresenceControl) -> bool {
+    !matches!(message, PresenceControl::Logout(PresenceLogout { announcement: DepartureAnnouncement::CustomJson(json), .. }) if json.len() > 16384)
+}
+
 pub fn encode_control(message: &PresenceControl) -> Result<Vec<u8>, PresenceError> {
+    if !valid_announcement(message) {
+        return Err(PresenceError {
+            message: "presence announcement exceeds payload budget".to_owned(),
+        });
+    }
     let encoded = postcard::to_allocvec(message).map_err(|error| PresenceError {
         message: format!("encode presence control: {error}"),
     })?;
@@ -185,9 +213,15 @@ pub fn decode_control(bytes: &[u8]) -> Result<PresenceControl, PresenceError> {
             message: String::from("decode presence control: wrong discriminator"),
         });
     };
-    postcard::from_bytes(encoded).map_err(|error| PresenceError {
+    let message = postcard::from_bytes(encoded).map_err(|error| PresenceError {
         message: format!("decode presence control: {error}"),
-    })
+    })?;
+    if !valid_announcement(&message) {
+        return Err(PresenceError {
+            message: "presence announcement exceeds payload budget".to_owned(),
+        });
+    }
+    Ok(message)
 }
 
 pub fn login_parcels_for_peers(
@@ -210,7 +244,7 @@ pub fn logout_parcels_for_peers(
     logout: &PresenceLogout,
     peers: &[u16],
 ) -> Result<Vec<PresenceParcel>, PresenceError> {
-    let bytes = encode_control(&PresenceControl::Logout(*logout))?;
+    let bytes = encode_control(&PresenceControl::Logout(logout.clone()))?;
     let mut parcels = Vec::with_capacity(peers.len());
     for peer in peers {
         parcels.push(PresenceParcel::new(
@@ -240,6 +274,8 @@ pub fn try_broadcast_control_message(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemotePlayerEntry {
+    pub source: Option<crate::realm_completion::PeerGeneration>,
+    pub session: u64,
     pub gid: GlobalPlayerId,
     pub uuid: [u8; 16],
     pub name: String,
@@ -247,6 +283,7 @@ pub struct RemotePlayerEntry {
     pub joined_at_millis: u64,
     pub in_lobby: bool,
     pub listed: bool,
+    pub native_skin: bool,
 }
 
 impl RemotePlayerEntry {
@@ -261,6 +298,8 @@ impl RemotePlayerEntry {
         listed: bool,
     ) -> Self {
         Self {
+            source: None,
+            session: 0,
             gid,
             uuid,
             name,
@@ -268,7 +307,14 @@ impl RemotePlayerEntry {
             joined_at_millis,
             in_lobby,
             listed,
+            native_skin: false,
         }
+    }
+
+    #[must_use]
+    pub fn with_native_skin(mut self, native_skin: bool) -> Self {
+        self.native_skin = native_skin;
+        self
     }
 
     #[must_use]
@@ -279,6 +325,7 @@ impl RemotePlayerEntry {
 
 #[derive(Debug, Default)]
 pub struct PresenceTable {
+    names: HashMap<String, std::collections::BTreeSet<GlobalPlayerId>>,
     entries: HashMap<GlobalPlayerId, RemotePlayerEntry>,
 }
 
@@ -286,7 +333,15 @@ impl PresenceTable {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            names: HashMap::new(),
             entries: HashMap::new(),
+        }
+    }
+
+    fn remove_name(&mut self, name: &str, gid: GlobalPlayerId) {
+        if let Some(matches) = self.names.get_mut(name) {
+            matches.remove(&gid);
+            if matches.is_empty() { self.names.remove(name); }
         }
     }
 
@@ -296,18 +351,24 @@ impl PresenceTable {
         }
         let properties = sanitize_presence_properties(login.properties.clone());
         if let Some(entry) = self.entries.get_mut(&login.gid) {
+            let old_name = entry.name.to_ascii_lowercase();
+            let new_name = login.name.to_ascii_lowercase();
             entry.uuid = login.uuid;
             entry.name = login.name.clone();
             entry.properties = properties;
             entry.in_lobby = login.in_lobby;
             entry.listed = login.listed;
+            entry.native_skin = login.native_skin;
+            if old_name != new_name {
+                self.remove_name(&old_name, login.gid);
+                self.names.entry(new_name).or_default().insert(login.gid);
+            }
             return true;
         }
         if self.entries.len() >= PRESENCE_MAX_ENTRIES {
-            if let Some(evicted) = self.entries.keys().next().copied() {
-                self.entries.remove(&evicted);
-            }
+            return false;
         }
+        self.names.entry(login.name.to_ascii_lowercase()).or_default().insert(login.gid);
         self.entries.insert(
             login.gid,
             RemotePlayerEntry::new(
@@ -318,13 +379,16 @@ impl PresenceTable {
                 now_millis,
                 login.in_lobby,
                 login.listed,
-            ),
+            )
+            .with_native_skin(login.native_skin),
         );
         true
     }
 
     pub fn apply_logout(&mut self, logout: &PresenceLogout) -> Option<RemotePlayerEntry> {
-        self.entries.remove(&logout.gid)
+        let entry = self.entries.remove(&logout.gid)?;
+        self.remove_name(&entry.name.to_ascii_lowercase(), logout.gid);
+        Some(entry)
     }
 
     #[must_use]
@@ -348,11 +412,8 @@ impl PresenceTable {
 
     #[must_use]
     pub fn locate_by_name(&self, name: &str) -> Option<GlobalPlayerId> {
-        let folded = name.to_lowercase();
-        self.entries
-            .iter()
-            .find(|(_, entry)| entry.name.to_lowercase() == folded)
-            .map(|(gid, _)| *gid)
+        let matches = self.names.get(&name.to_ascii_lowercase())?;
+        (matches.len() == 1).then(|| matches.iter().next().copied()).flatten()
     }
 }
 
@@ -392,6 +453,21 @@ mod tests {
     use super::*;
     use crate::identity::PlayerSlot;
 
+    #[test]
+    fn bounded_global_directory_preserves_existing_players_when_full() {
+        let mut table = PresenceTable::default();
+        for index in 0..PRESENCE_MAX_ENTRIES {
+            let entry = login((index / 65_536) as u16 + 1, index as u16, "online");
+            assert!(table.apply_login(&entry, 0));
+        }
+        let first = gid(1, 0);
+        let before = table.entries.get(&first).cloned().unwrap();
+        assert!(!table.apply_login(&login(4, 0, "overflow"), 0));
+        assert_eq!(table.len(), PRESENCE_MAX_ENTRIES);
+        assert_eq!(table.entries.get(&first), Some(&before));
+        assert_eq!(table.locate_by_name("overflow"), None);
+    }
+
     fn gid(server: u16, player: u16) -> GlobalPlayerId {
         GlobalPlayerId::new(ServerId(server), PlayerSlot(player))
     }
@@ -404,6 +480,34 @@ mod tests {
             Vec::new(),
             false,
         )
+    }
+
+    #[test]
+    fn normalized_name_index_rejects_ambiguity_and_tracks_rename_and_logout() {
+        let mut table = PresenceTable::new();
+        assert!(table.apply_login(&login(2, 7, "Steve"), 1));
+        assert_eq!(table.locate_by_name("sTEVE"), Some(gid(2, 7)));
+        assert!(table.apply_login(&login(3, 8, "STEVE"), 2));
+        assert_eq!(table.locate_by_name("steve"), None);
+        assert!(table.apply_login(&login(3, 8, "Alex"), 3));
+        assert_eq!(table.locate_by_name("steve"), Some(gid(2, 7)));
+        assert_eq!(table.locate_by_name("ALEX"), Some(gid(3, 8)));
+        table.apply_logout(&PresenceLogout::new(gid(2, 7)));
+        assert_eq!(table.locate_by_name("steve"), None);
+        assert_eq!(table.locate_by_name("alex"), Some(gid(3, 8)));
+    }
+
+    #[test]
+    fn native_skin_metadata_survives_wire_and_presence_updates() {
+        let native = login(7, 3, "NativeAlice").with_native_skin(true);
+        let bytes = encode_control(&PresenceControl::Login(native.clone())).unwrap();
+        let mut table = PresenceTable::new();
+        handle_presence_bytes(&mut table, &bytes, 10).unwrap();
+        assert!(table.get(&native.gid).unwrap().native_skin);
+        let java = login(7, 3, "NativeAlice");
+        let bytes = encode_control(&PresenceControl::Login(java)).unwrap();
+        handle_presence_bytes(&mut table, &bytes, 20).unwrap();
+        assert!(!table.get(&native.gid).unwrap().native_skin);
     }
 
     #[test]

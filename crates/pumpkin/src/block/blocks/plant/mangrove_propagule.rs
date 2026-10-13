@@ -87,6 +87,7 @@ impl MangrovePropaguleBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for MangrovePropaguleBlock {
     fn can_place_at(&self, args: CanPlaceAtArgs<'_>) -> bool {
         let props = MangrovePropaguleLikeProperties::from_state_id(args.state.id);

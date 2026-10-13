@@ -16,6 +16,7 @@ use crate::block::{
 #[pumpkin_block("minecraft:bamboo_sapling")]
 pub struct BambooSaplingBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for BambooSaplingBlock {
     fn is_valid_bonemeal_target(&self, args: crate::block::BonemealArgs<'_>) -> bool {
         let above = args.position.up();
@@ -35,17 +36,48 @@ impl BlockBehaviour for BambooSaplingBlock {
     }
 
     fn on_neighbor_update(&self, args: OnNeighborUpdateArgs<'_>) {
+        crate::block::neighbor::apply_legacy_neighbor_intent(self, args);
+    }
+
+    fn callback_intent(
+        &self,
+        args: crate::block::neighbor::BlockCallbackIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        use crate::block::neighbor::{BlockCallbackEffect, BlockCallbackEvent};
+        if matches!(args.event, BlockCallbackEvent::Neighbor { .. })
+            && args.world.get_block(args.position) == &Block::BAMBOO_SAPLING
+            && args.world.get_block(&args.position.up()) == &Block::BAMBOO
         {
-            if args.block == &Block::BAMBOO_SAPLING
-                && args.world.get_block(&args.position.up()) == &Block::BAMBOO
-            {
-                args.world.set_block_state(
-                    args.position,
-                    Block::BAMBOO.default_state.id,
-                    BlockFlags::NOTIFY_NEIGHBORS,
-                );
-            }
+            Some(vec![BlockCallbackEffect::SetBlock {
+                position: *args.position,
+                state: Block::BAMBOO.default_state.id,
+                flags: BlockFlags::NOTIFY_NEIGHBORS,
+            }])
+        } else {
+            Some(Vec::new())
         }
+    }
+
+    fn random_tick_intent(
+        &self,
+        args: crate::block::RandomTickIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        use pumpkin_util::random::RandomImpl;
+        if args.world.get_block(args.position) != &Block::BAMBOO_SAPLING
+            || !args.world.get_block_state(&args.position.up()).is_air()
+            || args.random.next_bounded_i32(3) != 0
+        {
+            return Some(Vec::new());
+        }
+        let mut properties = BambooLikeProperties::from_state_id(Block::BAMBOO.default_state.id);
+        properties.leaves = BambooLeaves::Small;
+        Some(vec![
+            crate::block::neighbor::BlockCallbackEffect::SetBlock {
+                position: args.position.up(),
+                state: properties.to_state_id(&Block::BAMBOO),
+                flags: BlockFlags::NOTIFY_ALL,
+            },
+        ])
     }
 
     fn get_state_for_neighbor_update(

@@ -10,6 +10,7 @@ use crate::block::{BlockBehaviour, OnEntityStepArgs};
 #[pumpkin_block("minecraft:magma_block")]
 pub struct MagmaBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for MagmaBlock {
     fn on_entity_step(&self, args: OnEntityStepArgs<'_>) {
         {

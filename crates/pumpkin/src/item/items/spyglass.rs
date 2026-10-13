@@ -13,6 +13,7 @@ impl ItemMetadata for SpyglassItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for SpyglassItem {
     fn normal_use(&self, _item: &Item, player: &Player) {
         player.world().play_sound(

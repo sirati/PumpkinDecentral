@@ -2,12 +2,7 @@
 use super::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use pumpkin_cluster::combat::{
-    capture_hit_entity, capture_hit_player, chunk_of_pos, next_combat_seq, stage_hit_entity,
-    stage_hit_player,
-};
-use pumpkin_cluster::identity::{GlobalPlayerId, ServerId};
-use pumpkin_cluster::protocol::EntityRef;
+use pumpkin_cluster::identity::GlobalPlayerId;
 use pumpkin_cluster::time::TickStamp;
 
 impl JavaClient {
@@ -17,6 +12,10 @@ impl JavaClient {
         }
         player.update_last_action_time();
         let entity_id = attack.entity_id;
+        if server.advanced_config.cluster.enabled {
+            stage_cluster_attack(player, server, entity_id.0, false);
+            return;
+        }
         let player_entity = &player.get_entity();
         let world = player_entity.world.load_full();
 
@@ -81,97 +80,46 @@ pub(crate) fn combat_tick() -> TickStamp {
     crate::server::cluster::disciplined_tick_stamp(millis)
 }
 
-fn living_health(victim: &Arc<dyn EntityBase>) -> f32 {
-    victim
-        .get_living_entity()
-        .map(|living| living.health.load())
-        .unwrap_or(0.0)
-}
-
-fn damage_dealt_milli(before: f32, after: f32) -> u16 {
-    (before - after)
-        .max(0.0)
-        .mul_add(1000.0, 0.0)
-        .clamp(0.0, f32::from(u16::MAX)) as u16
+pub(crate) fn stage_cluster_attack(
+    player: &Player,
+    server: &Server,
+    entity_id: i32,
+    bedrock: bool,
+) -> bool {
+    let Some(gid) = player.cluster_gid() else {
+        return false;
+    };
+    let targets = server.cluster_combat_client_targets.load();
+    let Some(target) = targets.get(&entity_id).cloned() else {
+        return true;
+    };
+    if !server.advanced_config.pvp.enabled
+        || target.contact.actor() == pumpkin_cluster::actor::ActorId::Player(gid)
+        || server.advanced_config.pvp.protect_creative && target.game_mode == Some(1)
+    {
+        return true;
+    }
+    crate::server::cluster_inventory_protocol::stage_inventory_input(
+        player,
+        crate::server::cluster_inventory_protocol::StagedInventoryInput::Combat { target, bedrock },
+    )
 }
 
 pub(crate) fn attack_and_replicate(
     attacker: &Player,
     victim: &Arc<dyn EntityBase>,
-    victim_is_player: bool,
-    victim_gid: Option<GlobalPlayerId>,
+    _victim_is_player: bool,
+    _victim_gid: Option<GlobalPlayerId>,
     server: &Arc<Server>,
 ) {
-    let before = living_health(victim);
-    attacker.attack(victim);
-    if !server.advanced_config.cluster.enabled {
-        return;
-    }
-    let Some(gid) = attacker.cluster_gid() else {
-        return;
-    };
-    let damage_milli = damage_dealt_milli(before, living_health(victim));
-    let seq = next_combat_seq(gid);
-    let tick = combat_tick();
-    let attacker_world = attacker.world();
-    let attacker_pos = attacker.get_entity().pos.load();
-    let actor_chunk = chunk_of_pos(
-        crate::server::cluster_world_delta::world_id(&attacker_world),
-        attacker_pos.x,
-        attacker_pos.z,
-    );
-    let victim_world = victim.get_entity().world.load();
-    if victim_is_player {
-        let Some(target) = victim_gid else {
-            return;
-        };
-        let target_chunk = chunk_of_pos(
-            crate::server::cluster_world_delta::world_id(&victim_world),
-            victim.get_entity().pos.load().x,
-            victim.get_entity().pos.load().z,
+    if server.advanced_config.cluster.enabled {
+        stage_cluster_attack(
+            attacker,
+            server,
+            victim.get_entity().entity_id,
+            attacker.client.bedrock().is_some(),
         );
-        stage_hit_player(capture_hit_player(
-            gid,
-            seq,
-            tick,
-            actor_chunk,
-            target,
-            target_chunk,
-            damage_milli,
-        ));
-    } else {
-        let entity = victim.get_entity();
-        let pos = entity.pos.load();
-        let target = victim
-            .cast_any()
-            .downcast_ref::<crate::entity::cluster_entity_replica::RemoteEntityReplica>()
-            .map_or(
-                EntityRef {
-                    origin: ServerId(server.advanced_config.cluster.server_id),
-                    local_id: entity.entity_id,
-                    generation: entity.cluster_generation(),
-                    chunk: chunk_of_pos(
-                        crate::server::cluster_world_delta::world_id(&victim_world),
-                        pos.x,
-                        pos.z,
-                    ),
-                },
-                |replica| EntityRef {
-                    chunk: chunk_of_pos(
-                        crate::server::cluster_world_delta::world_id(&victim_world),
-                        pos.x,
-                        pos.z,
-                    ),
-                    ..replica.cluster_ref
-                },
-            );
-        stage_hit_entity(capture_hit_entity(
-            gid,
-            seq,
-            tick,
-            actor_chunk,
-            target,
-            damage_milli,
-        ));
+        return;
     }
+    attacker.attack(victim);
 }

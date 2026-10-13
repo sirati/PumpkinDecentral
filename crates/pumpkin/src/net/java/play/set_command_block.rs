@@ -3,6 +3,12 @@ use super::*;
 
 impl JavaClient {
     pub fn handle_set_command_block(&self, player: &Arc<Player>, command: &SSetCommandBlock<'_>) {
+        if player.cluster_gid().is_some() {
+            player.send_system_message(&TextComponent::text(
+                "Command block editing is unavailable.",
+            ));
+            return;
+        }
         if !player.is_creative() {
             return;
         }

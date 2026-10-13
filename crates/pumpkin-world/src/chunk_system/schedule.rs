@@ -1,6 +1,6 @@
 use super::channel::LevelChange;
 use super::chunk_holder::ChunkHolder;
-use super::chunk_state::{Chunk, StagedChunkEnum};
+use super::chunk_state::{Chunk, InitialChunkPalettes, StagedChunkEnum};
 use super::dag::{DAG, EdgeKey, Node, NodeKey};
 use super::generation_cache::{Cache, SurfaceBiomeNeighborhood};
 use super::worker_logic::{RecvChunk, io_read_work, io_write_work};
@@ -9,13 +9,16 @@ use super::{
     LevelChannel,
 };
 use crate::chunk::io::Dirtiable;
-use crate::level::{Level, LoadedChunkChange, SyncChunk};
+use crate::level::{
+    ClusterSnapshotPublication, FreshChunkAdmission, Level, LoadedChunkChange,
+    PersistedChunkAdmission, SyncChunk,
+};
 use dashmap::DashMap;
 use pumpkin_config::lighting::LightingEngineConfig;
 use pumpkin_util::math::vector2::Vector2;
 use slotmap::Key;
 use std::cmp::{Ordering, max};
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::mem::swap;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex};
@@ -49,9 +52,22 @@ impl Ord for TaskHeapNode {
 
 pub struct GenerationSchedule {
     queue: BinaryHeap<TaskHeapNode>,
+    parked_full: BinaryHeap<TaskHeapNode>,
     graph: DAG,
 
     last_level: ChunkLevel,
+    player_level: ChunkLevel,
+    owner_demands: HashMapType<ChunkPos, HashSetType<u64>>,
+    peer_request_retention: HashSetType<ChunkPos>,
+    owner_ready_routes: HashMapType<
+        ChunkPos,
+        HashMapType<u64, tokio::sync::mpsc::Sender<crate::level::OwnerChunkReady>>,
+    >,
+    pending_owner_ready: VecDeque<(ChunkPos, u64, u64)>,
+    publication_generations: HashMapType<ChunkPos, u64>,
+    next_publication_generation: u64,
+    owner_demand_rx: crossbeam::channel::Receiver<crate::level::OwnerChunkDemand>,
+    deferred_primary_io: HashMapType<ChunkPos, Chunk>,
     last_high_priority: Vec<ChunkPos>,
     send_level: Arc<LevelChannel>,
 
@@ -67,6 +83,18 @@ pub struct GenerationSchedule {
 
     cluster_fetches: HashMapType<ChunkPos, Instant>,
     cluster_level: Option<Arc<Level>>,
+    pending_fresh: HashMapType<ChunkPos, PendingFresh>,
+    pending_persisted: HashMapType<ChunkPos, PendingPersisted>,
+    pending_persisted_decisions: VecDeque<crate::level::PersistedChunkDecision>,
+    next_fresh_generation: u64,
+    fresh_wake_tx: crossbeam::channel::Sender<()>,
+    fresh_wake_rx: crossbeam::channel::Receiver<()>,
+    cluster_publications: crossbeam::channel::Receiver<ClusterSnapshotPublication>,
+    peer_install_claims: crossbeam::channel::Receiver<crate::level::PeerChunkInstallClaim>,
+    pending_claim_results: VecDeque<(
+        tokio::sync::mpsc::Sender<crate::level::PeerChunkInstallClaimResult>,
+        crate::level::PeerChunkInstallClaimResult,
+    )>,
 
     io_lock: IOLock,
     running_task_count: u16,
@@ -82,9 +110,576 @@ pub struct GenerationSchedule {
     generation_pool: Option<Arc<rayon::ThreadPool>>,
 }
 
+struct PendingFresh {
+    chunk: SyncChunk,
+    image: std::sync::Arc<[u8]>,
+    palettes: Option<InitialChunkPalettes>,
+    generation: u64,
+    response: Option<tokio::sync::oneshot::Receiver<bool>>,
+    abort: bool,
+}
+
+struct PendingPersisted {
+    original: SyncChunk,
+    approved: Option<SyncChunk>,
+    generation: u64,
+    response: Option<tokio::sync::oneshot::Receiver<Option<SyncChunk>>>,
+    submitted: bool,
+    rejected: bool,
+    terminal_rejection: bool,
+    peer_claimed: bool,
+    unexpected_arrival_reported: bool,
+}
+
+fn publish_persisted_reservation(
+    reservations: &arc_swap::ArcSwap<
+        rustc_hash::FxHashMap<ChunkPos, crate::level::PersistedChunkReservation>,
+    >,
+    pos: ChunkPos,
+    reservation: Option<crate::level::PersistedChunkReservation>,
+) {
+    let mut next = (**reservations.load()).clone();
+    if let Some(reservation) = reservation {
+        next.insert(pos, reservation);
+    } else {
+        next.remove(&pos);
+    }
+    reservations.store(Arc::new(next));
+}
+
 impl GenerationSchedule {
-    fn publish_chunk(&self, pos: ChunkPos, chunk: SyncChunk) -> Option<SyncChunk> {
+    fn flush_peer_claim_results(&mut self) {
+        while let Some((respond, result)) = self.pending_claim_results.pop_front() {
+            match respond.try_send(result) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(result)) => {
+                    self.pending_claim_results.push_front((respond, result));
+                    break;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(result)) => {
+                    if let Some(pending) = self.pending_persisted.get_mut(&result.position)
+                        && pending.generation == result.generation
+                    {
+                        pending.peer_claimed = false;
+                    }
+                }
+            }
+        }
+    }
+
+    fn poll_peer_install_claims(&mut self) {
+        self.flush_peer_claim_results();
+        let mut drained = false;
+        if let Some(level) = self.cluster_level.as_ref() {
+            for _ in 0..1_024 {
+                let Some((position, generation)) = level.cluster_peer_install_releases.pop() else {
+                    break;
+                };
+                drained = true;
+                if let Some(pending) = self.pending_persisted.get_mut(&position)
+                    && pending.generation == generation
+                {
+                    pending.peer_claimed = false;
+                }
+            }
+        }
+        for _ in 0..256 {
+            if self.pending_claim_results.len() >= 256 {
+                break;
+            }
+            let Ok(claim) = self.peer_install_claims.try_recv() else {
+                break;
+            };
+            drained = true;
+            self.process_peer_install_claim(claim);
+        }
+        self.flush_peer_claim_results();
+        if drained
+            && let Some(level) = self.cluster_level.as_ref()
+            && let Some(route) = level.cluster_peer_claim_capacity.load_full()
+        {
+            let _ = route.try_send(());
+        }
+    }
+
+    fn process_peer_install_claim(&mut self, claim: crate::level::PeerChunkInstallClaim) {
+        match claim {
+            crate::level::PeerChunkInstallClaim::Claim {
+                position,
+                generation,
+                respond,
+            } => {
+                let private = self.pending_persisted.get(&position).is_some_and(|pending| {
+                        self.chunk_map.get(&position).is_some_and(|holder| {
+                            !holder.public && matches!(holder.chunk.as_ref(), Some(Chunk::Level(chunk)) if Arc::ptr_eq(chunk, &pending.original))
+                        })
+                    });
+                let recovery = self.cluster_level.as_ref().is_some_and(|level| {
+                    level
+                        .cluster_publication_reservations
+                        .load()
+                        .get(&position)
+                        .is_some_and(|reservation| {
+                            reservation.generation == generation
+                                && reservation.state
+                                    == crate::level::PersistedChunkReservationState::Recovery
+                        })
+                });
+                let allowed = self
+                    .pending_persisted
+                    .get_mut(&position)
+                    .is_some_and(|pending| {
+                        if !private
+                            || !recovery
+                            || pending.generation != generation
+                            || !pending.rejected
+                            || !pending.terminal_rejection
+                            || pending.peer_claimed
+                        {
+                            return false;
+                        }
+                        pending.peer_claimed = true;
+                        true
+                    });
+                if let Some(level) = self.cluster_level.as_ref() {
+                    self.pending_claim_results.push_back((
+                        respond,
+                        crate::level::PeerChunkInstallClaimResult {
+                            world_key: level.cluster_world_key,
+                            dimension: level.cluster_dimension,
+                            position,
+                            generation,
+                            allowed,
+                        },
+                    ));
+                }
+            }
+            crate::level::PeerChunkInstallClaim::Release {
+                position,
+                generation,
+            } => {
+                if let Some(pending) = self.pending_persisted.get_mut(&position)
+                    && pending.generation == generation
+                {
+                    pending.peer_claimed = false;
+                }
+            }
+        }
+        self.flush_peer_claim_results();
+    }
+
+    fn flush_persisted_decisions(&mut self) {
+        let Some(level) = self.cluster_level.as_ref() else {
+            return;
+        };
+        let Some(route) = level.cluster_persisted_decision.load_full() else {
+            return;
+        };
+        while let Some(decision) = self.pending_persisted_decisions.pop_front() {
+            match route.try_send(decision) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(decision)) => {
+                    self.pending_persisted_decisions.push_front(decision);
+                    break;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+            }
+        }
+    }
+
+    fn apply_cluster_publication(&mut self, publication: ClusterSnapshotPublication) {
+        let pos = publication.position;
+        let snapshot = publication.snapshot;
+        if crate::level::is_cluster_secondary() {
+            self.secondary_cluster_arrive(pos, snapshot.clone());
+        } else if self.pending_persisted.get(&pos).is_some_and(|pending| {
+            publication.reservation_generation == Some(pending.generation)
+                && pending.rejected
+                && pending.peer_claimed
+        }) && self.cluster_level.as_ref().is_some_and(|level| {
+            level
+                .cluster_publication_reservations
+                .load()
+                .get(&pos)
+                .is_some_and(|reservation| {
+                    reservation.generation == publication.reservation_generation.unwrap_or_default()
+                        && reservation.state
+                            == crate::level::PersistedChunkReservationState::Recovery
+                })
+        }) {
+            let private = self.pending_persisted.get(&pos).is_some_and(|pending| {
+                self.chunk_map.get(&pos).is_some_and(|holder| {
+                    !holder.public
+                        && matches!(holder.chunk.as_ref(), Some(Chunk::Level(chunk)) if Arc::ptr_eq(chunk, &pending.original))
+                })
+            });
+            if private {
+                self.pending_persisted.remove(&pos);
+                if let Some(level) = self.cluster_level.as_ref() {
+                    publish_persisted_reservation(
+                        &level.cluster_publication_reservations,
+                        pos,
+                        None,
+                    );
+                }
+                self.cluster_fetches.remove(&pos);
+                if let Some(level) = self.cluster_level.as_ref() {
+                    level.clear_cluster_fetch_wanted(&pos);
+                }
+                if let Some(mut holder) = self.chunk_map.remove(&pos) {
+                    let stage = StagedChunkEnum::Full;
+                    self.drop_satisfied_tasks(&mut holder, stage);
+                    holder.current_stage = stage;
+                    if !holder.occupied.is_null() && self.graph.nodes.contains_key(holder.occupied)
+                    {
+                        self.drop_node(holder.occupied);
+                    }
+                    holder.occupied = NodeKey::null();
+                    holder.chunk = Some(Chunk::Level(snapshot.clone()));
+                    holder.public = true;
+                    self.publish_chunk(pos, snapshot.clone());
+                    self.listener.process_new_chunk(pos, &snapshot);
+                    self.chunk_map.insert(pos, holder);
+                    self.check_waiting_tasks(false);
+                }
+            }
+        }
+        let published = self
+            .public_chunk_map
+            .get(&pos)
+            .is_some_and(|current| Arc::ptr_eq(current.value(), &snapshot));
+        let _ = publication.respond.send(published);
+    }
+
+    fn poll_cluster_publications(&mut self) {
+        for _ in 0..256 {
+            let Ok(publication) = self.cluster_publications.try_recv() else {
+                break;
+            };
+            self.apply_cluster_publication(publication);
+        }
+    }
+
+    fn poll_persisted_admissions(&mut self) {
+        self.flush_persisted_decisions();
+        let Some(level) = self.cluster_level.as_ref() else {
+            return;
+        };
+        let Some(route) = level.persisted_chunk_admission.load_full() else {
+            return;
+        };
+        let world_key = level.cluster_world_key;
+        let dimension = level.cluster_dimension;
+        let publication_reservations = level.cluster_publication_reservations.clone();
+        for pos in self.pending_persisted.keys().copied().collect::<Vec<_>>() {
+            if self.pending_persisted_decisions.len() >= 4_096 {
+                break;
+            }
+            let Some(mut pending) = self.pending_persisted.remove(&pos) else {
+                continue;
+            };
+            if pending.rejected {
+                self.pending_persisted.insert(pos, pending);
+                continue;
+            }
+            if !pending.submitted {
+                let (respond, response) = tokio::sync::oneshot::channel();
+                match route.try_send(PersistedChunkAdmission::Prepare {
+                    world_key,
+                    dimension,
+                    position: pos,
+                    generation: pending.generation,
+                    original: pending.original.clone(),
+                    respond,
+                    wake: self.fresh_wake_tx.clone(),
+                }) {
+                    Ok(()) => {
+                        pending.response = Some(response);
+                        pending.submitted = true;
+                    }
+                    Err(_) => {
+                        self.pending_persisted.insert(pos, pending);
+                        continue;
+                    }
+                }
+            }
+            if let Some(response) = pending.response.as_mut() {
+                match response.try_recv() {
+                    Ok(Some(approved)) => {
+                        pending.approved = Some(approved);
+                        pending.response = None;
+                        if let Some(mut reservation) =
+                            publication_reservations.load().get(&pos).copied()
+                            && reservation.generation == pending.generation
+                        {
+                            reservation.state =
+                                crate::level::PersistedChunkReservationState::Approved;
+                            publish_persisted_reservation(
+                                &publication_reservations,
+                                pos,
+                                Some(reservation),
+                            );
+                        }
+                        self.pending_persisted_decisions.push_back(
+                            crate::level::PersistedChunkDecision {
+                                world_key,
+                                dimension,
+                                position: pos,
+                                generation: pending.generation,
+                                recovery: false,
+                            },
+                        );
+                    }
+                    Ok(None) => {
+                        pending.rejected = true;
+                        pending.terminal_rejection = true;
+                        if let Some(mut reservation) =
+                            publication_reservations.load().get(&pos).copied()
+                            && reservation.generation == pending.generation
+                        {
+                            reservation.state =
+                                crate::level::PersistedChunkReservationState::Recovery;
+                            publish_persisted_reservation(
+                                &publication_reservations,
+                                pos,
+                                Some(reservation),
+                            );
+                        }
+                        self.pending_persisted_decisions.push_back(
+                            crate::level::PersistedChunkDecision {
+                                world_key,
+                                dimension,
+                                position: pos,
+                                generation: pending.generation,
+                                recovery: true,
+                            },
+                        );
+                        error!(
+                            x = pos.x,
+                            z = pos.y,
+                            generation = pending.generation,
+                            "cluster persisted chunk admission rejected"
+                        );
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                        pending.rejected = true;
+                        if let Some(mut reservation) =
+                            publication_reservations.load().get(&pos).copied()
+                            && reservation.generation == pending.generation
+                        {
+                            reservation.state = crate::level::PersistedChunkReservationState::Lost;
+                            publish_persisted_reservation(
+                                &publication_reservations,
+                                pos,
+                                Some(reservation),
+                            );
+                        }
+                        self.pending_persisted_decisions.push_back(
+                            crate::level::PersistedChunkDecision {
+                                world_key,
+                                dimension,
+                                position: pos,
+                                generation: pending.generation,
+                                recovery: false,
+                            },
+                        );
+                        error!(
+                            x = pos.x,
+                            z = pos.y,
+                            generation = pending.generation,
+                            "cluster persisted chunk admission outcome was lost"
+                        );
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                }
+            }
+            if let Some(approved) = pending.approved.as_ref() {
+                let same_private_chunk = self.chunk_map.get(&pos).is_some_and(|holder| {
+                    !holder.public
+                        && matches!(holder.chunk.as_ref(), Some(Chunk::Level(chunk)) if Arc::ptr_eq(chunk, &pending.original))
+                });
+                if !same_private_chunk {
+                    pending.rejected = true;
+                    error!(
+                        x = pos.x,
+                        z = pos.y,
+                        generation = pending.generation,
+                        "cluster persisted chunk changed during admission"
+                    );
+                } else if let Ok(permit) = route.try_reserve() {
+                    let approved = approved.clone();
+                    if let Some(holder) = self.chunk_map.get_mut(&pos) {
+                        holder.chunk = Some(Chunk::Level(approved.clone()));
+                        holder.public = true;
+                    }
+                    self.publish_chunk(pos, approved.clone());
+                    permit.send(PersistedChunkAdmission::Published {
+                        world_key,
+                        dimension,
+                        position: pos,
+                        generation: pending.generation,
+                    });
+                    self.listener.process_new_chunk(pos, &approved);
+                    publish_persisted_reservation(&publication_reservations, pos, None);
+                    self.check_waiting_tasks(crate::level::is_cluster_secondary());
+                    continue;
+                }
+            }
+            self.pending_persisted.insert(pos, pending);
+        }
+        self.flush_persisted_decisions();
+    }
+
+    fn resume_parked_full(&mut self) {
+        let available = 128usize.saturating_sub(
+            self.pending_fresh.len()
+                + self.pending_persisted.len()
+                + usize::from(self.running_task_count),
+        );
+        for _ in 0..available {
+            let Some(mut task) = self.parked_full.pop() else {
+                break;
+            };
+            if let Some(node) = self.graph.nodes.get(task.1) {
+                task.0 = Self::calc_priority(
+                    &self.last_level,
+                    &self.last_high_priority,
+                    node.pos,
+                    node.stage,
+                );
+                self.queue.push(task);
+            }
+        }
+    }
+
+    fn poll_fresh_admissions(&mut self) {
+        let Some(level) = self.cluster_level.as_ref() else {
+            return;
+        };
+        let Some(route) = level.fresh_chunk_admission.load_full() else {
+            return;
+        };
+        let world_key = level.cluster_world_key;
+        let dimension = level.cluster_dimension;
+        for pos in self.pending_fresh.keys().copied().collect::<Vec<_>>() {
+            let Some(mut pending) = self.pending_fresh.remove(&pos) else {
+                continue;
+            };
+            if pending.abort {
+                if route
+                    .try_send(FreshChunkAdmission::Aborted {
+                        world_key,
+                        dimension,
+                        position: pos,
+                        generation: pending.generation,
+                    })
+                    .is_err()
+                {
+                    self.pending_fresh.insert(pos, pending);
+                }
+                continue;
+            }
+            if pending.response.is_none() && pending.palettes.is_some() {
+                let palettes = pending.palettes.take().expect("checked above");
+                let (respond, response) = tokio::sync::oneshot::channel();
+                match route.try_send(FreshChunkAdmission::Prepare {
+                    world_key,
+                    dimension,
+                    position: pos,
+                    generation: pending.generation,
+                    image: pending.image.clone(),
+                    palettes,
+                    respond,
+                    wake: self.fresh_wake_tx.clone(),
+                }) {
+                    Ok(()) => pending.response = Some(response),
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(
+                        FreshChunkAdmission::Prepare { palettes, .. },
+                    ))
+                    | Err(tokio::sync::mpsc::error::TrySendError::Closed(
+                        FreshChunkAdmission::Prepare { palettes, .. },
+                    )) => pending.palettes = Some(palettes),
+                    Err(_) => unreachable!(),
+                }
+            }
+            if let Some(response) = pending.response.as_mut() {
+                match response.try_recv() {
+                    Ok(true) => pending.response = None,
+                    Ok(false) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                        error!(
+                            x = pos.x,
+                            z = pos.y,
+                            generation = pending.generation,
+                            "cluster fresh chunk admission rejected"
+                        );
+                        continue;
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                }
+            }
+            if pending.response.is_none() && pending.palettes.is_none() {
+                let same_private_chunk = self.chunk_map.get(&pos).is_some_and(|holder| {
+                    !holder.public
+                        && matches!(
+                            holder.chunk.as_ref(),
+                            Some(Chunk::Level(chunk)) if Arc::ptr_eq(chunk, &pending.chunk)
+                        )
+                });
+                if !same_private_chunk {
+                    error!(
+                        x = pos.x,
+                        z = pos.y,
+                        generation = pending.generation,
+                        "cluster fresh chunk changed during admission"
+                    );
+                    pending.abort = true;
+                    self.pending_fresh.insert(pos, pending);
+                    continue;
+                }
+                let Ok(permit) = route.try_reserve() else {
+                    self.pending_fresh.insert(pos, pending);
+                    continue;
+                };
+                self.publish_chunk(pos, pending.chunk.clone());
+                if let Some(holder) = self.chunk_map.get_mut(&pos) {
+                    holder.public = true;
+                    if holder.target_stage == StagedChunkEnum::None
+                        && holder.dependency_stage == StagedChunkEnum::None
+                    {
+                        self.unload_chunks.insert(pos);
+                    }
+                }
+                permit.send(FreshChunkAdmission::Published {
+                    world_key,
+                    dimension,
+                    position: pos,
+                    generation: pending.generation,
+                });
+                self.listener.process_new_chunk(pos, &pending.chunk);
+                self.check_waiting_tasks(crate::level::is_cluster_secondary());
+                continue;
+            }
+            self.pending_fresh.insert(pos, pending);
+        }
+        self.resume_parked_full();
+    }
+
+    fn publish_chunk(&mut self, pos: ChunkPos, chunk: SyncChunk) -> Option<SyncChunk> {
         let previous = self.public_chunk_map.insert(pos, chunk);
+        if let Some(level) = self
+            .cluster_level
+            .as_ref()
+            .filter(|level| level.cluster_genesis_required)
+        {
+            level.install_primary_chunk_fence(pos);
+        }
+        self.next_publication_generation = self.next_publication_generation.wrapping_add(1).max(1);
+        let generation = self.next_publication_generation;
+        self.publication_generations.insert(pos, generation);
+        if let Some(routes) = self.owner_ready_routes.get(&pos) {
+            self.pending_owner_ready
+                .extend(routes.keys().copied().map(|lease| (pos, lease, generation)));
+        }
         if previous.is_none() {
             self.loaded_chunk_changes
                 .push(LoadedChunkChange::Loaded(pos));
@@ -92,13 +687,72 @@ impl GenerationSchedule {
         previous
     }
 
-    fn unpublish_chunk(&self, pos: ChunkPos) -> Option<SyncChunk> {
+    fn unpublish_chunk(&mut self, pos: ChunkPos) -> Option<SyncChunk> {
         let removed = self.public_chunk_map.remove(&pos).map(|(_, chunk)| chunk);
+        if let Some(level) = self
+            .cluster_level
+            .as_ref()
+            .filter(|level| level.cluster_genesis_required)
+        {
+            level.retire_primary_chunk_fence(pos);
+        }
+        self.publication_generations.remove(&pos);
         if removed.is_some() {
             self.loaded_chunk_changes
                 .push(LoadedChunkChange::Unloaded(pos));
         }
         removed
+    }
+
+    fn flush_owner_ready(&mut self) {
+        let count = self.pending_owner_ready.len();
+        for _ in 0..count {
+            let Some((position, lease, generation)) = self.pending_owner_ready.pop_front() else {
+                break;
+            };
+            if self.publication_generations.get(&position) != Some(&generation)
+                || !self
+                    .owner_demands
+                    .get(&position)
+                    .is_some_and(|leases| leases.contains(&lease))
+            {
+                continue;
+            }
+            let Some(route) = self
+                .owner_ready_routes
+                .get(&position)
+                .and_then(|routes| routes.get(&lease))
+            else {
+                continue;
+            };
+            match route.try_send(crate::level::OwnerChunkReady {
+                world_key: self
+                    .cluster_level
+                    .as_ref()
+                    .map_or(0, |level| level.cluster_world_key),
+                dimension: self
+                    .cluster_level
+                    .as_ref()
+                    .map_or(0, |level| level.cluster_dimension),
+                position,
+                lease,
+                publication_generation: generation,
+            }) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    self.pending_owner_ready
+                        .push_back((position, lease, generation));
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    if let Some(routes) = self.owner_ready_routes.get_mut(&position) {
+                        routes.remove(&lease);
+                        if routes.is_empty() {
+                            self.owner_ready_routes.remove(&position);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn create(
@@ -109,6 +763,22 @@ impl GenerationSchedule {
         thread_tracker: &mut Vec<thread::JoinHandle<()>>,
     ) {
         let (send_chunk, recv_chunk) = crossbeam::channel::unbounded();
+        let (fresh_wake_tx, fresh_wake_rx) = crossbeam::channel::bounded(1);
+        let (cluster_publication_tx, cluster_publications) = crossbeam::channel::bounded(256);
+        let (peer_install_claim_tx, peer_install_claims) = crossbeam::channel::bounded(256);
+        let (owner_demand_tx, owner_demand_rx) = crossbeam::channel::bounded(1_024);
+        level
+            .cluster_snapshot_publication
+            .store(Some(Arc::new(cluster_publication_tx)));
+        level
+            .cluster_peer_install_claim
+            .store(Some(Arc::new(peer_install_claim_tx)));
+        level
+            .cluster_owner_chunk_demand
+            .store(Some(Arc::new(owner_demand_tx)));
+        level
+            .fresh_chunk_wake
+            .store(Some(Arc::new(fresh_wake_tx.clone())));
 
         let (send_read_io, recv_read_io) = tokio::sync::mpsc::channel(io_read_thread_count + 5);
         let recv_read_io = Arc::new(tokio::sync::Mutex::new(recv_read_io));
@@ -160,8 +830,18 @@ impl GenerationSchedule {
             .spawn(move || {
                 let scheduler = Self {
                     queue: BinaryHeap::new(),
+                    parked_full: BinaryHeap::new(),
                     graph: DAG::default(),
                     last_level: ChunkLevel::default(),
+                    player_level: ChunkLevel::default(),
+                    owner_demands: HashMapType::default(),
+                    peer_request_retention: HashSetType::default(),
+                    owner_ready_routes: HashMapType::default(),
+                    pending_owner_ready: VecDeque::new(),
+                    publication_generations: HashMapType::default(),
+                    next_publication_generation: 1,
+                    owner_demand_rx,
+                    deferred_primary_io: HashMapType::default(),
                     last_high_priority: Vec::new(),
                     send_level: level_channel,
                     public_chunk_map: level_sched.loaded_chunks.clone(),
@@ -170,6 +850,15 @@ impl GenerationSchedule {
                     waiting_for_chunks: HashSetType::default(),
                     cluster_fetches: HashMapType::default(),
                     cluster_level: Some(level_sched.clone()),
+                    pending_fresh: HashMapType::default(),
+                    pending_persisted: HashMapType::default(),
+                    pending_persisted_decisions: VecDeque::new(),
+                    next_fresh_generation: 1,
+                    fresh_wake_tx,
+                    fresh_wake_rx,
+                    cluster_publications,
+                    peer_install_claims,
+                    pending_claim_results: VecDeque::new(),
                     io_lock,
                     running_task_count: 0,
                     max_in_flight,
@@ -250,9 +939,6 @@ impl GenerationSchedule {
     }
 
     fn sort_queue(&mut self) {
-        if self.queue.is_empty() {
-            return;
-        }
         let mut tasks: Vec<_> = self.queue.drain().collect();
         for i in &mut tasks {
             if let Some(node) = self.graph.nodes.get(i.1) {
@@ -265,6 +951,18 @@ impl GenerationSchedule {
             }
         }
         self.queue = BinaryHeap::from(tasks);
+        let mut parked: Vec<_> = self.parked_full.drain().collect();
+        for task in &mut parked {
+            if let Some(node) = self.graph.nodes.get(task.1) {
+                task.0 = Self::calc_priority(
+                    &self.last_level,
+                    &self.last_high_priority,
+                    node.pos,
+                    node.stage,
+                );
+            }
+        }
+        self.parked_full = BinaryHeap::from(parked);
     }
 
     fn resort_work_secondary(
@@ -351,18 +1049,23 @@ impl GenerationSchedule {
         }
     }
 
-    fn secondary_poll_fetches(&mut self) {
-        if !crate::level::is_cluster_secondary() {
-            return;
-        }
+    fn poll_cluster_fetches(&mut self) {
         let Some(fetch_level) = self.cluster_level.clone() else {
             return;
         };
-        let positions: Vec<_> = fetch_level
-            .cluster_snapshots
-            .iter()
-            .map(|entry| *entry.key())
-            .collect();
+        let secondary = crate::level::is_cluster_secondary();
+        if !secondary && !fetch_level.cluster_genesis_required {
+            return;
+        }
+        let positions: Vec<_> = if secondary {
+            fetch_level
+                .cluster_snapshots
+                .iter()
+                .map(|entry| *entry.key())
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut completed: Vec<(ChunkPos, SyncChunk)> = Vec::with_capacity(positions.len());
         for pos in positions {
             if let Some((_, snapshot)) = fetch_level.cluster_snapshots.remove(&pos) {
@@ -378,6 +1081,7 @@ impl GenerationSchedule {
             .cluster_fetch_wanted
             .iter()
             .map(|entry| *entry.key())
+            .filter(|pos| secondary || self.pending_persisted.contains_key(pos))
             .collect();
         for pos in wanted {
             if self.cluster_fetches.contains_key(&pos) {
@@ -387,7 +1091,9 @@ impl GenerationSchedule {
                 self.cluster_fetches.insert(pos, Instant::now());
             }
         }
-        self.secondary_discard_timed_out_partials();
+        if secondary {
+            self.secondary_discard_timed_out_partials();
+        }
     }
 
     fn secondary_discard_timed_out_partials(&mut self) {
@@ -795,7 +1501,14 @@ impl GenerationSchedule {
             } else {
                 if old_stage == StagedChunkEnum::None {
                     self.unload_chunks.remove(&pos);
-                    if holder.current_stage == StagedChunkEnum::Full && !holder.public {
+                    if holder.current_stage == StagedChunkEnum::Full
+                        && !holder.public
+                        && !(self
+                            .cluster_level
+                            .as_ref()
+                            .is_some_and(|level| level.cluster_genesis_required)
+                            && matches!(holder.chunk, Some(Chunk::Level(_))))
+                    {
                         holder.public = true;
                         match holder.chunk.as_ref().expect("chunk exists") {
                             Chunk::Level(chunk) => {
@@ -908,6 +1621,110 @@ impl GenerationSchedule {
         true
     }
 
+    fn advance_owner_demands_and_levels(&mut self) -> bool {
+        let (player_change, priority) = self.send_level.get();
+        let mut changed = HashSetType::<ChunkPos>::default();
+        if let Some((changes, player_level)) = player_change {
+            changed.extend(changes.keys().copied());
+            self.player_level = player_level;
+        }
+        for _ in 0..1_024 {
+            let Ok(demand) = self.owner_demand_rx.try_recv() else {
+                break;
+            };
+            match demand {
+                crate::level::OwnerChunkDemand::RetainPeerRequest { position } => {
+                    if self.peer_request_retention.insert(position) {
+                        changed.insert(position);
+                    }
+                }
+                crate::level::OwnerChunkDemand::ReleasePeerRequest { position } => {
+                    if self.peer_request_retention.remove(&position) {
+                        changed.insert(position);
+                    }
+                }
+                crate::level::OwnerChunkDemand::Acquire {
+                    position,
+                    lease,
+                    ready,
+                } => {
+                    if let Some(ready) = ready {
+                        self.owner_ready_routes
+                            .entry(position)
+                            .or_default()
+                            .insert(lease, ready);
+                        if let Some(generation) =
+                            self.publication_generations.get(&position).copied()
+                        {
+                            self.pending_owner_ready
+                                .push_back((position, lease, generation));
+                        }
+                    }
+                    if self
+                        .owner_demands
+                        .entry(position)
+                        .or_default()
+                        .insert(lease)
+                    {
+                        changed.insert(position);
+                    }
+                }
+                crate::level::OwnerChunkDemand::Release { position, lease } => {
+                    if let Some(routes) = self.owner_ready_routes.get_mut(&position) {
+                        routes.remove(&lease);
+                        if routes.is_empty() {
+                            self.owner_ready_routes.remove(&position);
+                        }
+                    }
+                    if let Some(leases) = self.owner_demands.get_mut(&position)
+                        && leases.remove(&lease)
+                    {
+                        changed.insert(position);
+                        if leases.is_empty() {
+                            self.owner_demands.remove(&position);
+                        }
+                    }
+                }
+            }
+        }
+        self.flush_owner_ready();
+        if changed.is_empty() {
+            return self.resort_work((None, priority));
+        }
+        let mut combined = self.player_level.clone();
+        for position in self
+            .owner_demands
+            .keys()
+            .copied()
+            .chain(self.peer_request_retention.iter().copied())
+        {
+            combined
+                .entry(position)
+                .and_modify(|level| *level = (*level).min(43))
+                .or_insert(43);
+        }
+        let mut changes = HashMapType::default();
+        for position in changed {
+            let old = StagedChunkEnum::level_to_stage(
+                *self
+                    .last_level
+                    .get(&position)
+                    .unwrap_or(&ChunkLoading::MAX_LEVEL),
+            );
+            let new = StagedChunkEnum::level_to_stage(
+                *combined.get(&position).unwrap_or(&ChunkLoading::MAX_LEVEL),
+            );
+            if old != new {
+                changes.insert(position, (old, new));
+            }
+        }
+        if changes.is_empty() {
+            self.last_level = combined;
+            return self.resort_work((None, priority));
+        }
+        self.resort_work((Some((changes, combined)), priority))
+    }
+
     fn recompute_dependency_stages(&mut self) {
         let mut required: HashMapType<ChunkPos, StagedChunkEnum> = HashMapType::default();
         let mut worklist: Vec<(ChunkPos, StagedChunkEnum)> = self
@@ -999,6 +1816,8 @@ impl GenerationSchedule {
             .filter(|task| graph.nodes.contains_key(task.1))
             .collect();
         self.queue = BinaryHeap::from(tasks);
+        self.parked_full
+            .retain(|task| graph.nodes.contains_key(task.1));
     }
 
     fn garbage_collect_dependencies(&mut self) {
@@ -1055,6 +1874,54 @@ impl GenerationSchedule {
             let Some(mut holder) = self.chunk_map.remove(&pos) else {
                 continue;
             };
+            if self.cluster_level.as_ref().is_some_and(|level| {
+                level.cluster_genesis_required
+                    && level.cluster_unsettled_primary_chunks.load().contains(&pos)
+            }) {
+                self.chunk_map.insert(pos, holder);
+                self.unload_chunks.insert(pos);
+                continue;
+            }
+            if self.owner_demands.contains_key(&pos) || self.peer_request_retention.contains(&pos) {
+                self.chunk_map.insert(pos, holder);
+                continue;
+            }
+            if self.pending_fresh.contains_key(&pos) {
+                self.chunk_map.insert(pos, holder);
+                continue;
+            }
+            if let Some(pending) = self.pending_persisted.get(&pos)
+                && holder.target_stage == StagedChunkEnum::None
+                && holder.dependency_stage == StagedChunkEnum::None
+            {
+                let recovery_active = self.cluster_fetches.contains_key(&pos)
+                    || self
+                        .cluster_level
+                        .as_ref()
+                        .is_some_and(|level| level.cluster_fetch_wanted.contains(&pos));
+                let can_abort = (!pending.submitted || pending.terminal_rejection)
+                    && !recovery_active
+                    && !pending.peer_claimed;
+                if can_abort {
+                    self.pending_persisted.remove(&pos);
+                    if let Some(level) = self.cluster_level.as_ref() {
+                        publish_persisted_reservation(
+                            &level.cluster_publication_reservations,
+                            pos,
+                            None,
+                        );
+                    }
+                }
+            }
+            if self.pending_persisted.contains_key(&pos) {
+                let retiring = holder.target_stage == StagedChunkEnum::None
+                    && holder.dependency_stage == StagedChunkEnum::None;
+                self.chunk_map.insert(pos, holder);
+                if retiring {
+                    self.unload_chunks.insert(pos);
+                }
+                continue;
+            }
             if self
                 .cluster_level
                 .as_ref()
@@ -1070,6 +1937,17 @@ impl GenerationSchedule {
                 continue;
             }
             if !holder.occupied.is_null() {
+                self.chunk_map.insert(pos, holder);
+                self.unload_chunks.insert(pos);
+                continue;
+            }
+            if holder.public
+                && let Some(level) = self
+                    .cluster_level
+                    .as_ref()
+                    .filter(|level| level.cluster_genesis_required)
+                && !level.try_begin_primary_chunk_unload(pos)
+            {
                 self.chunk_map.insert(pos, holder);
                 self.unload_chunks.insert(pos);
                 continue;
@@ -1139,6 +2017,9 @@ impl GenerationSchedule {
         let mut chunks = Vec::with_capacity(self.chunk_map.len());
 
         for (pos, holder) in &mut self.chunk_map {
+            if self.pending_fresh.contains_key(pos) || self.pending_persisted.contains_key(pos) {
+                continue;
+            }
             if let Some(chunk) = &holder.chunk {
                 let should_save = match chunk {
                     Chunk::Level(sync_chunk) => sync_chunk.is_dirty(),
@@ -1229,9 +2110,53 @@ impl GenerationSchedule {
 
     #[expect(clippy::too_many_lines)]
     fn receive_chunk(&mut self, pos: ChunkPos, data: RecvChunk) {
+        let counted_task = !matches!(data, RecvChunk::Cluster(_));
+        if let Some(pending) = self.pending_persisted.get_mut(&pos) {
+            if !pending.unexpected_arrival_reported {
+                pending.unexpected_arrival_reported = true;
+                error!(
+                    x = pos.x,
+                    z = pos.y,
+                    generation = pending.generation,
+                    "cluster persisted admission reserved this chunk against replacement"
+                );
+            }
+            if counted_task {
+                self.running_task_count = self.running_task_count.saturating_sub(1);
+            }
+            return;
+        }
         match data {
             RecvChunk::IO(chunk) => {
                 let mut holder = self.chunk_map.remove(&pos).expect("holder exists");
+                if holder.public
+                    && let Some(level) = self
+                        .cluster_level
+                        .as_ref()
+                        .filter(|level| level.cluster_genesis_required)
+                {
+                    if matches!(chunk, Chunk::Level(_)) {
+                        // A stale disk image may never replace an already public,
+                        // owner-admitted primary image.
+                        if !holder.occupied.is_null()
+                            && self.graph.nodes.contains_key(holder.occupied)
+                        {
+                            self.drop_node(holder.occupied);
+                        }
+                        holder.occupied = NodeKey::null();
+                        holder.current_stage = StagedChunkEnum::Full;
+                        self.chunk_map.insert(pos, holder);
+                        self.running_task_count = self.running_task_count.saturating_sub(1);
+                        return;
+                    }
+                    if !level.try_begin_primary_chunk_unload(pos) {
+                        self.deferred_primary_io.insert(pos, chunk);
+                        self.chunk_map.insert(pos, holder);
+                        self.running_task_count = self.running_task_count.saturating_sub(1);
+                        return;
+                    }
+                }
+                let mut private = false;
                 if holder.chunk.is_some() {
                     warn!(
                         "receive_chunk(IO): holder already has chunk at {:?}; replacing",
@@ -1249,20 +2174,54 @@ impl GenerationSchedule {
 
                 match &chunk {
                     Chunk::Level(data) => {
-                        self.apply_lighting_override(data);
-                        let result = self.publish_chunk(pos, data.clone());
-                        if result.is_some() {
+                        if self
+                            .cluster_level
+                            .as_ref()
+                            .is_some_and(|level| level.cluster_genesis_required)
+                        {
+                            private = true;
+                            self.next_fresh_generation = self.next_fresh_generation.wrapping_add(1);
+                            self.pending_persisted.insert(
+                                pos,
+                                PendingPersisted {
+                                    original: data.clone(),
+                                    approved: None,
+                                    generation: self.next_fresh_generation,
+                                    response: None,
+                                    submitted: false,
+                                    rejected: false,
+                                    terminal_rejection: false,
+                                    peer_claimed: false,
+                                    unexpected_arrival_reported: false,
+                                },
+                            );
+                            if let Some(level) = self.cluster_level.as_ref() {
+                                publish_persisted_reservation(
+                                    &level.cluster_publication_reservations,
+                                    pos,
+                                    Some(crate::level::PersistedChunkReservation {
+                                        generation: self.next_fresh_generation,
+                                        state:
+                                            crate::level::PersistedChunkReservationState::Pending,
+                                    }),
+                                );
+                            }
+                        } else {
+                            self.apply_lighting_override(data);
+                            let result = self.publish_chunk(pos, data.clone());
+                            if result.is_some() {
+                                trace!(
+                                    "receive_chunk(IO): replacing existing public chunk at {:?}",
+                                    pos
+                                );
+                            }
+                            holder.public = true;
                             trace!(
-                                "receive_chunk(IO): replacing existing public chunk at {:?}",
+                                "Notifying players: chunk {:?} loaded from disk (Full status)",
                                 pos
                             );
+                            self.listener.process_new_chunk(pos, data);
                         }
-                        holder.public = true;
-                        trace!(
-                            "Notifying players: chunk {:?} loaded from disk (Full status)",
-                            pos
-                        );
-                        self.listener.process_new_chunk(pos, data);
                     }
                     Chunk::Proto(_) => {
                         if holder.public {
@@ -1279,7 +2238,9 @@ impl GenerationSchedule {
                 self.chunk_map.insert(pos, holder);
 
                 // A new chunk arrived — unblock any waiting generation tasks
-                self.check_waiting_tasks(crate::level::is_cluster_secondary());
+                if !private {
+                    self.check_waiting_tasks(crate::level::is_cluster_secondary());
+                }
             }
             RecvChunk::Cluster((cluster_pos, snapshot)) => {
                 if crate::level::is_cluster_secondary() {
@@ -1321,10 +2282,24 @@ impl GenerationSchedule {
                 return;
             }
             RecvChunk::Generation(data) => {
+                let mut initial_palettes = data.initial_palettes;
                 let mut dx = 0;
                 let mut dy = 0;
                 for chunk in data.chunks {
                     let new_pos = ChunkPos::new(data.x + dx, data.z + dy);
+                    dy += 1;
+                    if dy == data.size {
+                        dy = 0;
+                        dx += 1;
+                    }
+                    if self.pending_persisted.contains_key(&new_pos) {
+                        error!(
+                            x = new_pos.x,
+                            z = new_pos.y,
+                            "cluster persisted admission reserved a generated neighbor against replacement"
+                        );
+                        continue;
+                    }
                     match chunk {
                         Chunk::Level(chunk) => {
                             let mut holder =
@@ -1347,9 +2322,50 @@ impl GenerationSchedule {
                                 holder.current_stage = stage;
 
                                 let was_public = holder.public;
-                                self.apply_lighting_override(&chunk);
-                                let public_chunk = chunk.clone();
-                                if was_public {
+                                if self
+                                    .cluster_level
+                                    .as_ref()
+                                    .is_some_and(|level| level.cluster_genesis_required)
+                                    && was_public
+                                {
+                                    error!(
+                                        x = new_pos.x,
+                                        z = new_pos.y,
+                                        "cluster primary rejected regeneration of a published chunk"
+                                    );
+                                } else if let Some(palettes) = initial_palettes.take() {
+                                    let generation = self.next_fresh_generation;
+                                    self.next_fresh_generation = self
+                                        .next_fresh_generation
+                                        .checked_add(1)
+                                        .expect("fresh chunk generation exhausted");
+                                    holder.chunk = Some(Chunk::Level(chunk.clone()));
+                                    self.pending_fresh.insert(
+                                        new_pos,
+                                        PendingFresh {
+                                            image: std::sync::Arc::from(
+                                                crate::level::cluster_encode_snapshot(&chunk),
+                                            ),
+                                            chunk,
+                                            palettes: Some(palettes),
+                                            generation,
+                                            response: None,
+                                            abort: false,
+                                        },
+                                    );
+                                } else if self
+                                    .cluster_level
+                                    .as_ref()
+                                    .is_some_and(|level| level.cluster_genesis_required)
+                                {
+                                    error!(
+                                        x = new_pos.x,
+                                        z = new_pos.y,
+                                        "cluster primary generated a chunk without a genesis palette"
+                                    );
+                                    holder.chunk = Some(Chunk::Level(chunk));
+                                } else if was_public {
+                                    let public_chunk = chunk.clone();
                                     self.publish_chunk(new_pos, public_chunk);
                                     info!(
                                         "Notifying players: regenerated chunk at {:?} (was already public)",
@@ -1358,6 +2374,7 @@ impl GenerationSchedule {
                                     self.listener.process_new_chunk(new_pos, &chunk);
                                     holder.chunk = Some(Chunk::Level(chunk));
                                 } else {
+                                    let public_chunk = chunk.clone();
                                     holder.chunk = Some(Chunk::Level(chunk));
                                     let result = self.publish_chunk(new_pos, public_chunk);
                                     holder.public = true;
@@ -1422,11 +2439,6 @@ impl GenerationSchedule {
                             holder.chunk = Some(Chunk::Proto(chunk));
                             self.chunk_map.insert(new_pos, holder);
                         }
-                    }
-                    dy += 1;
-                    if dy == data.size {
-                        dy = 0;
-                        dx += 1;
                     }
                 }
 
@@ -1511,7 +2523,34 @@ impl GenerationSchedule {
                 }
             }
         }
-        self.running_task_count -= 1;
+        if counted_task {
+            self.running_task_count -= 1;
+        }
+    }
+
+    fn retry_deferred_primary_io(&mut self) {
+        let positions = self.deferred_primary_io.keys().copied().collect::<Vec<_>>();
+        for pos in positions {
+            let Some(holder) = self.chunk_map.get(&pos) else {
+                self.deferred_primary_io.remove(&pos);
+                continue;
+            };
+            if holder.public
+                && self.cluster_level.as_ref().is_some_and(|level| {
+                    level
+                        .cluster_primary_chunk_fences
+                        .load()
+                        .get(&pos)
+                        .is_none_or(|fence| fence.load(std::sync::atomic::Ordering::Acquire) != 0)
+                })
+            {
+                continue;
+            }
+            if let Some(chunk) = self.deferred_primary_io.remove(&pos) {
+                self.running_task_count += 1;
+                self.receive_chunk(pos, RecvChunk::IO(chunk));
+            }
+        }
     }
 
     #[expect(clippy::too_many_lines)]
@@ -1522,6 +2561,12 @@ impl GenerationSchedule {
             thread::current().name().unwrap_or("unknown")
         );
         loop {
+            self.retry_deferred_primary_io();
+            self.poll_fresh_admissions();
+            self.poll_persisted_admissions();
+            self.poll_peer_install_claims();
+            self.poll_cluster_publications();
+            self.flush_owner_ready();
             if level.should_unload.swap(false, Relaxed) {
                 self.garbage_collect_dependencies();
                 self.process_unload_queue();
@@ -1538,11 +2583,11 @@ impl GenerationSchedule {
             }
 
             // 1. Get latest world state (player moves, etc)
-            if self.resort_work(self.send_level.get()) {
+            if self.advance_owner_demands_and_levels() {
                 self.garbage_collect_dependencies();
             }
 
-            self.secondary_poll_fetches();
+            self.poll_cluster_fetches();
 
             // Process unload queue periodically (every 1 second) to batch writes together
             // and act as a brief memory cache if a player walks back into the chunk.
@@ -1558,6 +2603,11 @@ impl GenerationSchedule {
             while let Ok((pos, data)) = self.recv_chunk.try_recv() {
                 self.receive_chunk(pos, data);
             }
+            self.poll_fresh_admissions();
+            self.poll_persisted_admissions();
+            self.poll_peer_install_claims();
+            self.poll_cluster_publications();
+            self.flush_owner_ready();
 
             // 3. Re-sort if world state changed or new tasks added
             if self.queue_dirty {
@@ -1579,11 +2629,22 @@ impl GenerationSchedule {
                     self.queue.push(task);
                     break 'out2;
                 }
+                if self.graph.nodes.get(task.1).is_some_and(|node| {
+                    node.stage == StagedChunkEnum::Full
+                        || (node.stage == StagedChunkEnum::Empty && level.cluster_genesis_required)
+                }) && self.pending_fresh.len()
+                    + self.pending_persisted.len()
+                    + usize::from(self.running_task_count)
+                    >= 128
+                {
+                    self.parked_full.push(task);
+                    continue;
+                }
 
                 // Briefly check for high-priority results or world changes to avoid stalling
                 while let Ok((pos, data)) = self.recv_chunk.try_recv() {
                     self.receive_chunk(pos, data);
-                    if self.resort_work(self.send_level.get()) {
+                    if self.advance_owner_demands_and_levels() {
                         // If world state changed, we MUST re-sort before continuing
                         self.garbage_collect_dependencies();
                         self.queue.push(task);
@@ -1738,6 +2799,10 @@ impl GenerationSchedule {
                             node.pos.y - write_radius,
                             write_radius << 1 | 1,
                         );
+                        cache.capture_seed = self
+                            .cluster_level
+                            .as_ref()
+                            .is_some_and(|level| level.cluster_genesis_required);
 
                         if node.stage == StagedChunkEnum::Surface {
                             let mut neighborhood =
@@ -1858,17 +2923,51 @@ impl GenerationSchedule {
                     match self.recv_chunk.recv_timeout(Duration::from_millis(5)) {
                         Ok((pos, data)) => {
                             self.receive_chunk(pos, data);
-                            if self.resort_work(self.send_level.get()) {
+                            if self.advance_owner_demands_and_levels() {
                                 self.garbage_collect_dependencies();
                             }
                         }
                         Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
                             // Periodically check LevelChannel for new requests
-                            if self.resort_work(self.send_level.get()) {
+                            if self.advance_owner_demands_and_levels() {
                                 self.garbage_collect_dependencies();
                             }
                         }
                         Err(crossbeam::channel::RecvTimeoutError::Disconnected) => break,
+                    }
+                } else if !self.pending_fresh.is_empty()
+                    || !self.pending_persisted.is_empty()
+                    || !self.parked_full.is_empty()
+                {
+                    crossbeam::select! {
+                        recv(self.recv_chunk) -> received => {
+                            match received {
+                                Ok((pos, data)) => self.receive_chunk(pos, data),
+                                Err(_) => break,
+                            }
+                        }
+                        recv(self.fresh_wake_rx) -> _ => {}
+                        recv(self.cluster_publications) -> publication => {
+                            if let Ok(publication) = publication {
+                                self.apply_cluster_publication(publication);
+                            }
+                        }
+                        default(Duration::from_millis(5)) => {}
+                    }
+                    if self.advance_owner_demands_and_levels() {
+                        self.garbage_collect_dependencies();
+                    }
+                    if !crate::level::is_cluster_secondary() {
+                        self.check_waiting_tasks(false);
+                        let _ = Self::restore_ready_tasks(
+                            &mut self.graph,
+                            &mut self.queue,
+                            &self.chunk_map,
+                            &self.last_level,
+                            &self.last_high_priority,
+                            &self.waiting_for_chunks,
+                            false,
+                        );
                     }
                 } else {
                     // No tasks in flight, check for any unblocked waiting tasks or stranded ready tasks
@@ -1896,7 +2995,10 @@ impl GenerationSchedule {
                     }
                     debug_assert!(self.debug_check());
                     debug_assert_eq!(self.running_task_count, 0);
-                    if self.resort_work(self.send_level.wait_and_get(level)) {
+                    // Both player-level and owner-demand changes are sampled on
+                    // this bounded idle wake; the latter cannot wake LevelChannel.
+                    let _ = self.fresh_wake_rx.recv_timeout(Duration::from_millis(5));
+                    if self.advance_owner_demands_and_levels() {
                         self.garbage_collect_dependencies();
                     }
                 }
@@ -1910,12 +3012,12 @@ impl GenerationSchedule {
                 match self.recv_chunk.recv_timeout(Duration::from_millis(5)) {
                     Ok((pos, data)) => {
                         self.receive_chunk(pos, data);
-                        if self.resort_work(self.send_level.get()) {
+                        if self.advance_owner_demands_and_levels() {
                             self.garbage_collect_dependencies();
                         }
                     }
                     Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
-                        if self.resort_work(self.send_level.get()) {
+                        if self.advance_owner_demands_and_levels() {
                             self.garbage_collect_dependencies();
                         }
                     }
@@ -2033,6 +3135,10 @@ impl GenerationSchedule {
 mod secondary_park_regression {
     use super::*;
 
+    use pumpkin_config::world::LevelConfig;
+    use pumpkin_data::dimension::Dimension;
+    use tempfile::TempDir;
+
     static SECONDARY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     struct SecondaryTestMode {
@@ -2059,10 +3165,24 @@ mod secondary_park_regression {
         let (send_chunk, recv_chunk) = crossbeam::channel::unbounded();
         let (io_read_tx, _io_read_rx) = tokio::sync::mpsc::channel(8);
         let (io_write_tx, _io_write_rx) = tokio::sync::mpsc::channel(8);
+        let (fresh_wake_tx, fresh_wake_rx) = crossbeam::channel::bounded(1);
+        let (_cluster_publication_tx, cluster_publications) = crossbeam::channel::bounded(8);
+        let (_peer_install_claim_tx, peer_install_claims) = crossbeam::channel::bounded(8);
+        let (_owner_demand_tx, owner_demand_rx) = crossbeam::channel::bounded(8);
         GenerationSchedule {
             queue: BinaryHeap::new(),
+            parked_full: BinaryHeap::new(),
             graph: DAG::default(),
             last_level: ChunkLevel::default(),
+            player_level: ChunkLevel::default(),
+            owner_demands: HashMapType::default(),
+            peer_request_retention: HashSetType::default(),
+            owner_ready_routes: HashMapType::default(),
+            pending_owner_ready: VecDeque::new(),
+            publication_generations: HashMapType::default(),
+            next_publication_generation: 1,
+            owner_demand_rx,
+            deferred_primary_io: HashMapType::default(),
             last_high_priority: Vec::new(),
             send_level: Arc::new(LevelChannel::new()),
             public_chunk_map: Arc::new(DashMap::new()),
@@ -2087,7 +3207,822 @@ mod secondary_park_regression {
             generation_pool: None,
             cluster_fetches: HashMapType::default(),
             cluster_level: None,
+            pending_fresh: HashMapType::default(),
+            pending_persisted: HashMapType::default(),
+            pending_persisted_decisions: VecDeque::new(),
+            next_fresh_generation: 1,
+            fresh_wake_tx,
+            fresh_wake_rx,
+            cluster_publications,
+            peer_install_claims,
+            pending_claim_results: VecDeque::new(),
         }
+    }
+
+    #[test]
+    fn peer_request_retention_is_independent_of_action_leases() {
+        let _mode = SecondaryTestMode::enable();
+        let mut schedule = secondary_test_schedule();
+        let (sender, receiver) = crossbeam::channel::bounded(8);
+        schedule.owner_demand_rx = receiver;
+        let position = ChunkPos::new(8, -3);
+        sender
+            .send(crate::level::OwnerChunkDemand::RetainPeerRequest { position })
+            .unwrap();
+        sender
+            .send(crate::level::OwnerChunkDemand::Acquire {
+                position,
+                lease: 11,
+                ready: None,
+            })
+            .unwrap();
+        assert!(schedule.advance_owner_demands_and_levels());
+        sender
+            .send(crate::level::OwnerChunkDemand::ReleasePeerRequest { position })
+            .unwrap();
+        assert!(!schedule.advance_owner_demands_and_levels());
+        assert_eq!(schedule.last_level.get(&position), Some(&43));
+        assert!(!schedule.peer_request_retention.contains(&position));
+        sender
+            .send(crate::level::OwnerChunkDemand::Release {
+                position,
+                lease: 11,
+            })
+            .unwrap();
+        assert!(schedule.advance_owner_demands_and_levels());
+        assert!(!schedule.last_level.contains_key(&position));
+        sender
+            .send(crate::level::OwnerChunkDemand::RetainPeerRequest { position })
+            .unwrap();
+        assert!(schedule.advance_owner_demands_and_levels());
+        sender
+            .send(crate::level::OwnerChunkDemand::Release {
+                position,
+                lease: 11,
+            })
+            .unwrap();
+        assert!(!schedule.advance_owner_demands_and_levels());
+        assert_eq!(schedule.last_level.get(&position), Some(&43));
+    }
+
+    #[test]
+    fn owner_demand_retains_full_stage_until_last_lease_releases() {
+        let _mode = SecondaryTestMode::enable();
+        let mut schedule = secondary_test_schedule();
+        let (sender, receiver) = crossbeam::channel::bounded(8);
+        schedule.owner_demand_rx = receiver;
+        let position = ChunkPos::new(8, -3);
+        sender
+            .send(crate::level::OwnerChunkDemand::Acquire {
+                position,
+                lease: 11,
+                ready: None,
+            })
+            .unwrap();
+        sender
+            .send(crate::level::OwnerChunkDemand::Acquire {
+                position,
+                lease: 12,
+                ready: None,
+            })
+            .unwrap();
+        assert!(schedule.advance_owner_demands_and_levels());
+        assert_eq!(schedule.last_level.get(&position), Some(&43));
+        assert_eq!(schedule.owner_demands[&position].len(), 2);
+
+        sender
+            .send(crate::level::OwnerChunkDemand::Release {
+                position,
+                lease: 11,
+            })
+            .unwrap();
+        assert!(!schedule.advance_owner_demands_and_levels());
+        assert_eq!(schedule.last_level.get(&position), Some(&43));
+
+        sender
+            .send(crate::level::OwnerChunkDemand::Release {
+                position,
+                lease: 12,
+            })
+            .unwrap();
+        assert!(schedule.advance_owner_demands_and_levels());
+        assert!(!schedule.owner_demands.contains_key(&position));
+        assert!(!schedule.last_level.contains_key(&position));
+    }
+
+    #[test]
+    fn owner_demand_ready_is_generation_qualified_and_retained_until_delivered() {
+        let _mode = SecondaryTestMode::enable();
+        let mut schedule = secondary_test_schedule();
+        let (demand_tx, demand_rx) = crossbeam::channel::bounded(2);
+        schedule.owner_demand_rx = demand_rx;
+        let (ready_tx, mut ready_rx) = tokio::sync::mpsc::channel(1);
+        let position = ChunkPos::new(13, -6);
+        schedule.publication_generations.insert(position, 27);
+        schedule.public_chunk_map.insert(
+            position,
+            crate::chunk::ChunkData::empty_sync(position.x, position.y),
+        );
+        ready_tx
+            .try_send(crate::level::OwnerChunkReady {
+                world_key: 0,
+                dimension: 0,
+                position,
+                lease: 99,
+                publication_generation: 1,
+            })
+            .unwrap();
+        demand_tx
+            .send(crate::level::OwnerChunkDemand::Acquire {
+                position,
+                lease: 7,
+                ready: Some(ready_tx),
+            })
+            .unwrap();
+        assert!(schedule.advance_owner_demands_and_levels());
+        assert_eq!(schedule.pending_owner_ready.len(), 1);
+        assert_eq!(ready_rx.try_recv().unwrap().lease, 99);
+        schedule.flush_owner_ready();
+        let ready = ready_rx.try_recv().unwrap();
+        assert_eq!(
+            (ready.position, ready.lease, ready.publication_generation),
+            (position, 7, 27)
+        );
+
+        schedule.pending_owner_ready.push_back((position, 7, 27));
+        schedule.publication_generations.insert(position, 28);
+        schedule.flush_owner_ready();
+        assert!(ready_rx.try_recv().is_err());
+
+        schedule.pending_owner_ready.push_back((position, 7, 27));
+        demand_tx
+            .send(crate::level::OwnerChunkDemand::Release { position, lease: 7 })
+            .unwrap();
+        assert!(schedule.advance_owner_demands_and_levels());
+        assert!(ready_rx.try_recv().is_err());
+        assert!(schedule.pending_owner_ready.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unsettled_primary_chunk_cannot_unload_until_owner_releases_it() {
+        let _mode = SecondaryTestMode::enable();
+        let root = TempDir::new().unwrap();
+        let level = Level::from_root_folder_with_cluster_genesis(
+            &LevelConfig::default(),
+            root.path().to_path_buf(),
+            0,
+            Dimension::OVERWORLD,
+            true,
+        );
+        let position = ChunkPos::new(3, 5);
+        level
+            .cluster_unsettled_primary_chunks
+            .store(Arc::new([position].into_iter().collect()));
+        let mut schedule = secondary_test_schedule();
+        schedule.cluster_level = Some(level.clone());
+        let mut holder = ChunkHolder::default();
+        holder.current_stage = StagedChunkEnum::Full;
+        let chunk = crate::chunk::ChunkData::empty_sync(position.x, position.y);
+        schedule.publish_chunk(position, chunk.clone());
+        holder.public = true;
+        holder.chunk = Some(Chunk::Level(chunk));
+        schedule.chunk_map.insert(position, holder);
+        assert!(level.claim_primary_chunk_for_actions(position));
+        schedule.unload_chunks.insert(position);
+        schedule.process_unload_queue();
+        assert!(schedule.chunk_map.contains_key(&position));
+        assert!(schedule.unload_chunks.contains(&position));
+
+        level
+            .cluster_unsettled_primary_chunks
+            .store(Arc::new(Default::default()));
+        schedule.process_unload_queue();
+        assert!(schedule.chunk_map.contains_key(&position));
+        level.release_primary_chunk_action_claim(position);
+        schedule.process_unload_queue();
+        assert!(!schedule.chunk_map.contains_key(&position));
+    }
+
+    #[tokio::test]
+    async fn primary_prepublication_claim_blocks_first_unload() {
+        let _mode = SecondaryTestMode::enable();
+        let root = TempDir::new().unwrap();
+        let level = Level::from_root_folder_with_cluster_genesis(
+            &LevelConfig::default(),
+            root.path().to_path_buf(),
+            0,
+            Dimension::OVERWORLD,
+            true,
+        );
+        let position = ChunkPos::new(31, 7);
+        level.install_primary_chunk_fence(position);
+        assert!(level.claim_primary_chunk_for_actions(position));
+        let mut schedule = secondary_test_schedule();
+        schedule.cluster_level = Some(level.clone());
+        let chunk = crate::chunk::ChunkData::empty_sync(position.x, position.y);
+        schedule.publish_chunk(position, chunk.clone());
+        let mut holder = ChunkHolder::default();
+        holder.current_stage = StagedChunkEnum::Full;
+        holder.public = true;
+        holder.chunk = Some(Chunk::Level(chunk));
+        schedule.chunk_map.insert(position, holder);
+        schedule.unload_chunks.insert(position);
+        schedule.process_unload_queue();
+        assert!(schedule.chunk_map.contains_key(&position));
+        assert!(schedule.unload_chunks.contains(&position));
+        let stale_reader = level.cluster_primary_chunk_fences.load_full();
+        let stale_token = stale_reader.get(&position).unwrap().clone();
+        level.release_primary_chunk_action_claim(position);
+        schedule.process_unload_queue();
+        assert!(!schedule.chunk_map.contains_key(&position));
+        assert_eq!(stale_token.load(std::sync::atomic::Ordering::Acquire), 2);
+        assert!(
+            !level
+                .cluster_primary_chunk_fences
+                .load()
+                .contains_key(&position)
+        );
+    }
+
+    #[tokio::test]
+    async fn primary_proto_downgrade_waits_for_owner_action_claim() {
+        let _mode = SecondaryTestMode::enable();
+        let root = TempDir::new().unwrap();
+        let level = Level::from_root_folder_with_cluster_genesis(
+            &LevelConfig::default(),
+            root.path().to_path_buf(),
+            0,
+            Dimension::OVERWORLD,
+            true,
+        );
+        let position = ChunkPos::new(7, -2);
+        let mut schedule = secondary_test_schedule();
+        schedule.cluster_level = Some(level.clone());
+        let public = crate::chunk::ChunkData::empty_sync(position.x, position.y);
+        schedule.publish_chunk(position, public.clone());
+        let occupied = schedule
+            .graph
+            .nodes
+            .insert(Node::new(position, StagedChunkEnum::Empty));
+        let mut holder = ChunkHolder::default();
+        holder.public = true;
+        holder.occupied = occupied;
+        holder.chunk = Some(Chunk::Level(public));
+        schedule.chunk_map.insert(position, holder);
+        schedule.running_task_count = 1;
+        assert!(level.claim_primary_chunk_for_actions(position));
+        let proto = crate::generation::proto_chunk::ProtoChunk::new(
+            position.x,
+            position.y,
+            &level.world_gen(),
+        );
+        schedule.receive_chunk(position, RecvChunk::IO(Chunk::Proto(Box::new(proto))));
+        assert!(schedule.public_chunk_map.contains_key(&position));
+        assert!(schedule.deferred_primary_io.contains_key(&position));
+        assert_eq!(schedule.running_task_count, 0);
+
+        level.release_primary_chunk_action_claim(position);
+        schedule.retry_deferred_primary_io();
+        assert!(!schedule.public_chunk_map.contains_key(&position));
+        assert!(!schedule.deferred_primary_io.contains_key(&position));
+    }
+
+    #[test]
+    fn owner_demand_creates_primary_generation_target() {
+        let _guard = SECONDARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::level::set_cluster_secondary(false);
+        let mut schedule = secondary_test_schedule();
+        let (sender, receiver) = crossbeam::channel::bounded(1);
+        schedule.owner_demand_rx = receiver;
+        let position = ChunkPos::new(4, 7);
+        sender
+            .send(crate::level::OwnerChunkDemand::Acquire {
+                position,
+                lease: 71,
+                ready: None,
+            })
+            .unwrap();
+        assert!(schedule.advance_owner_demands_and_levels());
+        assert_eq!(
+            schedule.chunk_map[&position].target_stage,
+            StagedChunkEnum::Full
+        );
+        assert!(schedule.graph.nodes.len() > 0);
+    }
+
+    #[test]
+    fn owner_release_restores_player_stage() {
+        let _mode = SecondaryTestMode::enable();
+        let mut schedule = secondary_test_schedule();
+        let position = ChunkPos::new(-6, 2);
+        let mut player_level = ChunkLevel::default();
+        player_level.insert(position, 44);
+        let mut changes = HashMapType::default();
+        changes.insert(position, (StagedChunkEnum::None, StagedChunkEnum::Spawn));
+        schedule.send_level.set_level((changes, player_level));
+        assert!(schedule.advance_owner_demands_and_levels());
+        assert_eq!(
+            schedule
+                .chunk_map
+                .get(&position)
+                .map(|holder| holder.target_stage),
+            None
+        );
+        assert_eq!(schedule.last_level.get(&position), Some(&44));
+
+        let (sender, receiver) = crossbeam::channel::bounded(2);
+        schedule.owner_demand_rx = receiver;
+        sender
+            .send(crate::level::OwnerChunkDemand::Acquire {
+                position,
+                lease: 9,
+                ready: None,
+            })
+            .unwrap();
+        assert!(schedule.advance_owner_demands_and_levels());
+        assert_eq!(schedule.last_level.get(&position), Some(&43));
+        sender
+            .send(crate::level::OwnerChunkDemand::Release { position, lease: 9 })
+            .unwrap();
+        assert!(schedule.advance_owner_demands_and_levels());
+        assert_eq!(schedule.last_level.get(&position), Some(&44));
+    }
+
+    #[tokio::test]
+    async fn persisted_chunk_requires_matching_owner_publication() {
+        let _guard = SECONDARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::level::set_cluster_secondary(false);
+        let root = TempDir::new().unwrap();
+        let level = Level::from_root_folder_with_cluster_genesis(
+            &LevelConfig::default(),
+            root.path().to_path_buf(),
+            0,
+            Dimension::OVERWORLD,
+            true,
+        );
+        let (admission_tx, mut admission_rx) = tokio::sync::mpsc::channel(8);
+        level
+            .persisted_chunk_admission
+            .store(Some(Arc::new(admission_tx)));
+        let (decision_tx, mut decision_rx) = tokio::sync::mpsc::channel(8);
+        level
+            .cluster_persisted_decision
+            .store(Some(Arc::new(decision_tx)));
+        let mut schedule = secondary_test_schedule();
+        schedule.cluster_level = Some(level);
+        let pos = ChunkPos::new(9, -4);
+        let original = crate::chunk::ChunkData::empty_sync(pos.x, pos.y);
+        let approved = crate::chunk::ChunkData::empty_sync(pos.x, pos.y);
+        let mut holder = ChunkHolder::default();
+        holder.current_stage = StagedChunkEnum::Full;
+        holder.chunk = Some(Chunk::Level(original.clone()));
+        schedule.chunk_map.insert(pos, holder);
+        schedule.pending_persisted.insert(
+            pos,
+            PendingPersisted {
+                original,
+                approved: None,
+                generation: 17,
+                response: None,
+                submitted: false,
+                rejected: false,
+                terminal_rejection: false,
+                peer_claimed: false,
+                unexpected_arrival_reported: false,
+            },
+        );
+
+        schedule.poll_persisted_admissions();
+        assert!(!schedule.public_chunk_map.contains_key(&pos));
+        let PersistedChunkAdmission::Prepare {
+            generation,
+            respond,
+            ..
+        } = admission_rx.try_recv().unwrap()
+        else {
+            panic!("expected persisted prepare");
+        };
+        assert_eq!(generation, 17);
+        schedule.receive_chunk(
+            pos,
+            RecvChunk::IO(Chunk::Level(crate::chunk::ChunkData::empty_sync(
+                pos.x, pos.y,
+            ))),
+        );
+        assert!(schedule.chunk_map.get(&pos).is_some_and(|holder| {
+            matches!(holder.chunk.as_ref(), Some(Chunk::Level(chunk)) if Arc::ptr_eq(chunk, &schedule.pending_persisted[&pos].original))
+        }));
+        schedule.receive_chunk(
+            pos,
+            RecvChunk::Cluster((pos, crate::chunk::ChunkData::empty_sync(pos.x, pos.y))),
+        );
+        assert!(!schedule.public_chunk_map.contains_key(&pos));
+        assert!(schedule.pending_persisted.contains_key(&pos));
+
+        let rejected_pos = ChunkPos::new(10, -4);
+        let rejected_chunk = crate::chunk::ChunkData::empty_sync(rejected_pos.x, rejected_pos.y);
+        let mut rejected_holder = ChunkHolder::default();
+        rejected_holder.current_stage = StagedChunkEnum::Full;
+        rejected_holder.chunk = Some(Chunk::Level(rejected_chunk.clone()));
+        schedule.chunk_map.insert(rejected_pos, rejected_holder);
+        schedule.pending_persisted.insert(
+            rejected_pos,
+            PendingPersisted {
+                original: rejected_chunk,
+                approved: None,
+                generation: 18,
+                response: None,
+                submitted: false,
+                rejected: false,
+                terminal_rejection: false,
+                peer_claimed: false,
+                unexpected_arrival_reported: false,
+            },
+        );
+        schedule.poll_persisted_admissions();
+        let PersistedChunkAdmission::Prepare {
+            respond: rejected_response,
+            ..
+        } = admission_rx.try_recv().unwrap()
+        else {
+            panic!("expected persisted prepare");
+        };
+        assert!(rejected_response.send(None).is_ok());
+        schedule.poll_persisted_admissions();
+        let rejected = decision_rx.try_recv().unwrap();
+        assert_eq!(rejected.generation, 18);
+        assert!(rejected.recovery);
+        assert!(!schedule.public_chunk_map.contains_key(&rejected_pos));
+        schedule.unload_chunks.insert(rejected_pos);
+        schedule.process_unload_queue();
+        assert!(!schedule.pending_persisted.contains_key(&rejected_pos));
+
+        let held_pos = ChunkPos::new(12, -4);
+        let held_chunk = crate::chunk::ChunkData::empty_sync(held_pos.x, held_pos.y);
+        let mut held_holder = ChunkHolder::default();
+        held_holder.current_stage = StagedChunkEnum::Full;
+        held_holder.chunk = Some(Chunk::Level(held_chunk.clone()));
+        schedule.chunk_map.insert(held_pos, held_holder);
+        schedule.pending_persisted.insert(
+            held_pos,
+            PendingPersisted {
+                original: held_chunk,
+                approved: None,
+                generation: 20,
+                response: None,
+                submitted: true,
+                rejected: true,
+                terminal_rejection: true,
+                peer_claimed: false,
+                unexpected_arrival_reported: false,
+            },
+        );
+        schedule.cluster_fetches.insert(held_pos, Instant::now());
+        schedule.unload_chunks.insert(held_pos);
+        schedule.process_unload_queue();
+        assert!(schedule.pending_persisted.contains_key(&held_pos));
+        assert!(!schedule.public_chunk_map.contains_key(&held_pos));
+
+        let recovered_pos = ChunkPos::new(11, -4);
+        let stale = crate::chunk::ChunkData::empty_sync(recovered_pos.x, recovered_pos.y);
+        let recovered = crate::chunk::ChunkData::empty_sync(recovered_pos.x, recovered_pos.y);
+        let mut recovered_holder = ChunkHolder::default();
+        recovered_holder.current_stage = StagedChunkEnum::Full;
+        recovered_holder.chunk = Some(Chunk::Level(stale.clone()));
+        schedule.chunk_map.insert(recovered_pos, recovered_holder);
+        schedule.pending_persisted.insert(
+            recovered_pos,
+            PendingPersisted {
+                original: stale,
+                approved: None,
+                generation: 19,
+                response: None,
+                submitted: false,
+                rejected: true,
+                terminal_rejection: true,
+                peer_claimed: false,
+                unexpected_arrival_reported: false,
+            },
+        );
+        publish_persisted_reservation(
+            &schedule
+                .cluster_level
+                .as_ref()
+                .unwrap()
+                .cluster_publication_reservations,
+            recovered_pos,
+            Some(crate::level::PersistedChunkReservation {
+                generation: 19,
+                state: crate::level::PersistedChunkReservationState::Recovery,
+            }),
+        );
+        let (old_claim_tx, mut old_claim_rx) = tokio::sync::mpsc::channel(1);
+        schedule.process_peer_install_claim(crate::level::PeerChunkInstallClaim::Claim {
+            position: recovered_pos,
+            generation: 18,
+            respond: old_claim_tx,
+        });
+        assert!(!old_claim_rx.try_recv().unwrap().allowed);
+        let (claim_result_tx, mut claim_result_rx) = tokio::sync::mpsc::channel(1);
+        schedule.process_peer_install_claim(crate::level::PeerChunkInstallClaim::Claim {
+            position: recovered_pos,
+            generation: 19,
+            respond: claim_result_tx,
+        });
+        assert!(claim_result_rx.try_recv().unwrap().allowed);
+        schedule.unload_chunks.insert(recovered_pos);
+        schedule.process_unload_queue();
+        assert!(schedule.pending_persisted.contains_key(&recovered_pos));
+        assert!(!schedule.public_chunk_map.contains_key(&recovered_pos));
+        let (claim_route, claim_rx) = crossbeam::channel::bounded(1);
+        schedule.peer_install_claims = claim_rx;
+        schedule
+            .cluster_level
+            .as_ref()
+            .unwrap()
+            .cluster_peer_install_claim
+            .store(Some(Arc::new(claim_route.clone())));
+        assert!(
+            claim_route
+                .try_send(crate::level::PeerChunkInstallClaim::Release {
+                    position: ChunkPos::new(99, 99),
+                    generation: 1,
+                })
+                .is_ok()
+        );
+        assert!(
+            schedule
+                .cluster_level
+                .as_ref()
+                .unwrap()
+                .try_release_peer_chunk_install(recovered_pos, 19)
+        );
+        assert_eq!(
+            schedule
+                .cluster_level
+                .as_ref()
+                .unwrap()
+                .cluster_peer_install_releases
+                .len(),
+            1
+        );
+        schedule.poll_peer_install_claims();
+        assert!(!schedule.pending_persisted[&recovered_pos].peer_claimed);
+        let (reclaim_tx, mut reclaim_rx) = tokio::sync::mpsc::channel(1);
+        schedule.process_peer_install_claim(crate::level::PeerChunkInstallClaim::Claim {
+            position: recovered_pos,
+            generation: 19,
+            respond: reclaim_tx,
+        });
+        assert!(reclaim_rx.try_recv().unwrap().allowed);
+        schedule.receive_chunk(
+            recovered_pos,
+            RecvChunk::Cluster((recovered_pos, recovered.clone())),
+        );
+        assert!(!schedule.public_chunk_map.contains_key(&recovered_pos));
+        assert!(schedule.pending_persisted[&recovered_pos].peer_claimed);
+        let (wrong_respond, mut wrong_result) = tokio::sync::oneshot::channel();
+        schedule.apply_cluster_publication(ClusterSnapshotPublication {
+            position: recovered_pos,
+            snapshot: recovered.clone(),
+            reservation_generation: Some(18),
+            respond: wrong_respond,
+        });
+        assert_eq!(wrong_result.try_recv(), Ok(false));
+        assert!(!schedule.public_chunk_map.contains_key(&recovered_pos));
+        let (published, mut published_result) = tokio::sync::oneshot::channel();
+        schedule.apply_cluster_publication(ClusterSnapshotPublication {
+            position: recovered_pos,
+            snapshot: recovered.clone(),
+            reservation_generation: Some(19),
+            respond: published,
+        });
+        assert_eq!(published_result.try_recv(), Ok(true));
+        assert!(Arc::ptr_eq(
+            &schedule.public_chunk_map.get(&recovered_pos).unwrap(),
+            &recovered
+        ));
+        assert!(!schedule.pending_persisted.contains_key(&recovered_pos));
+
+        let (late_respond, mut late_result) = tokio::sync::oneshot::channel();
+        schedule.apply_cluster_publication(ClusterSnapshotPublication {
+            position: recovered_pos,
+            snapshot: crate::chunk::ChunkData::empty_sync(recovered_pos.x, recovered_pos.y),
+            reservation_generation: Some(19),
+            respond: late_respond,
+        });
+        assert_eq!(late_result.try_recv(), Ok(false));
+        assert!(Arc::ptr_eq(
+            &schedule.public_chunk_map.get(&recovered_pos).unwrap(),
+            &recovered
+        ));
+
+        assert!(respond.send(Some(approved.clone())).is_ok());
+        schedule.poll_persisted_admissions();
+        let approved_decision = decision_rx.try_recv().unwrap();
+        assert_eq!(approved_decision.generation, 17);
+        assert!(!approved_decision.recovery);
+        assert!(Arc::ptr_eq(
+            &schedule.public_chunk_map.get(&pos).unwrap(),
+            &approved
+        ));
+        let PersistedChunkAdmission::Published { generation, .. } =
+            admission_rx.try_recv().unwrap()
+        else {
+            panic!("expected persisted publication");
+        };
+        assert_eq!(generation, 17);
+    }
+
+    #[tokio::test]
+    async fn fresh_chunk_remains_private_until_owner_admission() {
+        let root = TempDir::new().unwrap();
+        let level = Level::from_root_folder_with_cluster_genesis(
+            &LevelConfig::default(),
+            root.path().to_path_buf(),
+            0,
+            Dimension::OVERWORLD,
+            true,
+        );
+        let (admission_tx, mut admission_rx) = tokio::sync::mpsc::channel(8);
+        level
+            .fresh_chunk_admission
+            .store(Some(Arc::new(admission_tx)));
+        let mut schedule = secondary_test_schedule();
+        schedule.cluster_level = Some(level);
+        let pos = ChunkPos::new(4, 7);
+        let chunk = crate::chunk::ChunkData::empty_sync(pos.x, pos.y);
+        let mut holder = ChunkHolder::default();
+        holder.current_stage = StagedChunkEnum::Full;
+        holder.chunk = Some(Chunk::Level(chunk.clone()));
+        schedule.chunk_map.insert(pos, holder);
+        schedule.pending_fresh.insert(
+            pos,
+            PendingFresh {
+                image: std::sync::Arc::from(crate::level::cluster_encode_snapshot(&chunk)),
+                chunk,
+                palettes: Some(InitialChunkPalettes {
+                    min_y: 0,
+                    blocks: Box::new([]),
+                    biomes: Box::new([]),
+                }),
+                generation: 1,
+                response: None,
+                abort: false,
+            },
+        );
+        let mut changes = HashMapType::default();
+        changes.insert(pos, (StagedChunkEnum::None, StagedChunkEnum::Full));
+        let mut levels = ChunkLevel::default();
+        levels.insert(pos, ChunkLoading::FULL_CHUNK_LEVEL);
+        assert!(schedule.resort_work((Some((changes, levels)), None)));
+        assert!(!schedule.public_chunk_map.contains_key(&pos));
+        schedule.poll_fresh_admissions();
+        assert!(!schedule.public_chunk_map.contains_key(&pos));
+        let FreshChunkAdmission::Prepare {
+            generation,
+            respond,
+            ..
+        } = admission_rx.try_recv().unwrap()
+        else {
+            panic!("fresh chunk was not prepared");
+        };
+        assert_eq!(generation, 1);
+        schedule.chunk_map.get_mut(&pos).unwrap().target_stage = StagedChunkEnum::None;
+        respond.send(true).unwrap();
+        schedule.poll_fresh_admissions();
+        assert!(schedule.public_chunk_map.contains_key(&pos));
+        let FreshChunkAdmission::Published { generation, .. } = admission_rx.try_recv().unwrap()
+        else {
+            panic!("fresh chunk publication was not reported");
+        };
+        assert_eq!(generation, 1);
+        assert!(!schedule.pending_fresh.contains_key(&pos));
+        assert!(schedule.unload_chunks.contains(&pos));
+    }
+
+    #[tokio::test]
+    async fn fresh_admission_does_not_publish_replaced_chunk() {
+        let root = TempDir::new().unwrap();
+        let level = Level::from_root_folder_with_cluster_genesis(
+            &LevelConfig::default(),
+            root.path().to_path_buf(),
+            0,
+            Dimension::OVERWORLD,
+            true,
+        );
+        let (admission_tx, mut admission_rx) = tokio::sync::mpsc::channel(8);
+        level
+            .fresh_chunk_admission
+            .store(Some(Arc::new(admission_tx)));
+        let mut schedule = secondary_test_schedule();
+        schedule.cluster_level = Some(level);
+        let pos = ChunkPos::new(4, 7);
+        let original = crate::chunk::ChunkData::empty_sync(pos.x, pos.y);
+        let replacement = crate::chunk::ChunkData::empty_sync(pos.x, pos.y);
+        let mut holder = ChunkHolder::default();
+        holder.current_stage = StagedChunkEnum::Full;
+        holder.chunk = Some(Chunk::Level(original.clone()));
+        schedule.chunk_map.insert(pos, holder);
+        schedule.pending_fresh.insert(
+            pos,
+            PendingFresh {
+                image: std::sync::Arc::from(crate::level::cluster_encode_snapshot(&original)),
+                chunk: original,
+                palettes: Some(InitialChunkPalettes {
+                    min_y: 0,
+                    blocks: Box::new([]),
+                    biomes: Box::new([]),
+                }),
+                generation: 1,
+                response: None,
+                abort: false,
+            },
+        );
+        schedule.poll_fresh_admissions();
+        let FreshChunkAdmission::Prepare { respond, .. } = admission_rx.try_recv().unwrap() else {
+            panic!("fresh chunk was not prepared");
+        };
+        schedule.chunk_map.get_mut(&pos).unwrap().chunk = Some(Chunk::Level(replacement));
+        respond.send(true).unwrap();
+        schedule.poll_fresh_admissions();
+        assert!(!schedule.public_chunk_map.contains_key(&pos));
+        schedule.poll_fresh_admissions();
+        let FreshChunkAdmission::Aborted { generation, .. } = admission_rx.try_recv().unwrap()
+        else {
+            panic!("replaced chunk did not abort its owner admission");
+        };
+        assert_eq!(generation, 1);
+    }
+
+    #[test]
+    fn saturated_fresh_admission_parks_only_full_generation() {
+        let mut schedule = secondary_test_schedule();
+        let full_pos = ChunkPos::new(1, 1);
+        let full = schedule
+            .graph
+            .nodes
+            .insert(Node::new(full_pos, StagedChunkEnum::Full));
+        schedule.parked_full.push(TaskHeapNode(0, full));
+        let empty_pos = ChunkPos::new(2, 2);
+        let empty = schedule
+            .graph
+            .nodes
+            .insert(Node::new(empty_pos, StagedChunkEnum::Empty));
+        schedule.queue.push(TaskHeapNode(0, empty));
+        let chunk = crate::chunk::ChunkData::empty_sync(0, 0);
+        for index in 0..128 {
+            schedule.pending_fresh.insert(
+                ChunkPos::new(index, 0),
+                PendingFresh {
+                    image: std::sync::Arc::from(crate::level::cluster_encode_snapshot(&chunk)),
+                    chunk: chunk.clone(),
+                    palettes: None,
+                    generation: index as u64,
+                    response: None,
+                    abort: false,
+                },
+            );
+        }
+        schedule.resume_parked_full();
+        assert_eq!(schedule.queue.pop().unwrap().1, empty);
+        assert!(schedule.queue.is_empty());
+        schedule.pending_fresh.remove(&ChunkPos::new(0, 0));
+        schedule.resume_parked_full();
+        assert_eq!(schedule.queue.pop().unwrap().1, full);
+    }
+
+    #[tokio::test]
+    async fn primary_generation_without_genesis_palette_never_publishes() {
+        let root = TempDir::new().unwrap();
+        let level = Level::from_root_folder_with_cluster_genesis(
+            &LevelConfig::default(),
+            root.path().to_path_buf(),
+            0,
+            Dimension::OVERWORLD,
+            true,
+        );
+        let mut schedule = secondary_test_schedule();
+        schedule.cluster_level = Some(level);
+        let pos = ChunkPos::new(4, 7);
+        let mut holder = ChunkHolder::default();
+        holder.current_stage = StagedChunkEnum::Spawn;
+        schedule.chunk_map.insert(pos, holder);
+        schedule.running_task_count = 1;
+        let mut generated = Cache::new(pos.x, pos.y, 1);
+        generated
+            .chunks
+            .push(Chunk::Level(crate::chunk::ChunkData::empty_sync(
+                pos.x, pos.y,
+            )));
+        schedule.receive_chunk(pos, RecvChunk::Generation(generated));
+        assert!(!schedule.public_chunk_map.contains_key(&pos));
+        assert!(!schedule.chunk_map.get(&pos).unwrap().public);
+        assert!(!schedule.pending_fresh.contains_key(&pos));
     }
 
     fn parked_noise_task(schedule: &mut GenerationSchedule) -> NodeKey {
@@ -2276,7 +4211,7 @@ mod secondary_park_regression {
         let mut schedule = secondary_test_schedule();
         let (pos, fetching) = fetching_surface_holder(&mut schedule);
         schedule.cluster_fetches.insert(pos, Instant::now());
-        schedule.secondary_poll_fetches();
+        schedule.poll_cluster_fetches();
         assert!(!schedule.cluster_fetches.is_empty());
         let holder = schedule.chunk_map.get(&pos).expect("holder exists");
         assert!(!holder.public);
@@ -2346,7 +4281,7 @@ mod secondary_park_regression {
         let mut schedule = secondary_test_schedule();
         let (pos, fetching) = fetching_surface_holder(&mut schedule);
         schedule.cluster_fetches.insert(pos, Instant::now());
-        schedule.secondary_poll_fetches();
+        schedule.poll_cluster_fetches();
         assert!(schedule.cluster_fetches.contains_key(&pos));
         let node = schedule
             .graph
@@ -2356,7 +4291,7 @@ mod secondary_park_regression {
         assert!(node.in_flight);
         assert!(!node.in_queue);
         assert!(schedule.queue.is_empty());
-        schedule.secondary_poll_fetches();
+        schedule.poll_cluster_fetches();
         schedule.check_waiting_tasks(true);
         let restored = GenerationSchedule::restore_ready_tasks(
             &mut schedule.graph,

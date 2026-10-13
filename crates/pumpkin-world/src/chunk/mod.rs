@@ -25,6 +25,14 @@ pub const CHUNK_AREA: usize = CHUNK_WIDTH * CHUNK_WIDTH;
 pub const BIOME_VOLUME: usize = BiomePalette::VOLUME;
 pub const SUBCHUNK_VOLUME: usize = CHUNK_AREA * CHUNK_WIDTH;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkOrigin {
+    Unknown,
+    FreshGenerated,
+    Persisted,
+    PeerSnapshot,
+}
+
 #[derive(Error, Debug)]
 pub enum ChunkReadingError {
     #[error("Io error: {0}")]
@@ -67,6 +75,7 @@ pub enum CompressionError {
 
 // Clone here cause we want to clone a snapshot of the chunk so we don't block writing for too long
 pub struct ChunkData {
+    pub origin: ChunkOrigin,
     pub section: ChunkSections,
     /// See `https://minecraft.wiki/w/Heightmap` for more info
     pub heightmap: std::sync::Mutex<ChunkHeightmaps>,
@@ -601,6 +610,7 @@ impl ChunkData {
     #[must_use]
     pub fn empty(x: i32, z: i32) -> Self {
         Self {
+            origin: ChunkOrigin::Unknown,
             section: ChunkSections::new(24, -64),
             heightmap: std::sync::Mutex::new(ChunkHeightmaps::default()),
             x,

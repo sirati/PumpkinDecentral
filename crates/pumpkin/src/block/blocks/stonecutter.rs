@@ -19,6 +19,7 @@ use pumpkin_inventory::stonecutter_screen_handler::StonecutterScreenHandler;
 #[pumpkin_block("minecraft:stonecutter")]
 pub struct StonecutterBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for StonecutterBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut props = WallTorchLikeProperties::default(args.block);

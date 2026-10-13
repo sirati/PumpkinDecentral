@@ -41,6 +41,7 @@ impl ScreenHandlerFactory for BeaconScreenFactory {
 #[pumpkin_block("minecraft:beacon")]
 pub struct BeaconBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for BeaconBlock {
     fn normal_use(&self, args: NormalUseArgs<'_>) -> BlockActionResult {
         self.get_screen_handler_factory(GetScreenHandlerFactoryArgs {

@@ -1,5 +1,4 @@
 use arc_swap::ArcSwap;
-use dashmap::DashMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 
@@ -64,8 +63,7 @@ impl Permission {
 /// Repository for all registered permissions in the server.
 pub struct PermissionRegistry {
     /// All registered permissions.
-    permissions: DashMap<String, Permission>,
-    defaults: ArcSwap<HashMap<String, PermissionDefault>>,
+    view: ArcSwap<HashMap<String, Permission>>,
 }
 
 impl Default for PermissionRegistry {
@@ -82,8 +80,7 @@ impl PermissionRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            permissions: DashMap::new(),
-            defaults: ArcSwap::from_pointee(HashMap::new()),
+            view: ArcSwap::from_pointee(HashMap::new()),
         }
     }
 
@@ -96,21 +93,21 @@ impl PermissionRegistry {
     /// - `Ok(())` if the permission was successfully registered.
     /// - `Err(String)` if a permission with the same node already exists.
     pub fn register_permission(&self, permission: Permission) -> Result<(), String> {
-        if self.permissions.contains_key(&permission.node) {
-            return Err(format!(
-                "Permission {} is already registered",
-                permission.node
-            ));
-        }
         let node = permission.node.clone();
-        let default = permission.default.clone();
-        self.permissions.insert(node.clone(), permission);
-        self.defaults.rcu(|current| {
+        let mut existed = false;
+        self.view.rcu(|current| {
+            existed = current.contains_key(&node);
             let mut next = (**current).clone();
-            next.insert(node.clone(), default.clone());
+            if !existed {
+                next.insert(node.clone(), permission.clone());
+            }
             next
         });
-        Ok(())
+        if existed {
+            Err(format!("Permission {node} is already registered"))
+        } else {
+            Ok(())
+        }
     }
 
     /// Registers a new permission in the registry and expects it to be registered.
@@ -135,16 +132,20 @@ impl PermissionRegistry {
     /// # Returns
     /// `Some(Ref<'_, String, Permission>)` if the node exists, or `None` otherwise.
     #[must_use]
-    pub fn get_permission(
-        &self,
-        node: &str,
-    ) -> Option<dashmap::mapref::one::Ref<'_, String, Permission>> {
-        self.permissions.get(node)
+    pub fn get_permission(&self, node: &str) -> Option<Permission> {
+        self.view.load().get(node).cloned()
     }
 
     #[must_use]
     pub fn get_default_snapshot(&self, node: &str) -> Option<PermissionDefault> {
-        self.defaults.load().get(node).cloned()
+        self.view
+            .load()
+            .get(node)
+            .map(|permission| permission.default.clone())
+    }
+
+    pub fn get_permission_snapshot(&self, node: &str) -> Option<Permission> {
+        self.view.load().get(node).cloned()
     }
 
     /// Overrides the default behaviour of an already-registered permission.
@@ -161,18 +162,18 @@ impl PermissionRegistry {
     /// - `false` if no permission with that node is registered.
     #[must_use]
     pub fn set_default(&self, node: &str, default: PermissionDefault) -> bool {
-        if let Some(mut permission) = self.permissions.get_mut(node) {
-            permission.default = default.clone();
-            drop(permission);
-            self.defaults.rcu(|current| {
-                let mut next = (**current).clone();
-                next.insert(node.to_owned(), default.clone());
-                next
-            });
-            true
-        } else {
-            false
-        }
+        let mut updated = false;
+        self.view.rcu(|current| {
+            let mut next = (**current).clone();
+            updated = if let Some(permission) = next.get_mut(node) {
+                permission.default = default.clone();
+                true
+            } else {
+                false
+            };
+            next
+        });
+        updated
     }
 
     /// Checks whether a permission node exists in the registry.
@@ -184,7 +185,7 @@ impl PermissionRegistry {
     /// `true` if the node exists, `false` otherwise.
     #[must_use]
     pub fn has_permission(&self, node: &str) -> bool {
-        self.permissions.contains_key(node)
+        self.view.load().contains_key(node)
     }
 }
 
@@ -252,7 +253,7 @@ pub struct PermissionManager {
     /// Global registry of permissions.
     pub registry: PermissionRegistry,
     /// Player permission attachments keyed by player UUID.
-    pub attachments: DashMap<uuid::Uuid, DashMap<String, bool>>,
+    attachments: ArcSwap<HashMap<uuid::Uuid, HashMap<String, bool>>>,
 }
 
 impl PermissionManager {
@@ -261,7 +262,7 @@ impl PermissionManager {
     pub fn new() -> Self {
         Self {
             registry: PermissionRegistry::new(),
-            attachments: DashMap::new(),
+            attachments: ArcSwap::from_pointee(HashMap::new()),
         }
     }
 
@@ -270,7 +271,7 @@ impl PermissionManager {
     pub fn with_registry(registry: PermissionRegistry) -> Self {
         Self {
             registry,
-            attachments: DashMap::new(),
+            attachments: ArcSwap::from_pointee(HashMap::new()),
         }
     }
 
@@ -286,16 +287,21 @@ impl PermissionManager {
 
     /// Retrieves a permission node by its name from the registry.
     #[must_use]
-    pub fn get_permission(
-        &self,
-        node: &str,
-    ) -> Option<dashmap::mapref::one::Ref<'_, String, Permission>> {
+    pub fn get_permission(&self, node: &str) -> Option<Permission> {
         self.registry.get_permission(node)
     }
 
     #[must_use]
     pub fn get_default_snapshot(&self, node: &str) -> Option<PermissionDefault> {
         self.registry.get_default_snapshot(node)
+    }
+
+    pub fn get_permission_snapshot(&self, node: &str) -> Option<Permission> {
+        self.registry.get_permission_snapshot(node)
+    }
+
+    pub fn permission_nodes_snapshot(&self) -> Vec<String> {
+        self.registry.view.load().keys().cloned().collect()
     }
 
     /// Overrides the default behaviour of an already-registered permission in the registry.
@@ -312,40 +318,49 @@ impl PermissionManager {
 
     /// Sets a player's explicit permission.
     pub fn set_permission(&self, player_id: uuid::Uuid, node: impl Into<String>, value: bool) {
-        self.attachments
-            .entry(player_id)
-            .or_default()
-            .insert(node.into(), value);
+        let node = node.into();
+        self.attachments.rcu(|current| {
+            let mut next = (**current).clone();
+            next.entry(player_id)
+                .or_default()
+                .insert(node.clone(), value);
+            next
+        });
     }
 
     /// Unsets a player's explicit permission.
     pub fn unset_permission(&self, player_id: &uuid::Uuid, node: &str) {
-        if let Some(player_perms) = self.attachments.get(player_id) {
-            player_perms.remove(node);
-        }
+        self.attachments.rcu(|current| {
+            let mut next = (**current).clone();
+            if let Some(permissions) = next.get_mut(player_id) {
+                permissions.remove(node);
+            }
+            next
+        });
     }
 
     /// Checks if a permission is explicitly set for a player.
     #[must_use]
     pub fn has_permission_set(&self, player_id: &uuid::Uuid, node: &str) -> Option<bool> {
         self.attachments
+            .load()
             .get(player_id)
-            .and_then(|p| p.get(node).as_deref().copied())
+            .and_then(|p| p.get(node).copied())
     }
 
     /// Removes all permission attachments for a player.
     pub fn remove_attachment(&self, player_id: &uuid::Uuid) {
-        self.attachments.remove(player_id);
+        self.attachments.rcu(|current| {
+            let mut next = (**current).clone();
+            next.remove(player_id);
+            next
+        });
     }
 
     /// Retrieves all explicitly assigned permissions for a player.
     #[must_use]
     pub fn get_player_permissions(&self, player_id: &uuid::Uuid) -> Option<HashMap<String, bool>> {
-        self.attachments.get(player_id).map(|p| {
-            p.iter()
-                .map(|item| (item.key().clone(), *item.value()))
-                .collect()
-        })
+        self.attachments.load().get(player_id).cloned()
     }
 
     /// Checks if a player has a specific permission.
@@ -364,8 +379,75 @@ impl PermissionManager {
         permission_node: &str,
         player_op_level: PermissionLvl,
     ) -> bool {
+        self.snapshot()
+            .has_permission(player_id, permission_node, player_op_level)
+    }
+
+    pub fn snapshot(&self) -> PermissionPolicySnapshot {
+        PermissionPolicySnapshot {
+            permissions: self.registry.view.load_full(),
+            attachments: self.attachments.load_full(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct PermissionPolicySnapshot {
+    permissions: std::sync::Arc<HashMap<String, Permission>>,
+    attachments: std::sync::Arc<HashMap<uuid::Uuid, HashMap<String, bool>>>,
+}
+
+impl PermissionPolicySnapshot {
+    pub fn nodes(&self) -> Vec<String> {
+        self.permissions.keys().cloned().collect()
+    }
+
+    pub fn default(&self, node: &str) -> Option<PermissionDefault> {
+        self.permissions
+            .get(node)
+            .map(|permission| permission.default.clone())
+    }
+
+    pub fn fingerprint_bytes(&self, uuid: &uuid::Uuid) -> Result<Vec<u8>, serde_json::Error> {
+        let mut permissions = self
+            .permissions
+            .iter()
+            .map(|(node, permission)| {
+                let default = match permission.default {
+                    PermissionDefault::Allow => 255,
+                    PermissionDefault::Deny => 254,
+                    PermissionDefault::Op(level) => level as u8,
+                };
+                let mut children = permission
+                    .children
+                    .iter()
+                    .map(|(node, value)| (node.clone(), *value))
+                    .collect::<Vec<_>>();
+                children.sort_unstable();
+                (node.clone(), default, children)
+            })
+            .collect::<Vec<_>>();
+        permissions.sort_unstable();
+        let mut attachments = self
+            .attachments
+            .get(uuid)
+            .into_iter()
+            .flat_map(|values| values.iter())
+            .map(|(node, value)| (node.clone(), *value))
+            .collect::<Vec<_>>();
+        attachments.sort_unstable();
+        serde_json::to_vec(&(permissions, attachments))
+    }
+    pub fn has_permission(
+        &self,
+        player_id: &uuid::Uuid,
+        permission_node: &str,
+        player_op_level: PermissionLvl,
+    ) -> bool {
         // Check explicitly set permissions
-        if let Some(attachment) = self.attachments.get(player_id) {
+        let attachments = &self.attachments;
+        let permissions = &self.permissions;
+        if let Some(attachment) = attachments.get(player_id) {
             // Check for the exact permission match
             if let Some(value) = attachment.get(permission_node) {
                 return *value;
@@ -401,10 +483,11 @@ impl PermissionManager {
             }
 
             // Check for inherited permissions from parent nodes
-            for item in attachment.iter() {
-                let node = item.key();
-                let value = *item.value();
-                if let Some(permission) = self.registry.get_permission(node)
+            let mut parents = attachment.iter().collect::<Vec<_>>();
+            parents.sort_unstable_by_key(|(node, _)| *node);
+            for (node, value) in parents {
+                let value = *value;
+                if let Some(permission) = permissions.get(node)
                     && let Some(child_val) = permission.children.get(permission_node)
                 {
                     return value && *child_val;
@@ -413,8 +496,8 @@ impl PermissionManager {
         }
 
         // Fall back to the default permission value
-        self.registry
-            .get_permission(permission_node)
+        permissions
+            .get(permission_node)
             .is_some_and(|permission| match permission.default {
                 PermissionDefault::Allow => true,
                 PermissionDefault::Deny => false,

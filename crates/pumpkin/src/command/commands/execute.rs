@@ -57,6 +57,12 @@ use uuid::Uuid;
 
 const DESCRIPTION: &str = "Execute a command with a modified context.";
 const PERMISSION: &str = "minecraft:command.execute";
+const ERROR_CLUSTER_SUMMON_CONTINUATION: CommandErrorType<0> = CommandErrorType::new(
+    pumpkin_data::translation::java::COMMANDS_SUMMON_FAILED,
+    pumpkin_data::translation::bedrock::COMMANDS_SUMMON_FAILED,
+);
+const ERROR_POSITION_UNAVAILABLE: CommandErrorType<0> =
+    CommandErrorType::new("Position is unavailable", "Position is unavailable");
 
 static ERROR_INVALID_DIMENSION: CommandErrorType<1> =
     CommandErrorType::new("argument.dimension.invalid", "argument.dimension.invalid");
@@ -82,9 +88,17 @@ fn execute_at_modifier(context: &CommandContext) -> crate::command::node::Redire
     let targets = EntityArgumentType::get_optional_entities(context, "targets")?;
     let mut sources = Vec::new();
     for target in targets {
+        if context.source.server.as_ref().is_some_and(|server| {
+            server.advanced_config.cluster.enabled
+                && crate::server::cluster_player_commands::entity_target(server, target.as_ref())
+                    .is_none()
+        }) {
+            continue;
+        }
         let entity = target.get_entity();
         let mut source = context.source.as_ref().clone();
         source.position = entity.pos.load();
+        source.position_known = [true; 3];
         source.rotation = Vector2::new(entity.yaw.load(), entity.pitch.load());
         source.world = Some(entity.world.load().clone());
         sources.push(Arc::new(source));
@@ -119,9 +133,20 @@ fn execute_in_modifier(context: &CommandContext) -> crate::command::node::Redire
 fn execute_positioned_modifier(
     context: &CommandContext,
 ) -> crate::command::node::RedirectModifierResult {
-    let pos = Vec3ArgumentType::get_vector3(context, "pos")?;
+    let coordinates = Vec3ArgumentType::get_coordinates(context, "pos")?;
+    let pos = coordinates.resolve(&context.source);
     let mut source = context.source.as_ref().clone();
     source.position = pos;
+    for (index, axis) in [
+        pumpkin_util::math::vector3::Axis::X,
+        pumpkin_util::math::vector3::Axis::Y,
+        pumpkin_util::math::vector3::Axis::Z,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        source.position_known[index] |= !coordinates.is_relative(axis);
+    }
     Ok(vec![Arc::new(source)])
 }
 
@@ -131,8 +156,16 @@ fn execute_positioned_as_modifier(
     let targets = EntityArgumentType::get_optional_entities(context, "targets")?;
     let mut sources = Vec::new();
     for target in targets {
+        if context.source.server.as_ref().is_some_and(|server| {
+            server.advanced_config.cluster.enabled
+                && crate::server::cluster_player_commands::entity_target(server, target.as_ref())
+                    .is_none()
+        }) {
+            continue;
+        }
         let mut source = context.source.as_ref().clone();
         source.position = target.get_entity().pos.load();
+        source.position_known = [true; 3];
         sources.push(Arc::new(source));
     }
     Ok(sources)
@@ -147,8 +180,42 @@ fn execute_positioned_over_modifier(
     let block_z = pos.z.floor() as i32;
 
     if let Some(ref world) = source.world {
-        let top_y = world.get_top_block(Vector2::new(block_x, block_z));
-        source.position.y = (top_y + 1) as f64;
+        let top_y = if let Some(server) = world
+            .server
+            .upgrade()
+            .filter(|server| server.advanced_config.cluster.enabled)
+        {
+            if !source.position_known[0] || !source.position_known[2] {
+                return Err(ERROR_POSITION_UNAVAILABLE.create_without_context());
+            }
+            let chunk = pumpkin_cluster::protocol::ChunkKey::new(
+                crate::server::cluster_world_delta::world_id(world),
+                block_x.div_euclid(16),
+                block_z.div_euclid(16),
+            );
+            let published = server.cluster_owned_chunk_blocks.load();
+            let palettes = published
+                .get(&chunk)
+                .ok_or_else(|| ERROR_POSITION_UNAVAILABLE.create_without_context())?;
+            crate::server::cluster_owned_mob_spawn_facts::column_height_palettes(
+                palettes,
+                chunk,
+                world.get_bottom_y(),
+                world.get_top_y(),
+                block_x,
+                block_z,
+                pumpkin_world::chunk::ChunkHeightmapType::WorldSurface,
+            )
+            .map_err(|_| ERROR_POSITION_UNAVAILABLE.create_without_context())?
+        } else {
+            world.get_top_block(Vector2::new(block_x, block_z))
+        };
+        source.position.y = f64::from(
+            top_y
+                .checked_add(1)
+                .ok_or_else(|| ERROR_POSITION_UNAVAILABLE.create_without_context())?,
+        );
+        source.position_known[1] = true;
     }
     Ok(vec![Arc::new(source)])
 }
@@ -426,10 +493,7 @@ fn execute_unless_biome_modifier(
 
 fn get_score(context: &CommandContext, target: &str, objective: &str) -> Option<i32> {
     let world = context.source.world.as_ref()?;
-    let scoreboard = world
-        .scoreboard
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let scoreboard = world.scoreboard.snapshot();
     scoreboard.get_score(target, objective).map(|s| s.value.0)
 }
 
@@ -871,8 +935,56 @@ fn execute_unless_stopwatch_modifier(
 
 fn execute_summon_modifier(
     context: &CommandContext,
-) -> crate::command::node::RedirectModifierResult {
+) -> Result<
+    pumpkin_command::node::RedirectOutcome<crate::command::CommandSource>,
+    pumpkin_command::errors::command_syntax_error::CommandSyntaxError,
+> {
     let entity_type = ResourceArgument::get_summonable_entity_type(context, "entity_type")?;
+    if let Some(server) = context
+        .source
+        .world()
+        .server
+        .upgrade()
+        .filter(|server| server.advanced_config.cluster.enabled)
+    {
+        if !context.source.position_known.iter().all(|known| *known) {
+            return Err(ERROR_CLUSTER_SUMMON_CONTINUATION.create_without_context());
+        }
+        let position = context.source.position;
+        if !crate::world::World::is_valid(BlockPos::floored_v(position))
+            || !entity_type.mob
+                && crate::server::cluster_vehicle_birth::vehicle_kind(entity_type).is_none()
+        {
+            return Err(ERROR_CLUSTER_SUMMON_CONTINUATION.create_without_context());
+        }
+        let spatial = pumpkin_cluster::entity_body::EntitySpatial {
+            world: crate::server::cluster_world_delta::world_id(context.source.world()),
+            position: [position.x, position.y, position.z].map(f64::to_bits),
+            velocity_micro: [0; 3],
+            yaw: 0.0_f32.to_bits(),
+            pitch: 0.0_f32.to_bits(),
+            on_ground: false,
+        };
+        let root = pumpkin_nbt::compound::NbtCompound::new();
+        let initial = if entity_type.mob {
+            crate::server::cluster_owned_mob_initial::parse_initialization(
+                entity_type,
+                &spatial,
+                &root,
+            )
+        } else {
+            crate::server::cluster_vehicle_birth::parse_initialization(entity_type, &root)
+        }
+        .map_err(|_| ERROR_CLUSTER_SUMMON_CONTINUATION.create_without_context())?;
+        let request = pumpkin_cluster::mob_initialization::EntityAdmissionRequest {
+            kind: entity_type.id,
+            spatial,
+            initial,
+        };
+        let token = crate::server::cluster_execute_continuation::submit(&server, context, request)
+            .map_err(|_| ERROR_CLUSTER_SUMMON_CONTINUATION.create_without_context())?;
+        return Ok(pumpkin_command::node::RedirectOutcome::Deferred(token));
+    }
     let entity = from_type(
         entity_type,
         context.source.position,
@@ -882,12 +994,39 @@ fn execute_summon_modifier(
     context.source.world().spawn_entity(entity.clone());
     let mut source = context.source.as_ref().clone();
     source.entity = Some(entity);
-    Ok(vec![Arc::new(source)])
+    Ok(pumpkin_command::node::RedirectOutcome::Sources(vec![
+        Arc::new(source),
+    ]))
 }
 
 fn execute_on_owner_modifier(
     context: &CommandContext,
 ) -> crate::command::node::RedirectModifierResult {
+    if let Some(server) = context
+        .source
+        .world()
+        .server
+        .upgrade()
+        .filter(|server| server.advanced_config.cluster.enabled)
+    {
+        let selected = context.source.entity.as_ref().and_then(|entity| {
+            crate::server::cluster_owned_mob_commands::owner(
+                &server,
+                context.source.world(),
+                entity.as_ref(),
+            )
+        });
+        return Ok(selected
+            .into_iter()
+            .map(|entity| {
+                let mut source = context.source.as_ref().clone();
+                source.name = entity.get_name().get_text();
+                source.display_name = entity.get_display_name();
+                source.entity = Some(entity);
+                Arc::new(source)
+            })
+            .collect());
+    }
     let mut sources = Vec::new();
     if let Some(ref entity) = context.source.entity {
         let world = context.source.world();
@@ -935,6 +1074,31 @@ fn execute_on_leasher_modifier(
 fn execute_on_target_modifier(
     context: &CommandContext,
 ) -> crate::command::node::RedirectModifierResult {
+    if let Some(server) = context
+        .source
+        .world()
+        .server
+        .upgrade()
+        .filter(|server| server.advanced_config.cluster.enabled)
+    {
+        let selected = context.source.entity.as_ref().and_then(|entity| {
+            crate::server::cluster_owned_mob_commands::target(
+                &server,
+                context.source.world(),
+                entity.as_ref(),
+            )
+        });
+        return Ok(selected
+            .into_iter()
+            .map(|entity| {
+                let mut source = context.source.as_ref().clone();
+                source.name = entity.get_name().get_text();
+                source.display_name = entity.get_display_name();
+                source.entity = Some(entity);
+                Arc::new(source)
+            })
+            .collect());
+    }
     let mut sources = Vec::new();
     if let Some(ref entity) = context.source.entity {
         if let Some(mob) = entity.get_mob() {
@@ -1154,7 +1318,7 @@ pub fn register(dispatcher: &mut CommandDispatcher, registry: &PermissionRegistr
         .then(literal("summon").then(
             argument("entity_type", ENTITY_TYPE_ARGUMENT.clone()).redirect_with_modifier(
                 Redirection::Root,
-                RedirectModifier::Custom(Arc::new(execute_summon_modifier)),
+                RedirectModifier::CustomOutcome(Arc::new(execute_summon_modifier)),
             ),
         ))
         .then(
@@ -1585,5 +1749,62 @@ fn set_redirects_to_execute(tree: &mut Tree, parent: NodeId, execute_id: Command
             tree[child_id].set_redirect(Some(Redirection::Local(NodeId::from(execute_id))));
         }
         set_redirects_to_execute(tree, child_id, execute_id);
+    }
+}
+
+#[cfg(test)]
+mod position_provenance_tests {
+    use super::*;
+    use crate::command::CommandSource;
+    use pumpkin_command::argument_types::argument_type::ArgumentType;
+    use pumpkin_command::context::command_context::{CommandContextBuilder, ParsedArgument};
+    use pumpkin_command::context::string_range::StringRange;
+    use pumpkin_command::node::tree::ROOT_NODE_ID;
+    use pumpkin_command::string_reader::StringReader;
+
+    fn positioned(source: Arc<CommandSource>, input: &str) -> Arc<CommandSource> {
+        let dispatcher = crate::command::CommandDispatcher::new();
+        let mut reader = StringReader::new(input);
+        let coordinates = <Vec3ArgumentType as ArgumentType<CommandSource>>::parse(
+            &Vec3ArgumentType::Uncorrected,
+            &mut reader,
+        )
+        .unwrap();
+        let mut builder = CommandContextBuilder::new(&dispatcher, source, ROOT_NODE_ID, 0);
+        builder.with_argument(
+            "pos".to_owned(),
+            Arc::new(ParsedArgument::new(
+                StringRange::between(0, input.len()),
+                Box::new(coordinates),
+            )),
+        );
+        let context = builder.build(input);
+        execute_positioned_modifier(&context)
+            .unwrap()
+            .pop()
+            .unwrap()
+    }
+
+    #[test]
+    fn virtual_origin_requires_an_absolute_or_accepted_origin_for_every_axis() {
+        let mut virtual_source = CommandSource::dummy();
+        virtual_source.position =
+            pumpkin_util::math::vector3::Vector3::new(1_000_008.0, 101.0, 1_000_008.0);
+        let source = positioned(Arc::new(virtual_source), "~ ~ ~");
+        assert_eq!(source.position_known, [false; 3]);
+        let source = positioned(source, "0 ~ 0");
+        assert_eq!(source.position_known, [true, false, true]);
+        let source = positioned(source, "~ 64 ~");
+        assert_eq!(source.position_known, [true; 3]);
+        assert_eq!(
+            source.position,
+            pumpkin_util::math::vector3::Vector3::new(0.0, 64.0, 0.0)
+        );
+        let source = positioned(source, "~1 ~ ~2");
+        assert_eq!(source.position_known, [true; 3]);
+        assert_eq!(
+            source.position,
+            pumpkin_util::math::vector3::Vector3::new(1.0, 64.0, 2.0)
+        );
     }
 }

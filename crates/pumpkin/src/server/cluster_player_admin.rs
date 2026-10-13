@@ -7,8 +7,7 @@ use pumpkin_cluster::completion::ActionKey;
 use pumpkin_cluster::identity::{GlobalPlayerId, PlayerSeq, ServerId};
 use pumpkin_cluster::player_admin::{
     EffectState, PlayerAdministrativeAction, PlayerAdministrativeIntent,
-    PlayerAdministrativeMutation, PlayerAdministrativePublication, PlayerAdministrativeState,
-    PlayerLivingAdministrativeState,
+    PlayerAdministrativePublication, PlayerAdministrativeState, PlayerLivingAdministrativeState,
 };
 use pumpkin_cluster::protocol::ChunkKey;
 use pumpkin_cluster::protocol::StreamKind;
@@ -451,25 +450,27 @@ pub fn subscribe_player_administrative_failures(
 }
 
 pub(crate) fn capture_living_projection(player: &Player) -> PlayerLivingAdministrativeState {
+    let mut effects = player
+        .get_active_effects()
+        .into_iter()
+        .map(|effect| EffectState {
+            kind: u16::from(effect.effect_type.id),
+            duration: effect.duration,
+            amplifier: effect.amplifier,
+            ambient: effect.ambient,
+            show_particles: effect.show_particles,
+            show_icon: effect.show_icon,
+            blend: effect.blend,
+        })
+        .collect::<Vec<_>>();
+    effects.sort_unstable_by_key(|effect| effect.kind);
     PlayerLivingAdministrativeState {
         health: player.living_entity.health.load(),
         absorption: player.get_absorption(),
         food: player.get_food_level(),
         saturation: player.get_food_saturation(),
         gamemode: player.gamemode.load() as u8,
-        effects: player
-            .get_active_effects()
-            .into_iter()
-            .map(|effect| EffectState {
-                kind: u16::from(effect.effect_type.id),
-                duration: effect.duration,
-                amplifier: effect.amplifier,
-                ambient: effect.ambient,
-                show_particles: effect.show_particles,
-                show_icon: effect.show_icon,
-                blend: effect.blend,
-            })
-            .collect(),
+        effects,
         fall_distance: player.living_entity.fall_distance.load(),
         on_fire: player.get_entity().is_on_fire(),
     }
@@ -494,6 +495,44 @@ pub(crate) fn capture_initial_state(player: &Player) -> PlayerAdministrativeStat
         effects: living.effects,
         fall_distance: living.fall_distance,
         on_fire: living.on_fire,
+    }
+}
+
+pub(crate) fn capture_initial_state_off_registry(player: &mut Player) -> PlayerAdministrativeState {
+    let mut effects = player
+        .living_entity
+        .active_effects
+        .get_mut()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .map(|effect| EffectState {
+            kind: u16::from(effect.effect_type.id),
+            duration: effect.duration,
+            amplifier: effect.amplifier,
+            ambient: effect.ambient,
+            show_particles: effect.show_particles,
+            show_icon: effect.show_icon,
+            blend: effect.blend,
+        })
+        .collect::<Vec<_>>();
+    effects.sort_unstable_by_key(|effect| effect.kind);
+    let entity = player.get_entity();
+    let position = entity.pos.load();
+    let velocity = entity.velocity.load();
+    PlayerAdministrativeState {
+        world: super::cluster_world_delta::world_id(&player.world()),
+        position: [position.x, position.y, position.z],
+        yaw: entity.yaw.load(),
+        pitch: entity.pitch.load(),
+        velocity: [velocity.x, velocity.y, velocity.z],
+        health: player.living_entity.health.load(),
+        absorption: player.get_absorption(),
+        food: player.get_food_level(),
+        saturation: player.get_food_saturation(),
+        gamemode: player.gamemode.load() as u8,
+        effects,
+        fall_distance: player.living_entity.fall_distance.load(),
+        on_fire: entity.is_on_fire(),
     }
 }
 
@@ -576,7 +615,7 @@ pub(crate) fn capture_pending(
             break;
         };
         let mut forward = expected.clone();
-        apply_mutation(&mut forward, &intent.mutation);
+        intent.mutation.apply(&mut forward);
         let mut affected = vec![chunk_key(
             expected.world,
             expected.position[0],
@@ -598,8 +637,8 @@ pub(crate) fn capture_pending(
             forward,
             undo: expected,
             origin: intent.origin,
+            mutation: intent.mutation.clone(),
         };
-        let action_key = ActionKey::player_administrative(&action);
         if route.try_send(action).is_err() {
             let _ = server
                 .cluster_player_admin
@@ -610,47 +649,7 @@ pub(crate) fn capture_pending(
                 });
             break;
         }
-        origins.insert(action_key, routed.source);
         sequences.insert(intent.target, next);
-    }
-}
-
-fn apply_mutation(state: &mut PlayerAdministrativeState, mutation: &PlayerAdministrativeMutation) {
-    match mutation {
-        PlayerAdministrativeMutation::Reset {
-            health,
-            absorption,
-            food,
-            saturation,
-            gamemode,
-            clear_effects,
-            velocity,
-            fall_distance,
-            on_fire,
-        } => {
-            state.health = *health;
-            state.absorption = *absorption;
-            state.food = *food;
-            state.saturation = *saturation;
-            state.gamemode = *gamemode;
-            if *clear_effects {
-                state.effects.clear();
-            }
-            state.velocity = *velocity;
-            state.fall_distance = *fall_distance;
-            state.on_fire = *on_fire;
-        }
-        PlayerAdministrativeMutation::Teleport {
-            world,
-            position,
-            yaw,
-            pitch,
-        } => {
-            state.world = *world;
-            state.position = *position;
-            state.yaw = *yaw;
-            state.pitch = *pitch;
-        }
     }
 }
 

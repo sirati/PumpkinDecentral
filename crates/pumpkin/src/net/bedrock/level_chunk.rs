@@ -70,13 +70,54 @@ impl CLevelChunk<'_> {
         cache_enabled: bool,
         block_actors: &[NbtCompound],
     ) -> Result<EncodedChunk, Error> {
+        let blocks = chunk
+            .section
+            .block_sections
+            .read()
+            .map_err(|_| Error::other("block_sections read lock poisoned"))?;
+        let biomes = chunk
+            .section
+            .biome_sections
+            .read()
+            .map_err(|_| Error::other("biome_sections read lock poisoned"))?;
+        Self::encode_owned(
+            chunk.x,
+            chunk.z,
+            chunk.section.min_y,
+            &blocks,
+            &biomes,
+            dimension,
+            cache_enabled,
+            block_actors,
+        )
+    }
+
+    pub(crate) fn encode_owned(
+        x: i32,
+        z: i32,
+        min_y: i32,
+        block_sections: &[pumpkin_world::chunk::palette::BlockPalette],
+        biome_sections: &[pumpkin_world::chunk::palette::BiomePalette],
+        dimension: i32,
+        cache_enabled: bool,
+        block_actors: &[NbtCompound],
+    ) -> Result<EncodedChunk, Error> {
+        if block_sections.len() != biome_sections.len()
+            || block_sections.is_empty()
+            || block_sections.len() > 62
+            || min_y.rem_euclid(16) != 0
+            || i8::try_from(min_y.div_euclid(16)).is_err()
+            || i8::try_from(min_y.div_euclid(16) + block_sections.len() as i32 - 1).is_err()
+        {
+            return Err(Error::other("invalid owned Bedrock chunk height"));
+        }
         let mut writer = Vec::new();
 
-        VarInt(chunk.x).write(&mut writer)?;
-        VarInt(chunk.z).write(&mut writer)?;
+        VarInt(x).write(&mut writer)?;
+        VarInt(z).write(&mut writer)?;
 
         VarInt(dimension).write(&mut writer)?;
-        let sub_chunk_count = chunk.section.count as u32;
+        let sub_chunk_count = block_sections.len() as u32;
         VarUInt(sub_chunk_count).write(&mut writer)?;
         // Optional sub-chunk request limit. Pumpkin sends complete chunks.
         false.write(&mut writer)?;
@@ -84,12 +125,7 @@ impl CLevelChunk<'_> {
 
         let mut blobs = Vec::new();
 
-        let block_sections = chunk
-            .section
-            .block_sections
-            .read()
-            .map_err(|_| Error::other("block_sections read lock poisoned"))?;
-        let min_y_section = (chunk.section.min_y >> 4) as i8;
+        let min_y_section = (min_y >> 4) as i8;
 
         let mut subchunk_bytes_list = Vec::with_capacity(block_sections.len());
 
@@ -108,12 +144,6 @@ impl CLevelChunk<'_> {
 
             subchunk_bytes_list.push(subchunk_buf);
         }
-
-        let biome_sections = chunk
-            .section
-            .biome_sections
-            .read()
-            .map_err(|_| Error::other("biome_sections read lock poisoned"))?;
 
         let mut biome_buf = Vec::new();
         for biome_palette in biome_sections.iter() {
@@ -344,4 +374,40 @@ mod tests {
             ]
         );
     }
+}
+
+pub(crate) fn encode_presentation(
+    key: pumpkin_cluster::protocol::ChunkKey,
+    presentation: &crate::server::cluster_chunk_presentation::ChunkPresentation,
+    dimension: i32,
+) -> Result<bytes::Bytes, Error> {
+    use crate::block::entities::BlockEntity;
+    let mut actors = Vec::new();
+    for (position, _) in presentation.block_entities.iter() {
+        let state = presentation
+            .blocks
+            .block(key, *position)
+            .map_err(|error| Error::other(format!("owned Bedrock block actor state: {error:?}")))?;
+        let position =
+            pumpkin_util::math::position::BlockPos::new(position.x, position.y, position.z);
+        if let Some(actor) =
+            crate::world::bedrock_chest_block_actor(state, position).or_else(|| {
+                crate::block::entities::bed::BedBlockEntity::new(position)
+                    .bedrock_block_actor_data(state)
+            })
+        {
+            actors.push(actor);
+        }
+    }
+    let (payload, _) = CLevelChunk::encode_owned(
+        key.x(),
+        key.z(),
+        presentation.blocks.min_y(),
+        presentation.blocks.block_palettes(),
+        presentation.blocks.biome_palettes(),
+        dimension,
+        false,
+        &actors,
+    )?;
+    Ok(payload.into())
 }

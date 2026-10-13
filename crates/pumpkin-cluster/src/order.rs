@@ -28,7 +28,7 @@ pub fn rank_tick_actor(cluster_seed: u64, tick: TickStamp, actor: ActorId) -> u6
             hasher.write_u8(1);
             hasher.write_u16(entity.origin.0);
             hasher.write_i32(entity.local_id);
-            hasher.write_u32(entity.generation);
+            hasher.write_u64(entity.generation);
         }
         ActorId::Peer(peer) => {
             hasher.write_u8(2);
@@ -39,12 +39,7 @@ pub fn rank_tick_actor(cluster_seed: u64, tick: TickStamp, actor: ActorId) -> u6
 }
 
 #[must_use]
-pub fn order_actors(
-    cluster_seed: u64,
-    tick: TickStamp,
-    left: ActorId,
-    right: ActorId,
-) -> Ordering {
+pub fn order_actors(cluster_seed: u64, tick: TickStamp, left: ActorId, right: ActorId) -> Ordering {
     rank_tick_actor(cluster_seed, tick, left)
         .cmp(&rank_tick_actor(cluster_seed, tick, right))
         .then_with(|| left.cmp(&right))

@@ -17,6 +17,7 @@ impl ItemMetadata for MapItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for MapItem {
     fn normal_use(&self, _item: &Item, player: &Player) {
         let Some(server) = player.world().server.upgrade() else {

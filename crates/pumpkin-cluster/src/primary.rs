@@ -99,7 +99,7 @@ impl PrimarySaveInbox {
     pub async fn run<Apply, Save, SaveFuture>(self, mut apply: Apply, mut save: Save)
     where
         Apply: FnMut(&AcceptedTick),
-        Save: FnMut() -> SaveFuture,
+        Save: FnMut(&AcceptedTick) -> SaveFuture,
         SaveFuture: Future<Output = ()>,
     {
         let Self {
@@ -110,7 +110,7 @@ impl PrimarySaveInbox {
             match rx.try_recv() {
                 Ok(accepted) => {
                     apply(&accepted);
-                    save().await;
+                    save(&accepted).await;
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => break,
                 Err(mpsc::error::TryRecvError::Empty) => {
@@ -125,7 +125,7 @@ impl PrimarySaveInbox {
                         break;
                     };
                     apply(&accepted);
-                    save().await;
+                    save(&accepted).await;
                 }
             }
         }
@@ -726,7 +726,7 @@ mod tests {
                 move |accepted| {
                     applied_task.lock().unwrap().push(accepted.tick.0);
                 },
-                || {
+                |_| {
                     saves_task.fetch_add(1, Ordering::Relaxed);
                     async {}
                 },
@@ -748,7 +748,7 @@ mod tests {
                 move |_| {
                     applied_task.fetch_add(1, Ordering::Relaxed);
                 },
-                || async {},
+                |_| async {},
             )
             .await;
 

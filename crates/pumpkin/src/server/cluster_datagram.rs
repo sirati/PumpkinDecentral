@@ -246,6 +246,18 @@ mod tests {
     fn sample_pos(player: u16, seq: u16) -> PosUpdate {
         PosUpdate {
             gid: pumpkin_cluster::identity::GlobalPlayerId::new(ServerId(1), PlayerSlot(player)),
+            incarnation: 1,
+            spatial_epoch: pumpkin_cluster::canonical_action::SpatialEpoch::Admission {
+                lease: pumpkin_cluster::canonical_action::LivePlayerLease {
+                    key: pumpkin_cluster::canonical_action::PlayerKey(uuid::Uuid::nil()),
+                    gid: pumpkin_cluster::identity::GlobalPlayerId::new(
+                        ServerId(1),
+                        PlayerSlot(player),
+                    ),
+                    incarnation: 1,
+                },
+                admitted_at: TickStamp(0),
+            },
             seq: PlayerSeq(seq),
             tick: TickStamp(seq),
             world: pumpkin_cluster::protocol::WorldId::new(0, 7),

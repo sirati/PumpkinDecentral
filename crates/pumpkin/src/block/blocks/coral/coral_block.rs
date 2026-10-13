@@ -17,6 +17,7 @@ impl BlockMetadata for CoralBlock {
         plants.into()
     }
 }
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for CoralBlock {
     fn placed(&self, args: PlacedArgs<'_>) {
         {

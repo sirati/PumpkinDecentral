@@ -324,6 +324,7 @@ impl SignBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for SignBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let is_hanging = args.block.name.contains("hanging");

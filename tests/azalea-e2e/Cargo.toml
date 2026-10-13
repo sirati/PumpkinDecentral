@@ -10,11 +10,22 @@ publish = false
 anyhow = "1.0.100"
 azalea = { git = "https://github.com/azalea-rs/azalea", rev = "b65fa8cf1bb957976cefa926b9b500d44767d806", default-features = false, features = ["packet-event"] }
 azalea-protocol = { git = "https://github.com/azalea-rs/azalea", rev = "b65fa8cf1bb957976cefa926b9b500d44767d806", default-features = false }
+azalea-inventory = { git = "https://github.com/azalea-rs/azalea", rev = "b65fa8cf1bb957976cefa926b9b500d44767d806", default-features = false }
 hex = "0.4.3"
+nix = { version = "0.30", default-features = false, features = ["process", "signal"] }
 flate2 = "1.1.10"
 rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "ring"] }
 serde_json = "1.0.150"
 sha2 = "0.11.0"
 tempfile = "3.27.0"
-tokio = { version = "1.53.0", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
+tokio = { version = "1.53.0", features = ["io-util", "macros", "net", "process", "rt", "sync", "time", "signal"] }
 uuid = "1.23.4"
+xxhash-rust = { version = "0.8", default-features = false, features = ["xxh64"] }
+
+[[bin]]
+name = "pumpkin-azalea-e2e"
+path = "src/main.rs"
+
+[[bin]]
+name = "pumpkin-cluster-full-spec"
+path = "src/full_spec.rs"

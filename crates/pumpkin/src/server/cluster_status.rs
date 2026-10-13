@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::sync::OnceLock;
 
 use pumpkin_data::packet::{CURRENT_MC_VERSION, LOWEST_SUPPORTED_MC_VERSION};
@@ -9,8 +8,6 @@ use pumpkin_util::text::TextComponent;
 use super::Server;
 
 static FAVICON: OnceLock<String> = OnceLock::new();
-static VERSION_NAME: LazyLock<String> =
-    LazyLock::new(|| format!("{LOWEST_SUPPORTED_MC_VERSION}-{CURRENT_MC_VERSION}"));
 const SAMPLE_LIMIT: usize = 12;
 
 #[must_use]
@@ -26,33 +23,23 @@ pub fn install_favicon(favicon: Option<String>) {
 
 #[must_use]
 fn live_status_players(server: &Server) -> (u32, Vec<Sample>) {
+    let snapshot = server.cluster_presence.snapshot();
     let mut sample = Vec::new();
     let mut visible = std::collections::HashSet::new();
     for player in server.get_all_players().iter() {
-        if super::cluster_hide::is_hidden_player(server, player) {
-            continue;
-        }
+        if snapshot.hidden_uuids.contains(player.gameprofile.id.as_bytes())
+            || player.cluster_gid().is_some_and(|gid| snapshot.hidden_gids.contains(&gid)) { continue; }
         let id = player.gameprofile.id.to_string();
         visible.insert(id.clone());
         if player.config.load().server_listing {
-            sample.push(Sample {
-                name: player.gameprofile.name.clone(),
-                id,
-            });
+            sample.push(Sample { name: player.gameprofile.name.clone(), id });
         }
     }
-    for (gid, entry) in super::cluster_presence::all_presence_entries(server) {
-        if super::cluster_hide::is_hidden_remote_gid(server, &gid)
-            || super::cluster_hide::is_hidden_uuid_bytes(server, &entry.uuid)
-        {
-            continue;
-        }
+    for entry in snapshot.entries.values() {
+        if snapshot.is_hidden(&entry.gid, &entry.uuid) { continue; }
         let id = uuid::Uuid::from_bytes(entry.uuid).to_string();
         if visible.insert(id.clone()) && entry.listed {
-            sample.push(Sample {
-                name: entry.name,
-                id,
-            });
+            sample.push(Sample { name: entry.name.clone(), id });
         }
     }
     sample.sort_by(|left, right| {
@@ -85,7 +72,7 @@ fn apply_protocol(mut response: StatusResponse, client_protocol: i32) -> StatusR
 pub fn base_status_response(server: &Server, client_protocol: i32) -> StatusResponse {
     let base = StatusResponse {
         version: Some(Version {
-            name: VERSION_NAME.clone(),
+            name: format!("{LOWEST_SUPPORTED_MC_VERSION}-{CURRENT_MC_VERSION}"),
             protocol: LOWEST_SUPPORTED_MC_VERSION.protocol_version() as u32,
         }),
         players: Some(Players {

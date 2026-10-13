@@ -19,6 +19,10 @@ use crate::{SHOULD_STOP, STOP_INTERRUPT, server::Server};
 
 pub use pumpkin_protocol::rcon as packet;
 
+mod completion;
+
+use completion::{CompletionEvent, CompletionSink, PendingResponse};
+
 pub struct RCONServer;
 
 impl RCONServer {
@@ -92,51 +96,129 @@ pub struct RCONClient {
     logged_in: bool,
     incoming: Vec<u8>,
     closed: bool,
+    responses: std::collections::VecDeque<PendingResponse>,
+    completions: tokio::sync::mpsc::Receiver<CompletionEvent>,
+    completion_tx: tokio::sync::mpsc::Sender<CompletionEvent>,
+    next_sequence: u64,
 }
 
 impl RCONClient {
     #[must_use]
-    pub const fn new(connection: tokio::net::TcpStream, address: SocketAddr) -> Self {
+    pub fn new(connection: tokio::net::TcpStream, address: SocketAddr) -> Self {
+        let (completion_tx, completions) = tokio::sync::mpsc::channel(65_536);
         Self {
             connection,
             address,
             logged_in: false,
             incoming: Vec::new(),
             closed: false,
+            responses: std::collections::VecDeque::new(),
+            completions,
+            completion_tx,
+            next_sequence: 1,
         }
     }
 
     /// Returns whether the client is closed or not.
     pub async fn handle(&mut self, server: &Arc<Server>, password: &str) -> bool {
-        if !self.closed {
-            match self.read_bytes().await {
-                // The stream is closed, so we can't reply, so we just close everything.
-                Ok(true) => return true,
-                Ok(false) => {}
-                Err(e) => {
-                    error!("Could not read packet: {e}");
-                    return true;
-                }
-            }
-            while !self.closed {
-                match self.receive_packet() {
-                    Ok(Some(packet)) => {
-                        if let Err(e) = self.process_packet(server, password, packet).await {
-                            error!("RCON error: {e}");
-                            self.closed = true;
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        error!("RCON packet error: {e}");
+        if self.closed {
+            return true;
+        }
+        for _ in 0..65_536 {
+            let Ok(event) = self.completions.try_recv() else {
+                break;
+            };
+            self.complete_response(&event);
+        }
+        if let Err(error) = self.flush_responses(server).await {
+            error!(?error, "RCON response write failed");
+            return true;
+        }
+        let mut processed = false;
+        while !self.closed && self.responses.len() < 16 {
+            match self.receive_packet() {
+                Ok(Some(packet)) => {
+                    processed = true;
+                    if let Err(error) = self.process_packet(server, password, packet).await {
+                        error!(?error, "RCON command packet failed");
                         self.closed = true;
-                        break;
                     }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    error!(?error, "RCON packet decode failed");
+                    self.closed = true;
                 }
             }
         }
+        if self.closed {
+            return true;
+        }
+        if let Err(error) = self.flush_responses(server).await {
+            error!(?error, "RCON response write failed");
+            return true;
+        }
+        if processed && !self.incoming.is_empty() && self.responses.len() < 16 {
+            return false;
+        }
+        let mut buffer = [0; 1460];
+        select! {
+            received = self.connection.read(&mut buffer) => {
+                match received {
+                    Ok(0) => return true,
+                    Ok(length) => {
+                        if self.incoming.len().saturating_add(length) > 65_536 {
+                            error!("RCON pending input capacity exceeded");
+                            return true;
+                        }
+                        self.incoming.extend_from_slice(&buffer[..length]);
+                    },
+                    Err(error) => { error!(?error, "RCON socket read failed"); return true; }
+                }
+            }
+            event = self.completions.recv(), if !self.responses.is_empty() => {
+                let Some(event) = event else { return true; };
+                self.complete_response(&event);
+            }
+        }
         self.closed
+    }
+
+    fn complete_response(&mut self, event: &CompletionEvent) {
+        if let Some(response) = self
+            .responses
+            .iter_mut()
+            .find(|response| response.sequence == event.sequence)
+        {
+            response.complete(event);
+        }
+    }
+
+    async fn flush_responses(&mut self, server: &Server) -> Result<(), PacketError> {
+        while self.responses.front().is_some_and(PendingResponse::ready) {
+            let response = self.responses.pop_front().unwrap();
+            let mut lines = response.output.drain();
+            if response.lost_receipts.load(Ordering::Acquire) != 0 {
+                error!(
+                    sequence = response.sequence,
+                    "RCON completion receipt capacity exceeded"
+                );
+                lines.push("RCON command completion receipt capacity exceeded".into());
+            }
+            if lines.is_empty() {
+                self.send(ClientboundPacket::Output, response.packet_id, "")
+                    .await?;
+            } else {
+                for line in lines {
+                    if server.advanced_config.networking.rcon.logging.commands {
+                        info!(address = %self.address, %line, "RCON command output");
+                    }
+                    self.send(ClientboundPacket::Output, response.packet_id, &line)
+                        .await?;
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn process_packet(
@@ -165,38 +247,41 @@ impl RCONClient {
             }
             ServerboundPacket::ExecCommand => {
                 if self.logged_in {
-                    let output = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-                    let packet_body = packet.get_body().to_owned();
-
-                    let command_source = CommandSender::Rcon(output.clone()).into_source(server);
-
-                    server
+                    let output = Arc::new(crate::command::RconOutput::default());
+                    let sequence = self.next_sequence;
+                    self.next_sequence = self.next_sequence.wrapping_add(1);
+                    let lost_receipts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                    let callback = Arc::new(CompletionSink {
+                        sequence,
+                        events: self.completion_tx.clone(),
+                        lost_receipts: lost_receipts.clone(),
+                    });
+                    let command_source = CommandSender::Rcon(output.clone())
+                        .into_source(server)
+                        .with_command_result_taker(pumpkin_command::source::ResultValueTaker(
+                            vec![callback],
+                        ));
+                    let summary = server
                         .command_dispatcher
                         .load()
-                        .handle_command(&command_source, &packet_body);
-
-                    let output_lines: Vec<String> = output
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .clone();
-                    if output_lines.is_empty() {
-                        if config.logging.commands {
-                            info!(
-                                "RCON ({}): Executed command: {}",
-                                self.address,
-                                packet.get_body()
-                            );
-                        }
-                        self.send(ClientboundPacket::Output, packet.get_id(), "")
-                            .await?;
-                    } else {
-                        for line in &output_lines {
-                            if config.logging.commands {
-                                info!("RCON ({}): {}", self.address, line);
+                        .handle_command_outcome(&command_source, packet.get_body());
+                    let pending = summary
+                        .map(|summary| {
+                            if summary.pending.len() > 65_536 {
+                                lost_receipts.fetch_add(1, Ordering::Relaxed);
                             }
-                            self.send(ClientboundPacket::Output, packet.get_id(), line)
-                                .await?;
-                        }
+                            summary.pending.into_iter().take(65_536).collect()
+                        })
+                        .unwrap_or_default();
+                    self.responses.push_back(PendingResponse {
+                        sequence,
+                        packet_id: packet.get_id(),
+                        output,
+                        pending,
+                        lost_receipts,
+                    });
+                    if config.logging.commands {
+                        info!(address = %self.address, command = packet.get_body(), "RCON command submitted");
                     }
                 } else {
                     if config.logging.wrong_password {
@@ -211,16 +296,6 @@ impl RCONClient {
             }
         }
         Ok(())
-    }
-
-    async fn read_bytes(&mut self) -> std::io::Result<bool> {
-        let mut buf = [0; 1460];
-        let n = self.connection.read(&mut buf).await?;
-        if n == 0 {
-            return Ok(true);
-        }
-        self.incoming.extend_from_slice(&buf[..n]);
-        Ok(false)
     }
 
     async fn send(

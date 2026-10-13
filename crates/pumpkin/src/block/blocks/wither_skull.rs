@@ -83,6 +83,7 @@ fn spawn_wither(world: &Arc<World>, pattern: &WitherPattern) {
 #[pumpkin_block("wither_skeleton_skull")]
 pub struct WitherSkeletonSkullBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for WitherSkeletonSkullBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         SkullBlock::on_place(&SkullBlock, args)

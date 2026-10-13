@@ -59,7 +59,12 @@ pub fn kick_non_whitelisted_players(server: &Server) {
     let ops = admin
         .is_none()
         .then(|| server.data.operator_config.read().unwrap());
-    if server.basic_config.enforce_whitelist && server.white_list.load(Ordering::Relaxed) {
+    if server.basic_config.enforce_whitelist
+        && policy.as_ref().map_or_else(
+            || server.white_list.load(Ordering::Relaxed),
+            |policy| policy.enabled,
+        )
+    {
         for player in server.get_all_players() {
             if admin.as_ref().is_some_and(|snapshot| {
                 snapshot
@@ -94,6 +99,24 @@ struct OnExecutor;
 impl CommandExecutor for OnExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let server = context.source.server();
+        if server.advanced_config.cluster.enabled {
+            if server.cluster_access_policy.snapshot().enabled {
+                return Err(ERROR_ALREADY_ON.create_without_context());
+            }
+            if !server
+                .cluster_access_policy
+                .try_submit(AccessPolicyCommand::SetEnabled(true))
+            {
+                context
+                    .source
+                    .send_error(TextComponent::text("Whitelist change could not be queued"));
+                return Ok(0);
+            }
+            context
+                .source
+                .send_message(TextComponent::text("Whitelist change queued"));
+            return Ok(1);
+        }
         let previous = server.white_list.swap(true, Ordering::Relaxed);
         if previous {
             Err(ERROR_ALREADY_ON.create_without_context())
@@ -116,6 +139,24 @@ struct OffExecutor;
 impl CommandExecutor for OffExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let server = context.source.server();
+        if server.advanced_config.cluster.enabled {
+            if !server.cluster_access_policy.snapshot().enabled {
+                return Err(ERROR_ALREADY_OFF.create_without_context());
+            }
+            if !server
+                .cluster_access_policy
+                .try_submit(AccessPolicyCommand::SetEnabled(false))
+            {
+                context
+                    .source
+                    .send_error(TextComponent::text("Whitelist change could not be queued"));
+                return Ok(0);
+            }
+            context
+                .source
+                .send_message(TextComponent::text("Whitelist change queued"));
+            return Ok(1);
+        }
         let previous = server.white_list.swap(false, Ordering::Relaxed);
         if previous {
             context.source.send_feedback(

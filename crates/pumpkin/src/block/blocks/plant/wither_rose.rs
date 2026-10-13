@@ -12,6 +12,7 @@ use crate::block::{BlockBehaviour, CanPlaceAtArgs, OnEntityCollisionArgs};
 #[pumpkin_block("minecraft:wither_rose")]
 pub struct WitherRoseBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for WitherRoseBlock {
     fn on_entity_collision(&self, args: OnEntityCollisionArgs<'_>) {
         if let Some(living_entity) = args.entity.get_living_entity() {

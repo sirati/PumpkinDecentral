@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use pumpkin_util::text::TextComponent;
 use tokio::sync::mpsc;
@@ -7,8 +6,6 @@ use tokio::sync::mpsc;
 use crate::plugin::server::server_broadcast::ServerBroadcastEvent;
 
 use super::Server;
-
-static CALLBACK_WARN_LAST: AtomicU64 = AtomicU64::new(0);
 
 pub struct ChatPresentation {
     pub message: TextComponent,
@@ -32,17 +29,10 @@ pub fn try_enqueue(
         .is_ok()
 }
 
-fn warn_timeout() {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|age| age.as_secs())
-        .unwrap_or(0);
-    let previous = CALLBACK_WARN_LAST.load(Ordering::Relaxed);
-    if now.saturating_sub(previous) >= 60
-        && CALLBACK_WARN_LAST
-            .compare_exchange(previous, now, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-    {
+fn warn_timeout(previous: &mut Option<std::time::Instant>) {
+    let now = std::time::Instant::now();
+    if previous.is_none_or(|last| now.duration_since(last).as_secs() >= 300) {
+        *previous = Some(now);
         tracing::warn!("cluster chat broadcast plugin callback timed out");
     }
 }
@@ -50,6 +40,7 @@ fn warn_timeout() {
 pub fn spawn(server: &Arc<Server>, mut rx: mpsc::Receiver<ChatPresentation>) {
     let task_server = Arc::clone(server);
     server.spawn_task(async move {
+        let mut callback_warning = None;
         while let Some(delivery) = rx.recv().await {
             let mut event =
                 ServerBroadcastEvent::new(delivery.message.clone(), delivery.sender.clone());
@@ -60,7 +51,7 @@ pub fn spawn(server: &Arc<Server>, mut rx: mpsc::Receiver<ChatPresentation>) {
             .await
             .is_err()
             {
-                warn_timeout();
+                warn_timeout(&mut callback_warning);
                 event = ServerBroadcastEvent::new(delivery.message, delivery.sender);
             }
             if !event.cancelled {

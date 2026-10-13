@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use crate::block::{
     EmitsRedstonePowerArgs, GetRedstonePowerArgs, GetStateForNeighborUpdateArgs, OnPlaceArgs,
     OnScheduledTickArgs, OnStateReplacedArgs,
@@ -10,11 +8,12 @@ use pumpkin_macros::pumpkin_block;
 use pumpkin_util::math::position::BlockPos;
 use pumpkin_world::{tick::TickPriority, world::BlockFlags};
 
-use crate::{block::BlockBehaviour, world::World};
+use crate::block::BlockBehaviour;
 
 #[pumpkin_block("minecraft:observer")]
 pub struct ObserverBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for ObserverBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut props = ObserverLikeProperties::default(args.block);
@@ -23,27 +22,46 @@ impl BlockBehaviour for ObserverBlock {
     }
 
     fn on_scheduled_tick(&self, args: OnScheduledTickArgs<'_>) {
+        crate::block::neighbor::apply_legacy_scheduled_intent(self, args);
+    }
+
+    fn scheduled_tick_intent(
+        &self,
+        args: crate::block::ScheduledTickIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        use crate::block::neighbor::BlockCallbackEffect;
         let state = args.world.get_block_state(args.position);
         let mut props = ObserverLikeProperties::from_state_id(state.id);
-
+        props.powered = !props.powered;
+        let mut effects = vec![BlockCallbackEffect::SetBlock {
+            position: *args.position,
+            state: props.to_state_id(args.block),
+            flags: BlockFlags::NOTIFY_LISTENERS,
+        }];
         if props.powered {
-            props.powered = false;
-            args.world.set_block_state(
-                args.position,
-                props.to_state_id(args.block),
-                BlockFlags::NOTIFY_LISTENERS,
-            );
-        } else {
-            props.powered = true;
-            args.world.set_block_state(
-                args.position,
-                props.to_state_id(args.block),
-                BlockFlags::NOTIFY_LISTENERS,
-            );
-            args.world
-                .schedule_block_tick(args.block, *args.position, 2, TickPriority::Normal);
+            effects.push(BlockCallbackEffect::ScheduleBlock {
+                position: *args.position,
+                block: args.block.id,
+                delay: 2,
+                priority: TickPriority::Normal,
+            });
         }
-        Self::update_neighbors(args.world, args.block, args.position, props);
+        let facing = props.facing.to_block_direction();
+        let offset = facing.opposite().to_offset();
+        let position = BlockPos::new(
+            args.position.0.x.checked_add(offset.x)?,
+            args.position.0.y.checked_add(offset.y)?,
+            args.position.0.z.checked_add(offset.z)?,
+        );
+        effects.push(BlockCallbackEffect::NotifyNeighbor {
+            position,
+            source: args.block.id,
+        });
+        effects.push(BlockCallbackEffect::NotifyNeighbors {
+            position,
+            except: Some(facing),
+        });
+        Some(effects)
     }
 
     fn get_state_for_neighbor_update(
@@ -82,34 +100,59 @@ impl BlockBehaviour for ObserverBlock {
     }
 
     fn on_state_replaced(&self, args: OnStateReplacedArgs<'_>) {
-        if !args.moved {
-            let props = ObserverLikeProperties::from_state_id(args.old_state_id);
-            if props.powered
-                && args
-                    .world
-                    .is_block_tick_scheduled(args.position, &Block::OBSERVER)
-            {
-                Self::update_neighbors(args.world, args.block, args.position, props);
+        crate::block::neighbor::apply_legacy_replaced_intent(self, args);
+    }
+
+    fn callback_intent(
+        &self,
+        args: crate::block::neighbor::BlockCallbackIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        use crate::block::neighbor::{BlockCallbackEffect, BlockCallbackEvent};
+        match args.event {
+            BlockCallbackEvent::Scheduled => {
+                self.scheduled_tick_intent(crate::block::ScheduledTickIntentArgs {
+                    world: args.world,
+                    block: args.block,
+                    position: args.position,
+                })
             }
+            BlockCallbackEvent::StateReplaced { old_state, moved } => {
+                let properties = ObserverLikeProperties::from_state_id(old_state);
+                if moved
+                    || !properties.powered
+                    || !args
+                        .world
+                        .is_block_tick_scheduled(args.position, &Block::OBSERVER)
+                {
+                    return Some(Vec::new());
+                }
+                let facing = properties.facing.to_block_direction();
+                let offset = facing.opposite().to_offset();
+                let position = BlockPos::new(
+                    args.position.0.x.checked_add(offset.x)?,
+                    args.position.0.y.checked_add(offset.y)?,
+                    args.position.0.z.checked_add(offset.z)?,
+                );
+                Some(vec![
+                    BlockCallbackEffect::NotifyNeighbor {
+                        position,
+                        source: args.block.id,
+                    },
+                    BlockCallbackEffect::NotifyNeighbors {
+                        position,
+                        except: Some(facing),
+                    },
+                ])
+            }
+            BlockCallbackEvent::Placed { .. }
+            | BlockCallbackEvent::Prepare { .. }
+            | BlockCallbackEvent::Neighbor { .. } => Some(Vec::new()),
         }
     }
 }
 
 impl ObserverBlock {
-    fn update_neighbors(
-        world: &Arc<World>,
-        block: &Block,
-        block_pos: &BlockPos,
-        props: ObserverLikeProperties,
-    ) {
-        let facing = props.facing.to_block_direction();
-        let opposite_facing_pos = block_pos.offset(facing.opposite().to_offset());
-
-        world.update_neighbor(&opposite_facing_pos, block);
-        world.update_neighbors(&opposite_facing_pos, Some(facing));
-    }
-
-    fn schedule_tick(world: &World, block_pos: &BlockPos) {
+    fn schedule_tick(world: &dyn crate::block::NeighborUpdateWorld, block_pos: &BlockPos) {
         world.schedule_block_tick(&Block::OBSERVER, *block_pos, 2, TickPriority::Normal);
     }
 }

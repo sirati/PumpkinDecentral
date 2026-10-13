@@ -17,6 +17,7 @@ const MAX_CHARGES: u8 = 4;
 #[pumpkin_block("minecraft:respawn_anchor")]
 pub struct RespawnAnchorBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for RespawnAnchorBlock {
     fn use_with_item(&self, args: UseWithItemArgs<'_>) -> BlockActionResult {
         if args.item_stack.item.id != Item::GLOWSTONE.id {

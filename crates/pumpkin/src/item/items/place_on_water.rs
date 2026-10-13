@@ -18,6 +18,7 @@ impl ItemMetadata for PlaceOnWaterBlockItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for PlaceOnWaterBlockItem {
     fn normal_use(&self, item: &Item, player: &Player) {
         let world = player.world();

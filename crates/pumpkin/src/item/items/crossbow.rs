@@ -20,6 +20,7 @@ impl ItemMetadata for CrossbowItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for CrossbowItem {
     fn normal_use(&self, _item: &Item, player: &Player) {
         let inventory = player.inventory();

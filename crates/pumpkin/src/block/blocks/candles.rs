@@ -24,6 +24,7 @@ use crate::{
 #[pumpkin_block_from_tag("minecraft:candles")]
 pub struct CandleBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for CandleBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         if args.player.get_entity().pose.load() != EntityPose::Crouching

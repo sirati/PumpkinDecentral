@@ -126,7 +126,16 @@ async fn bank_fuse_batch_decode_roundtrip() {
 
     let mover = gid(1, 1);
     worker_a.bank.pos.push(PosUpdate {
+        spatial_epoch: pumpkin_cluster::canonical_action::SpatialEpoch::Admission {
+            lease: pumpkin_cluster::canonical_action::LivePlayerLease {
+                key: pumpkin_cluster::canonical_action::PlayerKey(uuid::Uuid::nil()),
+                gid: mover,
+                incarnation: 1,
+            },
+            admitted_at: tick,
+        },
         gid: mover,
+        incarnation: 1,
         seq: PlayerSeq(1),
         tick,
         world: world(),

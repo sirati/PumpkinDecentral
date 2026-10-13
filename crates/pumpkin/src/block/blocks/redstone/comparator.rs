@@ -26,6 +26,7 @@ use super::abstract_redstone_gate::{self, RedstoneGateBlock, RedstoneGateBlockPr
 #[pumpkin_block("minecraft:comparator")]
 pub struct ComparatorBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for ComparatorBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         RedstoneGateBlock::on_place(self, args.player, args.block)
@@ -157,13 +158,8 @@ impl RedstoneGateBlockProperties for ComparatorLikeProperties {
 }
 
 impl RedstoneGateBlock<ComparatorLikeProperties> for ComparatorBlock {
-    fn get_output_level(&self, world: &World, pos: BlockPos) -> u8 {
-        if let Some(blockentity) = world.get_block_entity(&pos)
-            && let Some(comparator) = blockentity.as_any().downcast_ref::<ComparatorBlockEntity>()
-        {
-            return comparator.output_signal.load(Ordering::Relaxed);
-        }
-        0
+    fn get_output_level(&self, world: &dyn crate::block::RedstonePowerWorld, pos: BlockPos) -> u8 {
+        world.comparator_output(&pos)
     }
 
     fn update_powered(&self, world: &World, pos: BlockPos, state: &BlockState, block: &Block) {

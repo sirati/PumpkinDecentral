@@ -15,6 +15,7 @@ type BeetrootProperties = NetherWartLikeProperties;
 #[pumpkin_block("minecraft:beetroots")]
 pub struct BeetrootBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for BeetrootBlock {
     fn is_valid_bonemeal_target(&self, args: crate::block::BonemealArgs<'_>) -> bool {
         <Self as CropBlockBase>::is_valid_bonemeal_target(self, args.world, args.position)

@@ -7,6 +7,7 @@ use crate::block::{BlockBehaviour, BonemealArgs};
 #[pumpkin_block("minecraft:rooted_dirt")]
 pub struct RootedDirtBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for RootedDirtBlock {
     fn is_valid_bonemeal_target(&self, args: BonemealArgs<'_>) -> bool {
         let below = args.position.down();

@@ -17,6 +17,7 @@ use crate::block::{
 #[pumpkin_block("minecraft:snow")]
 pub struct LayeredSnowBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for LayeredSnowBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         if !can_place_at(args.world, args.position) {
@@ -67,10 +68,21 @@ impl BlockBehaviour for LayeredSnowBlock {
     }
 
     fn on_scheduled_tick(&self, args: OnScheduledTickArgs<'_>) {
-        if !can_place_at(args.world.as_ref(), args.position) {
-            args.world
-                .break_block(args.position, None, BlockFlags::empty());
-        }
+        crate::block::neighbor::apply_legacy_scheduled_intent(self, args);
+    }
+
+    fn callback_intent(
+        &self,
+        args: crate::block::neighbor::BlockCallbackIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        crate::block::neighbor::support_callback_intent(self, args)
+    }
+
+    fn scheduled_tick_intent(
+        &self,
+        args: crate::block::ScheduledTickIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        crate::block::neighbor::support_tick_intent(args, can_place_at)
     }
 
     fn random_tick(&self, args: RandomTickArgs<'_>) {

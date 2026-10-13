@@ -22,6 +22,7 @@ impl ItemMetadata for ShovelItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for ShovelItem {
     fn use_on_block(
         &self,

@@ -8,6 +8,7 @@ use crate::block::{BlockBehaviour, BrokenArgs, PlacedArgs};
 #[pumpkin_block("minecraft:trial_spawner")]
 pub struct TrialSpawnerBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for TrialSpawnerBlock {
     fn placed(&self, args: PlacedArgs<'_>) {
         let entity = TrialSpawnerBlockEntity::new(*args.position);

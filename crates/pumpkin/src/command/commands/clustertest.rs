@@ -15,6 +15,84 @@ struct ClusterTestExecutor;
 impl CommandExecutor for ClusterTestExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let test_id = StringArgumentType::get(context, "test-id")?;
+        if let Some(mode) = crate::server::cluster_test_health_policy::parse(test_id) {
+            if crate::server::cluster_test_health_policy::submit(context.server(), &context.source, mode) {
+                return Ok(1);
+            }
+            context.source.send_feedback(TextComponent::text("cluster test health policy arm unavailable"), false);
+            return Ok(0);
+        }
+
+        if let Some(scenario) =
+            crate::server::cluster_test_preflight::PreflightScenario::parse(test_id)
+        {
+            let submitted = crate::server::cluster_test_preflight::submit_arm(
+                context.server(),
+                &context.source,
+                scenario,
+            );
+            let state = if submitted {
+                "submitted"
+            } else {
+                "submission failed"
+            };
+            context.source.send_feedback(
+                TextComponent::text(format!("cluster test {test_id} {state}")),
+                false,
+            );
+            return Ok(if submitted { 1 } else { 0 });
+        }
+        if matches!(
+            test_id,
+            "packet-preflight-lobby-depart" | "handoff-callback-release"
+        ) && !crate::server::cluster_test_preflight::authorize_operator(
+            context.server(),
+            &context.source,
+        ) {
+            context.source.send_feedback(
+                TextComponent::text(
+                    "cluster test departure requires the registered independent operator",
+                ),
+                false,
+            );
+            return Ok(0);
+        }
+        if let Some(command) =
+            crate::server::cluster_test_scenarios::ActionScenarioCommand::parse(test_id)
+        {
+            let result = crate::server::cluster_test_scenarios::submit_action_scenario(
+                context.server(),
+                &context.source,
+                command,
+            );
+            let success = result.is_ok();
+            let feedback = match result {
+                Ok(()) => format!("cluster test {test_id} submitted"),
+                Err(reason) => format!("cluster test {test_id} submission failed: {reason:?}"),
+            };
+            context
+                .source
+                .send_feedback(TextComponent::text(feedback), false);
+            return Ok(if success { 1 } else { 0 });
+        }
+        if let Some(command) =
+            crate::server::cluster_test_scenarios::InventoryScenarioCommand::parse(test_id)
+        {
+            let result = crate::server::cluster_test_scenarios::submit_inventory(
+                context.server(),
+                &context.source,
+                command,
+            );
+            let success = result.is_ok();
+            let feedback = match result {
+                Ok(()) => format!("cluster test {test_id} submitted"),
+                Err(reason) => format!("cluster test {test_id} submission failed: {reason:?}"),
+            };
+            context
+                .source
+                .send_feedback(TextComponent::text(feedback), false);
+            return Ok(if success { 1 } else { 0 });
+        }
         if !matches!(
             test_id,
             "arena"
@@ -22,6 +100,14 @@ impl CommandExecutor for ClusterTestExecutor {
                 | "beacon"
                 | "departure-admin-lobby"
                 | "departure-admin-disconnect"
+                | "item-place"
+                | "item-stale"
+                | "handoff-revision-mismatch"
+                | "packet-preflight-lobby-depart"
+                | "handoff-callback-release"
+                | "door-trapdoor"
+                | "button-lever"
+                | "end-frame-anchor"
         ) {
             context
                 .source

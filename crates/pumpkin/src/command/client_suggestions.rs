@@ -12,6 +12,7 @@ use crate::command::node::{
     dispatcher::CommandDispatcher,
     tree::ROOT_NODE_ID,
 };
+use crate::entity::EntityBase;
 use crate::entity::player::Player;
 use crate::net::java::JavaClient;
 use crate::server::Server;
@@ -160,6 +161,7 @@ pub fn send_java_commands_packet(
 }
 
 struct BuilderContext<'a> {
+    source: &'a crate::command::CommandSource,
     enum_values: &'a mut Vec<String>,
     enums: &'a mut Vec<EnumData>,
 }
@@ -167,6 +169,19 @@ struct BuilderContext<'a> {
 pub fn send_bedrock_commands_packet(
     player: &Arc<Player>,
     _server: &Server,
+    dispatcher: &CommandDispatcher,
+) {
+    let Some(server) = player.world().server.upgrade() else {
+        return;
+    };
+    if let crate::net::ClientPlatform::Bedrock(client) = player.client.as_ref() {
+        send_bedrock_commands_for_source(client, &player.get_command_source(&server), dispatcher);
+    }
+}
+
+pub fn send_bedrock_commands_for_source(
+    client: &crate::net::bedrock::BedrockClient,
+    source: &crate::command::CommandSource,
     dispatcher: &CommandDispatcher,
 ) {
     let mut enum_values: Vec<String> = Vec::new();
@@ -191,6 +206,9 @@ pub fn send_bedrock_commands_packet(
         let Some(node) = tree_nodes.get(idx) else {
             continue;
         };
+        if !node.requirements().evaluate(source) {
+            continue;
+        }
 
         let (name, is_executable, child_ids) = match node {
             AttachedNode::Literal(lit) => (
@@ -215,12 +233,16 @@ pub fn send_bedrock_commands_packet(
         }
 
         let mut ctx = BuilderContext {
+            source,
             enum_values: &mut enum_values,
             enums: &mut enums,
         };
 
         let overloads =
             build_overloads_from_attached_nodes(&tree_nodes, &child_ids, is_executable, &mut ctx);
+        if overloads.is_empty() {
+            continue;
+        }
 
         commands.push(CommandData {
             name,
@@ -244,10 +266,8 @@ pub fn send_bedrock_commands_packet(
         constraints: Vec::new(),
     };
 
-    if let crate::net::ClientPlatform::Bedrock(bedrock_client) = player.client.as_ref()
-        && let Ok(data) = bedrock_client.serialize_packet(&packet)
-    {
-        bedrock_client.try_enqueue_packet(data);
+    if let Ok(data) = client.serialize_packet(&packet) {
+        client.try_enqueue_packet(data);
     }
 }
 
@@ -265,12 +285,6 @@ fn build_overloads_from_attached_nodes(
         });
     }
     collect_overloads_from_attached(tree, child_ids, &Vec::new(), &mut overloads, ctx);
-    if overloads.is_empty() {
-        overloads.push(OverloadData {
-            is_chaining: false,
-            parameter_data: Vec::new(),
-        });
-    }
     overloads
 }
 
@@ -284,6 +298,9 @@ fn collect_overloads_from_attached(
     for &child_id in child_ids {
         let idx = child_id.0.get() - 1;
         let Some(node) = tree.get(idx) else { continue };
+        if !node.requirements().evaluate(ctx.source) {
+            continue;
+        }
 
         match node {
             AttachedNode::Literal(lit) => {

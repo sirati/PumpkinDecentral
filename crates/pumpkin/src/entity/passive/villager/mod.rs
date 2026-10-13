@@ -61,7 +61,7 @@ pub(crate) fn trigger_trade_advancement(player: &Player) {
     );
 }
 
-fn enchanted_book_offer_items(
+pub(crate) fn enchanted_book_offer_items(
     rng: &mut impl rand::Rng,
 ) -> Option<(ItemStack, ItemStack, Option<ItemStack>)> {
     use pumpkin_data::data_component::DataComponent;
@@ -95,7 +95,7 @@ fn enchanted_book_offer_items(
     ))
 }
 
-fn enchant_trade_item(
+pub(crate) fn enchant_trade_item(
     rng: &mut impl rand::Rng,
     item: &'static Item,
     min_level: i32,

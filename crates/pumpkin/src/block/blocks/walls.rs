@@ -1,7 +1,6 @@
 use crate::block::{
     BlockBehaviour, GetStateForNeighborUpdateArgs, OnPlaceArgs, PathComputationType,
 };
-use crate::world::World;
 use pumpkin_data::block_properties::EastWall;
 use pumpkin_data::block_properties::HorizontalFacing;
 use pumpkin_data::block_properties::NorthWall;
@@ -19,6 +18,7 @@ type WallProperties = pumpkin_data::block_properties::ResinBrickWallLikeProperti
 #[pumpkin_block_from_tag("minecraft:walls")]
 pub struct WallBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for WallBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut wall_props = WallProperties::default(args.block);
@@ -42,7 +42,7 @@ impl BlockBehaviour for WallBlock {
 
 pub fn compute_wall_state(
     mut wall_props: WallProperties,
-    world: &World,
+    world: &dyn pumpkin_world::world::BlockAccessor,
     block: &Block,
     block_pos: &BlockPos,
 ) -> BlockStateId {

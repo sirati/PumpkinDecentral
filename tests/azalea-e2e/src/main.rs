@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashSet},
     env, fs,
     future::Future,
     io::Write,
@@ -7,36 +7,45 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::OnceLock,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 use azalea::account::Account;
+use azalea::registry::builtin::{BlockKind, EntityKind, ItemKind, MenuKind};
 use azalea::{
     BlockPos, Client, ClientInformation, Event, Vec3, WalkDirection,
     core::direction::Direction,
     ecs::query::With,
-    entity::{LookDirection, metadata::{AbstractEntityShiftKeyDown, Zombie}},
+    entity::{
+        LookDirection,
+        metadata::{AbstractEntityShiftKeyDown, Zombie},
+    },
 };
+use azalea_inventory::components::CustomName;
 use azalea_protocol::common::movements::MoveFlags;
 use azalea_protocol::packets::game::ClientboundGamePacket;
-use azalea_protocol::packets::game::s_chunk_batch_received::ServerboundChunkBatchReceived;
-use azalea_protocol::packets::game::s_move_player_pos_rot::ServerboundMovePlayerPosRot;
-use azalea_protocol::packets::game::s_player_input::ServerboundPlayerInput;
-use azalea_protocol::packets::game::s_command_suggestion::ServerboundCommandSuggestion;
-use azalea_protocol::packets::game::s_player_action::{Action as PlayerAction, ServerboundPlayerAction};
 use azalea_protocol::packets::game::c_game_event::EventType;
+use azalea_protocol::packets::game::s_chunk_batch_received::ServerboundChunkBatchReceived;
+use azalea_protocol::packets::game::s_command_suggestion::ServerboundCommandSuggestion;
 use azalea_protocol::packets::game::s_container_close::ServerboundContainerClose;
 use azalea_protocol::packets::game::s_interact::InteractionHand;
+use azalea_protocol::packets::game::s_move_player_pos_rot::ServerboundMovePlayerPosRot;
+use azalea_protocol::packets::game::s_player_action::{
+    Action as PlayerAction, ServerboundPlayerAction,
+};
+use azalea_protocol::packets::game::s_player_input::ServerboundPlayerInput;
 use azalea_protocol::packets::game::s_set_beacon::ServerboundSetBeacon;
 use azalea_protocol::packets::game::s_use_item_on::{BlockHit, ServerboundUseItemOn};
-use azalea::registry::builtin::{BlockKind, EntityKind, ItemKind, MenuKind};
 use flate2::{Compression, write::GzEncoder};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, UdpSocket},
     process::{Child, Command},
     task::{JoinHandle, LocalSet},
@@ -44,10 +53,14 @@ use tokio::{
 };
 use uuid::Uuid;
 
+mod scenario_catalog;
+mod spec_scenarios;
+
 const BOT_A: &str = "PumpkinE2eA";
 const BOT_B: &str = "PumpkinE2eB";
 const BOT_C: &str = "PumpkinE2eC";
 const BOT_D: &str = "PumpkinE2eD";
+const BOT_E: &str = "PumpkinE2eE";
 const E2E_DEADLINE: Duration = Duration::from_secs(600);
 const E2E_STAGE_DEADLINE: Duration = Duration::from_secs(45);
 const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -55,11 +68,67 @@ const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(100);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 const SNTP_EXCHANGE_TIMEOUT: Duration = Duration::from_millis(800);
 const E2E_PREGEN_RADIUS: u8 = 16;
-const PREGEN_DEADLINE: Duration = Duration::from_secs(600);
+const MULTI_PRIMARY_PREGEN_CHUNK_CENTERS: &str = "-512,0;512,0";
 static LOBBY_LOGIN_HANDSHAKE: OnceLock<time::Instant> = OnceLock::new();
+static NEXT_PUMPKIN_SCOPE: AtomicU64 = AtomicU64::new(0);
+
+fn pumpkin_scope(id: u16) -> Result<String> {
+    let scope = format!(
+        "pumpkin-e2e-{}-{id}-{}.scope",
+        std::process::id(),
+        NEXT_PUMPKIN_SCOPE.fetch_add(1, Ordering::Relaxed)
+    );
+    if let Some(path) = env::var_os("PUMPKIN_E2E_SCOPE_JOURNAL") {
+        let mut journal = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        writeln!(journal, "{scope}")?;
+        journal.sync_all()?;
+    }
+    Ok(scope)
+}
+
+fn pumpkin_command(executable: &Path, scope: &str) -> Command {
+    let mut command = Command::new("systemd-run");
+    command
+        .args(["--user", "--scope", "--quiet", "--collect"])
+        .arg(format!("--unit={scope}"))
+        .args(["-p", "MemoryMax=1G", "-p", "TimeoutStopSec=5s"]);
+    if let Ok(slice) = env::var("PUMPKIN_E2E_SYSTEMD_SLICE") {
+        command.arg("-p").arg(format!("Slice={slice}"));
+    }
+    command.arg("--").arg(executable);
+    command
+}
+
+async fn stop_pumpkin_scope(scope: &str) -> Result<()> {
+    let status = Command::new("systemctl")
+        .args(["--user", "stop", scope])
+        .status()
+        .await
+        .with_context(|| format!("stopping {scope}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("could not stop {scope}")
+    }
+}
+
+async fn kill_pumpkin_scope(scope: &str) {
+    let _ = Command::new("systemctl")
+        .args(["--user", "kill", "--signal=SIGKILL", scope])
+        .status()
+        .await;
+}
 
 fn client_view_distance() -> u8 {
-    if env::var_os("PUMPKIN_E2E_FULL_RADIUS").is_some() {
+    if env::var_os("PUMPKIN_E2E_FULL_RADIUS").is_some()
+        || env::var("PUMPKIN_E2E_SPEC_SCENARIOS")
+            .unwrap_or_default()
+            .split(',')
+            .any(|scenario| scenario == "pinned-radius-view-change")
+    {
         8
     } else {
         2
@@ -80,8 +149,16 @@ struct Deadline {
 
 impl Deadline {
     fn start() -> Self {
+        let duration = if env::var("PUMPKIN_E2E_SPEC_SCENARIOS")
+            .ok()
+            .is_some_and(|selected| selected.split(',').any(|id| id == "acceptance-cooldown"))
+        {
+            Duration::from_secs(900)
+        } else {
+            E2E_DEADLINE
+        };
         Self {
-            end: time::Instant::now() + E2E_DEADLINE,
+            end: time::Instant::now() + duration,
         }
     }
 
@@ -113,6 +190,7 @@ struct Node {
     alternate_java: Option<String>,
     unrelated_java: Option<String>,
     malformed_java: Option<String>,
+    cancel_java: Option<String>,
     root: PathBuf,
     pin: String,
 }
@@ -139,7 +217,8 @@ fn set_tree_permissions(path: &Path, read_only: bool) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    let metadata = fs::metadata(path).with_context(|| format!("reading {} permissions", path.display()))?;
+    let metadata =
+        fs::metadata(path).with_context(|| format!("reading {} permissions", path.display()))?;
     if metadata.is_dir() {
         for entry in fs::read_dir(path).with_context(|| format!("reading {}", path.display()))? {
             set_tree_permissions(&entry?.path(), read_only)?;
@@ -158,12 +237,14 @@ fn set_tree_permissions(path: &Path, read_only: bool) -> Result<()> {
 
 struct NodeProcess {
     id: u16,
+    scope: String,
     child: Child,
     log: PathBuf,
 }
 
 struct Supervisor {
     children: Vec<NodeProcess>,
+    primary_started: bool,
 }
 
 struct ExerciseEvidence {
@@ -174,6 +255,7 @@ struct ExerciseEvidence {
 #[derive(Default)]
 struct LobbyPacketEvidence {
     packet_trace: Vec<&'static str>,
+    login_received_at: Option<time::Instant>,
     active_batch_chunks: Option<u32>,
     completed_batches: Vec<(u32, u32)>,
     chunk_positions: HashSet<(i32, i32)>,
@@ -196,6 +278,8 @@ impl LobbyPacketEvidence {
         match packet {
             ClientboundGamePacket::Login(packet) => {
                 self.packet_trace.push("Login");
+                self.login_received_at
+                    .get_or_insert_with(time::Instant::now);
                 self.spectator_login = packet.common.game_type.to_id() == 3;
             }
             ClientboundGamePacket::AddEntity(packet)
@@ -208,7 +292,9 @@ impl LobbyPacketEvidence {
             {
                 self.marker_spawned = true;
             }
-            ClientboundGamePacket::GameEvent(packet) if packet.event == EventType::WaitForLevelChunks => {
+            ClientboundGamePacket::GameEvent(packet)
+                if packet.event == EventType::WaitForLevelChunks =>
+            {
                 self.packet_trace.push("WaitForLevelChunks");
             }
             ClientboundGamePacket::PlayerPosition(packet) => {
@@ -219,8 +305,12 @@ impl LobbyPacketEvidence {
                     && (pos.z - 1_000_008.5).abs() < 0.01
                     && (packet.change.look_direction.x_rot() - 90.0).abs() < 0.01;
             }
-            ClientboundGamePacket::SetDefaultSpawnPosition(_) => self.packet_trace.push("SetDefaultSpawnPosition"),
-            ClientboundGamePacket::SetChunkCacheCenter(_) => self.packet_trace.push("SetChunkCacheCenter"),
+            ClientboundGamePacket::SetDefaultSpawnPosition(_) => {
+                self.packet_trace.push("SetDefaultSpawnPosition")
+            }
+            ClientboundGamePacket::SetChunkCacheCenter(_) => {
+                self.packet_trace.push("SetChunkCacheCenter")
+            }
             ClientboundGamePacket::ChunkBatchStart(_) => {
                 self.packet_trace.push("ChunkBatchStart");
                 if self.active_batch_chunks.replace(0).is_some() {
@@ -272,7 +362,9 @@ impl LobbyPacketEvidence {
                 self.packet_trace.push("SetCamera");
                 self.marker_camera |= packet.camera_id.0 == -1_000_001;
             }
-            ClientboundGamePacket::GameEvent(packet) if packet.event == EventType::ChangeGameMode => {
+            ClientboundGamePacket::GameEvent(packet)
+                if packet.event == EventType::ChangeGameMode =>
+            {
                 self.spectator_presentation |= packet.param == 3.0;
             }
             ClientboundGamePacket::SetTime(packet) => {
@@ -280,6 +372,34 @@ impl LobbyPacketEvidence {
                     && packet.clock_updates.values().all(|clock| clock.rate == 0.0);
             }
             ClientboundGamePacket::SetSubtitleText(packet) => {
+                let display = packet.text.to_string();
+                if display.matches('%').count() == 2 {
+                    let azalea::FormattedText::Text(first) = &packet.text else {
+                        bail!("lobby progress subtitle was not a text component: {display}");
+                    };
+                    let second = first
+                        .base
+                        .siblings
+                        .first()
+                        .context("lobby progress omitted client-received percentage")?;
+                    let peer_color = first
+                        .base
+                        .style
+                        .color
+                        .as_ref()
+                        .and_then(|color| color.name.as_deref());
+                    let client_color = second
+                        .get_base()
+                        .style
+                        .color
+                        .as_ref()
+                        .and_then(|color| color.name.as_deref());
+                    if peer_color != Some("dark_gray") || client_color != Some("white") {
+                        bail!(
+                            "lobby progress colors are wrong: peer={peer_color:?}, client={client_color:?}"
+                        );
+                    }
+                }
                 self.progress_subtitles.push(packet.text.to_string());
             }
             ClientboundGamePacket::BlockUpdate(packet) => {
@@ -306,11 +426,14 @@ impl LobbyPacketEvidence {
             "ChunkBatchFinished",
             "SetCamera",
         ];
-        let indices = expected.map(|name| self.packet_trace.iter().position(|packet| *packet == name));
-        if indices.iter().any(Option::is_none)
-            || !indices.windows(2).all(|pair| pair[0] < pair[1])
+        let indices =
+            expected.map(|name| self.packet_trace.iter().position(|packet| *packet == name));
+        if indices.iter().any(Option::is_none) || !indices.windows(2).all(|pair| pair[0] < pair[1])
         {
-            bail!("virtual lobby packet order diverged from recovered login sequence: {}", self.packet_trace.join(" -> "))
+            bail!(
+                "virtual lobby packet order diverged from recovered login sequence: {}",
+                self.packet_trace.join(" -> ")
+            )
         }
         let Some(&(declared, observed)) = self.completed_batches.first() else {
             bail!("virtual lobby spawned without a completed chunk batch");
@@ -327,7 +450,10 @@ impl LobbyPacketEvidence {
             bail!("virtual lobby chunk coordinates differ from the exact 9x9 layout");
         }
         if !self.incomplete_fake_chunks.is_empty() {
-            bail!("virtual lobby chunks lack full heightmaps or lighting: {:?}", self.incomplete_fake_chunks);
+            bail!(
+                "virtual lobby chunks lack full heightmaps or lighting: {:?}",
+                self.incomplete_fake_chunks
+            );
         }
         let expected_platform = (1_000_000..1_000_016)
             .flat_map(|x| (1_000_000..1_000_016).map(move |z| (x, 100, z)))
@@ -338,8 +464,16 @@ impl LobbyPacketEvidence {
         if self.platform_block_entities != expected_platform {
             bail!("virtual lobby did not send all 256 portal block entities");
         }
-        if !self.marker_spawned || !self.marker_camera || !self.anchor_position || !self.spectator_login || !self.spectator_presentation || !self.frozen_clock {
-            bail!("virtual lobby omitted its marker camera, spectator presentation, or frozen clock");
+        if !self.marker_spawned
+            || !self.marker_camera
+            || !self.anchor_position
+            || !self.spectator_login
+            || !self.spectator_presentation
+            || !self.frozen_clock
+        {
+            bail!(
+                "virtual lobby omitted its marker camera, spectator presentation, or frozen clock"
+            );
         }
         if !self.received_commands {
             bail!("virtual lobby spawned without receiving the command graph");
@@ -384,25 +518,151 @@ impl LobbyPacketEvidence {
         if !first.starts_with("100%") {
             bail!("warm reconnect first peer progress was not 100%: {first}");
         }
+        if first.split_whitespace().count() != 2
+            || !first.split_whitespace().all(|part| part.ends_with('%'))
+        {
+            bail!("warm reconnect progress did not show peer and client percentages: {first}");
+        }
         Ok(())
     }
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    LocalSet::new().run_until(run()).await
+    let selected = env::var("PUMPKIN_E2E_SPEC_SCENARIOS").unwrap_or_default();
+    for id in selected.split(',').filter(|id| !id.is_empty()) {
+        if !scenario_catalog::REQUIRED_SCENARIOS.contains(&id) {
+            bail!("unknown mandatory scenario {id}");
+        }
+    }
+    if env::var_os("PUMPKIN_E2E_NORMAL_BIN").is_some() && !selected.is_empty() {
+        bail!("normal-feature omission must run separately from feature scenarios");
+    }
+    LocalSet::new().run_until(run()).await?;
+    if let Some(path) = env::var_os("PUMPKIN_E2E_RECEIPT_PATH") {
+        let case = env::var("PUMPKIN_E2E_CASE").context("receipt requires case identity")?;
+        let nonce = env::var("PUMPKIN_E2E_NONCE").context("receipt requires invocation nonce")?;
+        fs::write(
+            path,
+            serde_json::to_vec(&serde_json::json!({
+                "status": "passed", "scope": "partial", "case": case, "nonce": nonce,
+                "scenarios": selected.split(',').filter(|id| !id.is_empty()).collect::<Vec<_>>(),
+                "normal_feature": env::var_os("PUMPKIN_E2E_NORMAL_BIN").is_some(),
+                "full_radius": env::var_os("PUMPKIN_E2E_FULL_RADIUS").is_some(),
+                "one_way_delay_ms": env::var("PUMPKIN_E2E_ONE_WAY_DELAY_MS").unwrap_or_default(),
+                "recovered_handoff_max_ms": env::var("PUMPKIN_E2E_RECOVERED_HANDOFF_MAX_MS").unwrap_or_default(),
+                "delayed_chunk": env::var("PUMPKIN_E2E_DELAY_CHUNK").unwrap_or_default(),
+                "large_admin": env::var_os("PUMPKIN_E2E_LARGE_ADMIN").is_some(),
+            }))?,
+        )?;
+    }
+    println!(
+        "Partial E2E invocation passed; full acceptance requires pumpkin-cluster-full-spec and separate protocol/audit gates."
+    );
+    Ok(())
 }
 
 async fn run() -> Result<()> {
     let setup_deadline = Deadline::start();
     let fixture = within(&setup_deadline, "fixture creation", Fixture::create()).await?;
+    if let Some(normal_binary) = env::var_os("PUMPKIN_E2E_NORMAL_BIN") {
+        let normal_binary = PathBuf::from(normal_binary);
+        let deadline = Deadline::start();
+        let mut supervisor = within(
+            &deadline,
+            "normal-feature secondary startup",
+            Supervisor::start(
+                &normal_binary,
+                &fixture
+                    .nodes
+                    .iter()
+                    .filter(|node| node.role == "secondary")
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            ),
+        )
+        .await?;
+        let result = verify_normal_binary_command_absence(&fixture.nodes, &deadline).await;
+        let logs = supervisor.shutdown().await;
+        return result.with_context(|| log_failure_context(&logs));
+    }
     let executable = pumpkin_executable()?;
-    let primary = fixture
-        .nodes
-        .iter()
-        .find(|node| node.role == "primary")
-        .context("missing primary for world preparation")?;
-    prepare_primary_world(&executable, primary).await?;
+    let selected_scenarios = env::var("PUMPKIN_E2E_SPEC_SCENARIOS").unwrap_or_default();
+    if selected_scenarios
+        .split(',')
+        .any(|id| id == "multi-primary-no-coholder")
+    {
+        if selected_scenarios
+            .split(',')
+            .filter(|id| !id.is_empty())
+            .count()
+            != 1
+        {
+            bail!("multi-primary-no-coholder is a separate four-process topology run");
+        }
+        let deadline = Deadline::start();
+        let mut supervisor = within(
+            &deadline,
+            "two-primary fixture startup",
+            Supervisor::start(&executable, &fixture.nodes),
+        )
+        .await?;
+        let result = verify_multi_primary_settlement(&fixture.nodes, &deadline).await;
+        let logs = supervisor.shutdown().await;
+        result.with_context(|| log_failure_context(&logs))?;
+        validate_multi_primary_settlement(&logs)?;
+        fixture.validate_secondary_persistence()?;
+        return Ok(());
+    }
+    if let Some(membership_id) = selected_scenarios.split(',').find(|id| {
+        matches!(
+            *id,
+            "membership-ack-ten-seconds" | "membership-expand-set" | "membership-peer-removal"
+        )
+    }) {
+        if selected_scenarios
+            .split(',')
+            .filter(|id| !id.is_empty())
+            .count()
+            != 1
+        {
+            bail!("{membership_id} is a separate isolated topology run");
+        }
+        let deadline = Deadline::start();
+        let mut supervisor = within(
+            &deadline,
+            "isolated membership nodes",
+            Supervisor::start(&executable, &fixture.nodes),
+        )
+        .await?;
+        let result =
+            verify_isolated_membership(&fixture.nodes, &mut supervisor, membership_id, &deadline)
+                .await;
+        let logs = supervisor.shutdown().await;
+        result.with_context(|| log_failure_context(&logs))?;
+        spec_scenarios::validate_world_scenario_records(&logs)?;
+        let node2_log = logs
+            .iter()
+            .find(|(id, _)| *id == 2)
+            .context("candidate log absent")?
+            .1
+            .as_str();
+        let uuid = offline_uuid(BOT_B).to_string();
+        let ack = node2_log
+            .lines()
+            .map(strip_ansi)
+            .find(|line| {
+                line.contains("cluster e2e lobby client chunks acknowledged")
+                    && structured_value(line, "uuid") == Some(uuid.as_str())
+            })
+            .context("candidate promoted without complete client chunk ACK record")?;
+        if structured_value(&ack, "required") != Some("49")
+            || structured_value(&ack, "acknowledged") != Some("49")
+        {
+            bail!("candidate promoted without complete 49/49 client chunk ACK: {ack}");
+        }
+        return Ok(());
+    }
     let deadline = Deadline::start();
     let mut supervisor = within(
         &deadline,
@@ -418,14 +678,19 @@ async fn run() -> Result<()> {
         ),
     )
     .await?;
-    let result = exercise(
-        &fixture.nodes,
-        &executable,
-        &mut supervisor,
-        &deadline,
-    )
-    .await;
-    let logs = supervisor.shutdown().await;
+    let result = exercise(&fixture.nodes, &executable, &mut supervisor, &deadline).await;
+    let mut logs = supervisor.shutdown().await;
+    for node in &fixture.nodes {
+        if !logs.iter().any(|(id, _)| *id == node.id) {
+            let path = node.root.join("server.log");
+            logs.push((
+                node.id,
+                fs::read_to_string(&path).unwrap_or_else(|error| {
+                    format!("failed to read node log {}: {error}", path.display())
+                }),
+            ));
+        }
+    }
     fixture.sntp.abort();
     for proxy in &fixture.proxies {
         proxy.abort();
@@ -437,6 +702,7 @@ async fn run() -> Result<()> {
         Ok(evidence) => {
             persistence_check?;
             virtual_request_check?;
+            validate_primary_pregen(&logs)?;
             validate_server_lobby_latency(&logs)?;
             validate_initial_client_chunk_acknowledgements(&logs)?;
             validate_early_real_chunk_streaming(&logs)?;
@@ -445,6 +711,12 @@ async fn run() -> Result<()> {
             validate_malformed_ack_log(&logs)?;
             validate_manual_lobby_gid_log(&logs)?;
             validate_departure_admin_logs(&logs)?;
+            spec_scenarios::validate_world_scenario_records(&logs)?;
+            spec_scenarios::validate_acceptance_delay_records(&logs)?;
+            spec_scenarios::validate_acceptance_cooldown_records(&logs)?;
+            spec_scenarios::validate_saturated_departure_records(&logs)?;
+            spec_scenarios::validate_login_plugin_cancel_record(&logs)?;
+            validate_large_admin_snapshot(&logs)?;
             validate_logs(&logs)
         }
         Err(error) => {
@@ -459,6 +731,31 @@ async fn run() -> Result<()> {
             }
         }
     }
+}
+
+fn validate_primary_pregen(logs: &[(u16, String)]) -> Result<()> {
+    let primary = logs
+        .iter()
+        .find(|(id, _)| *id == 0)
+        .context("missing primary log for same-process world preparation")?;
+    let complete = primary
+        .1
+        .lines()
+        .map(strip_ansi)
+        .find(|line| line.contains("primary_pregen_complete"))
+        .context("primary did not complete same-process world preparation")?;
+    let count = structured_value(&complete, "count")
+        .context("primary world preparation omitted chunk count")?
+        .parse::<usize>()
+        .context("invalid primary world preparation chunk count")?;
+    let radius = structured_value(&complete, "radius")
+        .context("primary world preparation omitted radius")?
+        .parse::<u8>()
+        .context("invalid primary world preparation radius")?;
+    if count != 1057 || radius != E2E_PREGEN_RADIUS {
+        bail!("primary same-process world preparation was incomplete: {complete}");
+    }
+    Ok(())
 }
 
 fn validate_initial_client_chunk_acknowledgements(logs: &[(u16, String)]) -> Result<()> {
@@ -482,16 +779,60 @@ fn validate_initial_client_chunk_acknowledgements(logs: &[(u16, String)]) -> Res
             ))
         });
         let Some((Some(required), Some(acknowledged))) = observed else {
-            bail!("missing complete client chunk acknowledgement record for {player} on node {node}")
+            bail!(
+                "missing complete client chunk acknowledgement record for {player} on node {node}"
+            )
         };
         if required != expected_client_chunks() || acknowledged != required {
-            bail!("incomplete client chunk acknowledgement for {player} on node {node}: required={required}, acknowledged={acknowledged}")
+            bail!(
+                "incomplete client chunk acknowledgement for {player} on node {node}: required={required}, acknowledged={acknowledged}"
+            )
+        }
+    }
+    Ok(())
+}
+
+fn validate_large_admin_snapshot(logs: &[(u16, String)]) -> Result<()> {
+    if env::var_os("PUMPKIN_E2E_LARGE_ADMIN").is_none() {
+        eprintln!(
+            "untested large-admin-snapshot: set PUMPKIN_E2E_LARGE_ADMIN after multipart snapshot applied records exist"
+        );
+        return Ok(());
+    }
+    for id in [1, 2] {
+        let log = &logs
+            .iter()
+            .find(|(candidate, _)| *candidate == id)
+            .with_context(|| format!("missing secondary {id} large-admin log"))?
+            .1;
+        let record = log.lines().map(strip_ansi).find(|line| {
+            line.contains("cluster e2e admin snapshot applied")
+                && structured_value(line, "entries")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .is_some_and(|count| count >= 12_002)
+                && structured_value(line, "bytes")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .is_some_and(|bytes| bytes > 1_048_576)
+        });
+        if record.is_none() {
+            bail!("secondary {id} did not prove application of a multipart >1MiB admin snapshot");
         }
     }
     Ok(())
 }
 
 fn validate_early_real_chunk_streaming(logs: &[(u16, String)]) -> Result<()> {
+    let delayed_chunk = env::var("PUMPKIN_E2E_DELAY_CHUNK").ok();
+    if delayed_chunk.is_some() {
+        let primary = &logs
+            .iter()
+            .find(|(id, _)| *id == 0)
+            .context("missing primary log for deterministic delayed chunk")?
+            .1;
+        if !primary.contains("cluster e2e chunk serve intentionally delayed") {
+            bail!("delayed-chunk scenario did not actually delay the configured primary chunk");
+        }
+    }
     for (node, player) in [(1, BOT_A), (2, BOT_B)] {
         let log = &logs
             .iter()
@@ -525,133 +866,6 @@ fn validate_early_real_chunk_streaming(logs: &[(u16, String)]) -> Result<()> {
             bail!("real chunk stream for {player} waited for peer completion: {first}; {complete}")
         }
     }
-    Ok(())
-}
-
-async fn prepare_primary_world(executable: &Path, primary: &Node) -> Result<()> {
-    let cache = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("target/pregenerated-flat-radius16");
-    let manifest = cache.join("complete");
-    if fs::read_to_string(&manifest).ok().as_deref() == Some("radius=16 count=1057 spawn_y=-59\n") {
-        copy_tree(&cache.join("world"), &primary.root.join("world"))?;
-        eprintln!("primary world preparation reused: radius=16 chunks=1057");
-        return Ok(());
-    }
-    pre_generate_primary_world(executable, primary).await?;
-    let staging = cache.with_extension("staging");
-    if staging.exists() {
-        fs::remove_dir_all(&staging).context("removing incomplete primary world preparation")?;
-    }
-    copy_tree(&primary.root.join("world"), &staging.join("world"))?;
-    fs::write(staging.join("complete"), "radius=16 count=1057 spawn_y=-59\n")
-        .context("writing primary world preparation record")?;
-    if cache.exists() {
-        fs::remove_dir_all(&cache).context("replacing primary world preparation cache")?;
-    }
-    fs::rename(&staging, &cache).context("publishing primary world preparation cache")?;
-    Ok(())
-}
-
-fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
-    fs::create_dir_all(destination)
-        .with_context(|| format!("creating {}", destination.display()))?;
-    for entry in fs::read_dir(source).with_context(|| format!("reading {}", source.display()))? {
-        let entry = entry?;
-        let target = destination.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_tree(&entry.path(), &target)?;
-        } else {
-            fs::copy(entry.path(), &target)
-                .with_context(|| format!("copying {}", entry.path().display()))?;
-        }
-    }
-    Ok(())
-}
-
-async fn pre_generate_primary_world(executable: &Path, primary: &Node) -> Result<()> {
-    let mut child = Command::new(executable)
-        .current_dir(&primary.root)
-        .env("RUST_LOG", "info,cluster_e2e=info")
-        .env("PUMPKIN_CLUSTER_E2E_PREGEN_RADIUS", E2E_PREGEN_RADIUS.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("starting primary world preparation")?;
-    let stdout = child.stdout.take().context("primary preparation stdout unavailable")?;
-    let stderr = child.stderr.take().context("primary preparation stderr unavailable")?;
-    let mut stdout = BufReader::new(stdout).lines();
-    let mut stderr = BufReader::new(stderr).lines();
-    let mut stdout_open = true;
-    let mut stderr_open = true;
-    let mut tail = VecDeque::new();
-    let result = time::timeout(PREGEN_DEADLINE, async {
-        loop {
-            tokio::select! {
-                line = stdout.next_line(), if stdout_open => {
-                    match line.context("reading primary preparation stdout")? {
-                        Some(line) => {
-                            let line = strip_ansi(&line);
-                            if line.contains("primary_pregen_complete") {
-                                return Ok(line);
-                            }
-                            if tail.len() == 20 { tail.pop_front(); }
-                            tail.push_back(line);
-                        }
-                        None => stdout_open = false,
-                    }
-                }
-                line = stderr.next_line(), if stderr_open => {
-                    match line.context("reading primary preparation stderr")? {
-                        Some(line) => {
-                            let line = strip_ansi(&line);
-                            if line.contains("primary_pregen_complete") {
-                                return Ok(line);
-                            }
-                            if tail.len() == 20 { tail.pop_front(); }
-                            tail.push_back(line);
-                        }
-                        None => stderr_open = false,
-                    }
-                }
-                status = child.wait() => {
-                    bail!("primary preparation exited before completion: {}", status?);
-                }
-            }
-            if !stdout_open && !stderr_open {
-                bail!("primary preparation closed both log streams before completion");
-            }
-        }
-    })
-    .await;
-    if let Some(pid) = child.id() {
-        let _ = Command::new("kill").arg("-TERM").arg(pid.to_string()).status().await;
-    }
-    if time::timeout(CLEANUP_TIMEOUT, child.wait()).await.is_err() {
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-    }
-    let record = match result {
-        Ok(Ok(record)) => record,
-        Ok(Err(error)) => bail!("primary world preparation failed: {error:#}; log tail: {tail:?}"),
-        Err(_) => bail!("primary world preparation exceeded {PREGEN_DEADLINE:?}; log tail: {tail:?}"),
-    };
-    let radius = record
-        .split_whitespace()
-        .find_map(|field| field.strip_prefix("radius="))
-        .context("primary pregen completion omitted radius")?
-        .parse::<u8>()
-        .context("invalid primary pregen radius")?;
-    let count = record
-        .split_whitespace()
-        .find_map(|field| field.strip_prefix("count="))
-        .context("primary pregen completion omitted count")?
-        .parse::<usize>()
-        .context("invalid primary pregen count")?;
-    if radius != E2E_PREGEN_RADIUS || count != 1057 {
-        bail!("primary world preparation covered too few chunks: radius={radius} count={count}");
-    }
-    eprintln!("primary world preparation completed: radius={radius} chunks={count}");
     Ok(())
 }
 
@@ -694,10 +908,57 @@ impl Fixture {
                 alternate_java: None,
                 unrelated_java: None,
                 malformed_java: None,
+                cancel_java: None,
                 root: node_root,
                 pin: write_keypair(&root.path().join(directory))?,
             });
             write_flat_world(&root.path().join(directory))?;
+        }
+        if env::var("PUMPKIN_E2E_SPEC_SCENARIOS")
+            .unwrap_or_default()
+            .split(',')
+            .any(|id| id == "multi-primary-no-coholder")
+        {
+            let node_root = root.path().join("primary-3");
+            fs::create_dir_all(&node_root).context("creating second primary directory")?;
+            nodes.push(Node {
+                id: 3,
+                role: "primary",
+                quic: unused_udp_address().await?,
+                java: None,
+                client_java: None,
+                alternate_java: None,
+                unrelated_java: None,
+                malformed_java: None,
+                cancel_java: None,
+                pin: write_keypair(&node_root)?,
+                root: node_root.clone(),
+            });
+            write_flat_world(&node_root)?;
+        }
+        if env::var("PUMPKIN_E2E_SPEC_SCENARIOS")
+            .unwrap_or_default()
+            .split(',')
+            .any(|id| id == "relay-drop-newest-ground-election")
+        {
+            for id in [3, 4] {
+                let node_root = root.path().join(format!("holder-{id}"));
+                fs::create_dir_all(&node_root)?;
+                nodes.push(Node {
+                    id,
+                    role: "secondary",
+                    quic: unused_udp_address().await?,
+                    java: None,
+                    client_java: None,
+                    alternate_java: None,
+                    unrelated_java: None,
+                    malformed_java: None,
+                    cancel_java: None,
+                    pin: write_keypair(&node_root)?,
+                    root: node_root.clone(),
+                });
+                write_flat_world(&node_root)?;
+            }
         }
         let mut proxies = Vec::new();
         let proxy_delay = env::var("PUMPKIN_E2E_ONE_WAY_DELAY_MS")
@@ -753,6 +1014,17 @@ impl Fixture {
         let (address, proxy) = start_forward_proxy(backend, BOT_D, proxy_delay).await?;
         node_one.malformed_java = Some(address);
         proxies.push(proxy);
+        let node_one = nodes
+            .iter_mut()
+            .find(|node| node.id == 1)
+            .context("missing secondary one for canceled-login client")?;
+        let backend = node_one
+            .java
+            .clone()
+            .context("secondary one Java listener missing")?;
+        let (address, proxy) = start_forward_proxy(backend, BOT_E, proxy_delay).await?;
+        node_one.cancel_java = Some(address);
+        proxies.push(proxy);
         for node in &nodes {
             write_config(node, &nodes, &sntp_addr)?;
         }
@@ -795,9 +1067,7 @@ impl Fixture {
                     .filter(|path| before.get(*path) != after.get(*path))
                     .map(|path| path.display().to_string())
                     .collect::<Vec<_>>();
-                bail!(
-                    "secondary {id} modified its world or persistence data: {changes:?}"
-                );
+                bail!("secondary {id} modified its world or persistence data: {changes:?}");
             }
         }
         Ok(())
@@ -857,8 +1127,7 @@ fn write_flat_world(node_root: &Path) -> Result<()> {
     write_gzip(&world.join("level.dat"), &level)?;
 
     let data_dir = world.join("data/minecraft");
-    fs::create_dir_all(&data_dir)
-        .with_context(|| format!("creating {}", data_dir.display()))?;
+    fs::create_dir_all(&data_dir).with_context(|| format!("creating {}", data_dir.display()))?;
     let mut settings = Vec::new();
     nbt_header(&mut settings, 10, "");
     nbt_int(&mut settings, "DataVersion", 4903);
@@ -937,62 +1206,233 @@ fn nbt_string(out: &mut Vec<u8>, name: &str, value: &str) {
 impl Supervisor {
     async fn start(executable: &Path, nodes: &[Node]) -> Result<Self> {
         let mut children = Vec::with_capacity(nodes.len());
+        let mut primary_started = false;
         for node in nodes {
-            match Self::spawn_node(executable, node) {
-                Ok(process) => children.push(process),
+            match Self::spawn_node(executable, node, node.id == 0 && !primary_started) {
+                Ok(process) => {
+                    children.push(process);
+                    primary_started |= node.id == 0;
+                }
                 Err(error) => {
-                    let mut supervisor = Self { children };
+                    let mut supervisor = Self {
+                        children,
+                        primary_started,
+                    };
                     let _ = supervisor.shutdown().await;
                     return Err(error);
                 }
             }
         }
-        Ok(Self { children })
+        Ok(Self {
+            children,
+            primary_started,
+        })
     }
 
     fn start_node(&mut self, executable: &Path, node: &Node) -> Result<()> {
-        let process = Self::spawn_node(executable, node)?;
+        let process = Self::spawn_node(executable, node, node.id == 0 && !self.primary_started)?;
         self.children.push(process);
+        self.primary_started |= node.id == 0;
         Ok(())
     }
 
-    fn spawn_node(executable: &Path, node: &Node) -> Result<NodeProcess> {
+    async fn stop_node(&mut self, id: u16, deadline: &Deadline) -> Result<()> {
+        let index = self
+            .children
+            .iter()
+            .position(|process| process.id == id)
+            .with_context(|| format!("node {id} is not running"))?;
+        let mut process = self.children.swap_remove(index);
+        stop_pumpkin_scope(&process.scope)
+            .await
+            .with_context(|| format!("stopping node {id}"))?;
+        match time::timeout(
+            deadline
+                .remaining("primary dropout")?
+                .min(Duration::from_secs(15)),
+            process.child.wait(),
+        )
+        .await
+        {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(error)) => bail!("node {id} failed to stop: {error}"),
+            Err(_) => {
+                kill_pumpkin_scope(&process.scope).await;
+                let _ = process.child.start_kill();
+                let _ = process.child.wait().await;
+                bail!("node {id} did not stop within the dropout deadline")
+            }
+        }
+    }
+
+    fn spawn_node(executable: &Path, node: &Node, pregen: bool) -> Result<NodeProcess> {
         let log_path = node.root.join("server.log");
-        let log = fs::File::create(&log_path)
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
             .with_context(|| format!("creating node {} log", node.id))?;
         let error_log = log
             .try_clone()
             .with_context(|| format!("cloning node {} log handle", node.id))?;
-        let child = Command::new(executable)
+        let scope = pumpkin_scope(node.id)?;
+        let mut command = pumpkin_command(executable, &scope);
+        command
             .current_dir(&node.root)
             .env("RUST_LOG", "info,pumpkin::server::cluster_lobby=debug,pumpkin::server::cluster_world_owner=info")
             .env("PUMPKIN_CLUSTER_E2E_PLAYER_A", BOT_A)
             .env("PUMPKIN_CLUSTER_E2E_PLAYER_B", BOT_B)
+            .env("PUMPKIN_CLUSTER_E2E_PLAYER_C", BOT_C)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
-            .stderr(Stdio::from(error_log))
+            .stderr(Stdio::from(error_log));
+        if pregen
+            || (node.role == "primary"
+                && env::var("PUMPKIN_E2E_SPEC_SCENARIOS")
+                    .unwrap_or_default()
+                    .split(',')
+                    .any(|id| id == "multi-primary-no-coholder"))
+        {
+            command.env(
+                "PUMPKIN_CLUSTER_E2E_PREGEN_RADIUS",
+                E2E_PREGEN_RADIUS.to_string(),
+            );
+        }
+        if node.role == "primary"
+            && env::var("PUMPKIN_E2E_SPEC_SCENARIOS")
+                .unwrap_or_default()
+                .split(',')
+                .any(|id| id == "multi-primary-no-coholder")
+        {
+            command.env(
+                "PUMPKIN_CLUSTER_E2E_PREGEN_CENTERS",
+                MULTI_PRIMARY_PREGEN_CHUNK_CENTERS,
+            );
+        }
+        if node.id == 0 {
+            if let Some(delayed) = env::var_os("PUMPKIN_E2E_DELAY_CHUNK") {
+                command.env("PUMPKIN_CLUSTER_E2E_DELAY_CHUNK", delayed);
+            }
+        }
+        if node.id == 2
+            && env::var("PUMPKIN_E2E_SPEC_SCENARIOS")
+                .ok()
+                .is_some_and(|selected| {
+                    selected.split(',').any(|id| {
+                        matches!(
+                            id,
+                            "membership-ack-ten-seconds"
+                                | "membership-expand-set"
+                                | "membership-peer-removal"
+                        )
+                    })
+                })
+        {
+            command.env("PUMPKIN_CLUSTER_E2E_BLOCK_DIRECT_PEER", "1");
+        }
+        if node.id == 1
+            && env::var("PUMPKIN_E2E_SPEC_SCENARIOS")
+                .ok()
+                .is_some_and(|selected| selected.split(',').any(|id| id == "login-plugin-cancel"))
+        {
+            command.env("PUMPKIN_CLUSTER_E2E_CANCEL_LOGIN_NAME", BOT_E);
+        }
+        if node.id == 1
+            && env::var("PUMPKIN_E2E_SPEC_SCENARIOS")
+                .ok()
+                .is_some_and(|selected| selected.split(',').any(|id| id == "login-plugin-delay"))
+        {
+            command
+                .env("PUMPKIN_CLUSTER_E2E_DELAY_LOGIN_NAME", BOT_E)
+                .env("PUMPKIN_CLUSTER_E2E_DELAY_LOGIN_MS", "3000");
+        }
+        if node.id == 1
+            && env::var("PUMPKIN_E2E_SPEC_SCENARIOS")
+                .ok()
+                .is_some_and(|selected| {
+                    selected
+                        .split(',')
+                        .any(|id| id == "handoff-callback-early-confirm")
+                })
+        {
+            command.env("PUMPKIN_CLUSTER_TEST_EARLY_CONFIRM_NAME", BOT_E);
+        }
+        let child = command
             .spawn()
             .with_context(|| format!("starting {} node", node.role))?;
         Ok(NodeProcess {
             id: node.id,
+            scope,
             child,
             log: log_path,
         })
     }
 
+    async fn restart_all(
+        &mut self,
+        executable: &Path,
+        nodes: &[Node],
+        deadline: &Deadline,
+    ) -> Result<()> {
+        let processes = std::mem::take(&mut self.children);
+        for mut process in processes {
+            stop_pumpkin_scope(&process.scope)
+                .await
+                .with_context(|| format!("stopping node {} for persistence restart", process.id))?;
+            match time::timeout(
+                deadline
+                    .remaining("graceful three-node restart")?
+                    .min(Duration::from_secs(15)),
+                process.child.wait(),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => bail!(
+                    "node {} failed to stop for persistence restart: {error}",
+                    process.id
+                ),
+                Err(_) => {
+                    kill_pumpkin_scope(&process.scope).await;
+                    let _ = process.child.start_kill();
+                    let _ = process.child.wait().await;
+                    bail!(
+                        "node {} did not stop gracefully for persistence restart",
+                        process.id
+                    )
+                }
+            }
+        }
+        for node in nodes {
+            self.start_node(executable, node)?;
+        }
+        Ok(())
+    }
+
     async fn shutdown(&mut self) -> Vec<(u16, String)> {
         for process in &mut self.children {
             if let Ok(Some(status)) = process.child.try_wait() {
-                eprintln!("node {} exited before fixture shutdown: {status}", process.id);
+                eprintln!(
+                    "node {} exited before fixture shutdown: {status}",
+                    process.id
+                );
             }
-            let _ = process.child.start_kill();
+            let _ = stop_pumpkin_scope(&process.scope).await;
         }
-        let _ = time::timeout(CLEANUP_TIMEOUT, async {
+        if time::timeout(CLEANUP_TIMEOUT, async {
             for process in &mut self.children {
                 let _ = process.child.wait().await;
             }
         })
-        .await;
+        .await
+        .is_err()
+        {
+            for process in &mut self.children {
+                kill_pumpkin_scope(&process.scope).await;
+                let _ = process.child.start_kill();
+                let _ = process.child.wait().await;
+            }
+        }
         self.children
             .iter()
             .map(|process| {
@@ -1035,11 +1475,19 @@ fn validate_server_lobby_latency(logs: &[(u16, String)]) -> Result<()> {
     }
     for (node, name) in [(1, BOT_A), (2, BOT_B)] {
         let key = (node, offline_uuid(name).to_string());
-        let received = receipts.get(&key).with_context(|| format!("missing final configuration receipt for {name}"))?;
-        let enqueued = enqueues.get(&key).with_context(|| format!("missing first lobby enqueue for {name}"))?;
-        let elapsed = enqueued.checked_sub(*received).with_context(|| format!("lobby enqueue preceded configuration receipt for {name}"))?;
+        let received = receipts
+            .get(&key)
+            .with_context(|| format!("missing final configuration receipt for {name}"))?;
+        let enqueued = enqueues
+            .get(&key)
+            .with_context(|| format!("missing first lobby enqueue for {name}"))?;
+        let elapsed = enqueued
+            .checked_sub(*received)
+            .with_context(|| format!("lobby enqueue preceded configuration receipt for {name}"))?;
         if elapsed > 50_000 {
-            bail!("final configuration receipt to first lobby enqueue exceeded 50 ms for {name}: {elapsed} us");
+            bail!(
+                "final configuration receipt to first lobby enqueue exceeded 50 ms for {name}: {elapsed} us"
+            );
         }
     }
     Ok(())
@@ -1089,7 +1537,9 @@ fn log_failure_context(logs: &[(u16, String)]) -> String {
                 *inbound_by_peer.entry((peer, kind.to_owned())).or_default() += 1;
             }
         }
-        context.push_str(&format!("node {id} reliable inbound by peer/kind: {inbound_by_peer:?}\n"));
+        context.push_str(&format!(
+            "node {id} reliable inbound by peer/kind: {inbound_by_peer:?}\n"
+        ));
         context.push_str(&format!(
             "node {id} handoff route counts: connected={} dropped={} hint_routed={} hint_received={}\n",
             log.matches("cluster e2e handoff primary connected").count(),
@@ -1101,7 +1551,8 @@ fn log_failure_context(logs: &[(u16, String)]) -> String {
             "node {id} handshake/hint counts: queued={} inbound={} primary_hint_received={}\n",
             log.matches("cluster handshake queued").count(),
             log.matches("cluster handshake inbound").count(),
-            log.matches("cluster e2e primary hint request received").count(),
+            log.matches("cluster e2e primary hint request received")
+                .count(),
         ));
         context.push_str(&format!(
             "node {id} peer connection closes: {}\n",
@@ -1193,13 +1644,15 @@ fn validate_logs(logs: &[(u16, String)]) -> Result<()> {
     for (id, log) in logs {
         let mut development_warning = 0;
         let mut non_tty_warning = 0;
+        let mut expected_peer_closes = 0;
+        let mut peer_joins = 0;
+        let mut peer_leaves = 0;
         for raw in log.lines() {
             let line = strip_ansi(raw);
+            peer_joins += usize::from(line.contains("cluster peer joined"));
+            peer_leaves += usize::from(line.contains("cluster peer left"));
             let lower = line.to_ascii_lowercase();
-            if !(lower.contains(" warn")
-                || lower.contains(" error")
-                || lower.contains("panic"))
-            {
+            if !(lower.contains(" warn") || lower.contains(" error") || lower.contains("panic")) {
                 continue;
             }
             if line.contains("Pumpkin is currently under heavy development!") {
@@ -1210,8 +1663,46 @@ fn validate_logs(logs: &[(u16, String)]) -> Result<()> {
                 non_tty_warning += 1;
                 continue;
             }
+            if line.contains("cluster peer connection closed")
+                && !line.contains("capacity exhausted")
+                && !line.contains("write failed")
+            {
+                expected_peer_closes += 1;
+                continue;
+            }
+            if env::var("PUMPKIN_E2E_SPEC_SCENARIOS")
+                .ok()
+                .is_some_and(|selected| {
+                    selected
+                        .split(',')
+                        .any(|id| matches!(id, "acceptance-delay" | "acceptance-cooldown"))
+                })
+                && line.contains("cluster acceptance delayed")
+            {
+                continue;
+            }
             if line.contains("cluster lobby handoff invariant failed")
                 && line.contains(&offline_uuid(BOT_D).to_string())
+            {
+                continue;
+            }
+            if env::var("PUMPKIN_E2E_SPEC_SCENARIOS")
+                .unwrap_or_default()
+                .split(',')
+                .any(|scenario| scenario == "handoff-revision-mismatch")
+                && line.contains(&offline_uuid(BOT_E).to_string())
+                && (line.contains("playerdata handoff revision mismatch")
+                    || line.contains("unavailable playerdata revision mismatch"))
+            {
+                continue;
+            }
+            if env::var("PUMPKIN_E2E_SPEC_SCENARIOS")
+                .unwrap_or_default()
+                .split(',')
+                .any(|case| case == "relay-drop-newest-ground-election")
+                && line.contains("cluster peer dropped recovery reconciled")
+                && line.contains("ERROR")
+                && structured_value(&line, "peer") == Some("3")
             {
                 continue;
             }
@@ -1219,15 +1710,23 @@ fn validate_logs(logs: &[(u16, String)]) -> Result<()> {
                 unexpected.push(format!("node {id}: {line}"));
             }
         }
-        if development_warning > 1 {
+        if development_warning > 2 {
             unexpected.push(format!(
                 "node {id}: development warning repeated {development_warning} times"
             ));
         }
-        if non_tty_warning > 1 {
+        if non_tty_warning > 2 {
             unexpected.push(format!(
                 "node {id}: non-TTY warning repeated {non_tty_warning} times"
             ));
+        }
+        if expected_peer_closes > logs.len() + 1 {
+            unexpected.push(format!(
+                "node {id}: peer connection close repeated {expected_peer_closes} times"
+            ));
+        }
+        if peer_joins > 2 * (logs.len() - 1) + 4 || peer_leaves > logs.len() + 2 {
+            unexpected.push(format!("node {id}: membership transitions repeated: joined={peer_joins}, left={peer_leaves}"));
         }
     }
     if unexpected.is_empty() {
@@ -1290,16 +1789,27 @@ fn validate_departure_admin_logs(logs: &[(u16, String)]) -> Result<()> {
         let records = logs
             .iter()
             .flat_map(|(_, log)| log.lines().map(strip_ansi))
-            .filter(|line| line.contains("cluster test departure admin committed") && line.contains(kind))
+            .filter(|line| {
+                line.contains("cluster test departure admin committed") && line.contains(kind)
+            })
             .collect::<Vec<_>>();
         let [record] = records.as_slice() else {
-            bail!("expected one durable {kind} record, observed {}", records.len());
+            bail!(
+                "expected one durable {kind} record, observed {}",
+                records.len()
+            );
         };
         let revision = structured_value(record, "revision")
             .context("departure record has no committed revision")?
             .parse::<u64>()
             .context("departure record has invalid committed revision")?;
-        if revision == 0 || !record.contains("gid=") || !record.contains(coordinate) {
+        if revision == 0
+            || !record.contains("gid=")
+            || !record.contains(coordinate)
+            || structured_value(record, "canonical_ground") != Some("true")
+            || !record.contains("ground_action=Some(")
+            || !record.contains("correlation=Some(")
+        {
             bail!("departure record lacks the committed actor or target: {record}");
         }
     }
@@ -1351,7 +1861,11 @@ fn validate_virtual_lobby_world_footprint(logs: &[(u16, String)]) -> Result<()> 
         if structured_value(&record, "real_players") != Some("0") {
             bail!("virtual lobby created a real player for {player}: {record}")
         }
-        for field in ["real_chunk_wants", "real_chunk_fetches", "real_chunk_holders"] {
+        for field in [
+            "real_chunk_wants",
+            "real_chunk_fetches",
+            "real_chunk_holders",
+        ] {
             let before = structured_value(&record, &format!("{field}_before"))
                 .and_then(|value| value.parse::<u64>().ok())
                 .with_context(|| format!("missing {field}_before in virtual lobby footprint"))?;
@@ -1479,6 +1993,429 @@ fn strip_ansi(line: &str) -> String {
     plain
 }
 
+async fn verify_normal_binary_command_absence(nodes: &[Node], deadline: &Deadline) -> Result<()> {
+    let secondary = nodes
+        .iter()
+        .find(|node| node.id == 1)
+        .context("normal binary fixture lacks secondary one")?;
+    let endpoint = secondary
+        .client_java
+        .as_deref()
+        .context("normal binary fixture lacks Java forwarding endpoint")?;
+    let (client, mut events) = connect(BOT_A, endpoint, deadline).await?;
+    let login = wait_login(&mut events, deadline, "normal binary Java login", None).await?;
+    let lobby = wait_virtual_lobby_spawn(
+        &mut events,
+        login,
+        deadline,
+        "normal binary virtual lobby",
+        None,
+    )
+    .await?;
+    lobby.validate_virtual_lobby_scene()?;
+    if lobby.command_roots.contains("clustertest") {
+        bail!("normal binary exposed /clustertest in decoded CCommands");
+    }
+    client.chat("/clustertest arena");
+    within(deadline, "normal binary rejects test command", async {
+        while let Some(event) = events.recv().await {
+            match event {
+                Event::Chat(chat) => {
+                    let message = chat.message().to_string();
+                    if message.contains("cluster test") || message.contains("arena accepted") {
+                        bail!("normal binary executed a feature-only command: {message}");
+                    }
+                    if message.contains("Unknown")
+                        || message.contains("unknown")
+                        || message.contains("Incomplete")
+                    {
+                        return Ok(());
+                    }
+                }
+                Event::Disconnect(reason) => {
+                    bail!("normal binary disconnected client on unknown test command: {reason:?}")
+                }
+                Event::Packet(packet)
+                    if matches!(
+                        packet.as_ref(),
+                        ClientboundGamePacket::Respawn(_) | ClientboundGamePacket::Login(_)
+                    ) =>
+                {
+                    bail!("normal binary test command caused a terrain transition");
+                }
+                _ => {}
+            }
+        }
+        bail!("normal binary event stream ended without unknown-command feedback")
+    })
+    .await?;
+    client.disconnect();
+    eprintln!(
+        "passed normal-binary-command-absence: decoded CCommands omitted /clustertest and execution was rejected"
+    );
+    Ok(())
+}
+
+async fn verify_multi_primary_settlement(nodes: &[Node], deadline: &Deadline) -> Result<()> {
+    let mut clients = Vec::new();
+    for (node_id, name, remote) in [(1, BOT_A, BOT_B), (2, BOT_B, BOT_A)] {
+        let node = nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .context("multi-primary secondary missing")?;
+        let (client, mut events) = connect(
+            name,
+            node.client_java
+                .as_deref()
+                .context("multi-primary Java proxy missing")?,
+            deadline,
+        )
+        .await?;
+        let login = wait_login(&mut events, deadline, "multi-primary login", None).await?;
+        let lobby =
+            wait_virtual_lobby_spawn(&mut events, login, deadline, "multi-primary lobby", None)
+                .await?;
+        lobby.validate_virtual_lobby_scene()?;
+        wait_for_local_promotion(
+            &client,
+            &mut events,
+            remote,
+            false,
+            deadline,
+            "multi-primary promotion",
+        )
+        .await?;
+        clients.push((client, events));
+    }
+    let (actor, mut actor_events) = clients.remove(0);
+    let (observer, mut observer_events) = clients.remove(0);
+    while actor_events.try_recv().is_ok() {}
+    while observer_events.try_recv().is_ok() {}
+    actor.chat("/clustertest multi-primary-no-coholder");
+    let (source_window, destination_window) = tokio::try_join!(
+        wait_multi_primary_chest(&mut actor_events, true, deadline),
+        wait_multi_primary_chest(&mut observer_events, false, deadline),
+    )?;
+    for (client, x) in [(&actor, -8192), (&observer, 8192)] {
+        wait_for_position(
+            client,
+            Vec3::new(f64::from(x) + 0.5, 80.0, 0.5),
+            deadline,
+            "distant chest holder position",
+        )
+        .await?;
+        let chest = BlockPos::new(x, 80, 1);
+        wait_until(client, deadline, "real distant chest chunk", || {
+            Ok(client
+                .world()?
+                .read()
+                .get_block_state(chest)
+                .is_some_and(|state| BlockKind::from(state) == BlockKind::Chest)
+                .then_some(()))
+        })
+        .await?;
+    }
+    actor.chat("/clustertest multi-primary-no-coholder-run");
+    within(deadline, "cross-primary chest transaction ground settlement", async {
+        let mut source_empty = false;
+        let mut destination_one = false;
+        let mut accepted = false;
+        while !(source_empty && destination_one && accepted) {
+            tokio::select! {
+                event = actor_events.recv() => match event.context("multi-primary source stream closed")? {
+                    Event::Packet(packet) => {
+                        source_empty |= match packet.as_ref() {
+                            ClientboundGamePacket::ContainerSetSlot(update) if update.container_id == source_window && update.slot == 0 => update.item_stack.is_empty(),
+                            ClientboundGamePacket::ContainerSetContent(update) if update.container_id == source_window => update.items.first().is_some_and(|stack| stack.is_empty()),
+                            _ => false,
+                        };
+                    }
+                    Event::Chat(chat) if chat.message().to_string() == "cluster test multi-primary-no-coholder accepted" => accepted = true,
+                    Event::Disconnect(reason) => bail!("joint primary resolution disconnected source: {reason:?}"),
+                    _ => {}
+                },
+                event = observer_events.recv() => match event.context("multi-primary destination stream closed")? {
+                    Event::Packet(packet) => {
+                        let stack = match packet.as_ref() {
+                            ClientboundGamePacket::ContainerSetSlot(update) if update.container_id == destination_window && update.slot == 0 => Some(&update.item_stack),
+                            ClientboundGamePacket::ContainerSetContent(update) if update.container_id == destination_window => update.items.first(),
+                            _ => None,
+                        };
+                        destination_one |= stack.is_some_and(|stack| stack.kind() == ItemKind::Stone && stack.count() == 1);
+                    }
+                    Event::Disconnect(reason) => bail!("joint primary resolution disconnected destination: {reason:?}"),
+                    _ => {}
+                },
+            }
+        }
+        Ok(())
+    }).await?;
+    actor.chat("/list");
+    wait_chat_contains(
+        &mut actor_events,
+        BOT_B,
+        deadline,
+        "joint settlement source responsiveness",
+    )
+    .await?;
+    observer.chat("/list");
+    wait_chat_contains(
+        &mut observer_events,
+        BOT_A,
+        deadline,
+        "joint settlement destination responsiveness",
+    )
+    .await?;
+    wait_ticks(
+        &actor,
+        110,
+        deadline,
+        "settlement owner five-second retention",
+    )
+    .await?;
+    for (client, count) in [(&actor, 0), (&observer, 1)] {
+        let menu = client
+            .get_inventory()?
+            .menu()?
+            .context("joint chest screen disappeared")?;
+        let stone: i32 = menu
+            .slots()
+            .iter()
+            .filter(|stack| stack.kind() == ItemKind::Stone)
+            .map(|stack| stack.count())
+            .sum();
+        if stone != count {
+            bail!("joint chest transaction failed conservation: expected {count}, got {stone}");
+        }
+    }
+    actor.disconnect();
+    observer.disconnect();
+    Ok(())
+}
+
+async fn wait_multi_primary_chest(
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    source: bool,
+    deadline: &Deadline,
+) -> Result<i32> {
+    within(deadline, "cross-primary chest preparation", async {
+        let mut window = None;
+        while let Some(event) = events.recv().await {
+            match event {
+                Event::Packet(packet) => match packet.as_ref() {
+                    ClientboundGamePacket::OpenScreen(open)
+                        if open.menu_type == MenuKind::Generic9x3 =>
+                    {
+                        window = Some(open.container_id)
+                    }
+                    ClientboundGamePacket::ContainerSetContent(content)
+                        if Some(content.container_id) == window =>
+                    {
+                        let stack = content
+                            .items
+                            .first()
+                            .context("prepared chest has no slot zero")?;
+                        if (source && stack.kind() == ItemKind::Stone && stack.count() == 1)
+                            || (!source && stack.is_empty())
+                        {
+                            return Ok(content.container_id);
+                        }
+                    }
+                    _ => {}
+                },
+                Event::Disconnect(reason) => {
+                    bail!("multi-primary preparation disconnected client: {reason:?}")
+                }
+                _ => {}
+            }
+        }
+        bail!("multi-primary chest preparation ended without accepted content");
+    })
+    .await
+}
+
+fn validate_multi_primary_settlement(logs: &[(u16, String)]) -> Result<()> {
+    let mut hashes = HashSet::new();
+    let mut elected = HashSet::new();
+    for node in [0, 1, 2, 3] {
+        let log = logs
+            .iter()
+            .find(|(candidate, _)| *candidate == node)
+            .with_context(|| format!("node {node} multi-primary log missing"))?
+            .1
+            .as_str();
+        let record = log
+            .lines()
+            .map(strip_ansi)
+            .find(|line| line.contains("cluster e2e multi primary joint settled"))
+            .with_context(|| format!("node {node} has no accepted joint-primary outcome"))?;
+        for (field, expected) in [
+            ("initial_coholders", "0"),
+            ("source_count", "0"),
+            ("destination_count", "1"),
+            ("all_legs_ground", "true"),
+            ("dependency_notices", "true"),
+            ("primary_pending_retained", "true"),
+            ("peer_action_replies", "0"),
+        ] {
+            if structured_value(&record, field) != Some(expected) {
+                bail!("cross-primary settlement omitted {field} on node {node}: {record}");
+            }
+        }
+        let owner = structured_value(&record, "resolution_owner")
+            .context("joint resolution owner absent")?
+            .parse::<u16>()?;
+        let loads = structured_value(&record, "primary_loads")
+            .context("joint primary load advertisement absent")?
+            .split(',')
+            .map(|entry| {
+                let (peer, load) = entry
+                    .split_once(':')
+                    .context("malformed primary load entry")?;
+                Ok((peer.parse::<u16>()?, load.parse::<u64>()?))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        if loads.len() != 2
+            || !loads.contains_key(&0)
+            || !loads.contains_key(&3)
+            || loads.get(&owner) != loads.values().min()
+        {
+            bail!("joint resolver was not selected from primaries with least load: {record}");
+        }
+        if node == owner
+            && (structured_value(&record, "remote_legs_loaded") != Some("1")
+                || structured_value(&record, "retained_ms")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .is_none_or(|elapsed| elapsed < 5_000))
+        {
+            bail!("joint resolver failed remote-leg acquisition or retention: {record}");
+        }
+        elected.insert(owner);
+        hashes.insert(
+            structured_value(&record, "joint_ground_hash")
+                .context("joint settled hash absent")?
+                .to_owned(),
+        );
+        if [0, 3].contains(&node) && !log.contains("primary_pregen_complete") {
+            bail!("primary {node} did not complete fixture pregeneration");
+        }
+        if [0, 3].contains(&node) {
+            let centers = log.lines().map(strip_ansi).find(|line| {
+                line.contains("cluster e2e primary additional centers pregenerated")
+                    && structured_value(line, "centers") == Some(MULTI_PRIMARY_PREGEN_CHUNK_CENTERS)
+                    && structured_value(line, "complete") == Some("true")
+            });
+            if centers.is_none() {
+                bail!("primary {node} has no complete distant-leg pregeneration evidence");
+            }
+        }
+    }
+    if hashes.len() != 1 || elected.len() != 1 {
+        bail!("primary resolution election or ground outcome diverged");
+    }
+    Ok(())
+}
+
+async fn verify_isolated_membership(
+    nodes: &[Node],
+    supervisor: &mut Supervisor,
+    scenario: &str,
+    deadline: &Deadline,
+) -> Result<()> {
+    let secondary = nodes
+        .iter()
+        .find(|node| node.id == 2)
+        .context("membership fixture lacks candidate secondary")?;
+    let endpoint = secondary
+        .client_java
+        .as_deref()
+        .context("membership fixture lacks Java forwarding endpoint")?;
+    let (client, mut events) = connect(BOT_B, endpoint, deadline).await?;
+    let login = wait_login(&mut events, deadline, "ack-timeout candidate login", None).await?;
+    let lobby = wait_virtual_lobby_spawn(
+        &mut events,
+        login,
+        deadline,
+        "ack-timeout candidate virtual lobby",
+        None,
+    )
+    .await?;
+    lobby.validate_virtual_lobby_scene()?;
+    client.chat("/list");
+    wait_chat_contains(
+        &mut events,
+        BOT_B,
+        deadline,
+        "candidate lobby remains responsive before admission",
+    )
+    .await?;
+    if scenario == "membership-expand-set" {
+        client.chat("/clustertest membership-expand-set");
+        wait_chat_exact(
+            &mut events,
+            "cluster test membership-expand-set armed",
+            deadline,
+            "dynamic required-set expansion",
+        )
+        .await?;
+    } else if scenario == "membership-peer-removal" {
+        client.chat("/clustertest membership-waiting");
+        wait_chat_exact(
+            &mut events,
+            "cluster test membership-waiting active",
+            deadline,
+            "candidate requires node1 before removal",
+        )
+        .await?;
+        supervisor.stop_node(1, deadline).await?;
+    }
+    within(deadline, "candidate admitted through ten-second acknowledgement path", async {
+        let mut centered = false;
+        let mut batches = 0;
+        let mut chunks = 0;
+        while let Some(event) = events.recv().await {
+            match event {
+                Event::Packet(packet) => match packet.as_ref() {
+                    ClientboundGamePacket::Login(_) | ClientboundGamePacket::Respawn(_) | ClientboundGamePacket::StartConfiguration(_) => {
+                        bail!("acknowledgement-path handoff sent a terrain-loading packet");
+                    }
+                    ClientboundGamePacket::SetChunkCacheCenter(_) => centered = true,
+                    ClientboundGamePacket::ChunkBatchFinished(_) if centered => batches += 1,
+                    ClientboundGamePacket::LevelChunkWithLight(_) if centered => chunks += 1,
+                    ClientboundGamePacket::PlayerPosition(_) if centered => {
+                        if batches < 2 || chunks == 0 {
+                            bail!("acknowledgement-path handoff teleported before pipelined real chunks");
+                        }
+                        return Ok(());
+                    }
+                    _ => {}
+                },
+                Event::Disconnect(reason) => bail!("candidate disconnected while awaiting dynamic admission: {reason:?}"),
+                _ => {}
+            }
+        }
+        bail!("candidate never promoted through acknowledgement path")
+    }).await?;
+    wait_until(
+        &client,
+        deadline,
+        "acknowledgement-path real position",
+        || {
+            Ok(client
+                .position()
+                .ok()
+                .filter(|pos| pos.x.abs() < 100_000.0 && pos.z.abs() < 100_000.0)
+                .map(|_| ()))
+        },
+    )
+    .await?;
+    client.disconnect();
+    eprintln!(
+        "passed {scenario} client behavior: virtual lobby responsive, then pipelined real chunks and teleport without terrain transition"
+    );
+    Ok(())
+}
+
 async fn exercise(
     nodes: &[Node],
     executable: &Path,
@@ -1519,8 +2456,18 @@ async fn exercise(
         })?;
     }
     let (a_login, b_login) = tokio::try_join!(
-        wait_login(&mut a_events, deadline, "secondary one login", Some(lobby_started)),
-        wait_login(&mut b_events, deadline, "secondary two login", Some(lobby_started)),
+        wait_login(
+            &mut a_events,
+            deadline,
+            "secondary one login",
+            Some(lobby_started)
+        ),
+        wait_login(
+            &mut b_events,
+            deadline,
+            "secondary two login",
+            Some(lobby_started)
+        ),
     )?;
     let login_elapsed = lobby_started.elapsed();
     let (a_lobby, b_lobby) = tokio::try_join!(
@@ -1553,9 +2500,13 @@ async fn exercise(
         .get()
         .context("proxy did not observe an initial login-state handshake")?
         .elapsed();
-    eprintln!("lobby timing client_connect={connected_elapsed:?} client_login={login_elapsed:?} client_full_scene={lobby_elapsed:?} login_handshake_to_full_scene={handshake_elapsed:?}");
+    eprintln!(
+        "lobby timing client_connect={connected_elapsed:?} client_login={login_elapsed:?} client_full_scene={lobby_elapsed:?} login_handshake_to_full_scene={handshake_elapsed:?}"
+    );
     if handshake_elapsed > Duration::from_secs(1) {
-        bail!("virtual lobby entry exceeded one second from login handshake: {handshake_elapsed:?}");
+        bail!(
+            "virtual lobby entry exceeded one second from login handshake: {handshake_elapsed:?}"
+        );
     }
     tokio::try_join!(
         wait_for_forwarded_profiles(&bot_a, deadline, "secondary one lobby profiles"),
@@ -1597,7 +2548,13 @@ async fn exercise(
         "pre-primary hidden lobby suggestions",
     )
     .await?;
-    wait_ticks(&bot_b, 3, deadline, "pre-primary hidden lobby status publication").await?;
+    wait_ticks(
+        &bot_b,
+        3,
+        deadline,
+        "pre-primary hidden lobby status publication",
+    )
+    .await?;
     tokio::try_join!(
         assert_status_profiles(one, &[BOT_B], deadline, "secondary one hidden lobby status"),
         assert_status_profiles(two, &[BOT_B], deadline, "secondary two hidden lobby status"),
@@ -1618,10 +2575,36 @@ async fn exercise(
         "pre-primary restored lobby suggestions",
     )
     .await?;
-    wait_ticks(&bot_b, 3, deadline, "pre-primary restored lobby status publication").await?;
+    bot_a.chat("/tp 0 80 6");
+    wait_chat_exact(
+        &mut a_events,
+        "An entity is required to run this command here",
+        deadline,
+        "pre-primary entity-required command",
+    )
+    .await?;
+    bot_a.chat("/list");
+    wait_chat_contains(&mut a_events, BOT_B, deadline, "pre-primary global /list").await?;
+    wait_ticks(
+        &bot_b,
+        3,
+        deadline,
+        "pre-primary restored lobby status publication",
+    )
+    .await?;
     tokio::try_join!(
-        assert_status_profiles(one, &[BOT_A, BOT_B], deadline, "secondary one restored lobby status"),
-        assert_status_profiles(two, &[BOT_A, BOT_B], deadline, "secondary two restored lobby status"),
+        assert_status_profiles(
+            one,
+            &[BOT_A, BOT_B],
+            deadline,
+            "secondary one restored lobby status"
+        ),
+        assert_status_profiles(
+            two,
+            &[BOT_A, BOT_B],
+            deadline,
+            "secondary two restored lobby status"
+        ),
     )?;
     bot_a.chat("/exitlobby");
     wait_chat_exact(
@@ -1639,20 +2622,45 @@ async fn exercise(
         &format!("Queued /deop for {BOT_B}; pending primary durability."),
         deadline,
         "pre-primary queued moderation",
-    ).await?;
+    )
+    .await?;
     let primary = nodes
         .iter()
         .find(|node| node.role == "primary")
         .context("missing primary")?;
     supervisor.start_node(executable, primary)?;
     tokio::try_join!(
-        wait_for_local_promotion(&bot_a, &mut a_events, BOT_B, true, deadline, "player A real-world promotion"),
-        wait_for_local_promotion(&bot_b, &mut b_events, BOT_A, false, deadline, "player B real-world promotion"),
+        wait_for_local_promotion(
+            &bot_a,
+            &mut a_events,
+            BOT_B,
+            true,
+            deadline,
+            "player A real-world promotion"
+        ),
+        wait_for_local_promotion(
+            &bot_b,
+            &mut b_events,
+            BOT_A,
+            false,
+            deadline,
+            "player B real-world promotion"
+        ),
     )?;
     let remote_visibility_started = time::Instant::now();
     let (bot_b_uuid, bot_a_uuid) = tokio::try_join!(
-        wait_for_player(&bot_a, BOT_B, deadline, "remote player B entity after both promotions"),
-        wait_for_player(&bot_b, BOT_A, deadline, "remote player A entity after both promotions"),
+        wait_for_player(
+            &bot_a,
+            BOT_B,
+            deadline,
+            "remote player B entity after both promotions"
+        ),
+        wait_for_player(
+            &bot_b,
+            BOT_A,
+            deadline,
+            "remote player A entity after both promotions"
+        ),
     )?;
     eprintln!(
         "both remote player entities visible after {:?}",
@@ -1671,7 +2679,7 @@ async fn exercise(
     .await?;
     verify_mining_input(&bot_a, &mut a_events, deadline).await?;
     verify_item_placement_and_rejection(&bot_a, &bot_b, &mut a_events, deadline).await?;
-    let (unrelated, mut unrelated_events) = connect(
+    let (mut unrelated, mut unrelated_events) = connect(
         BOT_C,
         two.unrelated_java
             .as_deref()
@@ -1680,8 +2688,13 @@ async fn exercise(
     )
     .await?;
     eprintln!("unrelated client connector returned");
-    let unrelated_login =
-        wait_login(&mut unrelated_events, deadline, "unrelated player login", None).await?;
+    let unrelated_login = wait_login(
+        &mut unrelated_events,
+        deadline,
+        "unrelated player login",
+        None,
+    )
+    .await?;
     let unrelated_lobby = wait_virtual_lobby_spawn(
         &mut unrelated_events,
         unrelated_login,
@@ -1700,15 +2713,61 @@ async fn exercise(
     )
     .await?;
     tokio::try_join!(
-        assert_status_profiles_with_count(one, &[BOT_A, BOT_B], 3, deadline, "secondary one opt-out status"),
-        assert_status_profiles_with_count(two, &[BOT_A, BOT_B], 3, deadline, "secondary two opt-out status"),
+        assert_status_profiles_with_count(
+            one,
+            &[BOT_A, BOT_B],
+            3,
+            deadline,
+            "secondary one opt-out status"
+        ),
+        assert_status_profiles_with_count(
+            two,
+            &[BOT_A, BOT_B],
+            3,
+            deadline,
+            "secondary two opt-out status"
+        ),
     )?;
     let unrelated_before = unrelated.position()?;
     prepare_arena(&bot_a, &bot_b, &mut a_events, deadline).await?;
-    verify_beacon_menu(&bot_a, &mut a_events, deadline).await?;
     wait_ticks(&unrelated, 2, deadline, "unrelated arena exclusion").await?;
     if position_changed(unrelated.position()?, unrelated_before) {
         bail!("arena preparation changed an unrelated joined player")
+    }
+    verify_beacon_menu(&bot_a, &mut a_events, deadline).await?;
+    spec_scenarios::run_world_scenarios(
+        &bot_a,
+        &bot_b,
+        Some(&unrelated),
+        &mut a_events,
+        &mut b_events,
+        deadline,
+    )
+    .await?;
+    spec_scenarios::verify_handoff_revision_mismatch(one, &bot_a, &bot_b, &mut a_events, deadline)
+        .await?;
+    spec_scenarios::verify_login_plugin_cancel(one, &bot_a, deadline).await?;
+    spec_scenarios::verify_login_plugin_delay(one, &bot_a, &mut a_events, deadline).await?;
+    spec_scenarios::verify_handoff_callback_early_confirm(
+        one,
+        &bot_a,
+        &bot_b,
+        &mut a_events,
+        &mut b_events,
+        deadline,
+    )
+    .await?;
+    if let Some((replacement, replacement_events)) = spec_scenarios::verify_live_lease_reconnect(
+        two,
+        &bot_a,
+        &mut a_events,
+        &unrelated,
+        deadline,
+    )
+    .await?
+    {
+        unrelated = replacement;
+        unrelated_events = replacement_events;
     }
     verify_global_moderation_roundtrip(
         &bot_a,
@@ -1740,6 +2799,18 @@ async fn exercise(
         deadline,
     )
     .await?;
+    verify_primary_drop_lobby_capability(
+        &bot_a,
+        &bot_b,
+        bot_a_uuid,
+        &mut a_events,
+        &mut b_events,
+        supervisor,
+        executable,
+        primary,
+        deadline,
+    )
+    .await?;
     verify_remote_interaction(
         &bot_a,
         bot_b_uuid,
@@ -1748,14 +2819,7 @@ async fn exercise(
         "remote player right-click",
     )
     .await?;
-    verify_remote_visuals(
-        &bot_a,
-        &bot_b,
-        bot_a_uuid,
-        &mut b_events,
-        deadline,
-    )
-    .await?;
+    verify_remote_visuals(&bot_a, &bot_b, bot_a_uuid, &mut b_events, deadline).await?;
     let controller_positions =
         verify_controller_divergence(&bot_a, &bot_b, bot_a_uuid, &mut a_events, deadline).await?;
     prepare_arena(&bot_a, &bot_b, &mut a_events, deadline).await?;
@@ -1772,14 +2836,8 @@ async fn exercise(
     )
     .await?;
     wait_for_player(&bot_a, BOT_B, deadline, "remote player B after movement").await?;
-    fight_until_death_and_respawn(
-        &bot_a,
-        bot_b_uuid,
-        &mut a_events,
-        &mut b_events,
-        deadline,
-    )
-    .await?;
+    fight_until_death_and_respawn(&bot_a, bot_b_uuid, &mut a_events, &mut b_events, deadline)
+        .await?;
     summon_secondary_owned_zombie(&bot_a, &bot_b, deadline).await?;
     bot_a.chat("/clustertest departure-admin-disconnect");
     wait_chat_exact(
@@ -1787,7 +2845,44 @@ async fn exercise(
         "cluster test departure-admin-disconnect staged",
         deadline,
         "disconnect departure admin submission",
-    ).await?;
+    )
+    .await?;
+    spec_scenarios::prepare_cursor_crafting_departure(&bot_a, &mut a_events, deadline).await?;
+    let delayed_chat_started = if env::var("PUMPKIN_E2E_SPEC_SCENARIOS")
+        .unwrap_or_default()
+        .split(',')
+        .any(|id| id == "chat-departure-delay")
+    {
+        let started = time::Instant::now();
+        bot_a.chat("e2e-delayed-chat-departure");
+        Some(started)
+    } else {
+        eprintln!(
+            "untested chat-departure-delay: select PUMPKIN_E2E_SPEC_SCENARIOS=chat-departure-delay after feature-only delayed chat plugin callback exists"
+        );
+        None
+    };
+    let delayed_command_started = if env::var("PUMPKIN_E2E_SPEC_SCENARIOS")
+        .unwrap_or_default()
+        .split(',')
+        .any(|id| id == "command-departure-delay")
+    {
+        let started = time::Instant::now();
+        bot_a.chat("/me e2e-delayed-command-departure");
+        Some(started)
+    } else {
+        eprintln!(
+            "untested command-departure-delay: select PUMPKIN_E2E_SPEC_SCENARIOS=command-departure-delay after feature-only delayed command plugin callback exists"
+        );
+        None
+    };
+    spec_scenarios::arm_packet_preflight_departure(
+        &bot_a,
+        &mut a_events,
+        deadline,
+        "packet-preflight-disconnect",
+    )
+    .await?;
     bot_a.disconnect();
     time::sleep(Duration::from_millis(100)).await;
     let (reconnected_a, mut reconnect_events) = connect(
@@ -1798,9 +2893,14 @@ async fn exercise(
         deadline,
     )
     .await?;
-    let reconnect_login =
-        wait_login(&mut reconnect_events, deadline, "same-secondary reconnect login", None).await?;
-    let reconnect_lobby = wait_virtual_lobby_spawn(
+    let reconnect_login = wait_login(
+        &mut reconnect_events,
+        deadline,
+        "same-secondary reconnect login",
+        None,
+    )
+    .await?;
+    let mut reconnect_lobby = wait_virtual_lobby_spawn(
         &mut reconnect_events,
         reconnect_login,
         deadline,
@@ -1809,7 +2909,43 @@ async fn exercise(
     )
     .await?;
     reconnect_lobby.validate_virtual_lobby()?;
+    if let Some(started) = delayed_chat_started.or(delayed_command_started) {
+        verify_retiring_reconnect_lobby(
+            &reconnected_a,
+            &mut reconnect_events,
+            &mut reconnect_lobby,
+            started,
+            deadline,
+        )
+        .await?;
+    }
+    if let Some(started) = delayed_chat_started {
+        wait_chat_contains(
+            &mut b_events,
+            "e2e-delayed-chat-departure",
+            deadline,
+            "chat admitted before departure drain",
+        )
+        .await?;
+        if started.elapsed() < Duration::from_secs(3) {
+            bail!("chat plugin callback was not actually delayed across disconnect");
+        }
+    }
+    if let Some(started) = delayed_command_started {
+        wait_chat_contains(
+            &mut b_events,
+            "e2e-delayed-command-departure",
+            deadline,
+            "command admitted before departure drain",
+        )
+        .await?;
+        if started.elapsed() < Duration::from_secs(3) {
+            bail!("command plugin callback was not actually delayed across disconnect");
+        }
+    }
+    wait_first_reconnect_progress(&mut reconnect_events, &mut reconnect_lobby, deadline).await?;
     reconnect_lobby.validate_warm_reconnect()?;
+
     wait_for_player_transition(
         &reconnected_a,
         &mut reconnect_events,
@@ -1818,12 +2954,14 @@ async fn exercise(
         "same-secondary retained handoff",
     )
     .await?;
+    spec_scenarios::verify_cursor_crafting_after_reconnect(&reconnected_a, deadline).await?;
     wait_for_position(
         &reconnected_a,
         Vec3::new(0.5, 80.0, 4.5),
         deadline,
         "accepted admin position after disconnect",
-    ).await?;
+    )
+    .await?;
     reconnected_a.disconnect();
     time::sleep(Duration::from_millis(100)).await;
     let (cross_reconnected_a, mut cross_reconnect_events) = connect(
@@ -1860,14 +2998,200 @@ async fn exercise(
     .await?;
     let observed_entity_uuids =
         prove_primary_natural_spawn_boundary(&cross_reconnected_a, deadline).await?;
-    verify_remote_spectate(&cross_reconnected_a, &mut cross_reconnect_events, BOT_B, deadline).await?;
+    verify_remote_spectate(
+        &cross_reconnected_a,
+        &mut cross_reconnect_events,
+        BOT_B,
+        deadline,
+    )
+    .await?;
+    let saved_position = cross_reconnected_a.position()?;
+    cross_reconnected_a.chat(&format!("/ban {BOT_C} persistence-check"));
+    wait_chat_contains(
+        &mut cross_reconnect_events,
+        "Cluster admin change is durable on the primary.",
+        deadline,
+        "persistent ban before cluster restart",
+    )
+    .await?;
     assert_malformed_chunk_ack(one, deadline).await?;
     cross_reconnected_a.disconnect();
     bot_b.disconnect();
+    time::sleep(Duration::from_millis(500)).await;
+    supervisor.restart_all(executable, nodes, deadline).await?;
+    let ((restored_a, mut restored_a_events), (restored_b, mut restored_b_events)) = tokio::try_join!(
+        connect(
+            BOT_A,
+            one.client_java
+                .as_deref()
+                .context("restart A listener missing")?,
+            deadline
+        ),
+        connect(
+            BOT_B,
+            two.client_java
+                .as_deref()
+                .context("restart B listener missing")?,
+            deadline
+        ),
+    )?;
+    let (a_login, b_login) = tokio::try_join!(
+        wait_login(
+            &mut restored_a_events,
+            deadline,
+            "post-restart A login",
+            None
+        ),
+        wait_login(
+            &mut restored_b_events,
+            deadline,
+            "post-restart B login",
+            None
+        ),
+    )?;
+    let (a_lobby, b_lobby) = tokio::try_join!(
+        wait_virtual_lobby_spawn(
+            &mut restored_a_events,
+            a_login,
+            deadline,
+            "post-restart A lobby",
+            None
+        ),
+        wait_virtual_lobby_spawn(
+            &mut restored_b_events,
+            b_login,
+            deadline,
+            "post-restart B lobby",
+            None
+        ),
+    )?;
+    a_lobby.validate_virtual_lobby_scene()?;
+    b_lobby.validate_virtual_lobby_scene()?;
+    tokio::try_join!(
+        wait_for_forwarded_profiles(&restored_a, deadline, "post-restart A profile textures"),
+        wait_for_forwarded_profiles(&restored_b, deadline, "post-restart B profile textures"),
+    )?;
+    tokio::try_join!(
+        wait_for_local_promotion(
+            &restored_a,
+            &mut restored_a_events,
+            BOT_B,
+            false,
+            deadline,
+            "post-restart A promotion"
+        ),
+        wait_for_local_promotion(
+            &restored_b,
+            &mut restored_b_events,
+            BOT_A,
+            false,
+            deadline,
+            "post-restart B promotion"
+        ),
+    )?;
+    tokio::try_join!(
+        assert_status_profiles(one, &[BOT_A, BOT_B], deadline, "post-restart node1 status"),
+        assert_status_profiles(two, &[BOT_A, BOT_B], deadline, "post-restart node2 status"),
+    )?;
+    wait_for_position(
+        &restored_a,
+        saved_position,
+        deadline,
+        "post-restart persisted resume position",
+    )
+    .await?;
+    spec_scenarios::verify_ender_chest_after_restart(&restored_a, &mut restored_a_events, deadline)
+        .await?;
+    assert_persisted_ban(two, deadline).await?;
+    if env::var("PUMPKIN_E2E_SPEC_SCENARIOS")
+        .unwrap_or_default()
+        .split(',')
+        .any(|id| id == "entity-owner-leave")
+    {
+        verify_entity_owner_graceful_leave(
+            &restored_a,
+            &restored_b,
+            &mut restored_a_events,
+            &mut restored_b_events,
+            supervisor,
+            one,
+            deadline,
+        )
+        .await?;
+    } else {
+        eprintln!(
+            "untested entity-owner-leave: select PUMPKIN_E2E_SPEC_SCENARIOS=entity-owner-leave after canonical entity ownership-transfer hook exists"
+        );
+        restored_a.disconnect();
+    }
+    restored_b.disconnect();
     Ok(ExerciseEvidence {
         observed_entity_uuids,
         controller_positions,
     })
+}
+
+async fn verify_entity_owner_graceful_leave(
+    actor: &Client,
+    observer: &Client,
+    actor_events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    observer_events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    supervisor: &mut Supervisor,
+    old_owner: &Node,
+    deadline: &Deadline,
+) -> Result<()> {
+    let existing = zombie_uuids(observer)?;
+    actor.chat("/clustertest entity-owner-leave");
+    wait_chat_exact(
+        actor_events,
+        "cluster test entity-owner-leave accepted",
+        deadline,
+        "owned entity setup",
+    )
+    .await?;
+    let entity = wait_until(
+        observer,
+        deadline,
+        "owned zombie visible before graceful leave",
+        || {
+            Ok(zombie_uuids(observer)?
+                .difference(&existing)
+                .next()
+                .copied())
+        },
+    )
+    .await?;
+    actor.disconnect();
+    wait_observer_presence(
+        observer,
+        observer_events,
+        offline_uuid(BOT_A),
+        false,
+        deadline,
+        "old owner has no hosted player",
+    )
+    .await?;
+    let before = observer
+        .entity_by_uuid(entity)
+        .context("owned zombie vanished before leave")?
+        .position()
+        .context("owned zombie position absent")?;
+    supervisor.stop_node(old_owner.id, deadline).await?;
+    wait_for_position_change(
+        observer,
+        entity,
+        before,
+        deadline,
+        "transferred entity ticked by new owner",
+    )
+    .await?;
+    if observer.entity_by_uuid(entity).is_none() {
+        bail!("graceful old-owner leave removed the transferred entity");
+    }
+    eprintln!(
+        "passed entity-owner-leave: playerless secondary exited and former entity continued moving on the other holder"
+    );
+    Ok(())
 }
 
 async fn assert_malformed_chunk_ack(node: &Node, deadline: &Deadline) -> Result<()> {
@@ -1965,7 +3289,9 @@ async fn verify_controller_divergence(
         ..Default::default()
     });
     if position_changed(player_position(observer, actor_uuid)?, before) {
-        bail!("remote movement was applied directly from the client packet handler before a server tick")
+        bail!(
+            "remote movement was applied directly from the client packet handler before a server tick"
+        )
     }
     within(deadline, "controller divergence observation", async {
         let mut ticks = observer.get_tick_broadcaster();
@@ -2064,9 +3390,25 @@ async fn assert_player_suggestions(
     deadline: &Deadline,
     stage: &str,
 ) -> Result<()> {
+    assert_command_suggestions(
+        client, events, "/msg ", required, forbidden, request_id, deadline, stage,
+    )
+    .await
+}
+
+async fn assert_command_suggestions(
+    client: &Client,
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    command: &str,
+    required: &[&str],
+    forbidden: &[&str],
+    request_id: u32,
+    deadline: &Deadline,
+    stage: &str,
+) -> Result<()> {
     client.write_packet(ServerboundCommandSuggestion {
         id: request_id,
-        command: String::from("/msg "),
+        command: String::from(command),
     });
     within(deadline, stage, async {
         while let Some(event) = events.recv().await {
@@ -2147,7 +3489,9 @@ async fn wait_chat_contains(
         while let Some(event) = events.recv().await {
             match event {
                 Event::Chat(chat) if chat.message().to_string().contains(expected) => return Ok(()),
-                Event::Disconnect(reason) => bail!("Azalea disconnected during {stage}: {reason:?}"),
+                Event::Disconnect(reason) => {
+                    bail!("Azalea disconnected during {stage}: {reason:?}")
+                }
                 _ => {}
             }
         }
@@ -2180,7 +3524,18 @@ async fn verify_global_moderation_roundtrip(
     node: &Node,
     deadline: &Deadline,
 ) -> Result<()> {
-    for command in ["op", "deop"] {
+    for (index, command) in ["op", "deop"].into_iter().enumerate() {
+        assert_command_suggestions(
+            operator,
+            operator_events,
+            &format!("/{command} "),
+            &[BOT_C],
+            &[],
+            0x5b00 + index as u32,
+            deadline,
+            &format!("global /{command} suggestions"),
+        )
+        .await?;
         operator.chat(&format!("/{command} {BOT_C}"));
         wait_chat_contains(
             operator_events,
@@ -2189,12 +3544,63 @@ async fn verify_global_moderation_roundtrip(
             &format!("durable /{command} on unrelated player"),
         )
         .await?;
+        wait_permission_command_graph(target_events, command == "op", deadline).await?;
     }
+    target.chat(&format!("/op {BOT_C}"));
+    within(
+        deadline,
+        "deopped player cannot restore its own permission",
+        async {
+            while let Some(event) = target_events.recv().await {
+                match event {
+                    Event::Chat(chat) => {
+                        let message = chat.message().to_string();
+                        if message.contains("Queued /op")
+                            || message.contains("durable on the primary")
+                        {
+                            bail!("deopped player submitted an unauthorized global op action");
+                        }
+                        let text = message.to_lowercase();
+                        if text.contains("permission")
+                            || text.contains("unknown")
+                            || text.contains("incomplete command")
+                        {
+                            return Ok(());
+                        }
+                    }
+                    Event::Disconnect(reason) => {
+                        bail!("permission rejection disconnected target: {reason:?}")
+                    }
+                    _ => {}
+                }
+            }
+            bail!("deopped player's unauthorized op received no rejection");
+        },
+    )
+    .await?;
+    assert_command_suggestions(
+        operator,
+        operator_events,
+        "/kick ",
+        &[BOT_C],
+        &[],
+        0x5b02,
+        deadline,
+        "global /kick suggestions",
+    )
+    .await?;
     operator.chat(&format!("/kick {BOT_C} e2e-kick"));
-    wait_disconnect(target_events, deadline, "cross-peer /kick target disconnect").await?;
+    wait_disconnect(
+        target_events,
+        deadline,
+        "cross-peer /kick target disconnect",
+    )
+    .await?;
     let (kicked_return, mut kicked_events) = connect(
         BOT_C,
-        node.unrelated_java.as_deref().context("unrelated proxy missing")?,
+        node.unrelated_java
+            .as_deref()
+            .context("unrelated proxy missing")?,
         deadline,
     )
     .await?;
@@ -2208,6 +3614,12 @@ async fn verify_global_moderation_roundtrip(
     )
     .await?;
     kicked_lobby.validate_virtual_lobby_scene()?;
+    if ["op", "deop", "ban", "pardon"]
+        .iter()
+        .any(|command| kicked_lobby.command_roots.contains(*command))
+    {
+        bail!("unauthorized self-op restored operator commands after reconnect");
+    }
     wait_for_player_transition(
         &kicked_return,
         &mut kicked_events,
@@ -2216,13 +3628,40 @@ async fn verify_global_moderation_roundtrip(
         "post-kick real handoff",
     )
     .await?;
+    assert_command_suggestions(
+        operator,
+        operator_events,
+        "/ban ",
+        &[BOT_C],
+        &[],
+        0x5b03,
+        deadline,
+        "global /ban suggestions",
+    )
+    .await?;
     operator.chat(&format!("/ban {BOT_C} e2e-ban"));
-    wait_disconnect(&mut kicked_events, deadline, "cross-peer /ban target disconnect").await?;
+    wait_disconnect(
+        &mut kicked_events,
+        deadline,
+        "cross-peer /ban target disconnect",
+    )
+    .await?;
     wait_chat_contains(
         operator_events,
         "Cluster admin change is durable on the primary.",
         deadline,
         "durable /ban",
+    )
+    .await?;
+    assert_command_suggestions(
+        operator,
+        operator_events,
+        "/pardon ",
+        &[BOT_C],
+        &[],
+        0x5b04,
+        deadline,
+        "global /pardon suggestions",
     )
     .await?;
     operator.chat(&format!("/pardon {BOT_C}"));
@@ -2235,11 +3674,14 @@ async fn verify_global_moderation_roundtrip(
     .await?;
     let (pardoned, mut pardoned_events) = connect(
         BOT_C,
-        node.unrelated_java.as_deref().context("unrelated proxy missing")?,
+        node.unrelated_java
+            .as_deref()
+            .context("unrelated proxy missing")?,
         deadline,
     )
     .await?;
-    let pardon_login = wait_login(&mut pardoned_events, deadline, "post-pardon login", None).await?;
+    let pardon_login =
+        wait_login(&mut pardoned_events, deadline, "post-pardon login", None).await?;
     let pardon_lobby = wait_virtual_lobby_spawn(
         &mut pardoned_events,
         pardon_login,
@@ -2261,6 +3703,87 @@ async fn verify_global_moderation_roundtrip(
     Ok(())
 }
 
+async fn wait_permission_command_graph(
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    operator: bool,
+    deadline: &Deadline,
+) -> Result<()> {
+    within(deadline, "remote operator command graph update", async {
+        while let Some(event) = events.recv().await {
+            match event {
+                Event::Packet(packet) => {
+                    let ClientboundGamePacket::Commands(commands) = packet.as_ref() else {
+                        continue;
+                    };
+                    let root = commands
+                        .entries
+                        .get(commands.root_index as usize)
+                        .context("permission command graph root invalid")?;
+                    let names = root
+                        .children
+                        .iter()
+                        .map(|child| {
+                            Ok(commands
+                                .entries
+                                .get(*child as usize)
+                                .context("permission command graph child invalid")?
+                                .name())
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    if ["op", "deop", "ban", "pardon"]
+                        .iter()
+                        .all(|name| names.contains(&Some(*name)) == operator)
+                    {
+                        return Ok(());
+                    }
+                }
+                Event::Disconnect(reason) => {
+                    bail!("operator graph update disconnected player: {reason:?}")
+                }
+                _ => {}
+            }
+        }
+        bail!("remote op/deop did not update the actual Java command graph");
+    })
+    .await
+}
+
+async fn assert_persisted_ban(node: &Node, deadline: &Deadline) -> Result<()> {
+    let address = node
+        .unrelated_java
+        .as_deref()
+        .context("post-restart banned profile proxy missing")?;
+    within(deadline, "primary moderation persisted across restart", async {
+        let (client, mut events) = match Client::join(Account::offline(BOT_C), address).await {
+            Ok(connected) => connected,
+            Err(error) => {
+                if error.to_string().to_ascii_lowercase().contains("ban") {
+                    return Ok(());
+                }
+                bail!("post-restart banned login failed for a different reason: {error}")
+            }
+        };
+        while let Some(event) = events.recv().await {
+            match event {
+                Event::Disconnect(reason) => {
+                    let reason = reason.map_or_else(String::new, |text| text.to_string());
+                    if reason.to_ascii_lowercase().contains("ban") {
+                        client.disconnect();
+                        return Ok(());
+                    }
+                    bail!("post-restart banned profile disconnected for a different reason: {reason}")
+                }
+                Event::Login => bail!("primary restart admitted a persistently banned profile"),
+                Event::Packet(packet) if matches!(packet.as_ref(), ClientboundGamePacket::Login(_)) => {
+                    bail!("primary restart sent CLogin to a persistently banned profile")
+                }
+                _ => {}
+            }
+        }
+        bail!("banned profile connection closed without a ban decision")
+    }).await
+}
+
 async fn verify_cross_peer_chat_commands(
     bot_a: &Client,
     bot_b: &Client,
@@ -2269,19 +3792,49 @@ async fn verify_cross_peer_chat_commands(
     deadline: &Deadline,
 ) -> Result<()> {
     bot_a.chat(&format!("/msg {BOT_B} e2e-private-a"));
-    wait_chat_contains(b_events, "e2e-private-a", deadline, "cross-peer private message A to B").await?;
+    wait_chat_contains(
+        b_events,
+        "e2e-private-a",
+        deadline,
+        "cross-peer private message A to B",
+    )
+    .await?;
     bot_b.chat(&format!("/msg {BOT_A} e2e-private-b"));
-    wait_chat_contains(a_events, "e2e-private-b", deadline, "cross-peer private message B to A").await?;
+    wait_chat_contains(
+        a_events,
+        "e2e-private-b",
+        deadline,
+        "cross-peer private message B to A",
+    )
+    .await?;
     bot_a.chat("/me e2e-action-a");
-    wait_chat_contains(b_events, "e2e-action-a", deadline, "cross-peer /me delivery").await?;
+    wait_chat_contains(
+        b_events,
+        "e2e-action-a",
+        deadline,
+        "cross-peer /me delivery",
+    )
+    .await?;
     bot_a.chat("/say e2e-announcement-a");
-    wait_chat_contains(b_events, "e2e-announcement-a", deadline, "cross-peer /say delivery").await?;
+    wait_chat_contains(
+        b_events,
+        "e2e-announcement-a",
+        deadline,
+        "cross-peer /say delivery",
+    )
+    .await?;
     bot_a.chat("/team add E2eFixture");
     bot_a.chat(&format!("/team join E2eFixture {BOT_A}"));
     bot_a.chat(&format!("/team join E2eFixture {BOT_B}"));
     wait_ticks(bot_a, 3, deadline, "team membership publication").await?;
     bot_b.chat("/teammsg e2e-team-b");
-    wait_chat_contains(a_events, "e2e-team-b", deadline, "cross-peer team message B to A").await?;
+    wait_chat_contains(
+        a_events,
+        "e2e-team-b",
+        deadline,
+        "cross-peer team message B to A",
+    )
+    .await?;
     Ok(())
 }
 
@@ -2334,6 +3887,24 @@ async fn verify_remote_visuals(
             }
         }
         Ok(())
+    })
+    .await?;
+    within(deadline, "remote crouch state applied", async {
+        let mut ticks = observer.get_tick_broadcaster();
+        loop {
+            let remote = observer
+                .entity_by_uuid(actor_uuid)
+                .context("remote visual actor despawned")?;
+            let crouching = remote
+                .get_component::<azalea::entity::metadata::AbstractEntityShiftKeyDown>()
+                .is_some_and(|value| value.0);
+            if crouching {
+                return Ok(());
+            }
+            next_tick(&mut ticks)
+                .await
+                .context("Azalea tick stream closed before crouch application")?;
+        }
     })
     .await?;
     actor.set_crouching(false)?;
@@ -2460,13 +4031,20 @@ async fn verify_item_placement_and_rejection(
             &format!("cluster test {test_id} accepted"),
             deadline,
             &format!("accepted {test_id} setup"),
-        ).await?;
+        )
+        .await?;
         wait_until(actor, deadline, "item fixture client inventory", || {
-            let inventory = actor.get_inventory()?.menu()?.context("player inventory menu absent")?;
-            Ok(inventory.slots().get(40).is_some_and(|stack| {
-                stack.kind() == ItemKind::Stone && stack.count() == 2
-            }).then_some(()))
-        }).await?;
+            let inventory = actor
+                .get_inventory()?
+                .menu()?
+                .context("player inventory menu absent")?;
+            Ok(inventory
+                .slots()
+                .get(40)
+                .is_some_and(|stack| stack.kind() == ItemKind::Stone && stack.count() == 2)
+                .then_some(()))
+        })
+        .await?;
         actor.set_selected_hotbar_slot(4);
         actor.write_packet(ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
@@ -2534,40 +4112,58 @@ async fn wait_for_forwarded_profiles(
     deadline: &Deadline,
     stage: &str,
 ) -> Result<()> {
-    let outcome = time::timeout(Duration::from_secs(10), wait_until(client, deadline, stage, || {
-        let tab = client.tab_list().context("reading global lobby tab list")?;
-        for name in [BOT_A, BOT_B] {
-            let uuid = offline_uuid(name);
-            let Some(info) = tab.get(&uuid) else {
-                return Ok(None);
-            };
-            if info.profile.name != name || info.profile.uuid != uuid {
-                bail!("global profile identity differs for {name}");
+    let outcome = time::timeout(
+        Duration::from_secs(10),
+        wait_until(client, deadline, stage, || {
+            let tab = client.tab_list().context("reading global lobby tab list")?;
+            for name in [BOT_A, BOT_B] {
+                let uuid = offline_uuid(name);
+                let Some(info) = tab.get(&uuid) else {
+                    return Ok(None);
+                };
+                if info.profile.name != name || info.profile.uuid != uuid {
+                    bail!("global profile identity differs for {name}");
+                }
+                let texture = info
+                    .profile
+                    .properties
+                    .map
+                    .get("textures")
+                    .with_context(|| {
+                        format!("global profile for {name} has no texture property")
+                    })?;
+                let expected_value = format!("pumpkin-e2e-texture-{name}");
+                let expected_signature = format!("pumpkin-e2e-signature-{name}");
+                if texture.value != expected_value
+                    || texture.signature.as_deref() != Some(expected_signature.as_str())
+                {
+                    bail!("global texture property differs for {name}");
+                }
             }
-            let texture = info
-                .profile
-                .properties
-                .map
-                .get("textures")
-                .with_context(|| format!("global profile for {name} has no texture property"))?;
-            let expected_value = format!("pumpkin-e2e-texture-{name}");
-            let expected_signature = format!("pumpkin-e2e-signature-{name}");
-            if texture.value != expected_value
-                || texture.signature.as_deref() != Some(expected_signature.as_str())
-            {
-                bail!("global texture property differs for {name}");
-            }
-        }
-        Ok(Some(()))
-    })).await;
+            Ok(Some(()))
+        }),
+    )
+    .await;
     match outcome {
         Ok(result) => result,
         Err(_) => {
-            let tab = client.tab_list().context("reading tab list after profile deadline")?;
-            let observed = tab.iter().map(|(uuid, info)| {
-                format!("{}:{}:textures={}", info.profile.name, uuid, info.profile.properties.map.contains_key("textures"))
-            }).collect::<Vec<_>>();
-            bail!("{stage} did not receive both forwarded profiles within 10 seconds; observed tab entries: {observed:?}")
+            let tab = client
+                .tab_list()
+                .context("reading tab list after profile deadline")?;
+            let observed = tab
+                .iter()
+                .map(|(uuid, info)| {
+                    format!(
+                        "{}:{}:textures={}",
+                        info.profile.name,
+                        uuid,
+                        info.profile.properties.map.contains_key("textures")
+                    )
+                })
+                .collect::<Vec<_>>();
+            bail!(
+                "{stage} did not receive both forwarded profiles within 10 seconds; observed tab entries: {observed:?}"
+            )
         }
     }
 }
@@ -2668,6 +4264,88 @@ async fn verify_hide_visibility(
     Ok(())
 }
 
+async fn verify_primary_drop_lobby_capability(
+    actor: &Client,
+    observer: &Client,
+    actor_uuid: Uuid,
+    actor_events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    observer_events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    supervisor: &mut Supervisor,
+    executable: &Path,
+    primary: &Node,
+    deadline: &Deadline,
+) -> Result<()> {
+    while actor_events.try_recv().is_ok() {}
+    while observer_events.try_recv().is_ok() {}
+    let prior_position = actor.position()?;
+    actor.chat("/lobby");
+    wait_reentry_feedback(
+        actor_events,
+        "You are now waiting in the lobby.",
+        deadline,
+        "primary-drop lobby entry",
+    )
+    .await?;
+    wait_observer_presence(
+        observer,
+        observer_events,
+        actor_uuid,
+        false,
+        deadline,
+        "primary-drop lobby replica removal",
+    )
+    .await?;
+    let virtual_position = actor.position()?;
+    supervisor.stop_node(primary.id, deadline).await?;
+    actor.chat(&format!("/tp {BOT_B} 0.5 80 7.5"));
+    wait_for_position(
+        observer,
+        Vec3::new(0.5, 80.0, 7.5),
+        deadline,
+        "primary-drop remote /tp",
+    )
+    .await?;
+    wait_chat_contains(
+        actor_events,
+        "Teleported",
+        deadline,
+        "primary-drop remote /tp feedback",
+    )
+    .await?;
+    if position_changed(actor.position()?, virtual_position)
+        || observer.entity_id_by_uuid(actor_uuid).is_some()
+    {
+        bail!("primary-drop lobby command materialized the virtual actor")
+    }
+    assert_lobby_chat(actor, observer_events, deadline).await?;
+    supervisor.start_node(executable, primary)?;
+    actor.chat("/exitlobby");
+    wait_reentry_feedback(
+        actor_events,
+        "You left the lobby wait room.",
+        deadline,
+        "primary-drop lobby exit",
+    )
+    .await?;
+    wait_observer_presence(
+        observer,
+        observer_events,
+        actor_uuid,
+        true,
+        deadline,
+        "primary-drop replica restoration",
+    )
+    .await?;
+    wait_for_position(
+        actor,
+        prior_position,
+        deadline,
+        "primary-drop resumed position",
+    )
+    .await?;
+    Ok(())
+}
+
 async fn verify_manual_lobby_reentry(
     actor: &Client,
     observer: &Client,
@@ -2678,14 +4356,48 @@ async fn verify_manual_lobby_reentry(
 ) -> Result<()> {
     while actor_events.try_recv().is_ok() {}
     while observer_events.try_recv().is_ok() {}
+    let packet_preflight_lobby = env::var("PUMPKIN_E2E_SPEC_SCENARIOS")
+        .unwrap_or_default()
+        .split(',')
+        .any(|id| id == "packet-preflight-lobby");
+    if packet_preflight_lobby {
+        actor.chat(&format!("/op {BOT_B}"));
+        wait_chat_exact(
+            actor_events,
+            &format!("Queued /op for {BOT_B}; pending primary durability."),
+            deadline,
+            "independent preflight operator grant queued",
+        )
+        .await?;
+        wait_chat_exact(
+            actor_events,
+            "Cluster admin change is durable on the primary.",
+            deadline,
+            "independent preflight operator grant durable",
+        )
+        .await?;
+        wait_permission_command_graph(observer_events, true, deadline).await?;
+    }
     actor.chat("/clustertest departure-admin-lobby");
     wait_chat_exact(
         actor_events,
         "cluster test departure-admin-lobby staged",
         deadline,
         "manual lobby departure admin submission",
-    ).await?;
-    actor.chat("/lobby");
+    )
+    .await?;
+    spec_scenarios::arm_packet_preflight_departure(
+        actor,
+        actor_events,
+        deadline,
+        "packet-preflight-lobby",
+    )
+    .await?;
+    if packet_preflight_lobby {
+        observer.chat("/clustertest packet-preflight-lobby-depart");
+    } else {
+        actor.chat("/lobby");
+    }
     wait_reentry_feedback(
         actor_events,
         "You are now waiting in the lobby.",
@@ -2693,6 +4405,23 @@ async fn verify_manual_lobby_reentry(
         "manual lobby entry",
     )
     .await?;
+    if packet_preflight_lobby {
+        actor.chat(&format!("/deop {BOT_B}"));
+        wait_chat_exact(
+            actor_events,
+            &format!("Queued /deop for {BOT_B}; pending primary durability."),
+            deadline,
+            "independent preflight operator cleanup queued",
+        )
+        .await?;
+        wait_chat_exact(
+            actor_events,
+            "Cluster admin change is durable on the primary.",
+            deadline,
+            "independent preflight operator cleanup durable",
+        )
+        .await?;
+    }
     wait_observer_presence(
         observer,
         observer_events,
@@ -2724,6 +4453,36 @@ async fn verify_manual_lobby_reentry(
         "lobby operator remote teleport feedback",
     )
     .await?;
+    for command in [
+        format!("/tp {BOT_B} ~ ~ ~"),
+        format!("/tp {BOT_B} ^ ^ ^"),
+        format!("/tp {BOT_B} 0.5 80 6.5 ~ ~"),
+    ] {
+        let target_before = observer.position()?;
+        actor.chat(&command);
+        wait_chat_exact(
+            actor_events,
+            "An entity is required to run this command here",
+            deadline,
+            "virtual executor relative teleport rejection",
+        )
+        .await?;
+        for _ in 0..10 {
+            wait_ticks(
+                observer,
+                1,
+                deadline,
+                "relative lobby teleport remains unchanged",
+            )
+            .await?;
+            if position_changed(observer.position()?, target_before)
+                || position_changed(actor.position()?, virtual_position)
+                || observer.entity_id_by_uuid(actor_uuid).is_some()
+            {
+                bail!("relative lobby teleport mutated actor/target: {command}");
+            }
+        }
+    }
     actor.chat("/tp 0 80 6");
     wait_chat_exact(
         actor_events,
@@ -2736,6 +4495,26 @@ async fn verify_manual_lobby_reentry(
         || observer.entity_id_by_uuid(actor_uuid).is_some()
     {
         bail!("lobby operator command materialized or moved the virtual actor");
+    }
+    for command in ["op", "deop"] {
+        actor.chat(&format!("/{command} {BOT_B}"));
+        wait_chat_exact(
+            actor_events,
+            &format!("Queued /{command} for {BOT_B}; pending primary durability."),
+            deadline,
+            "virtual lobby UUID administration queued",
+        )
+        .await?;
+        wait_chat_exact(
+            actor_events,
+            "Cluster admin change is durable on the primary.",
+            deadline,
+            "virtual lobby UUID administration persisted",
+        )
+        .await?;
+        if observer.entity_id_by_uuid(actor_uuid).is_some() {
+            bail!("virtual lobby administration materialized the operator avatar");
+        }
     }
     assert_lobby_chat(actor, observer_events, deadline).await?;
     actor.chat("/exitlobby");
@@ -2760,7 +4539,8 @@ async fn verify_manual_lobby_reentry(
         Vec3::new(0.5, 80.0, 2.5),
         deadline,
         "accepted admin position after manual lobby",
-    ).await?;
+    )
+    .await?;
     let restored = observer
         .tab_list()
         .context("reading tab list after manual lobby")?
@@ -2888,7 +4668,10 @@ async fn assert_status_profiles_with_count(
         write_varint_vec(&mut frame, i32::try_from(handshake.len())?);
         frame.extend_from_slice(&handshake);
         frame.extend_from_slice(&[1, 0]);
-        stream.write_all(&frame).await.context("writing status request")?;
+        stream
+            .write_all(&frame)
+            .await
+            .context("writing status request")?;
         let length = usize::try_from(read_varint_async(&mut stream).await?)
             .context("negative status packet length")?;
         let mut response = vec![0; length];
@@ -2905,9 +4688,7 @@ async fn assert_status_profiles_with_count(
         let end = offset
             .checked_add(json_length)
             .context("status JSON length overflow")?;
-        let json = response
-            .get(offset..end)
-            .context("truncated status JSON")?;
+        let json = response.get(offset..end).context("truncated status JSON")?;
         serde_json::from_slice::<serde_json::Value>(json).context("decoding status JSON")
     })
     .await?;
@@ -2915,9 +4696,7 @@ async fn assert_status_profiles_with_count(
         .get("players")
         .and_then(serde_json::Value::as_object)
         .context("status has no players object")?;
-    if players.get("online").and_then(serde_json::Value::as_u64)
-        != Some(u64::try_from(online)?)
-    {
+    if players.get("online").and_then(serde_json::Value::as_u64) != Some(u64::try_from(online)?) {
         bail!("{stage} reported the wrong online count: {players:?}");
     }
     let sample = players
@@ -2944,9 +4723,10 @@ async fn assert_status_profiles_with_count(
             bail!("{stage} sample exposes {name}: {sample:?}");
         }
     }
-    if sample.iter().any(|entry| {
-        entry.get("name").and_then(serde_json::Value::as_str) == Some(BOT_C)
-    }) {
+    if sample
+        .iter()
+        .any(|entry| entry.get("name").and_then(serde_json::Value::as_str) == Some(BOT_C))
+    {
         bail!("{stage} sample exposes opted-out {BOT_C}: {sample:?}");
     }
     Ok(())
@@ -3008,18 +4788,27 @@ async fn prepare_arena(
     })
     .await?;
     for (client, name) in [(bot_a, BOT_A), (bot_b, BOT_B)] {
-        wait_until(client, deadline, &format!("arena deck and pits for {name}"), || {
-            let world = client.world()?;
-            let world = world.read();
-            let expected = [
-                (BlockPos::new(-1, 80, 0), BlockKind::Air.into()),
-                (BlockPos::new(-1, 79, 0), BlockKind::Stone.into()),
-                (BlockPos::new(0, 80, 0), BlockKind::Stone.into()),
-                (BlockPos::new(1, 80, 0), BlockKind::Air.into()),
-                (BlockPos::new(1, 79, 0), BlockKind::Stone.into()),
-            ];
-            Ok(expected.iter().all(|(pos, state)| world.get_block_state(*pos) == Some(*state)).then_some(()))
-        }).await?;
+        wait_until(
+            client,
+            deadline,
+            &format!("arena deck and pits for {name}"),
+            || {
+                let world = client.world()?;
+                let world = world.read();
+                let expected = [
+                    (BlockPos::new(-1, 80, 0), BlockKind::Air.into()),
+                    (BlockPos::new(-1, 79, 0), BlockKind::Stone.into()),
+                    (BlockPos::new(0, 80, 0), BlockKind::Stone.into()),
+                    (BlockPos::new(1, 80, 0), BlockKind::Air.into()),
+                    (BlockPos::new(1, 79, 0), BlockKind::Stone.into()),
+                ];
+                Ok(expected
+                    .iter()
+                    .all(|(pos, state)| world.get_block_state(*pos) == Some(*state))
+                    .then_some(()))
+            },
+        )
+        .await?;
     }
     let distance_squared = (expected_a.x - expected_b.x).powi(2)
         + (expected_a.y - expected_b.y).powi(2)
@@ -3042,6 +4831,17 @@ async fn verify_remote_spectate(
         .minecraft_id()
         .context("reading spectate target network entity id")?;
     while events.try_recv().is_ok() {}
+    assert_command_suggestions(
+        client,
+        events,
+        "/spectate ",
+        &[target],
+        &[],
+        0x5b05,
+        deadline,
+        "global /spectate suggestions",
+    )
+    .await?;
     client.chat(&format!("/spectate {target}"));
     within(deadline, "remote /spectate camera delivery", async {
         while let Some(event) = events.recv().await {
@@ -3053,12 +4853,15 @@ async fn verify_remote_spectate(
                         return Ok(());
                     }
                 }
-                Event::Disconnect(reason) => bail!("remote /spectate disconnected client: {reason:?}"),
+                Event::Disconnect(reason) => {
+                    bail!("remote /spectate disconnected client: {reason:?}")
+                }
                 _ => {}
             }
         }
         bail!("remote /spectate did not change the client camera")
-    }).await
+    })
+    .await
 }
 
 async fn verify_invsee_window(
@@ -3069,6 +4872,17 @@ async fn verify_invsee_window(
     deadline: &Deadline,
 ) -> Result<()> {
     while events.try_recv().is_ok() {}
+    assert_command_suggestions(
+        client,
+        events,
+        "/invsee edit ",
+        &[target],
+        &[],
+        0x5b06,
+        deadline,
+        "remote /invsee suggestions",
+    )
+    .await?;
     client.chat(&format!("/invsee edit {target}"));
     let container_id = within(deadline, "remote editable invsee presentation", async {
         let mut opened = None;
@@ -3091,6 +4905,12 @@ async fn verify_invsee_window(
                             if packet.items[slot].kind() != ItemKind::GrayStainedGlassPane {
                                 bail!("/invsee filler slot {slot} is not dark gray glass")
                             }
+                            if packet.items[slot]
+                                .get_component::<CustomName>()
+                                .is_none_or(|name| !name.name.to_string().is_empty())
+                            {
+                                bail!("/invsee filler slot {slot} exposes a visible item name")
+                            }
                         }
                         for (slot, expected) in [
                             (0, ItemKind::IronHelmet),
@@ -3103,7 +4923,10 @@ async fn verify_invsee_window(
                             (38, ItemKind::Arrow),
                         ] {
                             if packet.items[slot].kind() != expected {
-                                bail!("/invsee slot {slot} has {:?}, expected {expected:?}", packet.items[slot].kind())
+                                bail!(
+                                    "/invsee slot {slot} has {:?}, expected {expected:?}",
+                                    packet.items[slot].kind()
+                                )
                             }
                         }
                         if packet.items[38].count() != 64 {
@@ -3113,13 +4936,18 @@ async fn verify_invsee_window(
                     }
                     _ => {}
                 },
-                Event::Disconnect(reason) => bail!("client disconnected opening /invsee: {reason:?}"),
+                Event::Disconnect(reason) => {
+                    bail!("client disconnected opening /invsee: {reason:?}")
+                }
                 _ => {}
             }
         }
         bail!("/invsee window did not receive its complete content")
-    }).await?;
-    let open = client.get_inventory().context("reading editable /invsee window")?;
+    })
+    .await?;
+    let open = client
+        .get_inventory()
+        .context("reading editable /invsee window")?;
     if open.id() != container_id {
         bail!("Azalea did not retain the editable /invsee window")
     }
@@ -3131,7 +4959,8 @@ async fn verify_invsee_window(
         ItemKind::Air,
         deadline,
         "remote /invsee bow removal",
-    ).await?;
+    )
+    .await?;
     open.left_click(37usize);
     wait_inventory_slot_kind(
         target_events,
@@ -3140,7 +4969,8 @@ async fn verify_invsee_window(
         ItemKind::Bow,
         deadline,
         "remote /invsee bow restoration",
-    ).await?;
+    )
+    .await?;
     client.write_packet(ServerboundContainerClose { container_id });
     Ok(())
 }
@@ -3167,7 +4997,11 @@ async fn wait_inventory_slot_kind(
                     ClientboundGamePacket::ContainerSetContent(packet)
                         if packet.container_id == container_id =>
                     {
-                        if packet.items.get(slot as usize).is_some_and(|item| item.kind() == expected) {
+                        if packet
+                            .items
+                            .get(slot as usize)
+                            .is_some_and(|item| item.kind() == expected)
+                        {
                             return Ok(());
                         }
                     }
@@ -3178,7 +5012,8 @@ async fn wait_inventory_slot_kind(
             }
         }
         bail!("{stage} closed before the authoritative inventory update")
-    }).await
+    })
+    .await
 }
 
 async fn verify_beacon_menu(
@@ -3191,16 +5026,23 @@ async fn verify_beacon_menu(
     within(deadline, "accepted beacon fixture seed", async {
         while let Some(event) = events.recv().await {
             match event {
-                Event::Chat(chat) if chat.message().to_string() == "cluster test beacon prepared" => return Ok(()),
+                Event::Chat(chat)
+                    if chat.message().to_string() == "cluster test beacon prepared" =>
+                {
+                    return Ok(());
+                }
                 Event::Chat(chat) if chat.message().to_string() == "cluster test beacon failed" => {
                     bail!("beacon world preparation failed")
                 }
-                Event::Disconnect(reason) => bail!("Azalea disconnected during beacon setup: {reason:?}"),
+                Event::Disconnect(reason) => {
+                    bail!("Azalea disconnected during beacon setup: {reason:?}")
+                }
                 _ => {}
             }
         }
         bail!("Azalea event stream closed before beacon preparation")
-    }).await?;
+    })
+    .await?;
     client.write_packet(ServerboundUseItemOn {
         hand: InteractionHand::MainHand,
         block_hit: BlockHit {
@@ -3219,35 +5061,59 @@ async fn verify_beacon_menu(
         let mut accepted = false;
         while let Some(event) = events.recv().await {
             match event {
-                Event::Chat(chat) if chat.message().to_string() == "cluster test beacon accepted" => accepted = true,
-                Event::Chat(chat) if chat.message().to_string() == "cluster test beacon failed" => bail!("beacon seed was rejected"),
+                Event::Chat(chat)
+                    if chat.message().to_string() == "cluster test beacon accepted" =>
+                {
+                    accepted = true
+                }
+                Event::Chat(chat) if chat.message().to_string() == "cluster test beacon failed" => {
+                    bail!("beacon seed was rejected")
+                }
                 Event::Packet(packet) => match packet.as_ref() {
-                    ClientboundGamePacket::OpenScreen(packet) if packet.menu_type == MenuKind::Beacon => {
+                    ClientboundGamePacket::OpenScreen(packet)
+                        if packet.menu_type == MenuKind::Beacon =>
+                    {
                         opened = Some(packet.container_id);
                     }
                     ClientboundGamePacket::ContainerSetContent(packet)
-                        if opened == Some(packet.container_id) && packet.items.first().is_some_and(|item| item.count() == 1) => {
+                        if opened == Some(packet.container_id)
+                            && packet.items.first().is_some_and(|item| item.count() == 1) =>
+                    {
                         payment = true;
                     }
                     ClientboundGamePacket::ContainerSetData(packet)
-                        if opened == Some(packet.container_id) && packet.id == 0 && packet.value >= 1 => {
+                        if opened == Some(packet.container_id)
+                            && packet.id == 0
+                            && packet.value >= 1 =>
+                    {
                         levels = true;
                     }
                     _ => {}
                 },
-                Event::Disconnect(reason) => bail!("Azalea disconnected during beacon menu open: {reason:?}"),
+                Event::Disconnect(reason) => {
+                    bail!("Azalea disconnected during beacon menu open: {reason:?}")
+                }
                 _ => {}
             }
             if let Some(container_id) = opened
-                && payment && levels && accepted
+                && payment
+                && levels
+                && accepted
             {
                 return Ok(container_id);
             }
         }
         bail!("Azalea event stream closed before the accepted beacon menu")
-    }).await?;
-    client.write_packet(ServerboundSetBeacon { primary: Some(1), secondary: None });
-    client.write_packet(ServerboundSetBeacon { primary: Some(3), secondary: None });
+    })
+    .await?;
+    client.write_packet(ServerboundSetBeacon {
+        primary: Some(1),
+        secondary: None,
+    });
+    client.write_packet(ServerboundSetBeacon {
+        primary: Some(3),
+        secondary: None,
+    });
     within(deadline, "beacon conflict conservation", async {
         let mut configured = false;
         let mut conserved = false;
@@ -3255,24 +5121,42 @@ async fn verify_beacon_menu(
         let mut effect = false;
         while let Some(event) = events.recv().await {
             match event {
-                Event::Chat(chat) if chat.message().to_string() == "cluster test beacon configured" => configured = true,
-                Event::Chat(chat) if chat.message().to_string() == "cluster test beacon conserved" => conserved = true,
+                Event::Chat(chat)
+                    if chat.message().to_string() == "cluster test beacon configured" =>
+                {
+                    configured = true
+                }
+                Event::Chat(chat)
+                    if chat.message().to_string() == "cluster test beacon conserved" =>
+                {
+                    conserved = true
+                }
                 Event::Packet(packet) => match packet.as_ref() {
                     ClientboundGamePacket::ContainerSetSlot(packet)
-                        if packet.container_id == container_id && packet.slot == 0 && packet.item_stack.is_empty() => {
+                        if packet.container_id == container_id
+                            && packet.slot == 0
+                            && packet.item_stack.is_empty() =>
+                    {
                         empty_payment = true;
                     }
                     ClientboundGamePacket::ContainerSetContent(packet)
-                        if packet.container_id == container_id && packet.items.first().is_some_and(|item| item.is_empty()) => {
+                        if packet.container_id == container_id
+                            && packet.items.first().is_some_and(|item| item.is_empty()) =>
+                    {
                         empty_payment = true;
                     }
                     ClientboundGamePacket::ContainerSetData(packet)
-                        if packet.container_id == container_id && packet.id == 1 && matches!(packet.value, 1 | 3) => {
+                        if packet.container_id == container_id
+                            && packet.id == 1
+                            && matches!(packet.value, 1 | 3) =>
+                    {
                         effect = true;
                     }
                     _ => {}
                 },
-                Event::Disconnect(reason) => bail!("Azalea disconnected during beacon conflict: {reason:?}"),
+                Event::Disconnect(reason) => {
+                    bail!("Azalea disconnected during beacon conflict: {reason:?}")
+                }
                 _ => {}
             }
             if configured && conserved && empty_payment && effect {
@@ -3280,7 +5164,8 @@ async fn verify_beacon_menu(
             }
         }
         bail!("Azalea event stream closed before beacon conflict settled")
-    }).await?;
+    })
+    .await?;
     client.write_packet(ServerboundContainerClose { container_id });
     Ok(())
 }
@@ -3409,7 +5294,10 @@ where
 {
     let mut buffer = [0; 16 * 1024];
     loop {
-        let read = reader.read(&mut buffer).await.context("reading delayed relay")?;
+        let read = reader
+            .read(&mut buffer)
+            .await
+            .context("reading delayed relay")?;
         if read == 0 {
             writer.shutdown().await.context("closing delayed relay")?;
             return Ok(());
@@ -3542,7 +5430,7 @@ async fn wait_login(
                     if disconnects != 0 {
                         eprintln!("{stage} recovered after {disconnects} pre-login disconnects");
                     }
-                    return Ok(evidence)
+                    return Ok(evidence);
                 }
                 Event::Disconnect(reason) => {
                     disconnects += 1;
@@ -3560,7 +5448,10 @@ async fn wait_login(
                     let before = evidence.packet_trace.len();
                     evidence.observe(packet.as_ref())?;
                     if evidence.packet_trace.len() > before && evidence.packet_trace.len() <= 10 {
-                        eprintln!("{stage} lobby packet trace: {}", evidence.packet_trace.join(" -> "));
+                        eprintln!(
+                            "{stage} lobby packet trace: {}",
+                            evidence.packet_trace.join(" -> ")
+                        );
                     }
                 }
                 _ => {}
@@ -3630,6 +5521,19 @@ async fn wait_virtual_lobby_spawn(
                 && evidence.platform_block_entities.len() == 256
                 && evidence.received_commands
             {
+                if started.is_some() {
+                    let login_received = evidence.login_received_at
+                        .context("complete lobby scene arrived without decoded CLogin timestamp")?;
+                    let scene_elapsed = login_received.elapsed();
+                    let one_way_delay = env::var("PUMPKIN_E2E_ONE_WAY_DELAY_MS")
+                        .ok()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .unwrap_or(0);
+                    let allowed = Duration::from_millis(one_way_delay.saturating_mul(2).saturating_add(250));
+                    if scene_elapsed > allowed {
+                        bail!("{stage} CLogin-to-complete-scene exceeded {allowed:?}: {scene_elapsed:?}")
+                    }
+                }
                 return Ok(evidence);
             }
         }
@@ -3646,7 +5550,7 @@ async fn wait_for_player_transition(
     deadline: &Deadline,
     stage: &str,
 ) -> Result<Uuid> {
-    wait_for_local_promotion(client, events, name, deadline, stage).await?;
+    wait_for_local_promotion(client, events, name, false, deadline, stage).await?;
     wait_for_player(client, name, deadline, stage).await
 }
 
@@ -3679,6 +5583,12 @@ async fn wait_for_local_promotion(
         let mut promotion_packets = Vec::new();
         let started = time::Instant::now();
         let mut reported = false;
+        let change_pinned_view = name == BOT_A
+            && env::var("PUMPKIN_E2E_SPEC_SCENARIOS")
+                .unwrap_or_default()
+                .split(',')
+                .any(|scenario| scenario == "pinned-radius-view-change");
+        let mut changed_pinned_view = false;
         loop {
             tokio::select! {
                 tick = next_tick(&mut ticks) => {
@@ -3706,12 +5616,22 @@ async fn wait_for_local_promotion(
                         && lobby_chat_responsive
                         && lobby_suggestions_responsive
                         && durable_admin
+                        && (!change_pinned_view || changed_pinned_view)
                         && client.position().is_ok_and(|position| position.x.abs() < 100_000.0 && position.z.abs() < 100_000.0)
                     {
                         let ordered = ["PlayerPosition", "ContainerSetContent", "SetHealth", "PlayerAbilities", "ChangeGameMode", "SetCamera", "RemoveEntities"];
                         let indices = ordered.map(|name| promotion_packets.iter().position(|packet| packet == name));
                         if !indices.windows(2).all(|pair| pair[0] < pair[1]) {
                             bail!("lobby handoff packet order diverged from recovered teleport-first sequence: {}", promotion_packets.join(" -> "))
+                        }
+                        if env::var_os("PUMPKIN_E2E_FULL_RADIUS").is_some() {
+                            let max_ms = env::var("PUMPKIN_E2E_RECOVERED_HANDOFF_MAX_MS")
+                                .context("full-radius performance gate requires PUMPKIN_E2E_RECOVERED_HANDOFF_MAX_MS measured from the recovered build")?
+                                .parse::<u64>()
+                                .context("invalid recovered full-radius handoff limit")?;
+                            if started.elapsed() > Duration::from_millis(max_ms) {
+                                bail!("{stage} full-radius handoff regressed past recovered limit {max_ms} ms: {:?}", started.elapsed());
+                            }
                         }
                         eprintln!("{stage} promotion packets: {}", promotion_packets.join(" -> "));
                         return Ok(());
@@ -3750,6 +5670,14 @@ async fn wait_for_local_promotion(
                                 ClientboundGamePacket::SetChunkCacheCenter(_) => {
                                     promotion_packets.push(String::from("SetChunkCacheCenter"));
                                     last_packet_was_center = true;
+                                    if change_pinned_view && !changed_pinned_view {
+                                        client.set_client_information(ClientInformation {
+                                            view_distance: 2,
+                                            allows_listing: true,
+                                            ..ClientInformation::default()
+                                        })?;
+                                        changed_pinned_view = true;
+                                    }
                                     client.chat("/list");
                                     client.write_packet(ServerboundCommandSuggestion {
                                         id: 0x5a20,
@@ -3926,8 +5854,10 @@ async fn wait_for_position(
         let position = client.position()?;
         Ok(((position.x - expected.x).abs() < 0.01
             && (position.y - expected.y).abs() < 0.01
-            && (position.z - expected.z).abs() < 0.01).then_some(()))
-    }).await
+            && (position.z - expected.z).abs() < 0.01)
+            .then_some(()))
+    })
+    .await
 }
 
 async fn wait_ticks(client: &Client, count: usize, deadline: &Deadline, stage: &str) -> Result<()> {
@@ -4241,8 +6171,9 @@ fn write_config(node: &Node, nodes: &[Node], sntp: &str) -> Result<()> {
     let java_enabled = node.java.is_some();
     let java_address = node.java.as_deref().unwrap_or("127.0.0.1:25565");
     let save_player_data = node.role == "primary";
+    let bootstrap_vanilla_world = node.role == "primary";
     let config = format!(
-        "seed = \"1787949120387005756\"\ndefault_level_name = \"world\"\n\n[world]\nautosave_ticks = 6000\n\n[world.chunk]\ntype = \"anvil\"\nwrite_in_place = false\n\n[networking.java]\nenabled = {java_enabled}\naddress = \"{java_address}\"\nonline_mode = false\nencryption = false\n\n[networking.proxy]\nenabled = {java_enabled}\n\n[networking.proxy.bungeecord]\nenabled = {java_enabled}\nsecret = \"\"\n\n[networking.bedrock]\nenabled = false\n\n[networking.bedrock.nethernet]\nenabled = false\naddress = \"127.0.0.1:19132\"\n\n[networking.query]\nenabled = false\naddress = \"127.0.0.1:25565\"\n\n[networking.rcon]\nenabled = false\naddress = \"127.0.0.1:25575\"\n\n[networking.lan_broadcast]\nenabled = false\n\n[player_data]\nsave_player_data = {save_player_data}\n\n[cluster]\nenabled = true\nrole = \"{}\"\nserver_id = {}\nprimary_server_id = 0\nbind_addr = \"{}\"\ncert_path = \"cluster-cert.der\"\nkey_path = \"cluster-key.der\"\npeers = [{peers}]\nntp_servers = [\"{sntp}\"]\nmax_offset_millis = 25\n\n[telemetry]\nenabled = false\n",
+        "seed = \"1787949120387005756\"\ndefault_level_name = \"world\"\n\n[world]\nautosave_ticks = 6000\n\n[world.chunk]\ntype = \"anvil\"\nwrite_in_place = false\n\n[networking.java]\nenabled = {java_enabled}\naddress = \"{java_address}\"\nonline_mode = false\nencryption = false\n\n[networking.proxy]\nenabled = {java_enabled}\n\n[networking.proxy.bungeecord]\nenabled = {java_enabled}\nsecret = \"\"\n\n[networking.bedrock]\nenabled = false\n\n[networking.bedrock.nethernet]\nenabled = false\naddress = \"127.0.0.1:19132\"\n\n[networking.query]\nenabled = false\naddress = \"127.0.0.1:25565\"\n\n[networking.rcon]\nenabled = false\naddress = \"127.0.0.1:25575\"\n\n[networking.lan_broadcast]\nenabled = false\n\n[player_data]\nsave_player_data = {save_player_data}\n\n[cluster]\nenabled = true\nrole = \"{}\"\nserver_id = {}\nbootstrap_vanilla_world = {bootstrap_vanilla_world}\nbind_addr = \"{}\"\ncert_path = \"cluster-cert.der\"\nkey_path = \"cluster-key.der\"\npeers = [{peers}]\nntp_servers = [\"{sntp}\"]\nmax_offset_millis = 25\n\n[telemetry]\nenabled = false\n",
         node.role, node.id, node.quic
     );
     fs::write(node.root.join("pumpkin.toml"), config)
@@ -4250,7 +6181,7 @@ fn write_config(node: &Node, nodes: &[Node], sntp: &str) -> Result<()> {
 }
 
 fn write_ops(primary_root: &Path) -> Result<()> {
-    let ops = [BOT_A, BOT_B]
+    let mut ops = [BOT_A, BOT_B]
         .into_iter()
         .map(|name| {
             serde_json::json!({
@@ -4261,17 +6192,100 @@ fn write_ops(primary_root: &Path) -> Result<()> {
             })
         })
         .collect::<Vec<_>>();
-    let bytes = serde_json::to_vec_pretty(&ops)
-        .context("serializing deterministic offline operators")?;
+    if env::var_os("PUMPKIN_E2E_LARGE_ADMIN").is_some() {
+        for index in 0..12_000_u128 {
+            ops.push(serde_json::json!({
+                "uuid": Uuid::from_u128(0x9a10_0000_0000_0000_0000_0000_0000_0000 | index),
+                "name": format!("Test{index:012x}"),
+                "level": 1,
+                "bypasses_player_limit": false,
+            }));
+        }
+    }
+    let bytes =
+        serde_json::to_vec_pretty(&ops).context("serializing deterministic offline operators")?;
+    if env::var_os("PUMPKIN_E2E_LARGE_ADMIN").is_some() && bytes.len() <= 1_048_576 {
+        bail!("large administration fixture did not exceed the one-MiB snapshot boundary");
+    }
     fs::write(primary_root.join("ops.json"), &bytes)
         .with_context(|| format!("writing {}", primary_root.join("ops.json").display()))?;
     let bootstrap = primary_root.join("data/ops.json");
-    fs::create_dir_all(bootstrap.parent().context("operator bootstrap parent missing")?)
-        .context("creating operator bootstrap directory")?;
-    fs::write(&bootstrap, bytes)
-        .with_context(|| format!("writing {}", bootstrap.display()))
+    fs::create_dir_all(
+        bootstrap
+            .parent()
+            .context("operator bootstrap parent missing")?,
+    )
+    .context("creating operator bootstrap directory")?;
+    fs::write(&bootstrap, bytes).with_context(|| format!("writing {}", bootstrap.display()))
 }
 
 fn offline_uuid(name: &str) -> Uuid {
     Account::offline(name).uuid()
+}
+
+async fn verify_retiring_reconnect_lobby(
+    client: &Client,
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    evidence: &mut LobbyPacketEvidence,
+    callback_started: time::Instant,
+    deadline: &Deadline,
+) -> Result<()> {
+    let earliest_completion = callback_started + Duration::from_secs(3);
+    if time::Instant::now() >= earliest_completion {
+        bail!("reconnect did not establish virtual lobby while original callback was pending");
+    }
+    if !evidence.progress_subtitles.is_empty() {
+        bail!("reconnect pinned progress before original delayed callback completed");
+    }
+    client.chat("/list");
+    within(deadline,"responsive reconnect while retirement is pending",async {
+        let mut responsive=false;
+        loop {
+            tokio::select! {
+                _=time::sleep_until(earliest_completion)=>{
+                    if !responsive {bail!("pending retirement stalled normal virtual lobby /list");}
+                    return Ok(());
+                }
+                event=events.recv()=>match event {
+                    Some(Event::Packet(packet))=>{
+                        match packet.as_ref() {
+                            ClientboundGamePacket::LevelChunkWithLight(chunk) if !evidence.chunk_positions.contains(&(chunk.x,chunk.z))=>bail!("real chunk arrived before old callback could complete"),
+                            ClientboundGamePacket::PlayerPosition(position) if (position.change.pos.x-1_000_008.5).abs()>0.01 || (position.change.pos.z-1_000_008.5).abs()>0.01=>bail!("real teleport arrived before old callback could complete"),
+                            ClientboundGamePacket::ContainerSetContent(_)|ClientboundGamePacket::SetHealth(_)=>bail!("real player state arrived before old callback could complete"),
+                            _=>{}
+                        }
+                        evidence.observe(packet.as_ref())?;
+                        if !evidence.progress_subtitles.is_empty() {bail!("target progress was pinned before old callback could complete");}
+                    }
+                    Some(Event::Chat(chat))=>{responsive|=chat.message().to_string().contains(BOT_B);}
+                    Some(Event::Disconnect(reason))=>bail!("reconnect disconnected during retirement barrier: {reason:?}"),
+                    None=>bail!("reconnect event stream closed during retirement barrier"),
+                    _=>{}
+                }
+            }
+        }
+    }).await
+}
+
+async fn wait_first_reconnect_progress(
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    evidence: &mut LobbyPacketEvidence,
+    deadline: &Deadline,
+) -> Result<()> {
+    within(deadline,"first retained reconnect progress",async {
+        while evidence.progress_subtitles.is_empty() {
+            match events.recv().await {
+                Some(Event::Packet(packet))=>{
+                    if matches!(packet.as_ref(),ClientboundGamePacket::LevelChunkWithLight(chunk) if !evidence.chunk_positions.contains(&(chunk.x,chunk.z))) {
+                        bail!("real chunks arrived before first retained progress");
+                    }
+                    evidence.observe(packet.as_ref())?;
+                }
+                Some(Event::Disconnect(reason))=>bail!("reconnect disconnected before retained progress: {reason:?}"),
+                None=>bail!("reconnect stream closed before retained progress"),
+                _=>{}
+            }
+        }
+        Ok(())
+    }).await
 }

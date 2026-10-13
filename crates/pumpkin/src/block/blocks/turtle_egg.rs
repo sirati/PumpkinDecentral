@@ -90,7 +90,20 @@ impl TurtleEggBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for TurtleEggBlock {
+    fn player_broken_intent(
+        &self,
+        args: crate::block::neighbor::PlayerBrokenIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        Some(vec![crate::block::neighbor::BlockCallbackEffect::Sound {
+            position: *args.position,
+            sound: Sound::EntityTurtleEggBreak,
+            volume_milli: 1000,
+            pitch_milli: 1000,
+        }])
+    }
+
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         if args.player.get_entity().pose.load() != EntityPose::Crouching
             && let BlockIsReplacing::Itself(state_id) = args.replacing

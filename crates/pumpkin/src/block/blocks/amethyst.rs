@@ -34,6 +34,7 @@ impl BlockMetadata for AmethystBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for AmethystBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut props = AmethystClusterLikeProperties::from_state_id(args.block.default_state.id);
@@ -69,6 +70,7 @@ impl WallMountedBlock for AmethystBlock {
 #[pumpkin_block("minecraft:budding_amethyst")]
 pub struct BuddingAmethystBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for BuddingAmethystBlock {
     fn random_tick(&self, args: RandomTickArgs<'_>) {
         if rand::rng().random_range(0..5) == 0 {

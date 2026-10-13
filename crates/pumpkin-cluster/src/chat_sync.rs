@@ -71,21 +71,70 @@ impl PrivateChatRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamChatBroadcast {
+    pub message_id: [u8; 16],
+    pub source: crate::realm_completion::PeerGeneration,
     pub sender: GlobalPlayerId,
+    pub sender_uuid: [u8; 16],
+    pub sender_session: u64,
     pub sender_name: String,
+    pub world: crate::protocol::WorldId,
     pub team: String,
     pub body: String,
+    #[serde(deserialize_with = "crate::bounded_vec::deserialize")]
+    pub recipients: Vec<[u8; 16]>,
+    pub team_display_json: String,
+    pub sender_display_json: String,
 }
 
 impl TeamChatBroadcast {
     #[must_use]
-    pub fn new(sender: GlobalPlayerId, sender_name: String, team: String, body: String) -> Self {
+    pub fn new(
+        sender: GlobalPlayerId,
+        sender_name: String,
+        world: crate::protocol::WorldId,
+        team: String,
+        body: String,
+        source: crate::realm_completion::PeerGeneration,
+        sender_uuid: [u8; 16],
+        sender_session: u64,
+        recipients: Vec<[u8; 16]>,
+        team_display_json: String,
+        sender_display_json: String,
+    ) -> Self {
         Self {
+            message_id: *uuid::Uuid::new_v4().as_bytes(),
+            source,
             sender,
+            sender_uuid,
+            sender_session,
             sender_name,
+            world,
             team,
             body,
+            recipients,
+            team_display_json,
+            sender_display_json,
         }
+    }
+
+    pub fn valid(&self) -> bool {
+        self.message_id != [0; 16]
+            && self.sender_uuid != [0; 16]
+            && self.recipients.iter().all(|uuid| *uuid != [0; 16])
+            && self.source.server == self.sender.server
+            && self.source.generation != 0
+            && self.sender_session != 0
+            && is_valid_chat_name(&self.sender_name)
+            && is_valid_chat_body(&self.body)
+            && !self.team.is_empty()
+            && self.team.len() <= 4096
+            && self.recipients.len() <= 4096
+            && self.recipients.windows(2).all(|pair| pair[0] < pair[1])
+            && self.recipients.binary_search(&self.sender_uuid).is_ok()
+            && !self.team_display_json.is_empty()
+            && self.team_display_json.len() <= 262144
+            && !self.sender_display_json.is_empty()
+            && self.sender_display_json.len() <= 262144
     }
 }
 
@@ -193,15 +242,37 @@ pub fn canonical_chat_key(name: &str) -> String {
 }
 
 pub fn encode_control_message(message: &ChatControlMessage) -> Result<Vec<u8>, ChatSyncError> {
-    postcard::to_allocvec(message).map_err(|error| ChatSyncError {
+    if matches!(message, ChatControlMessage::Team(team) if !team.valid()) {
+        return Err(ChatSyncError {
+            message: "invalid frozen team message".into(),
+        });
+    }
+    let bytes = postcard::to_allocvec(message).map_err(|error| ChatSyncError {
         message: format!("encode chat control: {error}"),
-    })
+    })?;
+    if bytes.len() > 900_000 {
+        return Err(ChatSyncError {
+            message: "chat control payload exceeds budget".into(),
+        });
+    }
+    Ok(bytes)
 }
 
 pub fn decode_control_message(bytes: &[u8]) -> Result<ChatControlMessage, ChatSyncError> {
-    postcard::from_bytes(bytes).map_err(|error| ChatSyncError {
+    if bytes.len() > 900_000 {
+        return Err(ChatSyncError {
+            message: "chat control payload exceeds budget".into(),
+        });
+    }
+    let message = postcard::from_bytes(bytes).map_err(|error| ChatSyncError {
         message: format!("decode chat control: {error}"),
-    })
+    })?;
+    if matches!(&message, ChatControlMessage::Team(team) if !team.valid()) {
+        return Err(ChatSyncError {
+            message: "invalid frozen team message".into(),
+        });
+    }
+    Ok(message)
 }
 
 pub fn control_parcels_for_peers(
@@ -524,9 +595,61 @@ mod tests {
         TeamChatBroadcast::new(
             gid(1, 1),
             String::from("Alice"),
+            crate::protocol::WorldId::new(0, 1),
             String::from("red"),
             String::from("go red"),
+            crate::realm_completion::PeerGeneration {
+                server: ServerId(1),
+                generation: 11,
+            },
+            [1; 16],
+            7,
+            vec![[1; 16], [2; 16]],
+            String::from("{\"text\":\"Red\"}"),
+            String::from("{\"text\":\"Alice\"}"),
         )
+    }
+
+    #[test]
+    fn team_message_freezes_recipients_and_formatted_displays_through_wire() {
+        let original = team();
+        assert!(original.valid());
+        let bytes = encode_control_message(&ChatControlMessage::Team(original.clone())).unwrap();
+        let ChatControlMessage::Team(decoded) = decode_control_message(&bytes).unwrap() else {
+            panic!("missing team message")
+        };
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.recipients, [[1; 16], [2; 16]]);
+        assert_eq!(decoded.sender_session, 7);
+        assert_eq!(decoded.source.generation, 11);
+    }
+
+    #[test]
+    fn team_recipient_identity_and_payload_bounds_are_validated() {
+        let mut message = team();
+        message.recipients.push([1; 16]);
+        assert!(!message.valid());
+        message = team();
+        message.recipients = vec![[2; 16]];
+        assert!(!message.valid());
+        message = team();
+        message.message_id = [0; 16];
+        assert!(!message.valid());
+        message = team();
+        message.sender_uuid = [0; 16];
+        assert!(!message.valid());
+        message = team();
+        message.recipients.insert(0, [0; 16]);
+        assert!(!message.valid());
+        message = team();
+        message.sender_session = 0;
+        assert!(!message.valid());
+        message = team();
+        message.source.server = ServerId(9);
+        assert!(!message.valid());
+        message = team();
+        message.team_display_json = "x".repeat(262145);
+        assert!(!message.valid());
     }
 
     fn say() -> SayChatBroadcast {

@@ -14,7 +14,8 @@ pub const INV_ARMOR: u8 = 1;
 pub const INV_OFFHAND: u8 = 2;
 pub const INV_CURSOR: u8 = 3;
 pub const INV_SELECTED: u8 = 4;
-pub const INV_MAX_STACK: u8 = 64;
+pub const INV_MAX_STACK: u8 = 99;
+pub const INV_DEFAULT_STACK_LIMIT: u8 = 64;
 pub const INVENTORY_SERVICE_MAX_SLOTS: usize = 128;
 pub const INVENTORY_MAX_NBT_BYTES: usize = 1 << 20;
 
@@ -22,7 +23,7 @@ pub const INVENTORY_MAX_NBT_BYTES: usize = 1 << 20;
 pub struct EntityInventoryId {
     pub origin: crate::identity::ServerId,
     pub local_id: i32,
-    pub generation: u32,
+    pub generation: u64,
 }
 
 impl From<EntityRef> for EntityInventoryId {
@@ -48,6 +49,11 @@ impl From<GlobalEntityId> for EntityInventoryId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum InventoryTarget {
     Player(GlobalPlayerId),
+    LeasedPlayer {
+        key: uuid::Uuid,
+        player: GlobalPlayerId,
+        incarnation: u64,
+    },
     Entity(EntityInventoryId),
     Block {
         chunk: ChunkKey,
@@ -56,6 +62,21 @@ pub enum InventoryTarget {
     Virtual {
         host: crate::identity::ServerId,
         owner: ActorId,
+        session: u64,
+        kind: u16,
+    },
+    LeasedVirtual {
+        host: crate::identity::ServerId,
+        key: uuid::Uuid,
+        player: GlobalPlayerId,
+        incarnation: u64,
+        session: u64,
+        kind: u16,
+    },
+    BlockVirtual {
+        host: crate::identity::ServerId,
+        chunk: ChunkKey,
+        position: BlockPos,
         session: u64,
         kind: u16,
     },
@@ -69,26 +90,44 @@ impl From<GlobalPlayerId> for InventoryTarget {
 
 impl InventoryTarget {
     #[must_use]
+    pub const fn is_screen_virtual(self) -> bool {
+        matches!(self, Self::Virtual { kind, .. } | Self::LeasedVirtual { kind, .. } | Self::BlockVirtual { kind, .. } if kind != 0x100)
+    }
+
+    #[must_use]
     pub const fn intrinsic_chunk(self) -> Option<ChunkKey> {
         match self {
-            Self::Block { chunk, .. } => Some(chunk),
-            Self::Player(_) | Self::Entity(_) | Self::Virtual { .. } => None,
+            Self::Block { chunk, .. } | Self::BlockVirtual { chunk, .. } => Some(chunk),
+            Self::Player(_)
+            | Self::LeasedPlayer { .. }
+            | Self::Entity(_)
+            | Self::Virtual { .. }
+            | Self::LeasedVirtual { .. } => None,
         }
     }
 
     #[must_use]
     pub const fn is_valid(self) -> bool {
         match self {
-            Self::Block { chunk, position } => {
+            Self::Block { chunk, position }
+            | Self::BlockVirtual {
+                chunk, position, ..
+            } => {
                 position.x.div_euclid(16) == chunk.position.x
                     && position.z.div_euclid(16) == chunk.position.z
             }
+            Self::Virtual {
+                owner: ActorId::Peer(_),
+                ..
+            } => false,
+            Self::LeasedPlayer { incarnation, .. } => incarnation != 0,
+            Self::LeasedVirtual { incarnation, .. } => incarnation != 0,
             Self::Player(_) | Self::Entity(_) | Self::Virtual { .. } => true,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct InvLoc {
     pub inv: u8,
     pub slot: u16,
@@ -126,6 +165,64 @@ pub struct InventoryStateSnapshot {
     pub cells: Vec<InventoryCell>,
 }
 
+impl InventoryStateSnapshot {
+    pub fn has_complete_persistent_cells(&self) -> bool {
+        if matches!(
+            self.target,
+            InventoryTarget::Player(_) | InventoryTarget::LeasedPlayer { .. }
+        ) {
+            return self.has_complete_player_cells();
+        }
+        let InventoryTarget::LeasedVirtual {
+            kind, session: 0, ..
+        } = self.target
+        else {
+            return true;
+        };
+        let count = match kind {
+            crate::avatar_lifecycle::PLAYER_CRAFTING_INVENTORY_KIND => 5,
+            crate::avatar_lifecycle::PLAYER_ENDER_INVENTORY_KIND => 27,
+            _ => return true,
+        };
+        let mut expected = (0..count)
+            .map(|slot| InvLoc::new(INV_MAIN, slot))
+            .collect::<std::collections::BTreeSet<_>>();
+        self.cells.len() == expected.len()
+            && self.cells.iter().all(|cell| {
+                expected.remove(&cell.loc)
+                    && cell.count <= INV_MAX_STACK
+                    && (cell.item == 0) == (cell.count == 0)
+                    && cell.nbt.len() <= INVENTORY_MAX_NBT_BYTES
+                    && (!cell.is_empty() || cell.nbt.is_empty())
+            })
+            && expected.is_empty()
+    }
+
+    pub fn has_complete_player_cells(&self) -> bool {
+        if !matches!(
+            self.target,
+            InventoryTarget::Player(_) | InventoryTarget::LeasedPlayer { .. }
+        ) {
+            return false;
+        }
+        let mut expected = crate::avatar_lifecycle::PlayerInventoryAdmission::slots()
+            .collect::<std::collections::BTreeSet<_>>();
+        self.cells.len() == expected.len()
+            && self.cells.iter().all(|cell| {
+                expected.remove(&cell.loc)
+                    && cell.nbt.len() <= INVENTORY_MAX_NBT_BYTES
+                    && if cell.loc.inv == INV_SELECTED {
+                        (1..=9).contains(&cell.item) && cell.count == 1 && cell.nbt.is_empty()
+                    } else {
+                        cell.count <= INV_MAX_STACK
+                            && (cell.item == 0) == (cell.count == 0)
+                            && (!cell.is_empty() || cell.nbt.is_empty())
+                    }
+            })
+            && expected.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SemanticInventoryOp {
     pub target: InventoryTarget,
@@ -161,7 +258,8 @@ where
     {
         return None;
     }
-    let mut locations = Vec::with_capacity(destinations.len() + usize::from(source_after.is_some()));
+    let mut locations =
+        Vec::with_capacity(destinations.len() + usize::from(source_after.is_some()));
     if let Some(source) = source_after.filter(|source| source.is_empty()) {
         locations.push(source.loc);
     }
@@ -296,7 +394,11 @@ impl InventoryMutationIntent {
                     .map(|target| {
                         ledger
                             .snapshot(target)
-                            .or_else(|| preview.filter(|snapshot| snapshot.target == target).cloned())
+                            .or_else(|| {
+                                preview
+                                    .filter(|snapshot| snapshot.target == target)
+                                    .cloned()
+                            })
                             .ok_or(InventoryGestureError::MissingInventory)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -326,7 +428,10 @@ impl InventoryMutation {
         mut desired: Vec<InventoryCell>,
     ) -> Result<Self, InventoryMutationError> {
         if !desired.iter().any(|cell| cell.loc.inv == INV_SELECTED)
-            && let Some(selected) = snapshot.cells.iter().find(|cell| cell.loc.inv == INV_SELECTED)
+            && let Some(selected) = snapshot
+                .cells
+                .iter()
+                .find(|cell| cell.loc.inv == INV_SELECTED)
         {
             desired.push(selected.clone());
         }
@@ -416,6 +521,7 @@ pub struct InventoryDelta {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InventoryMutationError {
     MissingInventory,
+    TargetCollision,
     StaleRevision,
     InvalidLocation,
     DuplicateLocation,
@@ -860,7 +966,10 @@ pub fn preview_joint_inventory_action(
     let mut affected = operation.affected.clone();
     affected.sort_unstable();
     affected.dedup();
-    if affected.is_empty() || !affected.contains(&operation.actor_chunk) || legs.len() != affected.len() {
+    if affected.is_empty()
+        || !affected.contains(&operation.actor_chunk)
+        || legs.len() != affected.len()
+    {
         return Err(JointInventoryError::IncompleteChunks);
     }
     let mut seen_chunks = Vec::with_capacity(legs.len());
@@ -888,7 +997,10 @@ pub fn preview_joint_inventory_action(
             if seen_targets.contains(&inventory.target) {
                 return Err(JointInventoryError::DuplicateTarget);
             }
-            if inventory.target.intrinsic_chunk().is_some_and(|chunk| chunk != leg.chunk)
+            if inventory
+                .target
+                .intrinsic_chunk()
+                .is_some_and(|chunk| chunk != leg.chunk)
                 || matches!(operation.actor, ActorId::Player(actor) if inventory.target == InventoryTarget::Player(actor) && leg.chunk != operation.actor_chunk)
             {
                 return Err(JointInventoryError::InvalidTargetChunk);
@@ -905,7 +1017,9 @@ pub fn preview_joint_inventory_action(
     {
         return Err(JointInventoryError::MissingTarget);
     }
-    ledger.apply_op_result(operation).map_err(JointInventoryError::Apply)
+    ledger
+        .apply_op_result(operation)
+        .map_err(JointInventoryError::Apply)
 }
 
 #[derive(Debug, Default)]
@@ -969,7 +1083,9 @@ fn dst_accepts(dst_item: Option<(u16, u8)>, item: u16, count: u8) -> bool {
         None => true,
         Some((0, _)) => true,
         Some((existing, _)) if count == 0 => existing == item,
-        Some((existing, have)) => existing == item && have.saturating_add(count) <= INV_MAX_STACK,
+        Some((existing, have)) => {
+            existing == item && have.saturating_add(count) <= INV_DEFAULT_STACK_LIMIT
+        }
     }
 }
 
@@ -1164,12 +1280,69 @@ impl InvCells for MemCells {
 
 #[derive(Debug, Default, Clone)]
 pub struct InvLedger {
-    cells: HashMap<(InventoryTarget, u8, u16), InventoryCell>,
+    cells: HashMap<InventoryTarget, std::sync::Arc<HashMap<(u8, u16), InventoryCell>>>,
+    chunk_targets: HashMap<ChunkKey, std::collections::BTreeSet<InventoryTarget>>,
     revisions: HashMap<InventoryTarget, u64>,
     chunks: HashMap<InventoryTarget, Vec<ChunkKey>>,
 }
 
 impl InvLedger {
+    fn clear_target_chunks(&mut self, target: InventoryTarget) {
+        if let Some(chunks) = self.chunks.remove(&target) {
+            for chunk in chunks {
+                if let Some(targets) = self.chunk_targets.get_mut(&chunk) {
+                    targets.remove(&target);
+                    if targets.is_empty() { self.chunk_targets.remove(&chunk); }
+                }
+            }
+        }
+    }
+
+    fn set_target_chunks(&mut self, target: InventoryTarget, chunks: Vec<ChunkKey>) {
+        self.clear_target_chunks(target);
+        for &chunk in &chunks { self.chunk_targets.entry(chunk).or_default().insert(target); }
+        self.chunks.insert(target, chunks);
+    }
+
+    pub fn preflight_chunk_unit(&self, chunks: &std::collections::BTreeSet<ChunkKey>) -> Result<(), InventoryMutationError> {
+        for chunk in chunks {
+            for target in self.chunk_targets.get(chunk).into_iter().flat_map(|targets| targets.iter()) {
+                if self.chunks.get(target).is_none_or(|owned| owned.iter().any(|key| !chunks.contains(key))) {
+                    return Err(InventoryMutationError::TargetCollision);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn take_chunk_unit(&mut self, chunks: &std::collections::BTreeSet<ChunkKey>) -> Result<Self, InventoryMutationError> {
+        let targets: std::collections::BTreeSet<_> = chunks.iter().flat_map(|chunk| self.chunk_targets.get(chunk).into_iter().flat_map(|targets| targets.iter().copied())).collect();
+        self.preflight_chunk_unit(chunks)?;
+        let mut unit = Self::new();
+        for target in targets {
+            if let Some(cells) = self.cells.remove(&target) { unit.cells.insert(target, cells); }
+            if let Some(revision) = self.revisions.remove(&target) { unit.revisions.insert(target, revision); }
+            let owned = self.chunks[&target].clone();
+            self.clear_target_chunks(target);
+            unit.set_target_chunks(target, owned);
+        }
+        Ok(unit)
+    }
+
+    pub fn can_return_chunk_unit(&self, unit: &Self) -> bool {
+        !unit.revisions.keys().any(|target| self.revisions.contains_key(target))
+            && !unit.cells.keys().any(|target| self.cells.contains_key(target))
+            && !unit.chunks.keys().any(|target| self.chunks.contains_key(target))
+    }
+
+    pub fn return_chunk_unit(&mut self, mut unit: Self) -> Result<(), Self> {
+        if !self.can_return_chunk_unit(&unit) { return Err(unit); }
+        self.cells.extend(unit.cells.drain());
+        self.revisions.extend(unit.revisions.drain());
+        for (target, chunks) in unit.chunks.drain() { self.set_target_chunks(target, chunks); }
+        Ok(())
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -1178,17 +1351,18 @@ impl InvLedger {
     #[must_use]
     pub fn get(&self, gid: GlobalPlayerId, loc: InvLoc) -> Option<(u16, u8)> {
         self.cells
-            .get(&(InventoryTarget::Player(gid), loc.inv, loc.slot))
+            .get(&InventoryTarget::Player(gid))
+            .and_then(|cells| cells.get(&(loc.inv, loc.slot)))
             .map(|cell| (cell.item, cell.count))
     }
 
     pub fn record(&mut self, gid: GlobalPlayerId, loc: InvLoc, item: u16, count: u8) {
         let target = InventoryTarget::Player(gid);
         if count == 0 || item == 0 {
-            self.cells.remove(&(target, loc.inv, loc.slot));
+            if let Some(cells) = self.cells.get_mut(&target) { std::sync::Arc::make_mut(cells).remove(&(loc.inv, loc.slot)); }
         } else {
-            self.cells.insert(
-                (target, loc.inv, loc.slot),
+            std::sync::Arc::make_mut(self.cells.entry(target).or_default()).insert(
+                (loc.inv, loc.slot),
                 InventoryCell {
                     loc,
                     item,
@@ -1276,11 +1450,21 @@ impl InvLedger {
         &mut self,
         op: &InventoryOp,
     ) -> Result<InventoryDelta, InventoryApplyError> {
-        if op.expected_revisions.is_empty() {
+        self.apply_mutation(InventoryMutation {
+            expected_revisions: op.expected_revisions.clone(),
+            operations: op.changes.clone(),
+        })
+    }
+
+    pub fn apply_mutation(
+        &mut self,
+        mutation: InventoryMutation,
+    ) -> Result<InventoryDelta, InventoryApplyError> {
+        if mutation.expected_revisions.is_empty() {
             return Err(InventoryApplyError::Rejected);
         }
         let mut service = InventoryService::new();
-        for (target, revision) in &op.expected_revisions {
+        for (target, revision) in &mutation.expected_revisions {
             let current_revision = self
                 .revisions
                 .get(target)
@@ -1289,28 +1473,21 @@ impl InvLedger {
             if current_revision != *revision {
                 return Err(InventoryApplyError::Rejected);
             }
-            let cells = self
-                .cells
-                .iter()
-                .filter(|((stored, _, _), _)| stored == target)
-                .map(|(_, cell)| cell.clone())
-                .collect();
+            let cells = self.cells.get(target).into_iter().flat_map(|cells| cells.values().cloned()).collect();
             if service.install(*target, current_revision, cells).is_err() {
                 return Err(InventoryApplyError::Rejected);
             }
         }
         let delta = service
-            .mutate(InventoryMutation {
-                expected_revisions: op.expected_revisions.clone(),
-                operations: op.changes.clone(),
-            })
+            .mutate(mutation)
             .map_err(|_| InventoryApplyError::Rejected)?;
         for change in &delta.operations {
-            let key = (change.target, change.after.loc.inv, change.after.loc.slot);
+            let key = (change.after.loc.inv, change.after.loc.slot);
+            let cells = std::sync::Arc::make_mut(self.cells.entry(change.target).or_default());
             if change.after.is_empty() {
-                self.cells.remove(&key);
+                cells.remove(&key);
             } else {
-                self.cells.insert(key, change.after.clone());
+                cells.insert(key, change.after.clone());
             }
         }
         for (target, _, revision) in &delta.revisions {
@@ -1325,12 +1502,11 @@ impl InvLedger {
     ) -> Result<(), InventoryMutationError> {
         let mut service = InventoryService::new();
         service.install(snapshot.target, snapshot.revision, snapshot.cells.clone())?;
-        self.cells
-            .retain(|(target, _, _), _| *target != snapshot.target);
+        self.cells.remove(&snapshot.target);
         for cell in snapshot.cells {
             if !cell.is_empty() {
-                self.cells
-                    .insert((snapshot.target, cell.loc.inv, cell.loc.slot), cell);
+                std::sync::Arc::make_mut(self.cells.entry(snapshot.target).or_default())
+                    .insert((cell.loc.inv, cell.loc.slot), cell);
             }
         }
         self.revisions.insert(snapshot.target, snapshot.revision);
@@ -1350,7 +1526,7 @@ impl InvLedger {
         }
         let target = snapshot.target;
         self.install_snapshot(snapshot)?;
-        self.chunks.insert(target, chunks);
+        self.set_target_chunks(target, chunks);
         Ok(())
     }
 
@@ -1368,16 +1544,54 @@ impl InvLedger {
         if chunks.is_empty() {
             return Err(InventoryMutationError::InvalidLocation);
         }
-        self.chunks.insert(target, chunks);
+        self.set_target_chunks(target, chunks);
         Ok(())
     }
 
     pub fn remove_target(&mut self, target: InventoryTarget) -> Option<InventoryStateSnapshot> {
         let snapshot = self.snapshot(target)?;
-        self.cells.retain(|(stored, _, _), _| *stored != target);
+        self.cells.remove(&target);
         self.revisions.remove(&target);
-        self.chunks.remove(&target);
+        self.clear_target_chunks(target);
         Some(snapshot)
+    }
+
+    pub fn rename_targets(
+        &mut self,
+        renames: &[(InventoryTarget, InventoryTarget)],
+    ) -> Result<(), InventoryMutationError> {
+        let mut sources = std::collections::HashSet::new();
+        let mut destinations = std::collections::HashSet::new();
+        for &(source, destination) in renames {
+            if !self.revisions.contains_key(&source) {
+                return Err(InventoryMutationError::MissingInventory);
+            }
+            if !destination.is_valid()
+                || !sources.insert(source)
+                || !destinations.insert(destination)
+            {
+                return Err(InventoryMutationError::TargetCollision);
+            }
+        }
+        for &destination in &destinations {
+            if self.revisions.contains_key(&destination) && !sources.contains(&destination) {
+                return Err(InventoryMutationError::TargetCollision);
+            }
+        }
+        let moved: Vec<_> = renames.iter().map(|&(source, destination)| {
+            let cells = self.cells.remove(&source);
+            let revision = self.revisions.remove(&source).unwrap();
+            let chunks = self.chunks.get(&source).cloned();
+            self.clear_target_chunks(source);
+            (destination, cells, revision, chunks)
+        }).collect();
+        for (destination, cells, revision, chunks) in moved {
+            if let Some(cells) = cells { self.cells.insert(destination, cells); }
+            self.revisions.insert(destination, revision);
+            if let Some(chunks) = chunks { self.set_target_chunks(destination, chunks); }
+        }
+
+        Ok(())
     }
 
     #[must_use]
@@ -1387,25 +1601,29 @@ impl InvLedger {
 
     #[must_use]
     pub fn targets_for_chunk(&self, chunk: ChunkKey) -> Vec<InventoryTarget> {
-        let mut targets: Vec<_> = self
-            .chunks
-            .iter()
-            .filter_map(|(target, chunks)| chunks.contains(&chunk).then_some(*target))
-            .collect();
+        self.chunk_targets.get(&chunk).into_iter().flat_map(|targets| targets.iter().copied()).collect()
+    }
+
+    #[must_use]
+    pub fn targets(&self) -> Vec<InventoryTarget> {
+        let mut targets: Vec<_> = self.revisions.keys().copied().collect();
         targets.sort_unstable();
         targets
+    }
+
+    pub fn target_keys(&self) -> impl Iterator<Item = InventoryTarget> + '_ {
+        self.revisions.keys().copied()
+    }
+
+    pub fn revision(&self, target: impl Into<InventoryTarget>) -> Option<u64> {
+        self.revisions.get(&target.into()).copied()
     }
 
     #[must_use]
     pub fn snapshot(&self, target: impl Into<InventoryTarget>) -> Option<InventoryStateSnapshot> {
         let target = target.into();
         let revision = self.revisions.get(&target).copied()?;
-        let mut cells: Vec<_> = self
-            .cells
-            .iter()
-            .filter(|((stored, _, _), _)| *stored == target)
-            .map(|(_, cell)| cell.clone())
-            .collect();
+        let mut cells: Vec<_> = self.cells.get(&target).into_iter().flat_map(|cells| cells.values().cloned()).collect();
         cells.sort_by_key(|cell| (cell.loc.inv, cell.loc.slot));
         Some(InventoryStateSnapshot {
             target,
@@ -1439,12 +1657,12 @@ impl InvLedger {
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.cells.len()
+        self.cells.values().map(|cells| cells.len()).sum()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.cells.is_empty()
+        self.cells.values().all(|cells| cells.is_empty())
     }
 }
 
@@ -1777,7 +1995,7 @@ pub fn sort_inv_ops_for_tick_with_seed(seed: u64, tick: TickStamp, ops: &mut [In
     });
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct InventorySlotRef {
     pub target: InventoryTarget,
     pub loc: InvLoc,
@@ -1804,7 +2022,7 @@ pub enum QuickCraftMode {
     Fill,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct InventoryScreenSession {
     pub actor: GlobalPlayerId,
     pub session: u64,
@@ -1822,12 +2040,16 @@ pub struct InventoryScreenSlot {
 pub struct InventoryScreenSnapshot {
     pub session: InventoryScreenSession,
     pub sync_id: u8,
+    pub state_id: i32,
     pub window_kind: u16,
     pub container_slots: u16,
     pub slots: Vec<InventoryScreenSlot>,
     pub cursor: InventoryCell,
     pub affected: Vec<ChunkKey>,
     pub preview: Option<InventoryStateSnapshot>,
+    pub preview_incarnation: Option<u64>,
+    pub preview_lease: Option<crate::canonical_action::LivePlayerLease>,
+    pub preview_authority: Option<crate::invsee::InventoryPreviewAuthority>,
 }
 
 #[must_use]
@@ -1837,6 +2059,25 @@ pub fn inventory_screen_targets(screen: &InventoryScreenSnapshot) -> Vec<Invento
     targets.sort_unstable();
     targets.dedup();
     targets
+}
+
+pub fn rename_inventory_screen_targets(
+    screen: &mut InventoryScreenSnapshot,
+    renames: &[(InventoryTarget, InventoryTarget)],
+) {
+    let replacements: HashMap<_, _> = renames.iter().copied().collect();
+    for slot in &mut screen.slots {
+        slot.slot.target = replacements
+            .get(&slot.slot.target)
+            .copied()
+            .unwrap_or(slot.slot.target);
+    }
+    if let Some(preview) = &mut screen.preview {
+        preview.target = replacements
+            .get(&preview.target)
+            .copied()
+            .unwrap_or(preview.target);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1931,6 +2172,22 @@ impl InventoryScreenSessions {
         self.quick_craft.remove(&session);
     }
 
+    pub fn rename_targets(&mut self, renames: &[(InventoryTarget, InventoryTarget)]) {
+        let replacements: HashMap<_, _> = renames.iter().copied().collect();
+        for state in self.quick_craft.values_mut() {
+            state.source.target = replacements
+                .get(&state.source.target)
+                .copied()
+                .unwrap_or(state.source.target);
+            for (slot, _) in &mut state.destinations {
+                slot.target = replacements
+                    .get(&slot.target)
+                    .copied()
+                    .unwrap_or(slot.target);
+            }
+        }
+    }
+
     pub fn apply(&mut self, command: InventoryScreenCommand) -> Option<InventoryGesture> {
         match command {
             InventoryScreenCommand::BeginQuickCraft {
@@ -1975,7 +2232,35 @@ pub struct RecipePlacementIngredient {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InventoryTransferCount {
+    Exact(u8),
+    All,
+    Half,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InventoryGesture {
+    ExpectIdentity {
+        slot: InventorySlotRef,
+        item: u16,
+        components: Vec<u8>,
+    },
+    DropSelectedHand {
+        player: InventoryTarget,
+        count: InventoryTransferCount,
+    },
+    RemoveBy {
+        source: InventorySlotRef,
+        count: InventoryTransferCount,
+        kind: InventoryRemovalKind,
+    },
+    SwapSelectedHand {
+        player: InventoryTarget,
+    },
+    SelectHotbar {
+        slot: InventorySlotRef,
+        selected: u8,
+    },
     Expect {
         slot: InventorySlotRef,
         cell: InventoryCell,
@@ -1991,6 +2276,19 @@ pub enum InventoryGesture {
         count: u8,
         destination_limit: u8,
     },
+    TransferBy {
+        source: InventorySlotRef,
+        destination: InventorySlotRef,
+        count: InventoryTransferCount,
+        destination_limit: u8,
+    },
+    ExchangeCursor {
+        slot: InventorySlotRef,
+        cursor: InventorySlotRef,
+        single: bool,
+        slot_limit: u8,
+        cursor_limit: u8,
+    },
     Swap {
         first: InventorySlotRef,
         second: InventorySlotRef,
@@ -2001,6 +2299,11 @@ pub enum InventoryGesture {
         source: InventorySlotRef,
         count: u8,
         kind: InventoryRemovalKind,
+    },
+    CreativeClone {
+        source: InventorySlotRef,
+        destination: InventorySlotRef,
+        destination_limit: u8,
     },
     CreativeSet {
         destination: InventorySlotRef,
@@ -2051,6 +2354,124 @@ pub enum InventoryGesture {
 }
 
 impl InventoryGesture {
+    pub fn rename_targets(&mut self, renames: &[(InventoryTarget, InventoryTarget)]) {
+        let replacements: HashMap<_, _> = renames.iter().copied().collect();
+        let remap_target = |target: &mut InventoryTarget| {
+            *target = replacements.get(target).copied().unwrap_or(*target);
+        };
+        let remap_slot = |slot: &mut InventorySlotRef| {
+            slot.target = replacements
+                .get(&slot.target)
+                .copied()
+                .unwrap_or(slot.target);
+        };
+        match self {
+            Self::CreativeClone {
+                source,
+                destination,
+                ..
+            } => {
+                remap_slot(source);
+                remap_slot(destination);
+            }
+            Self::SwapSelectedHand { player } | Self::DropSelectedHand { player, .. } => {
+                remap_target(player)
+            }
+            Self::RemoveBy { source, .. } => remap_slot(source),
+            Self::SelectHotbar { slot, .. }
+            | Self::ExpectIdentity { slot, .. }
+            | Self::Expect { slot, .. }
+            | Self::ClearResult { slot } => remap_slot(slot),
+            Self::ExactSet { destination, .. } | Self::CreativeSet { destination, .. } => {
+                remap_slot(destination);
+            }
+            Self::Transfer {
+                source,
+                destination,
+                ..
+            }
+            | Self::TransferBy {
+                source,
+                destination,
+                ..
+            } => {
+                remap_slot(source);
+                remap_slot(destination);
+            }
+            Self::Swap { first, second, .. } => {
+                remap_slot(first);
+                remap_slot(second);
+            }
+            Self::ExchangeCursor { slot, cursor, .. } => {
+                remap_slot(slot);
+                remap_slot(cursor);
+            }
+            Self::Remove { source, .. } => remap_slot(source),
+            Self::CreativeDrop { owner, .. } => remap_target(owner),
+            Self::QuickMove {
+                source,
+                destinations,
+            }
+            | Self::QuickCraft {
+                source,
+                destinations,
+                ..
+            } => {
+                remap_slot(source);
+                for (destination, _) in destinations {
+                    remap_slot(destination);
+                }
+            }
+            Self::DrainToPlayer {
+                source,
+                destinations,
+                ..
+            } => {
+                remap_slot(source);
+                for (destination, _) in destinations {
+                    remap_slot(destination);
+                }
+            }
+            Self::PickupAll {
+                destination,
+                sources,
+                ..
+            } => {
+                remap_slot(destination);
+                for source in sources {
+                    remap_slot(source);
+                }
+            }
+            Self::RecipeCraft {
+                ingredients,
+                destination,
+                ..
+            } => {
+                for ingredient in ingredients {
+                    remap_slot(&mut ingredient.slot);
+                }
+                remap_slot(destination);
+            }
+            Self::PlaceRecipe {
+                player,
+                grid,
+                ingredients,
+                grid_slots,
+                player_sources,
+                ..
+            } => {
+                remap_target(player);
+                remap_target(grid);
+                for ingredient in ingredients {
+                    remap_slot(&mut ingredient.grid_slot);
+                }
+                for slot in grid_slots.iter_mut().chain(player_sources) {
+                    remap_slot(slot);
+                }
+            }
+        }
+    }
+
     #[must_use]
     pub fn targets(&self) -> Vec<InventoryTarget> {
         let mut targets = Vec::new();
@@ -2060,11 +2481,113 @@ impl InventoryGesture {
         targets
     }
 
+    #[must_use]
+    pub fn slots(&self) -> Vec<InventorySlotRef> {
+        let mut slots = match self {
+            Self::CreativeClone {
+                source,
+                destination,
+                ..
+            } => vec![*source, *destination],
+            Self::SwapSelectedHand { player } | Self::DropSelectedHand { player, .. } => (0..9)
+                .map(|slot| InventorySlotRef::new(*player, InvLoc::new(INV_MAIN, slot)))
+                .chain([
+                    InventorySlotRef::new(*player, InvLoc::new(INV_SELECTED, 0)),
+                    InventorySlotRef::new(*player, InvLoc::new(INV_OFFHAND, 0)),
+                ])
+                .collect(),
+            Self::SelectHotbar { slot, .. }
+            | Self::ExpectIdentity { slot, .. }
+            | Self::Expect { slot, .. }
+            | Self::ClearResult { slot } => vec![*slot],
+            Self::ExactSet { destination, .. } | Self::CreativeSet { destination, .. } => {
+                vec![*destination]
+            }
+            Self::Transfer {
+                source,
+                destination,
+                ..
+            }
+            | Self::TransferBy {
+                source,
+                destination,
+                ..
+            }
+            | Self::Swap {
+                first: source,
+                second: destination,
+                ..
+            } => vec![*source, *destination],
+            Self::ExchangeCursor { slot, cursor, .. } => vec![*slot, *cursor],
+            Self::Remove { source, .. } | Self::RemoveBy { source, .. } => vec![*source],
+            Self::CreativeDrop { .. } => Vec::new(),
+            Self::QuickMove {
+                source,
+                destinations,
+            }
+            | Self::DrainToPlayer {
+                source,
+                destinations,
+                ..
+            }
+            | Self::QuickCraft {
+                source,
+                destinations,
+                ..
+            } => std::iter::once(*source)
+                .chain(destinations.iter().map(|(slot, _)| *slot))
+                .collect(),
+            Self::PickupAll {
+                destination,
+                sources,
+                ..
+            } => std::iter::once(*destination)
+                .chain(sources.iter().copied())
+                .collect(),
+            Self::RecipeCraft {
+                ingredients,
+                destination,
+                ..
+            } => std::iter::once(*destination)
+                .chain(ingredients.iter().map(|ingredient| ingredient.slot))
+                .collect(),
+            Self::PlaceRecipe {
+                ingredients,
+                grid_slots,
+                player_sources,
+                ..
+            } => ingredients
+                .iter()
+                .map(|ingredient| ingredient.grid_slot)
+                .chain(grid_slots.iter().copied())
+                .chain(player_sources.iter().copied())
+                .collect(),
+        };
+        slots.sort_unstable();
+        slots.dedup();
+        slots
+    }
+
     fn push_targets(&self, targets: &mut Vec<InventoryTarget>) {
         match self {
-            Self::Expect { slot, .. } => targets.push(slot.target),
+            Self::ExchangeCursor { slot, cursor, .. } => {
+                targets.push(slot.target);
+                targets.push(cursor.target);
+            }
+            Self::RemoveBy { source, .. } => targets.push(source.target),
+            Self::SwapSelectedHand { player } | Self::DropSelectedHand { player, .. } => {
+                targets.push(*player)
+            }
+            Self::SelectHotbar { slot, .. }
+            | Self::ExpectIdentity { slot, .. }
+            | Self::Expect { slot, .. } => targets.push(slot.target),
             Self::ExactSet { destination, .. } => targets.push(destination.target),
             Self::Transfer {
+                source,
+                destination,
+                ..
+            }
+            | Self::TransferBy {
                 source,
                 destination,
                 ..
@@ -2078,6 +2601,14 @@ impl InventoryGesture {
                 targets.push(destination.target);
             }
             Self::Remove { source, .. } => targets.push(source.target),
+            Self::CreativeClone {
+                source,
+                destination,
+                ..
+            } => {
+                targets.push(source.target);
+                targets.push(destination.target);
+            }
             Self::CreativeSet { destination, .. } => targets.push(destination.target),
             Self::CreativeDrop { owner, .. } => targets.push(*owner),
             Self::QuickMove {
@@ -2124,7 +2655,11 @@ impl InventoryGesture {
             } => {
                 targets.push(*player);
                 targets.push(*grid);
-                targets.extend(ingredients.iter().map(|ingredient| ingredient.grid_slot.target));
+                targets.extend(
+                    ingredients
+                        .iter()
+                        .map(|ingredient| ingredient.grid_slot.target),
+                );
                 targets.extend(grid_slots.iter().map(|slot| slot.target));
                 targets.extend(player_sources.iter().map(|slot| slot.target));
             }
@@ -2401,10 +2936,7 @@ fn gesture_place_recipe(
     }
     let mut ordered = ingredients.to_vec();
     ordered.sort_unstable_by_key(|ingredient| {
-        (
-            ingredient.grid_slot.loc.inv,
-            ingredient.grid_slot.loc.slot,
-        )
+        (ingredient.grid_slot.loc.inv, ingredient.grid_slot.loc.slot)
     });
     let mut sources = player_sources.to_vec();
     sources.sort_unstable_by_key(|slot| (slot.loc.inv, slot.loc.slot));
@@ -2532,6 +3064,111 @@ pub fn reduce_inventory_gestures(
     let mut effect_only_targets = std::collections::HashSet::new();
     for gesture in gestures {
         match gesture {
+            InventoryGesture::ExpectIdentity {
+                slot,
+                item,
+                components,
+            } => {
+                let current =
+                    gesture_cell(gesture_inventory_mut(&mut inventories, *slot)?, slot.loc);
+                if current.is_empty() || current.item != *item || current.nbt != *components {
+                    return Err(InventoryGestureError::IncompatibleStack);
+                }
+            }
+            InventoryGesture::RemoveBy {
+                source,
+                count,
+                kind,
+            } => {
+                let current = gesture_cell(
+                    gesture_inventory_mut(&mut inventories, *source)?,
+                    source.loc,
+                );
+                let amount = match count {
+                    InventoryTransferCount::All => current.count,
+                    InventoryTransferCount::Half => current.count.div_ceil(2),
+                    InventoryTransferCount::Exact(amount) => *amount,
+                };
+                if amount > 0 {
+                    let stack = gesture_remove(&mut inventories, *source, amount)?;
+                    effects.push(InventoryGestureEffect::Removed {
+                        source: *source,
+                        stack,
+                        kind: *kind,
+                    });
+                }
+            }
+            InventoryGesture::DropSelectedHand { player, count } => {
+                let selector = InventorySlotRef::new(*player, InvLoc::new(INV_SELECTED, 0));
+                let selected = gesture_cell(
+                    gesture_inventory_mut(&mut inventories, selector)?,
+                    selector.loc,
+                );
+                let slot = selected
+                    .item
+                    .checked_sub(1)
+                    .filter(|slot| *slot < 9)
+                    .ok_or(InventoryGestureError::IncompatibleStack)?;
+                if selected.count != 1 || !selected.nbt.is_empty() {
+                    return Err(InventoryGestureError::IncompatibleStack);
+                }
+                let source = InventorySlotRef::new(*player, InvLoc::new(INV_MAIN, slot));
+                let current =
+                    gesture_cell(gesture_inventory_mut(&mut inventories, source)?, source.loc);
+                let amount = match count {
+                    InventoryTransferCount::All => current.count,
+                    InventoryTransferCount::Half => current.count.div_ceil(2),
+                    InventoryTransferCount::Exact(amount) => *amount,
+                };
+                if amount > 0 {
+                    let stack = gesture_remove(&mut inventories, source, amount)?;
+                    effects.push(InventoryGestureEffect::Removed {
+                        source,
+                        stack,
+                        kind: InventoryRemovalKind::Drop,
+                    });
+                }
+            }
+            InventoryGesture::SwapSelectedHand { player } => {
+                let selector = InventorySlotRef::new(*player, InvLoc::new(INV_SELECTED, 0));
+                let selected = gesture_cell(
+                    gesture_inventory_mut(&mut inventories, selector)?,
+                    selector.loc,
+                );
+                let slot = selected
+                    .item
+                    .checked_sub(1)
+                    .filter(|slot| *slot < 9)
+                    .ok_or(InventoryGestureError::IncompatibleStack)?;
+                if selected.count != 1 || !selected.nbt.is_empty() {
+                    return Err(InventoryGestureError::IncompatibleStack);
+                }
+                let first = InventorySlotRef::new(*player, InvLoc::new(INV_MAIN, slot));
+                let second = InventorySlotRef::new(*player, InvLoc::new(INV_OFFHAND, 0));
+                let mut first_cell =
+                    gesture_cell(gesture_inventory_mut(&mut inventories, first)?, first.loc);
+                let mut second_cell =
+                    gesture_cell(gesture_inventory_mut(&mut inventories, second)?, second.loc);
+                first_cell.loc = second.loc;
+                second_cell.loc = first.loc;
+                gesture_set_cell(&mut inventories, first, second_cell)?;
+                gesture_set_cell(&mut inventories, second, first_cell)?;
+            }
+            InventoryGesture::SelectHotbar { slot, selected } => {
+                if *selected >= 9 || slot.loc != InvLoc::new(INV_SELECTED, 0) {
+                    return Err(InventoryGestureError::IncompatibleStack);
+                }
+                gesture_set_cell(
+                    &mut inventories,
+                    *slot,
+                    InventoryCell {
+                        loc: slot.loc,
+                        item: u16::from(*selected) + 1,
+                        count: 1,
+                        nbt: Vec::new(),
+                    },
+                )?;
+            }
             InventoryGesture::Expect { slot, cell } => {
                 let actual =
                     gesture_cell(gesture_inventory_mut(&mut inventories, *slot)?, slot.loc);
@@ -2569,6 +3206,87 @@ pub fn reduce_inventory_gestures(
                 *count,
                 *destination_limit,
             )?,
+            InventoryGesture::TransferBy {
+                source,
+                destination,
+                count,
+                destination_limit,
+            } => {
+                let source_cell = gesture_cell(
+                    gesture_inventory_mut(&mut inventories, *source)?,
+                    source.loc,
+                );
+                let count = match count {
+                    InventoryTransferCount::Exact(count) => *count,
+                    InventoryTransferCount::All | InventoryTransferCount::Half => {
+                        let destination_cell = gesture_cell(
+                            gesture_inventory_mut(&mut inventories, *destination)?,
+                            destination.loc,
+                        );
+                        let requested = if *count == InventoryTransferCount::Half {
+                            source_cell.count.div_ceil(2)
+                        } else {
+                            source_cell.count
+                        };
+                        requested.min(destination_limit.saturating_sub(destination_cell.count))
+                    }
+                };
+                gesture_transfer(
+                    &mut inventories,
+                    *source,
+                    *destination,
+                    count,
+                    *destination_limit,
+                )?;
+            }
+            InventoryGesture::ExchangeCursor {
+                slot,
+                cursor,
+                single,
+                slot_limit,
+                cursor_limit,
+            } => {
+                let slot_cell =
+                    gesture_cell(gesture_inventory_mut(&mut inventories, *slot)?, slot.loc);
+                let cursor_cell = gesture_cell(
+                    gesture_inventory_mut(&mut inventories, *cursor)?,
+                    cursor.loc,
+                );
+                if cursor_cell.is_empty() {
+                    let count = if *single {
+                        slot_cell.count.div_ceil(2)
+                    } else {
+                        slot_cell.count
+                    };
+                    if count > 0 {
+                        gesture_transfer(
+                            &mut inventories,
+                            *slot,
+                            *cursor,
+                            count.min(*cursor_limit),
+                            *cursor_limit,
+                        )?;
+                    }
+                } else if slot_cell.is_empty()
+                    || slot_cell.item == cursor_cell.item && slot_cell.nbt == cursor_cell.nbt
+                {
+                    let count = if *single { 1 } else { cursor_cell.count };
+                    let count = count.min(slot_limit.saturating_sub(slot_cell.count));
+                    if count > 0 {
+                        gesture_transfer(&mut inventories, *cursor, *slot, count, *slot_limit)?;
+                    }
+                } else {
+                    if cursor_cell.count > *slot_limit || slot_cell.count > *cursor_limit {
+                        return Err(InventoryGestureError::CapacityExceeded);
+                    }
+                    let mut next_slot = cursor_cell;
+                    next_slot.loc = slot.loc;
+                    let mut next_cursor = slot_cell;
+                    next_cursor.loc = cursor.loc;
+                    gesture_set_cell(&mut inventories, *slot, next_slot)?;
+                    gesture_set_cell(&mut inventories, *cursor, next_cursor)?;
+                }
+            }
             InventoryGesture::Swap {
                 first,
                 second,
@@ -2605,6 +3323,31 @@ pub fn reduce_inventory_gestures(
                     stack,
                     kind: *kind,
                 });
+            }
+            InventoryGesture::CreativeClone {
+                source,
+                destination,
+                destination_limit,
+            } => {
+                if !gesture_cell(
+                    gesture_inventory_mut(&mut inventories, *destination)?,
+                    destination.loc,
+                )
+                .is_empty()
+                {
+                    return Err(InventoryGestureError::CapacityExceeded);
+                }
+                let mut stack = gesture_cell(
+                    gesture_inventory_mut(&mut inventories, *source)?,
+                    source.loc,
+                );
+                if stack.is_empty() || *destination_limit == 0 || *destination_limit > INV_MAX_STACK
+                {
+                    return Err(InventoryGestureError::InvalidStack);
+                }
+                stack.loc = destination.loc;
+                stack.count = *destination_limit;
+                gesture_set_cell(&mut inventories, *destination, stack)?;
             }
             InventoryGesture::CreativeSet {
                 destination,
@@ -2683,11 +3426,7 @@ pub fn reduce_inventory_gestures(
                     return Err(InventoryGestureError::InvalidCount);
                 }
                 effect_only_targets.insert(slot.target);
-                gesture_set_cell(
-                    &mut inventories,
-                    *slot,
-                    InventoryCell::empty(slot.loc),
-                )?;
+                gesture_set_cell(&mut inventories, *slot, InventoryCell::empty(slot.loc))?;
             }
             InventoryGesture::QuickCraft {
                 source,
@@ -2866,11 +3605,18 @@ pub enum InventoryPatternSelection {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InventoryMenuKind {
-    RenameAnvil { name: String },
+    RenameAnvil {
+        name: String,
+    },
     TakeAnvilResult,
     ContainerButton(InventoryContainerButton),
-    SelectTrade { offer: u32 },
-    ExecuteTrade { offer: u32, repetitions: u16 },
+    SelectTrade {
+        offer: u32,
+    },
+    ExecuteTrade {
+        offer: u32,
+        repetitions: u16,
+    },
     SetBeacon {
         primary_effect: u16,
         secondary_effect: Option<u16>,
@@ -2878,9 +3624,14 @@ pub enum InventoryMenuKind {
     ApplyLoomPattern {
         pattern: InventoryPatternSelection,
     },
-    TakeDisplayedResult { repetitions: u16 },
+    TakeDisplayedResult {
+        repetitions: u16,
+    },
     TakeGrindstoneResult,
-    CraftResult { recipe: u32, repetitions: u16 },
+    CraftResult {
+        recipe: u32,
+        repetitions: u16,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2899,9 +3650,17 @@ pub struct InventoryMenuIntent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InventoryMenuEffect {
-    AnvilNameChanged { name: String, level_cost: u32 },
-    AnvilResultTaken { level_cost: u32, damage_anvil: bool },
-    ContainerSelectionChanged { selection: InventoryContainerButton },
+    AnvilNameChanged {
+        name: String,
+        level_cost: u32,
+    },
+    AnvilResultTaken {
+        level_cost: u32,
+        damage_anvil: bool,
+    },
+    ContainerSelectionChanged {
+        selection: InventoryContainerButton,
+    },
     TradeSelected {
         offer: u32,
         merchant: InventoryMerchantPresentation,
@@ -2919,9 +3678,17 @@ pub enum InventoryMenuEffect {
         primary_effect: u16,
         secondary_effect: Option<u16>,
     },
-    LoomPatternApplied { pattern: String, menu_index: u16 },
-    GrindstoneResultTaken { experience: u32 },
-    CraftCompleted { recipe: u32, repetitions: u16 },
+    LoomPatternApplied {
+        pattern: String,
+        menu_index: u16,
+    },
+    GrindstoneResultTaken {
+        experience: u32,
+    },
+    CraftCompleted {
+        recipe: u32,
+        repetitions: u16,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2934,9 +3701,12 @@ pub struct BeaconMenuState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkInventoryState {
+    #[serde(default)]
+    pub menu_admission: Option<(crate::canonical_action::ActionRef, crate::canonical_menu::MenuVirtualInventoryAdmission)>,
     pub snapshot: InventoryStateSnapshot,
     pub chunks: Vec<ChunkKey>,
     pub beacon: Option<BeaconMenuState>,
+    pub player_lease: Option<crate::canonical_action::LivePlayerLease>,
 }
 
 #[must_use]
@@ -3017,6 +3787,24 @@ pub fn inventory_menu_targets(metadata: &InventoryMenuMetadata) -> Vec<Inventory
     targets
 }
 
+pub fn rename_inventory_menu_targets(
+    metadata: &mut InventoryMenuMetadata,
+    renames: &[(InventoryTarget, InventoryTarget)],
+) {
+    let replacements: HashMap<_, _> = renames.iter().copied().collect();
+    for (target, _) in &mut metadata.expected_revisions {
+        *target = replacements.get(target).copied().unwrap_or(*target);
+    }
+    for rule in &mut metadata.rules {
+        for gesture in rule.client_gestures.iter_mut().chain(&mut rule.gestures) {
+            gesture.rename_targets(renames);
+        }
+        if let InventoryMenuEffect::BeaconConfigured { target, .. } = &mut rule.effect {
+            *target = replacements.get(target).copied().unwrap_or(*target);
+        }
+    }
+}
+
 pub fn beacon_menu_metadata(
     screen: &InventoryScreenSnapshot,
     payment: &InventoryStateSnapshot,
@@ -3048,7 +3836,10 @@ pub fn beacon_menu_metadata(
             } else {
                 [None, None, None]
             };
-            for secondary in secondaries.into_iter().take(if state.levels == 4 { 3 } else { 1 }) {
+            for secondary in secondaries
+                .into_iter()
+                .take(if state.levels == 4 { 3 } else { 1 })
+            {
                 if !beacon_choice_valid(state.levels, primary, secondary) {
                     continue;
                 }
@@ -3164,12 +3955,20 @@ fn inventory_menu_gestures_conserve(
                 false
             }
         }
-        InventoryGesture::CreativeSet { .. }
+        InventoryGesture::CreativeClone { .. }
+        | InventoryGesture::CreativeSet { .. }
         | InventoryGesture::CreativeDrop { .. }
         | InventoryGesture::DrainToPlayer { .. }
         | InventoryGesture::ClearResult { .. } => false,
-        InventoryGesture::Expect { .. }
+        InventoryGesture::DropSelectedHand { .. }
+        | InventoryGesture::RemoveBy { .. }
+        | InventoryGesture::SwapSelectedHand { .. }
+        | InventoryGesture::SelectHotbar { .. }
+        | InventoryGesture::ExpectIdentity { .. }
+        | InventoryGesture::Expect { .. }
         | InventoryGesture::Transfer { .. }
+        | InventoryGesture::TransferBy { .. }
+        | InventoryGesture::ExchangeCursor { .. }
         | InventoryGesture::Swap { .. }
         | InventoryGesture::Remove { .. }
         | InventoryGesture::QuickMove { .. }
@@ -3180,22 +3979,15 @@ fn inventory_menu_gestures_conserve(
     })
 }
 
-fn inventory_menu_effect_matches(
-    kind: &InventoryMenuKind,
-    effect: &InventoryMenuEffect,
-) -> bool {
+fn inventory_menu_effect_matches(kind: &InventoryMenuKind, effect: &InventoryMenuEffect) -> bool {
     match (kind, effect) {
         (
             InventoryMenuKind::RenameAnvil { name },
             InventoryMenuEffect::AnvilNameChanged {
-                name: effect_name,
-                ..
+                name: effect_name, ..
             },
         ) => name == effect_name,
-        (
-            InventoryMenuKind::TakeAnvilResult,
-            InventoryMenuEffect::AnvilResultTaken { .. },
-        )
+        (InventoryMenuKind::TakeAnvilResult, InventoryMenuEffect::AnvilResultTaken { .. })
         | (
             InventoryMenuKind::TakeGrindstoneResult,
             InventoryMenuEffect::GrindstoneResultTaken { .. },
@@ -3259,7 +4051,10 @@ fn inventory_menu_effect_matches(
             InventoryPatternSelection::MenuIndex(index) => index == menu_index,
         },
         (
-            InventoryMenuKind::CraftResult { recipe, repetitions },
+            InventoryMenuKind::CraftResult {
+                recipe,
+                repetitions,
+            },
             InventoryMenuEffect::CraftCompleted {
                 recipe: effect_recipe,
                 repetitions: effect_repetitions,
@@ -3274,10 +4069,7 @@ fn normalized_inventory_revisions(
 ) -> Result<Vec<(InventoryTarget, u64)>, InventoryMenuError> {
     let mut normalized = revisions.to_vec();
     normalized.sort_unstable_by_key(|(target, _)| *target);
-    if normalized
-        .windows(2)
-        .any(|pair| pair[0].0 == pair[1].0)
-    {
+    if normalized.windows(2).any(|pair| pair[0].0 == pair[1].0) {
         return Err(InventoryMenuError::DuplicateRevision);
     }
     Ok(normalized)
@@ -3362,7 +4154,11 @@ pub fn reduce_inventory_menu(
     let mut affected = intent.affected.clone();
     affected.extend(screen.affected.iter().copied());
     affected.push(intent.actor_chunk);
-    affected.extend(expected.iter().filter_map(|(target, _)| target.intrinsic_chunk()));
+    affected.extend(
+        expected
+            .iter()
+            .filter_map(|(target, _)| target.intrinsic_chunk()),
+    );
     affected.sort_unstable();
     affected.dedup();
     let mutation = InventoryMutationIntent {
@@ -3408,6 +4204,59 @@ mod tests {
     }
 
     #[test]
+    fn reused_player_slot_keeps_inventory_incarnations_separate() {
+        let player = gid(1, 2);
+        let previous = InventoryTarget::LeasedPlayer {
+            key: uuid::Uuid::from_u128(19),
+            player,
+            incarnation: 41,
+        };
+        let current = InventoryTarget::LeasedPlayer {
+            key: uuid::Uuid::from_u128(19),
+            player,
+            incarnation: 42,
+        };
+        assert!(
+            !InventoryTarget::LeasedPlayer {
+                key: uuid::Uuid::from_u128(19),
+                player,
+                incarnation: 0,
+            }
+            .is_valid()
+        );
+        let mut ledger = InvLedger::default();
+        for (target, item) in [(previous, 5), (current, 7)] {
+            ledger
+                .install_snapshot(InventoryStateSnapshot {
+                    target,
+                    revision: 0,
+                    cells: vec![cell(INV_MAIN, 0, item, 1)],
+                })
+                .unwrap();
+        }
+        ledger
+            .apply_mutation(InventoryMutation {
+                expected_revisions: vec![(previous, 0)],
+                operations: vec![
+                    SemanticInventoryOp {
+                        target: previous,
+                        before: cell(INV_MAIN, 0, 5, 1),
+                        after: InventoryCell::empty(loc(0)),
+                    },
+                    SemanticInventoryOp {
+                        target: previous,
+                        before: InventoryCell::empty(loc(1)),
+                        after: cell(INV_MAIN, 1, 5, 1),
+                    },
+                ],
+            })
+            .unwrap();
+        assert_eq!(ledger.snapshot(previous).unwrap().cells[0].loc.slot, 1);
+        assert_eq!(ledger.snapshot(current).unwrap().cells[0].count, 1);
+        assert_eq!(ledger.snapshot(current).unwrap().cells[0].item, 7);
+    }
+
+    #[test]
     fn remainder_insertion_preserves_items_and_revision_under_conflict() {
         let target = InventoryTarget::Player(gid(1, 2));
         let consumed = cell(INV_MAIN, 0, 5, 1);
@@ -3424,7 +4273,13 @@ mod tests {
             64,
             &[loc(1), loc(2)],
             |left, right| left.item == right.item && left.nbt == right.nbt,
-            |item, loc, count| Some(InventoryCell { loc, count, ..item.clone() }),
+            |item, loc, count| {
+                Some(InventoryCell {
+                    loc,
+                    count,
+                    ..item.clone()
+                })
+            },
         )
         .unwrap();
         let mut service = InventoryService::new();
@@ -3438,14 +4293,24 @@ mod tests {
             })
             .unwrap();
         let result = service.snapshot(target).unwrap();
-        assert_eq!(result.cells.iter().filter(|cell| cell.item == 7).map(|cell| u16::from(cell.count)).sum::<u16>(), 65);
+        assert_eq!(
+            result
+                .cells
+                .iter()
+                .filter(|cell| cell.item == 7)
+                .map(|cell| u16::from(cell.count))
+                .sum::<u16>(),
+            65
+        );
         assert_eq!(result.cells.iter().filter(|cell| cell.item == 5).count(), 0);
-        assert!(service
-            .mutate(InventoryMutation {
-                expected_revisions: vec![(target, snapshot.revision)],
-                operations: ops,
-            })
-            .is_err());
+        assert!(
+            service
+                .mutate(InventoryMutation {
+                    expected_revisions: vec![(target, snapshot.revision)],
+                    operations: ops,
+                })
+                .is_err()
+        );
     }
 
     #[test]
@@ -3486,7 +4351,12 @@ mod tests {
             actor_chunk: viewer_chunk,
             affected: vec![viewer_chunk, remote_chunk],
         };
-        assert!(intent.clone().into_action(PlayerSeq(0), &viewer_ledger).is_err());
+        assert!(
+            intent
+                .clone()
+                .into_action(PlayerSeq(0), &viewer_ledger)
+                .is_err()
+        );
         let action = intent
             .into_action_with_preview(PlayerSeq(0), &viewer_ledger, Some(&remote_snapshot))
             .unwrap();
@@ -3512,7 +4382,10 @@ mod tests {
         remote_leg.finished.push(ServerId(2));
         let joint = preview_joint_inventory_action(&action, &[viewer_leg, remote_leg]).unwrap();
         assert_eq!(joint.operations.len(), 2);
-        assert_eq!(viewer_ledger.snapshot(viewer_target).unwrap().cells[0].count, 1);
+        assert_eq!(
+            viewer_ledger.snapshot(viewer_target).unwrap().cells[0].count,
+            1
+        );
         let mut holder = viewer_ledger;
         holder
             .install_owned_snapshot(remote_snapshot, vec![remote_chunk])
@@ -3708,11 +4581,20 @@ mod tests {
         assert!(sessions.add_quick_craft_slot(session, second, 64));
         assert!(sessions.add_quick_craft_slot(session, first, 64));
         assert!(sessions.add_quick_craft_slot(session, first, 64));
+        let leased = InventoryTarget::LeasedPlayer {
+            key: uuid::Uuid::from_u128(7),
+            player: actor,
+            incarnation: 11,
+        };
+        sessions.rename_targets(&[(target, leased)]);
         assert_eq!(
             sessions.finish_quick_craft(session),
             Some(InventoryGesture::QuickCraft {
-                source,
-                destinations: vec![(first, 64), (second, 64)],
+                source: InventorySlotRef::new(leased, source.loc),
+                destinations: vec![
+                    (InventorySlotRef::new(leased, first.loc), 64),
+                    (InventorySlotRef::new(leased, second.loc), 64),
+                ],
                 mode: QuickCraftMode::Even,
             })
         );
@@ -4247,9 +5129,18 @@ mod tests {
             actor_chunk(),
             Vec::new(),
         );
-        assert_eq!(ledger.apply_op_result(&operation), Err(InventoryApplyError::Rejected));
+        assert_eq!(
+            ledger.apply_op_result(&operation),
+            Err(InventoryApplyError::Rejected)
+        );
         assert_eq!(ledger.snapshot(source_target).unwrap().cells, vec![source]);
-        assert!(ledger.snapshot(destination_target).unwrap().cells.is_empty());
+        assert!(
+            ledger
+                .snapshot(destination_target)
+                .unwrap()
+                .cells
+                .is_empty()
+        );
         assert_eq!(ledger.snapshot(source_target).unwrap().revision, 7);
         assert_eq!(ledger.snapshot(destination_target).unwrap().revision, 9);
     }
@@ -4339,12 +5230,15 @@ mod tests {
                 z: 49,
             },
         };
-        let entity = InventoryTarget::Entity(EntityRef {
-            origin: crate::identity::ServerId(2),
-            local_id: 5,
-            generation: 1,
-            chunk,
-        }.into());
+        let entity = InventoryTarget::Entity(
+            EntityRef {
+                origin: crate::identity::ServerId(2),
+                local_id: 5,
+                generation: 1,
+                chunk,
+            }
+            .into(),
+        );
         let crafting = InventoryTarget::Virtual {
             host: crate::identity::ServerId(1),
             owner: ActorId::Player(gid(1, 4)),
@@ -4405,12 +5299,15 @@ mod tests {
         let chunk = ChunkKey::new(world, 0, 0);
         let actor = gid(1, 9);
         let player = InventoryTarget::Player(actor);
-        let dropped = InventoryTarget::Entity(EntityRef {
-            origin: crate::identity::ServerId(2),
-            local_id: 6,
-            generation: 1,
-            chunk,
-        }.into());
+        let dropped = InventoryTarget::Entity(
+            EntityRef {
+                origin: crate::identity::ServerId(2),
+                local_id: 6,
+                generation: 1,
+                chunk,
+            }
+            .into(),
+        );
         let cursor = InvLoc::new(INV_CURSOR, 0);
         let first = InvLoc::new(INV_MAIN, 0);
         let second = InvLoc::new(INV_MAIN, 1);
@@ -4725,7 +5622,10 @@ mod tests {
         let rebased = ledger.rebase_gesture_op(&action).unwrap();
         assert_eq!(action.actor, actor);
         assert_eq!(rebased.actor, actor);
-        assert_eq!(crate::completion::ActionKey::inventory(&action).actor, actor);
+        assert_eq!(
+            crate::completion::ActionKey::inventory(&action).actor,
+            actor
+        );
     }
 
     #[test]
@@ -4763,12 +5663,16 @@ mod tests {
         let screen = InventoryScreenSnapshot {
             session,
             sync_id: 3,
+            state_id: 0,
             window_kind: 7,
             container_slots: 3,
             slots: Vec::new(),
             cursor: InventoryCell::empty(loc(0)),
             affected: vec![chunk],
             preview: None,
+            preview_incarnation: None,
+            preview_lease: None,
+            preview_authority: None,
         };
         let kind = InventoryMenuKind::RenameAnvil {
             name: "new".to_string(),
@@ -4849,19 +5753,24 @@ mod tests {
             count: 3,
             ..state.clone()
         };
-        let kind = InventoryMenuKind::ContainerButton(
-            InventoryContainerButton::StonecutterRecipe { recipe: 6 },
-        );
+        let kind =
+            InventoryMenuKind::ContainerButton(InventoryContainerButton::StonecutterRecipe {
+                recipe: 6,
+            });
         let result = reduce_inventory_menu(
             &InventoryScreenSnapshot {
                 session,
                 sync_id: 9,
+                state_id: 0,
                 window_kind: 12,
                 container_slots: 2,
                 slots: Vec::new(),
                 cursor: InventoryCell::empty(loc(1)),
                 affected: vec![chunk],
                 preview: None,
+                preview_incarnation: None,
+                preview_lease: None,
+                preview_authority: None,
             },
             &[InventoryStateSnapshot {
                 target,
@@ -4924,6 +5833,7 @@ mod tests {
         let screen = InventoryScreenSnapshot {
             session,
             sync_id: 9,
+            state_id: 0,
             window_kind: 9,
             container_slots: 1,
             slots: vec![InventoryScreenSlot {
@@ -4935,6 +5845,9 @@ mod tests {
             cursor: InventoryCell::empty(loc),
             affected: vec![chunk],
             preview: None,
+            preview_incarnation: None,
+            preview_lease: None,
+            preview_authority: None,
         };
         let before = InventoryStateSnapshot {
             target,
@@ -4949,7 +5862,9 @@ mod tests {
         };
         let menu = beacon_menu_metadata(&screen, &before, state, true).unwrap();
         let mut ledger = InvLedger::new();
-        ledger.install_owned_snapshot(before.clone(), vec![chunk]).unwrap();
+        ledger
+            .install_owned_snapshot(before.clone(), vec![chunk])
+            .unwrap();
         let invalid = reduce_inventory_menu(
             &screen,
             std::slice::from_ref(&before),
@@ -4996,37 +5911,42 @@ mod tests {
                 companion_gestures: None,
             },
         );
-        assert_eq!(unavailable.unwrap_err(), InventoryMenuError::UnsupportedChoice);
+        assert_eq!(
+            unavailable.unwrap_err(),
+            InventoryMenuError::UnsupportedChoice
+        );
         assert_eq!(ledger.snapshot(target).unwrap().cells, before.cells);
         let actions: Vec<_> = [(PlayerSeq(0), 1_u16, true), (PlayerSeq(1), 3, false)]
             .into_iter()
             .map(|(sequence, primary, bedrock)| {
-            let reduction = reduce_inventory_menu(
-                &screen,
-                std::slice::from_ref(&before),
-                &menu,
-                InventoryMenuIntent {
-                    actor: ActorId::Player(player),
-                    tick: TickStamp(20),
-                    session,
-                    sync_id: 9,
-                    window_kind: 9,
-                    expected_revisions: vec![(target, 12)],
-                    actor_chunk: chunk,
-                    affected: vec![chunk],
-                    kind: InventoryMenuKind::SetBeacon {
-                        primary_effect: primary,
-                        secondary_effect: None,
+                let reduction = reduce_inventory_menu(
+                    &screen,
+                    std::slice::from_ref(&before),
+                    &menu,
+                    InventoryMenuIntent {
+                        actor: ActorId::Player(player),
+                        tick: TickStamp(20),
+                        session,
+                        sync_id: 9,
+                        window_kind: 9,
+                        expected_revisions: vec![(target, 12)],
+                        actor_chunk: chunk,
+                        affected: vec![chunk],
+                        kind: InventoryMenuKind::SetBeacon {
+                            primary_effect: primary,
+                            secondary_effect: None,
+                        },
+                        companion_gestures: bedrock.then(|| {
+                            vec![InventoryGesture::Remove {
+                                source: InventorySlotRef::new(target, loc),
+                                count: 1,
+                                kind: InventoryRemovalKind::Consume,
+                            }]
+                        }),
                     },
-                    companion_gestures: bedrock.then(|| vec![InventoryGesture::Remove {
-                        source: InventorySlotRef::new(target, loc),
-                        count: 1,
-                        kind: InventoryRemovalKind::Consume,
-                    }]),
-                },
-            )
-            .unwrap();
-            (sequence, reduction.into_action(sequence, &ledger).unwrap())
+                )
+                .unwrap();
+                (sequence, reduction.into_action(sequence, &ledger).unwrap())
             })
             .collect();
         for (sequence, action) in actions {
@@ -5051,7 +5971,10 @@ mod tests {
             chunk,
             position: BlockPos { x: 0, y: 80, z: 0 },
         };
-        let session = InventoryScreenSession { actor: player, session: 9 };
+        let session = InventoryScreenSession {
+            actor: player,
+            session: 9,
+        };
         let payment = cell(INV_MAIN, 0, 932, 1);
         let mut ledger = InvLedger::new();
         ledger
@@ -5095,6 +6018,7 @@ mod tests {
         let empty_screen = InventoryScreenSnapshot {
             session,
             sync_id: 9,
+            state_id: 0,
             window_kind: 9,
             container_slots: 1,
             slots: vec![InventoryScreenSlot {
@@ -5106,6 +6030,9 @@ mod tests {
             cursor: InventoryCell::empty(InvLoc::new(INV_CURSOR, 0)),
             affected: vec![chunk],
             preview: None,
+            preview_incarnation: None,
+            preview_lease: None,
+            preview_authority: None,
         };
         let state = BeaconMenuState {
             revision: 1,
@@ -5152,4 +6079,153 @@ mod tests {
         assert!(ledger.snapshot(beacon).unwrap().cells.is_empty());
         assert_eq!(operation.menu_effects.len(), 1);
     }
+
+    #[test]
+    fn block_virtual_inventory_installs_only_under_its_real_chunk() {
+        let chunk = ChunkKey::new(crate::protocol::WorldId::new(0, 9), 3, -2);
+        let target = InventoryTarget::BlockVirtual {
+            host: ServerId(1),
+            chunk,
+            position: BlockPos {
+                x: 49,
+                y: 64,
+                z: -31,
+            },
+            session: 12,
+            kind: 7,
+        };
+        let mut ledger = InvLedger::new();
+        ledger
+            .install_owned_snapshot(
+                InventoryStateSnapshot {
+                    target,
+                    revision: 1,
+                    cells: vec![cell(INV_MAIN, 0, 5, 3)],
+                },
+                Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(ledger.target_chunks(target), Some([chunk].as_slice()));
+        let invalid = InventoryTarget::BlockVirtual {
+            host: ServerId(1),
+            chunk,
+            position: BlockPos {
+                x: 32,
+                y: 64,
+                z: -31,
+            },
+            session: 12,
+            kind: 7,
+        };
+        assert_eq!(
+            ledger.install_owned_snapshot(
+                InventoryStateSnapshot {
+                    target: invalid,
+                    revision: 1,
+                    cells: vec![],
+                },
+                Vec::new(),
+            ),
+            Err(InventoryMutationError::InvalidLocation)
+        );
+        assert_eq!(ledger.snapshot(target).unwrap().cells.len(), 1);
+    }
+
+    #[test]
+    fn target_rename_preserves_contents_revisions_and_chunks_atomically() {
+        let player = GlobalPlayerId::new(ServerId(1), crate::identity::PlayerSlot(7));
+        let chunk = ChunkKey::new(crate::protocol::WorldId::new(0, 9), 3, -2);
+        let old = InventoryTarget::Player(player);
+        let new = InventoryTarget::LeasedPlayer {
+            key: uuid::Uuid::from_u128(8),
+            player,
+            incarnation: 3,
+        };
+        let occupied = InventoryTarget::LeasedPlayer {
+            key: uuid::Uuid::from_u128(9),
+            player,
+            incarnation: 4,
+        };
+        let mut ledger = InvLedger::new();
+        ledger
+            .install_owned_snapshot(
+                InventoryStateSnapshot {
+                    target: old,
+                    revision: 17,
+                    cells: vec![cell(INV_MAIN, 0, 5, 3)],
+                },
+                vec![chunk],
+            )
+            .unwrap();
+        ledger
+            .install_owned_snapshot(
+                InventoryStateSnapshot {
+                    target: occupied,
+                    revision: 2,
+                    cells: vec![cell(INV_MAIN, 1, 6, 1)],
+                },
+                vec![chunk],
+            )
+            .unwrap();
+        let before = ledger.clone();
+        assert_eq!(
+            ledger.rename_targets(&[(old, occupied)]),
+            Err(InventoryMutationError::TargetCollision)
+        );
+        assert_eq!(ledger.snapshot(old), before.snapshot(old));
+        assert_eq!(ledger.snapshot(occupied), before.snapshot(occupied));
+        ledger.rename_targets(&[(old, new)]).unwrap();
+        assert!(ledger.snapshot(old).is_none());
+        assert_eq!(ledger.snapshot(new).unwrap().revision, 17);
+        assert_eq!(
+            ledger.snapshot(new).unwrap().cells,
+            before.snapshot(old).unwrap().cells
+        );
+        assert_eq!(ledger.target_chunks(new), Some([chunk].as_slice()));
+        assert_eq!(ledger.snapshot(occupied), before.snapshot(occupied));
+    }
+    #[test]
+    fn chunk_unit_requires_complete_root_and_returns_exact_inventory() {
+        let a = ChunkKey::new(crate::protocol::WorldId::new(0, 9), 3, -2);
+        let b = ChunkKey::new(a.world, 4, -2);
+        let c = ChunkKey::new(a.world, 5, -2);
+        let shared = InventoryTarget::Player(GlobalPlayerId::new(ServerId(1), crate::identity::PlayerSlot(7)));
+        let unrelated = InventoryTarget::Player(GlobalPlayerId::new(ServerId(1), crate::identity::PlayerSlot(8)));
+        let mut ledger = InvLedger::new();
+        ledger.install_owned_snapshot(InventoryStateSnapshot { target: shared, revision: 17, cells: vec![cell(INV_MAIN, 0, 5, 3)] }, vec![a, b]).unwrap();
+        ledger.install_owned_snapshot(InventoryStateSnapshot { target: unrelated, revision: 21, cells: vec![cell(INV_MAIN, 1, 6, 1)] }, vec![c]).unwrap();
+        let shared_before = ledger.snapshot(shared).unwrap();
+        let unrelated_before = ledger.snapshot(unrelated).unwrap();
+        assert!(matches!(ledger.take_chunk_unit(&[a].into()), Err(InventoryMutationError::TargetCollision)));
+        assert_eq!(ledger.snapshot(shared), Some(shared_before.clone()));
+        let mut unit = ledger.take_chunk_unit(&[a, b].into()).unwrap();
+        assert!(ledger.snapshot(shared).is_none());
+        assert!(ledger.targets_for_chunk(a).is_empty());
+        assert_eq!(ledger.snapshot(unrelated), Some(unrelated_before.clone()));
+        assert_eq!(unit.snapshot(shared), Some(shared_before.clone()));
+        assert_eq!(unit.targets_for_chunk(a), vec![shared]);
+        unit.relocate_target(shared, vec![b]).unwrap();
+        assert!(unit.targets_for_chunk(a).is_empty());
+        ledger.return_chunk_unit(unit).unwrap();
+        assert_eq!(ledger.snapshot(shared), Some(shared_before));
+        assert_eq!(ledger.snapshot(unrelated), Some(unrelated_before));
+        assert_eq!(ledger.targets_for_chunk(b), vec![shared]);
+    }
+
+    #[test]
+    fn renamed_root_updates_chunk_index_and_collision_preserves_returned_unit() {
+        let chunk = ChunkKey::new(crate::protocol::WorldId::new(0, 9), 3, -2);
+        let old = InventoryTarget::Player(GlobalPlayerId::new(ServerId(1), crate::identity::PlayerSlot(7)));
+        let new = InventoryTarget::Player(GlobalPlayerId::new(ServerId(1), crate::identity::PlayerSlot(8)));
+        let mut ledger = InvLedger::new();
+        ledger.install_owned_snapshot(InventoryStateSnapshot { target: old, revision: 17, cells: vec![cell(INV_MAIN, 0, 5, 3)] }, vec![chunk]).unwrap();
+        ledger.rename_targets(&[(old, new)]).unwrap();
+        assert_eq!(ledger.targets_for_chunk(chunk), vec![new]);
+        let unit = ledger.take_chunk_unit(&[chunk].into()).unwrap();
+        ledger.install_owned_snapshot(InventoryStateSnapshot { target: new, revision: 20, cells: vec![cell(INV_MAIN, 0, 6, 1)] }, vec![chunk]).unwrap();
+        let rejected = ledger.return_chunk_unit(unit).unwrap_err();
+        assert_eq!(rejected.snapshot(new).unwrap().revision, 17);
+        assert_eq!(ledger.snapshot(new).unwrap().revision, 20);
+    }
+
 }

@@ -8,7 +8,9 @@ use pumpkin_cluster::item_action::ItemActionIntent;
 use super::Server;
 
 pub(crate) struct LocalItemActionIntent {
+    pub target_observation: Option<pumpkin_cluster::item_contact::ContactObservation>,
     pub intent: ItemActionIntent,
+    pub owner_install_generation: u64,
     pub origin: Option<u64>,
     pub input_sequence: Option<PlayerSeq>,
     pub effective_frame: Option<(ControllerFrame, f64)>,
@@ -25,9 +27,11 @@ pub(crate) fn attach_item_action_owner(server: &Server) -> mpsc::Receiver<LocalI
 pub(crate) fn submit_item_action_with_sequence(
     server: &Server,
     intent: ItemActionIntent,
+    owner_install_generation: u64,
     origin: Option<u64>,
     input_sequence: Option<PlayerSeq>,
     effective_frame: Option<(ControllerFrame, f64)>,
+    target_observation: Option<pumpkin_cluster::item_contact::ContactObservation>,
 ) -> Result<(), InventoryApplyError> {
     server
         .cluster_item_action_route_tx
@@ -35,7 +39,9 @@ pub(crate) fn submit_item_action_with_sequence(
         .clone()
         .ok_or(InventoryApplyError::TargetUnavailable)?
         .try_send(LocalItemActionIntent {
+            target_observation,
             intent,
+            owner_install_generation,
             origin,
             input_sequence,
             effective_frame,

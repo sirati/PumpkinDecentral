@@ -68,6 +68,7 @@ impl BreedGoal {
         let mob_entity = mob.get_mob_entity();
         let entity = mob.get_entity();
         let world = entity.world.load();
+        if world.server.upgrade().is_some_and(|server| server.advanced_config.cluster.enabled) { return; }
 
         let player_opt = mob_entity
             .breeder

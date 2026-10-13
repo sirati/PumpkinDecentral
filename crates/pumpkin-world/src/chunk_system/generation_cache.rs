@@ -1,4 +1,4 @@
-use super::chunk_state::{Chunk, StagedChunkEnum};
+use super::chunk_state::{Chunk, InitialChunkPalettes, StagedChunkEnum};
 use crate::ProtoChunk;
 use crate::chunk::ChunkHeightmapType;
 use crate::generation::biome_coords;
@@ -22,6 +22,8 @@ pub struct Cache {
     pub z: i32,
     pub size: i32,
     pub chunks: Vec<Chunk>,
+    pub capture_seed: bool,
+    pub initial_palettes: Option<InitialChunkPalettes>,
     surface_biomes: Option<Box<SurfaceBiomeNeighborhood>>,
 }
 
@@ -534,6 +536,8 @@ impl Cache {
             z,
             size,
             chunks: Vec::with_capacity((size * size) as usize),
+            capture_seed: false,
+            initial_palettes: None,
             surface_biomes: None,
         }
     }
@@ -701,7 +705,12 @@ impl Cache {
                 let chunk = self.chunks[mid].get_proto_chunk_mut();
                 debug_assert_eq!(chunk.stage, StagedChunkEnum::Spawn);
                 chunk.stage = StagedChunkEnum::Full;
-                self.chunks[mid].upgrade_to_level_chunk(generator.dimension(), lighting_config);
+                if self.capture_seed {
+                    self.initial_palettes = self.chunks[mid]
+                        .upgrade_to_level_chunk_with_seed(generator.dimension(), lighting_config);
+                } else {
+                    self.chunks[mid].upgrade_to_level_chunk(generator.dimension(), lighting_config);
+                }
             }
             StagedChunkEnum::None => {}
         }

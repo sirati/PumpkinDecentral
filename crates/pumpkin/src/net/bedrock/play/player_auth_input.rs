@@ -29,7 +29,10 @@ impl BedrockClient {
                     None
                 }
             };
-            let eye_height = player.get_entity().entity_type.eye_height;
+            let eye_height = player.cluster_gid().and_then(|gid|
+                server.cluster_actor_living.load().get(&pumpkin_cluster::actor::ActorId::Player(gid))
+                    .map(crate::server::cluster_living_metadata::player_eye_height))
+                .unwrap_or(player.get_entity().entity_type.eye_height);
             crate::server::cluster_controller::submit_patch(
                 server,
                 player,
@@ -67,6 +70,48 @@ impl BedrockClient {
                     ),
                 },
             );
+            let swimming = transition(
+                InputData::StartSwimming as usize,
+                InputData::StopSwimming as usize,
+            );
+            let gliding = transition(
+                InputData::StartGliding as usize,
+                InputData::StopGliding as usize,
+            );
+            if swimming.is_some() || gliding.is_some() {
+                crate::server::cluster_controller::submit_patch(
+                    server,
+                    player,
+                    crate::server::cluster_controller::ControllerPatch::Pose { swimming, gliding },
+                );
+            }
+            if let Some(gid) = player.cluster_gid()
+                && server
+                    .cluster_actor_living
+                    .load()
+                    .get(&pumpkin_cluster::actor::ActorId::Player(gid))
+                    .and_then(|living| living.avatar.as_ref())
+                    .is_some_and(|avatar| avatar.mount.is_some())
+            {
+                let direction = |value: f32| {
+                    if value > 0.01 {
+                        1
+                    } else if value < -0.01 {
+                        -1
+                    } else {
+                        0
+                    }
+                };
+                crate::server::cluster_controller::submit_patch(
+                    server,
+                    player,
+                    crate::server::cluster_controller::ControllerPatch::VehicleFlags {
+                        forward: direction(packet.move_vec.y),
+                        sideways: direction(packet.move_vec.x),
+                        jumping: packet.input_data.get(InputData::Jumping as usize),
+                    },
+                );
+            }
             if let Some(request) = packet.item_stack_request {
                 crate::server::cluster_inventory_protocol::stage_bedrock_stack_requests(
                     player,

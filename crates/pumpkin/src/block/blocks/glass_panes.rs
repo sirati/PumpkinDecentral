@@ -1,7 +1,6 @@
 use crate::block::{
     BlockBehaviour, GetStateForNeighborUpdateArgs, OnPlaceArgs, PathComputationType,
 };
-use crate::world::World;
 use pumpkin_data::block_properties::HorizontalFacing;
 use pumpkin_data::tag::Taggable;
 use pumpkin_data::{Block, BlockDirection, BlockState, BlockStateId, HorizontalFacingExt, tag};
@@ -13,6 +12,7 @@ type GlassPaneProperties = pumpkin_data::block_properties::OakFenceLikePropertie
 #[pumpkin_block_from_tag("c:glass_panes")]
 pub struct GlassPaneBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for GlassPaneBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut pane_props = GlassPaneProperties::default(args.block);
@@ -36,7 +36,7 @@ impl BlockBehaviour for GlassPaneBlock {
 
 pub fn compute_pane_state(
     mut pane_props: GlassPaneProperties,
-    world: &World,
+    world: &dyn pumpkin_world::world::BlockAccessor,
     block: &Block,
     block_pos: &BlockPos,
 ) -> BlockStateId {

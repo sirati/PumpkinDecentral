@@ -133,9 +133,12 @@ impl From<&ItemStack> for NetworkItemDescriptor {
                 |mapping| Self {
                     id: VarInt::from(mapping.bedrock_item.id),
                     stack_size: stack.item_count as u16,
-                    aux_value: VarUInt(mapping.bedrock_data),
+                    aux_value: VarUInt(super::item_components::item_component_aux(
+                        stack,
+                        mapping.bedrock_data,
+                    )),
                     block_runtime_id: VarInt::from(mapping.bedrock_block_state),
-                    nbt_data: Nbt::default(),
+                    nbt_data: super::item_components::item_component_nbt(stack),
                     place_on_blocks: Vec::default(),
                     destroy_blocks: Vec::default(),
                     shield_blocking_tick: 0,
@@ -236,9 +239,12 @@ impl From<&ItemStack> for ItemStackWrapper {
                 |mapping| Self {
                     id: mapping.bedrock_item.id,
                     stack_size: stack.item_count as u16,
-                    aux_value: VarUInt(mapping.bedrock_data),
+                    aux_value: VarUInt(super::item_components::item_component_aux(
+                        stack,
+                        mapping.bedrock_data,
+                    )),
                     block_runtime_id: VarInt::from(mapping.bedrock_block_state),
-                    nbt_data: Nbt::default(),
+                    nbt_data: super::item_components::item_component_nbt(stack),
                     place_on_blocks: Vec::default(),
                     destroy_blocks: Vec::default(),
                     shield_blocking_tick: 0,
@@ -257,6 +263,7 @@ pub struct NetworkItemStackDescriptor {
     pub block_runtime_id: VarUInt,
     pub extra_data: Vec<u8>,
     pub net_id: Option<NonZero<i32>>,
+    user_data: Option<NetworkItemDescriptor>,
 }
 
 impl PacketWrite for NetworkItemStackDescriptor {
@@ -273,8 +280,12 @@ impl PacketWrite for NetworkItemStackDescriptor {
 
         self.block_runtime_id.write(writer)?;
 
-        VarUInt(self.extra_data.len() as u32).write(writer)?;
-        writer.write_all(&self.extra_data)?;
+        if let Some(user_data) = &self.user_data {
+            user_data.write_user_data(writer)?;
+        } else {
+            VarUInt(self.extra_data.len() as u32).write(writer)?;
+            writer.write_all(&self.extra_data)?;
+        }
 
         Ok(())
     }
@@ -314,6 +325,7 @@ impl PacketRead for NetworkItemStackDescriptor {
             block_runtime_id,
             extra_data,
             net_id,
+            user_data: None,
         })
     }
 }
@@ -332,10 +344,14 @@ impl From<&ItemStack> for NetworkItemStackDescriptor {
                     Self {
                         id: mapping.bedrock_item.id,
                         stack_size: stack.item_count as u16,
-                        aux_value: VarUInt(mapping.bedrock_data),
+                        aux_value: VarUInt(super::item_components::item_component_aux(
+                            stack,
+                            mapping.bedrock_data,
+                        )),
                         block_runtime_id: VarUInt(mapping.bedrock_block_state as u32),
                         extra_data,
                         net_id: Some(stack.uid),
+                        user_data: Some(NetworkItemDescriptor::from(stack)),
                     }
                 },
             )
@@ -623,4 +639,250 @@ fn read_user_data(
         destroy_blocks,
         shield_blocking_tick,
     ))
+}
+
+#[cfg(test)]
+mod component_tests {
+    use super::*;
+    use pumpkin_data::data_component::DataComponent;
+    use pumpkin_data::data_component_impl::{
+        CustomDataImpl, DamageImpl, EnchantmentsImpl, LoreImpl, StoredEnchantmentsImpl,
+        WrittenBookContentImpl,
+    };
+    use pumpkin_data::enchantment::Enchantment;
+    use pumpkin_data::item::Item;
+    use pumpkin_nbt::{NbtCompound, tag::NbtTag};
+    use pumpkin_util::text::TextComponent;
+    use std::borrow::Cow;
+    use std::io::Cursor;
+
+    #[test]
+    fn potion_aux_uses_bedrock_identity_for_every_descriptor() {
+        use pumpkin_data::{data_component_impl::PotionContentsImpl, potion::Potion};
+        for (name, expected) in [
+            ("strong_healing", 22),
+            ("wind_charged", 43),
+            ("weaving", 44),
+            ("oozing", 45),
+            ("infested", 46),
+        ] {
+            let potion = Potion::from_name(name).unwrap();
+            for item in [
+                &Item::POTION,
+                &Item::SPLASH_POTION,
+                &Item::LINGERING_POTION,
+                &Item::TIPPED_ARROW,
+            ] {
+                let mut stack = ItemStack::new(1, item);
+                stack.set_data_component(PotionContentsImpl {
+                    potion_id: Some(i32::from(potion.id)),
+                    custom_color: None,
+                    custom_effects: Vec::new(),
+                    custom_name: None,
+                });
+                let expected = expected + u32::from(item.id == Item::TIPPED_ARROW.id);
+                assert_eq!(NetworkItemDescriptor::from(&stack).aux_value.0, expected);
+                assert_eq!(
+                    NetworkItemStackDescriptor::from(&stack).aux_value.0,
+                    expected
+                );
+                assert_eq!(ItemStackWrapper::from(&stack).aux_value.0, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn modern_enchantments_keep_native_bedrock_ids() {
+        let mut stack = ItemStack::new(1, &Item::MACE);
+        stack.set_data_component(EnchantmentsImpl {
+            enchantment: Cow::Owned(
+                [
+                    ("minecraft:wind_burst", 38),
+                    ("minecraft:density", 39),
+                    ("minecraft:breach", 40),
+                ]
+                .into_iter()
+                .map(|(name, _)| (Enchantment::from_name(name).unwrap(), 2))
+                .collect(),
+            ),
+        });
+        for nbt in [
+            NetworkItemDescriptor::from(&stack).nbt_data,
+            ItemStackWrapper::from(&stack).nbt_data,
+        ] {
+            let ids = nbt
+                .root_tag
+                .get_list("ench")
+                .unwrap()
+                .iter()
+                .map(|entry| entry.extract_compound().unwrap().get_short("id").unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(ids, vec![38, 39, 40]);
+        }
+    }
+
+    fn stack() -> ItemStack {
+        let mut stack = ItemStack::new(2, &Item::IRON_SWORD);
+        stack.set_custom_name("alpha".to_owned());
+        stack.set_data_component(DamageImpl { damage: 3 });
+        stack.set_data_component(LoreImpl {
+            lines: vec![TextComponent::text("first"), TextComponent::text("second")],
+        });
+        stack.set_data_component(EnchantmentsImpl {
+            enchantment: Cow::Owned(vec![(
+                Enchantment::from_name("minecraft:sharpness").unwrap(),
+                5,
+            )]),
+        });
+        let mut data = NbtCompound::new();
+        data.put_long("exact", i64::MAX);
+        stack.set_data_component(CustomDataImpl::new(data));
+        stack.patch.push((DataComponent::MaxStackSize, None));
+        stack
+    }
+
+    fn assert_components(nbt: &Nbt, stack: &ItemStack) {
+        let display = nbt.root_tag.get_compound("display").unwrap();
+        assert_eq!(display.get_string("Name"), Some("alpha"));
+        assert_eq!(
+            display.get_list("Lore").unwrap(),
+            &[
+                NbtTag::String("first".into()),
+                NbtTag::String("second".into())
+            ]
+        );
+        assert_eq!(nbt.root_tag.get_int("Damage"), Some(3));
+        assert_eq!(nbt.root_tag.get_long("exact"), Some(i64::MAX));
+        let enchantments = nbt.root_tag.get_list("ench").unwrap();
+        let entry = enchantments[0].extract_compound().unwrap();
+        assert_eq!(entry.get_short("id"), Some(9));
+        assert_eq!(entry.get_short("lvl"), Some(5));
+        let mut canonical = NbtCompound::new();
+        stack.write_item_stack(&mut canonical);
+        assert_eq!(
+            nbt.root_tag.get_compound("PumpkinComponents"),
+            canonical.get_compound("components")
+        );
+    }
+
+    #[test]
+    fn written_book_and_stored_enchantments_use_native_bedrock_tags() {
+        let mut book = ItemStack::new(1, &Item::WRITTEN_BOOK);
+        book.set_data_component(WrittenBookContentImpl {
+            title: "Title".to_owned(),
+            author: "Author".to_owned(),
+            pages: vec!["one".to_owned(), "two".to_owned()],
+        });
+        let native = NetworkItemDescriptor::from(&book).nbt_data;
+        assert_eq!(native.root_tag.get_string("title"), Some("Title"));
+        assert_eq!(native.root_tag.get_string("author"), Some("Author"));
+        let pages = native.root_tag.get_list("pages").unwrap();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(
+            pages[1].extract_compound().unwrap().get_string("text"),
+            Some("two")
+        );
+        assert_eq!(
+            pages[1].extract_compound().unwrap().get_string("photoname"),
+            Some("")
+        );
+        let mut enchanted = ItemStack::new(1, &Item::ENCHANTED_BOOK);
+        enchanted.set_data_component(StoredEnchantmentsImpl {
+            enchantment: Cow::Owned(vec![(
+                Enchantment::from_name("minecraft:mending").unwrap(),
+                1,
+            )]),
+        });
+        let native = NetworkItemDescriptor::from(&enchanted).nbt_data;
+        let enchantments = native.root_tag.get_list("ench").unwrap();
+        assert_eq!(
+            enchantments[0].extract_compound().unwrap().get_short("id"),
+            Some(26)
+        );
+    }
+
+    #[test]
+    fn removed_components_cannot_be_restored_by_custom_data_native_tags() {
+        let mut stack = ItemStack::new(1, &Item::STONE);
+        let mut display = NbtCompound::new();
+        display.put_string("Name", "spoofed".to_owned());
+        display.put_list("Lore", vec![NbtTag::String("spoofed".into())]);
+        let mut data = NbtCompound::new();
+        data.put_compound("display", display);
+        data.put_int("Damage", 50);
+        data.put_byte("Unbreakable", 1);
+        stack.set_data_component(CustomDataImpl::new(data));
+        for component in [
+            DataComponent::CustomName,
+            DataComponent::Lore,
+            DataComponent::Damage,
+            DataComponent::Unbreakable,
+        ] {
+            stack.patch.push((component, None));
+        }
+        let nbt = NetworkItemDescriptor::from(&stack).nbt_data;
+        assert!(nbt.root_tag.get_compound("display").is_none());
+        assert!(nbt.root_tag.get_int("Damage").is_none());
+        assert!(nbt.root_tag.get_byte("Unbreakable").is_none());
+        let mut canonical = NbtCompound::new();
+        stack.write_item_stack(&mut canonical);
+        assert_eq!(
+            nbt.root_tag.get_compound("PumpkinComponents"),
+            canonical.get_compound("components")
+        );
+    }
+
+    #[test]
+    fn every_item_descriptor_preserves_component_patch_and_native_fields() {
+        let stack = stack();
+        let original = stack.clone();
+        let mut bytes = Vec::new();
+        NetworkItemDescriptor::from(&stack)
+            .write(&mut bytes)
+            .unwrap();
+        bytes.push(127);
+        let mut cursor = Cursor::new(bytes);
+        let descriptor = NetworkItemDescriptor::read(&mut cursor).unwrap();
+        assert_components(&descriptor.nbt_data, &stack);
+        assert_eq!(u8::read(&mut cursor).unwrap(), 127);
+
+        let mut bytes = Vec::new();
+        ItemStackWrapper::from(&stack).write(&mut bytes).unwrap();
+        bytes.push(127);
+        let mut cursor = Cursor::new(bytes);
+        let wrapper = ItemStackWrapper::read(&mut cursor).unwrap();
+        assert_components(&wrapper.nbt_data, &stack);
+        assert_eq!(wrapper.net_id, Some(stack.uid));
+        assert_eq!(u8::read(&mut cursor).unwrap(), 127);
+
+        let mut bytes = Vec::new();
+        NetworkItemStackDescriptor::from(&stack)
+            .write(&mut bytes)
+            .unwrap();
+        bytes.push(127);
+        let mut cursor = Cursor::new(bytes);
+        let descriptor = NetworkItemStackDescriptor::read(&mut cursor).unwrap();
+        let (nbt, place, destroy, shield) = read_user_data(descriptor.extra_data, false).unwrap();
+        assert_components(&nbt, &stack);
+        assert!(place.is_empty() && destroy.is_empty());
+        assert_eq!(shield, 0);
+        assert_eq!(u8::read(&mut cursor).unwrap(), 127);
+        assert!(stack.are_equal(&original));
+    }
+
+    #[test]
+    fn shield_user_data_roundtrip_keeps_blocking_tick_and_packet_boundary() {
+        let stack = ItemStack::new(1, &Item::SHIELD);
+        let mut bytes = Vec::new();
+        NetworkItemStackDescriptor::from(&stack)
+            .write(&mut bytes)
+            .unwrap();
+        bytes.push(127);
+        let mut cursor = Cursor::new(bytes);
+        let descriptor = NetworkItemStackDescriptor::read(&mut cursor).unwrap();
+        let (_, place, destroy, shield) = read_user_data(descriptor.extra_data, true).unwrap();
+        assert!(place.is_empty() && destroy.is_empty());
+        assert_eq!(shield, 0);
+        assert_eq!(u8::read(&mut cursor).unwrap(), 127);
+    }
 }

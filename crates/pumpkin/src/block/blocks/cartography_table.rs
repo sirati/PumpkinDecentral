@@ -15,6 +15,7 @@ use std::sync::Mutex;
 #[pumpkin_block("minecraft:cartography_table")]
 pub struct CartographyTableBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for CartographyTableBlock {
     fn normal_use(&self, args: NormalUseArgs<'_>) -> BlockActionResult {
         if let Some(factory) = self.get_screen_handler_factory(GetScreenHandlerFactoryArgs {

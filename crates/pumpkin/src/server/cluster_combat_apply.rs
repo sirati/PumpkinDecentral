@@ -223,7 +223,7 @@ fn entity_matches_ref(
     }
     target.origin == local
         && inner.entity_id == target.local_id
-        && inner.cluster_generation() == target.generation
+        && u64::from(inner.cluster_generation()) == target.generation
 }
 
 fn arrow_speed_for_fire(update: &FireProjectileUpdate) -> f32 {

@@ -43,6 +43,7 @@ impl DragonEggBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for DragonEggBlock {
     fn placed(&self, args: PlacedArgs<'_>) {
         args.world

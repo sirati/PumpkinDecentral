@@ -30,6 +30,7 @@ impl SnifferEggBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for SnifferEggBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let props = SnifferEggLikeProperties::default(args.block);

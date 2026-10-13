@@ -29,6 +29,7 @@ impl BlockMetadata for TallPlantBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for TallPlantBlock {
     fn can_place_at(&self, args: CanPlaceAtArgs<'_>) -> bool {
         let up_pos = args.position.up();

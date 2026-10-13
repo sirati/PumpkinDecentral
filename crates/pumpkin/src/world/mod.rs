@@ -60,7 +60,7 @@ pub use explosion::{
     ExplosionInteraction, SimpleExplosionDamageCalculator,
 };
 use pumpkin_config::BasicConfiguration;
-use pumpkin_data::block_properties::{blocks_movement, is_air};
+use pumpkin_data::block_properties::is_air;
 use pumpkin_data::block_rotation::{Mirror, Rotation};
 use pumpkin_data::data_component_impl::EquipmentSlot;
 use pumpkin_data::dimension::Dimension;
@@ -185,7 +185,10 @@ use weather::Weather;
 
 const MAX_LIGHT_LEVEL: u8 = 15;
 
-fn bedrock_chest_block_actor(state_id: BlockStateId, position: BlockPos) -> Option<NbtCompound> {
+pub(crate) fn bedrock_chest_block_actor(
+    state_id: BlockStateId,
+    position: BlockPos,
+) -> Option<NbtCompound> {
     let (block, _) = BlockState::from_id_with_block(state_id);
     if !block.has_tag(&pumpkin_data::tag::Block::C_CHESTS_WOODEN)
         && !block.has_tag(&pumpkin_data::tag::Block::MINECRAFT_COPPER_CHESTS)
@@ -236,6 +239,33 @@ impl PumpkinError for GetBlockError {
     }
 }
 
+pub(crate) struct EntityQuerySnapshot {
+    local: Arc<Vec<Arc<dyn EntityBase>>>,
+    remote: Option<Arc<Vec<Arc<dyn EntityBase>>>>,
+    canonical: Option<crate::server::cluster_entity_registry::CanonicalEntityRoot>,
+    canonical_ids: Option<crate::server::cluster_entity_registry::CanonicalIdentityRoot>,
+}
+
+impl EntityQuerySnapshot {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Arc<dyn EntityBase>> {
+        self.local
+            .iter()
+            .filter(|entity| {
+                !entity
+                    .cast_any()
+                    .is::<crate::entity::cluster_player_ghost::RemotePlayerReplica>()
+                    && !self.canonical_ids.as_ref().is_some_and(|identities| {
+                        identities.contains_key(&(
+                            entity.get_entity().entity_id,
+                            entity.get_entity().entity_uuid,
+                        ))
+                    })
+            })
+            .chain(self.remote.iter().flat_map(|entities| entities.iter()))
+            .chain(self.canonical.iter().flat_map(|entities| entities.values()))
+    }
+}
+
 /// Represents a Minecraft world, containing entities, players, and the underlying level data.
 ///
 /// Each dimension (Overworld, Nether, End) typically has its own `World`.
@@ -257,12 +287,15 @@ pub struct World {
     /// This does not include players.
     pub entities: ArcSwap<Vec<Arc<dyn EntityBase>>>,
     /// The world's scoreboard, used for tracking scores, objectives, and display information.
-    pub scoreboard: std::sync::Mutex<Scoreboard>,
+    pub scoreboard: scoreboard::WorldScoreboard,
     pub team_chat_snapshot: Arc<ArcSwap<FxHashMap<String, Team>>>,
+    pub score_query_snapshot:
+        Arc<ArcSwap<FxHashMap<String, FxHashMap<String, scoreboard::ScoreboardScore>>>>,
     /// The world's worldborder, defining the playable area and controlling its expansion or contraction.
     pub worldborder: std::sync::Mutex<Worldborder>,
     /// The world's time, including counting ticks for weather, time cycles, and statistics.
     pub level_time: std::sync::Mutex<LevelTime>,
+    pub cluster_environment_view: ArcSwap<crate::server::cluster_environment::EnvironmentView>,
     /// The type of dimension the world is in.
     pub dimension: Dimension,
     pub sea_level: i32,
@@ -393,17 +426,37 @@ impl World {
             NbtCompound::new()
         };
 
+        let cluster_environment_view = ArcSwap::from_pointee(
+            crate::server::cluster_environment::EnvironmentView::from_level_info(
+                &level_info.load(),
+            ),
+        );
+        let scoreboard_world = format!(
+            "{}:{}",
+            dimension.id,
+            level
+                .level_folder
+                .root_folder
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("world")
+        );
         let team_chat_snapshot = Arc::new(ArcSwap::from_pointee(FxHashMap::default()));
+        let score_query_snapshot = Arc::new(ArcSwap::from_pointee(FxHashMap::default()));
         Self {
             uuid: Uuid::new_v4(),
             level,
             level_info,
             players: ArcSwap::new(Arc::new(Vec::new())),
             entities: ArcSwap::new(Arc::new(Vec::new())),
-            scoreboard: std::sync::Mutex::new(Scoreboard::with_team_snapshot(Arc::clone(
-                &team_chat_snapshot,
-            ))),
+            scoreboard: scoreboard::WorldScoreboard::new(
+                Scoreboard::with_team_snapshot(Arc::clone(&team_chat_snapshot))
+                    .with_score_snapshot(Arc::clone(&score_query_snapshot)),
+                server.clone(),
+                scoreboard_world,
+            ),
             team_chat_snapshot,
+            score_query_snapshot,
             worldborder: std::sync::Mutex::new(Worldborder::new(
                 0.0,
                 0.0,
@@ -413,6 +466,7 @@ impl World {
                 300,
             )),
             level_time: std::sync::Mutex::new(LevelTime::new()),
+            cluster_environment_view,
             dimension,
             weather: std::sync::Mutex::new(Weather::new()),
             block_registry,
@@ -878,6 +932,19 @@ impl World {
     }
 
     pub fn set_difficulty(&self, difficulty: Difficulty) {
+        if let Some(server) = self.server.upgrade()
+            && server.advanced_config.cluster.enabled
+        {
+            crate::server::cluster_gamerules::submit(
+                &server,
+                crate::server::cluster_gamerules::ConfigMutation::Difficulty {
+                    value: difficulty,
+                    force: true,
+                },
+            );
+            return;
+        }
+
         let current_info = self.level_info.load();
         let mut new_info = (**current_info).clone();
         new_info.difficulty = difficulty;
@@ -892,7 +959,12 @@ impl World {
         }
     }
 
-    pub fn set_game_rule(&self, rule: &GameRule, value: GameRuleValue<i64, bool>) {
+    pub fn set_game_rule(&self, rule: &GameRule, value: GameRuleValue<i64, bool>) -> bool {
+        if let Some(server) = self.server.upgrade()
+            && server.advanced_config.cluster.enabled
+        {
+            return crate::server::cluster_gamerules::set_rule(&server, rule, value);
+        }
         let current_info = self.level_info.load();
         let mut new_info = (**current_info).clone();
         match (new_info.game_rules.get_mut(rule), value) {
@@ -902,9 +974,10 @@ impl World {
             (GameRuleValue::Bool(target), GameRuleValue::Bool(val)) => {
                 *target = val;
             }
-            _ => {}
+            _ => return false,
         }
         self.level_info.store(Arc::new(new_info));
+        true
     }
 
     pub fn add_synced_block_event(&self, pos: BlockPos, r#type: u8, data: u8) {
@@ -1412,7 +1485,7 @@ impl World {
             is_baby: false,
             is_global: false,
             actor_unique_id: 0,
-            fire_at_position: None,
+            fire_at_position: Vector3::new(0.0, 0.0, 0.0),
         };
         let chunk_pos = BlockPos::floored_v(*position).chunk_position();
 
@@ -1518,8 +1591,11 @@ impl World {
 
     #[expect(clippy::too_many_lines)]
     pub fn tick(self: &Arc<Self>, server: &Arc<Server>) {
-        if pumpkin_world::level::is_cluster_secondary() {
-            self.tick_cluster_secondary(server);
+        if server.advanced_config.cluster.enabled {
+            if !server.cluster_environment.tick(self) {
+                return;
+            }
+            self.tick_cluster_owned_view(server);
             return;
         }
 
@@ -1697,14 +1773,11 @@ impl World {
         }
     }
 
-    fn tick_cluster_secondary(self: &Arc<Self>, server: &Arc<Server>) {
+    fn tick_cluster_owned_view(self: &Arc<Self>, server: &Arc<Server>) {
         let players = self.players.load();
         if secondary_tick_is_idle(true, players.len()) {
             return;
         }
-
-        self.flush_block_updates();
-        self.flush_synced_block_events();
 
         let handle = server.runtime.clone();
         players.par_iter().for_each(|player| {
@@ -1894,6 +1967,12 @@ impl World {
     }
 
     pub fn tick_environment(self: &Arc<Self>) {
+        if let Some(server) = self.server.upgrade()
+            && server.advanced_config.cluster.enabled
+        {
+            server.cluster_environment.tick(self);
+            return;
+        }
         let (world_age, is_night, time_of_day) = {
             let mut level_time = self
                 .level_time
@@ -1988,12 +2067,57 @@ impl World {
     pub fn tick_chunks(self: &Arc<Self>, server: &Arc<Server>) {
         const BATCH_SIZE: usize = 32;
         const INHABITED_TIME_BATCH_SIZE: usize = 1024;
+        const OWNER_INHABITED_PAGE: usize = 64;
+        // Reserve owner capacity before running chunk callbacks. Saturation
+        // delays the whole chunk tick instead of losing its inhabited update.
+        let inhabited_route = if server.is_cluster_primary() {
+            let Some(route) = server.cluster_chunk_inventory_route.load_full() else {
+                return;
+            };
+            Some(route)
+        } else {
+            None
+        };
+        let mut inhabited_permits = Vec::new();
+        if let Some(route) = &inhabited_route {
+            let Ok(permit) = route.as_ref().clone().try_reserve_owned() else {
+                return;
+            };
+            inhabited_permits.push(permit);
+        }
         let random_tick_speed = self.level_info.load().game_rules.random_tick_speed;
 
-        let active_chunks = self
+        let mut active_chunks = self
             .active_chunks
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let primary_inhabited_chunks = if let Some(route) = &inhabited_route {
+            let world = crate::server::cluster_world_delta::world_id(self);
+            let published = server.cluster_owned_chunk_blocks.load();
+            let fences = self.level.cluster_primary_chunk_fences.load();
+            active_chunks.retain(|pos| {
+                published.contains_key(&pumpkin_cluster::protocol::ChunkKey::new(
+                    world, pos.x, pos.y,
+                )) && fences
+                    .get(pos)
+                    .is_some_and(|fence| fence.load(std::sync::atomic::Ordering::Acquire) == 1)
+            });
+            let chunks = active_chunks
+                .iter()
+                .map(|pos| pumpkin_cluster::protocol::ChunkKey::new(world, pos.x, pos.y))
+                .collect::<Vec<_>>();
+            let needed = chunks.len().div_ceil(OWNER_INHABITED_PAGE);
+            while inhabited_permits.len() < needed {
+                let Ok(permit) = route.as_ref().clone().try_reserve_owned() else {
+                    return;
+                };
+                inhabited_permits.push(permit);
+            }
+            Some(chunks)
+        } else {
+            None
+        };
         let tick_data = self.level.get_tick_data(&active_chunks, random_tick_speed);
         let handle = server.runtime.clone();
 
@@ -2183,18 +2307,31 @@ impl World {
             });
         }
 
-        // Batch these cheap lookups and atomic increments to avoid waking Rayon
-        // workers for tiny tasks every tick, while retaining parallelism for large sets.
-        let loaded_chunks = self.level.loaded_chunks.clone();
         let active_chunks_vec: Vec<_> = active_chunks.iter().copied().collect();
-        active_chunks_vec
-            .par_iter()
-            .with_min_len(INHABITED_TIME_BATCH_SIZE)
-            .for_each(|pos| {
-                if let Some(chunk) = loaded_chunks.get(pos) {
-                    chunk.inhabited_time.fetch_add(1, Relaxed);
-                }
-            });
+        if let Some(chunks) = primary_inhabited_chunks {
+            for (permit, page) in inhabited_permits
+                .into_iter()
+                .zip(chunks.chunks(OWNER_INHABITED_PAGE))
+            {
+                permit.send(
+                    crate::server::cluster_world_owner::ChunkInventoryRequest::AdvanceInhabited {
+                        tick: server.tick_count.load(Relaxed) as u32,
+                        chunks: page.to_vec(),
+                    },
+                );
+            }
+        } else {
+            // Keep the vanilla counter for a non-cluster world.
+            let loaded_chunks = self.level.loaded_chunks.clone();
+            active_chunks_vec
+                .par_iter()
+                .with_min_len(INHABITED_TIME_BATCH_SIZE)
+                .for_each(|pos| {
+                    if let Some(chunk) = loaded_chunks.get(pos) {
+                        chunk.inhabited_time.fetch_add(1, Relaxed);
+                    }
+                });
+        }
     }
 
     pub fn check_fluid_collision(&self, bounding_box: BoundingBox) -> bool {
@@ -2252,96 +2389,10 @@ impl World {
         fluid0: &Fluid,
         state0: &FluidState,
     ) -> Vector3<f64> {
-        let mut velo = Vector3::default();
-
-        for dir in BlockDirection::horizontal() {
-            let offset = dir.to_offset();
-            let pos = pos0.offset(offset);
-
-            let (neighbor_fluid, neighbor_state) = self.get_fluid_and_fluid_state(&pos);
-
-            if neighbor_fluid.matches_type(fluid0) {
-                let mut neighbor_height = neighbor_state.height;
-                let mut amplitude = 0.0;
-
-                if neighbor_height == 0.0 {
-                    let state_id = self.get_block_state_id(&pos);
-                    let block_id = state_id.to_block_id();
-                    let block_state = state_id.to_state();
-
-                    let blocks_movement = blocks_movement(block_state, block_id);
-
-                    if !blocks_movement {
-                        let down_pos = pos.down();
-                        let (down_fluid, down_state) = self.get_fluid_and_fluid_state(&down_pos);
-
-                        if down_fluid.matches_type(fluid0) {
-                            neighbor_height = down_state.height;
-                            if neighbor_height > 0.0 {
-                                amplitude = f64::from(state0.height)
-                                    - (f64::from(neighbor_height) - 0.888_888_9);
-                            }
-                        }
-                    }
-                } else if neighbor_height > 0.0 {
-                    amplitude = f64::from(state0.height) - f64::from(neighbor_height);
-                }
-
-                if amplitude != 0.0 {
-                    velo.x += f64::from(offset.x) * amplitude;
-                    velo.z += f64::from(offset.z) * amplitude;
-                }
-            }
-        }
-
-        if state0.falling {
-            for dir in BlockDirection::horizontal() {
-                let pos = pos0.offset(dir.to_offset());
-
-                if self.is_solid_face(fluid0.id, pos, dir.to_block_direction())
-                    || self.is_solid_face(fluid0.id, pos.up(), dir.to_block_direction())
-                {
-                    if velo.length_squared() != 0.0 {
-                        velo = velo.normalize();
-                    }
-
-                    velo.y -= 6.0;
-                    break;
-                }
-            }
-        }
-
-        if velo.length_squared() == 0.0 {
-            velo
-        } else {
-            velo.normalize()
-        }
-    }
-
-    // FlowingFluid.isSolidFace()
-    fn is_solid_face(&self, fluid0_id: u16, pos: BlockPos, direction: BlockDirection) -> bool {
-        let id = self.get_block_state_id(&pos);
-
-        let fluid = Fluid::from_state_id(id).unwrap_or(&Fluid::EMPTY);
-
-        if Fluid::same_fluid_type(fluid.id, fluid0_id) {
-            return false;
-        }
-
-        if direction == BlockDirection::Up {
-            return true;
-        }
-
-        let block = Block::from_state_id(id);
-        let state = BlockState::from_id(id);
-
-        // Doesn't count blue ice or packed ice
-
-        if block == &Block::ICE || block == &Block::FROSTED_ICE {
-            return false;
-        }
-
-        state.is_side_solid(direction)
+        pumpkin_world::fluid_snapshot::fluid_velocity(pos0, fluid0, state0, |position| {
+            Ok::<_, std::convert::Infallible>(self.get_block_state_id(&position))
+        })
+        .unwrap_or_default()
     }
 
     pub fn check_outline<F>(
@@ -2417,50 +2468,19 @@ impl World {
         bounding_box: BoundingBox,
         entity: &dyn EntityBase,
     ) -> (Vec<BoundingBox>, Vec<(usize, BlockPos)>) {
-        let mut collisions = Vec::new();
-
-        let mut positions = Vec::new();
-
-        let min = BlockPos::floored_v(bounding_box.min.add_raw(0.0, -0.50001, 0.0));
-        let max = bounding_box.max_block_pos();
-        let pos_iter = BlockPos::iterate(min, max);
-
-        for pos in pos_iter {
-            let state = self.get_block_state(&pos);
-
-            if state.is_air() {
-                continue;
-            }
-
-            let block = Block::from_state_id(state.id);
-            let mut collided = false;
-
-            if block == &Block::POWDER_SNOW {
-                if let Some(shape) =
-                    crate::block::blocks::powder_snow::collision_shape_for_entity(entity, &pos)
-                {
-                    let shape = shape.at_pos(pos);
-                    if shape.intersects(&bounding_box) {
-                        collided = true;
-                        collisions.push(shape);
-                    }
-                }
-            } else {
-                for shape in state.get_block_collision_shapes_at(&pos) {
-                    let shape = shape.at_pos(pos);
-                    if shape.intersects(&bounding_box) {
-                        collided = true;
-                        collisions.push(shape);
-                    }
-                }
-            }
-
-            if collided {
-                positions.push((collisions.len(), pos));
-            }
+        match pumpkin_world::collision::collect_block_collisions::<std::convert::Infallible>(
+            bounding_box,
+            usize::MAX,
+            |position| Ok(self.get_block_state(&position)),
+            |position, state| {
+                (Block::from_state_id(state.id) == &Block::POWDER_SNOW).then(|| {
+                    crate::block::blocks::powder_snow::collision_shape_for_entity(entity, &position)
+                })
+            },
+        ) {
+            Ok(collisions) => (collisions.shapes, collisions.positions),
+            Err(_) => (Vec::new(), Vec::new()),
         }
-
-        (collisions, positions)
     }
 
     pub fn is_space_empty(&self, bounding_box: BoundingBox) -> bool {
@@ -2582,6 +2602,13 @@ impl World {
     }
 
     pub fn get_world_age(&self) -> i64 {
+        if self
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            return self.cluster_environment_view.load().time.world_age;
+        }
         self.level_time
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2589,6 +2616,13 @@ impl World {
     }
 
     pub fn get_time_of_day(&self) -> i64 {
+        if self
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            return self.cluster_environment_view.load().time.time_of_day;
+        }
         self.level_time
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2596,6 +2630,22 @@ impl World {
     }
 
     pub fn set_time_of_day(&self, time: i64) {
+        if let Some(server) = self.server.upgrade()
+            && server.advanced_config.cluster.enabled
+        {
+            if let Some(world) = server
+                .worlds
+                .load()
+                .iter()
+                .find(|world| world.uuid == self.uuid)
+            {
+                server.cluster_environment.time(
+                    world,
+                    crate::server::cluster_environment::TimeMutation::Set(time),
+                );
+            }
+            return;
+        }
         let level_time = {
             let mut guard = self
                 .level_time
@@ -2608,6 +2658,13 @@ impl World {
     }
 
     pub fn is_raining(&self) -> bool {
+        if self
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            return self.cluster_environment_view.load().weather.raining;
+        }
         self.weather
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2629,6 +2686,15 @@ impl World {
     }
 
     pub fn set_raining(&self, raining: bool) {
+        if let Some(server) = self.server.upgrade()
+            && server.advanced_config.cluster.enabled
+        {
+            let world = server.get_world_from_dimension(&self.dimension);
+            server
+                .cluster_environment
+                .weather_flag(&world, Some(raining), None);
+            return;
+        }
         if let Some(server) = self.server.upgrade() {
             let world_arc = server.get_world_from_dimension(&self.dimension);
             let mut event =
@@ -2651,6 +2717,13 @@ impl World {
     }
 
     pub fn is_thundering(&self) -> bool {
+        if self
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            return self.cluster_environment_view.load().weather.thundering;
+        }
         self.weather
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2658,6 +2731,15 @@ impl World {
     }
 
     pub fn set_thundering(&self, thundering: bool) {
+        if let Some(server) = self.server.upgrade()
+            && server.advanced_config.cluster.enabled
+        {
+            let world = server.get_world_from_dimension(&self.dimension);
+            server
+                .cluster_environment
+                .weather_flag(&world, None, Some(thundering));
+            return;
+        }
         if let Some(server) = self.server.upgrade() {
             let world_arc = server.get_world_from_dimension(&self.dimension);
             let mut event =
@@ -2747,7 +2829,10 @@ impl World {
         > = std::sync::OnceLock::new();
 
         let level_info = server.level_info.load();
-        let (rain_level, lightning_level) = {
+        let (rain_level, lightning_level) = if server.advanced_config.cluster.enabled {
+            let view = self.cluster_environment_view.load();
+            (view.weather.rain_level, view.weather.thunder_level)
+        } else {
             let weather = self
                 .weather
                 .lock()
@@ -3198,9 +3283,7 @@ impl World {
         if let Ok(data) = client.serialize_packet(&actor_data) {
             client.send_game_packet(data).await;
         }
-        if !server.advanced_config.cluster.enabled || !already_logged_in {
-            player.send_abilities_update();
-        }
+        player.send_abilities_update();
 
         {
             let command_dispatcher = server.command_dispatcher.load();
@@ -4240,10 +4323,7 @@ impl World {
                 .await;
         }
 
-        self.worldborder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .init_client(client);
+        self.border_for_command().init_client(client);
 
         // Sends initial time
         player.send_time(self);
@@ -4277,7 +4357,14 @@ impl World {
         }
 
         // Send initial weather state
-        let (is_raining, rain_level, thunder_level) = {
+        let (is_raining, rain_level, thunder_level) = if server.advanced_config.cluster.enabled {
+            let view = self.cluster_environment_view.load();
+            (
+                view.weather.raining,
+                view.weather.rain_level.clamp(0.0, 1.0),
+                view.weather.thunder_level.clamp(0.0, 1.0),
+            )
+        } else {
             let weather = self
                 .weather
                 .lock()
@@ -4416,10 +4503,7 @@ impl World {
         pitch: f32,
     ) {
         if let ClientPlatform::Java(client) = player.client.as_ref() {
-            self.worldborder
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .init_client(client);
+            self.border_for_command().init_client(client);
         }
 
         // TODO: World spawn (compass stuff)
@@ -5069,7 +5153,7 @@ impl World {
 
     /// Gets an entity by an entity id
     pub fn get_entity_by_id(&self, id: i32) -> Option<Arc<dyn EntityBase>> {
-        for entity in self.entities.load().iter() {
+        for entity in self.entity_query_snapshot().iter() {
             if entity.get_entity().entity_id == id {
                 return Some(entity.clone());
             }
@@ -5082,6 +5166,33 @@ impl World {
             }
         }
         None
+    }
+
+    pub(crate) fn entity_query_snapshot(&self) -> EntityQuerySnapshot {
+        let remote = self.server.upgrade().and_then(|server| {
+            server
+                .cluster_remote_players
+                .load()
+                .world_entities(crate::server::cluster_world_delta::world_id(self))
+        });
+        let (canonical, canonical_ids) = self
+            .server
+            .upgrade()
+            .map(|server| {
+                let directory = server.cluster_canonical_entities.load();
+                let world = crate::server::cluster_world_delta::world_id(self);
+                (
+                    directory.world_entities(world),
+                    directory.world_identities(world),
+                )
+            })
+            .unwrap_or_default();
+        EntityQuerySnapshot {
+            local: self.entities.load_full(),
+            remote,
+            canonical,
+            canonical_ids,
+        }
     }
 
     /// Gets a logged-in `Player` by username, skipping lobby waiters.
@@ -5102,7 +5213,7 @@ impl World {
 
     // Gets all entities at a Box
     pub fn get_all_at_box(&self, aabb: &BoundingBox) -> Vec<Arc<dyn EntityBase>> {
-        let entities_guard = self.entities.load();
+        let entities_guard = self.entity_query_snapshot();
         let players_guard = self.players.load();
 
         entities_guard
@@ -5120,8 +5231,7 @@ impl World {
 
     // Gets all non Player entities at a Box
     pub fn get_entities_at_box(&self, aabb: &BoundingBox) -> Vec<Arc<dyn EntityBase>> {
-        self.entities
-            .load()
+        self.entity_query_snapshot()
             .iter()
             .filter(|entity| entity.get_entity().bounding_box.load().intersects(aabb))
             .cloned()
@@ -5174,8 +5284,7 @@ impl World {
     ///
     /// An `Option<Arc<dyn EntityBase>>` containing the player if found, or `None` if not.
     pub fn get_entity_by_uuid(&self, id: uuid::Uuid) -> Option<Arc<dyn EntityBase>> {
-        self.entities
-            .load()
+        self.entity_query_snapshot()
             .iter()
             .find(|p| p.get_entity().entity_uuid == id)
             .cloned()
@@ -5232,8 +5341,7 @@ impl World {
     ) -> HashMap<uuid::Uuid, Arc<dyn EntityBase>> {
         let radius_squared = radius.powi(2);
 
-        self.entities
-            .load()
+        self.entity_query_snapshot()
             .iter()
             .filter_map(|entity| {
                 let entity_pos = entity.get_entity().pos.load();
@@ -5363,7 +5471,7 @@ impl World {
             }
         }
         // Same with entities.
-        for entity in self.entities.load().iter() {
+        for entity in self.entity_query_snapshot().iter() {
             if !predicate(entity.as_ref()) {
                 continue;
             }
@@ -5427,6 +5535,178 @@ impl World {
     ///
     /// - This function assumes `broadcast_packet_expect` and `remove_entity` are defined elsewhere.
     /// - The disconnect message sending is currently optional. Consider making it a configurable option.
+    pub(crate) fn mirror_cluster_player_world(
+        self: &Arc<Self>,
+        player: &Arc<Player>,
+        lease: pumpkin_cluster::canonical_action::LivePlayerLease,
+        generation: u64,
+        epoch: pumpkin_cluster::canonical_action::SpatialEpoch,
+    ) -> bool {
+        let Some(server) = self.server.upgrade() else {
+            return false;
+        };
+        if !server.advanced_config.cluster.enabled
+            || crate::server::cluster_world_owner::player_action_lease(&server, player)
+                != Some(lease)
+            || player
+                .cluster_owner_install_generation
+                .load(Ordering::Acquire)
+                != generation
+        {
+            return false;
+        }
+        let world_id = crate::server::cluster_world_delta::world_id(self);
+        let living = server.cluster_actor_living.load();
+        let Some(avatar) = living
+            .get(&pumpkin_cluster::actor::ActorId::Player(lease.gid))
+            .and_then(|state| state.avatar.as_ref())
+        else {
+            return false;
+        };
+        if avatar.world != world_id
+            || avatar.spatial_epoch != epoch
+            || server
+                .cluster_actor_spatial
+                .load()
+                .get(&lease.gid)
+                .is_none_or(|spatial| {
+                    spatial.local_epoch != epoch || spatial.truth.local.world != world_id
+                })
+            || self
+                .players
+                .load()
+                .iter()
+                .any(|entry| entry.cluster_gid() == Some(lease.gid) && !Arc::ptr_eq(entry, player))
+        {
+            return false;
+        }
+        for source in server
+            .worlds
+            .load()
+            .iter()
+            .filter(|source| source.uuid != self.uuid)
+        {
+            source.players.rcu(|current| {
+                current
+                    .iter()
+                    .filter(|entry| !Arc::ptr_eq(entry, player))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            });
+        }
+        self.players.rcu(|current| {
+            let mut next = (**current).clone();
+            if !next.iter().any(|entry| Arc::ptr_eq(entry, player)) {
+                next.push(player.clone());
+            }
+            next
+        });
+        player.get_entity().world.store(self.clone());
+        true
+    }
+
+    pub(crate) fn add_cluster_player_registry(self: &Arc<Self>, player: &Arc<Player>) -> bool {
+        let Some(server) = self.server.upgrade() else {
+            return false;
+        };
+        let Some(gid) = player.cluster_gid() else {
+            return false;
+        };
+        if !server.advanced_config.cluster.enabled
+            || player
+                .cluster_owner_install_generation
+                .load(Ordering::Acquire)
+                == 0
+            || !Arc::ptr_eq(&player.world(), self)
+        {
+            return false;
+        }
+        let mut accepted = false;
+        self.players.rcu(|current| {
+            accepted = false;
+            if current
+                .iter()
+                .any(|entry| entry.cluster_gid() == Some(gid) && !Arc::ptr_eq(entry, player))
+            {
+                return (**current).clone();
+            }
+            let mut next = (**current).clone();
+            if !next.iter().any(|entry| Arc::ptr_eq(entry, player)) {
+                next.push(player.clone());
+            }
+            accepted = true;
+            next
+        });
+        accepted
+    }
+
+    pub(crate) fn cancel_rejected_cluster_player_registry(
+        &self,
+        player: &Arc<Player>,
+        proof: &crate::server::cluster_world_actor::ActorAdmissionInstallResult,
+    ) -> bool {
+        if proof.accepted
+            || player.cluster_gid() != Some(proof.actor)
+            || player.gameprofile.id != proof.key
+            || player.living_entity.entity.entity_id != proof.client_entity_id
+            || player
+                .cluster_owner_install_generation
+                .load(Ordering::Acquire)
+                != proof.install_generation
+        {
+            return false;
+        }
+        let mut removed = false;
+        self.players.rcu(|current| {
+            let mut next = (**current).clone();
+            next.retain(|entry| {
+                let same = Arc::ptr_eq(entry, player);
+                removed |= same;
+                !same
+            });
+            next
+        });
+        removed
+    }
+
+    pub(crate) fn remove_cluster_player_registry(
+        &self,
+        player: &Arc<Player>,
+        frozen: &crate::server::cluster_controller::FrozenPlayerDeparture,
+    ) -> bool {
+        let Some(server) = self.server.upgrade() else {
+            return false;
+        };
+        if !server.advanced_config.cluster.enabled
+            || player.cluster_gid() != Some(frozen.lease.gid)
+            || frozen.lease.key.0 != player.gameprofile.id
+            || player
+                .cluster_owner_install_generation
+                .load(Ordering::Acquire)
+                != frozen.install_generation
+        {
+            return false;
+        }
+        let gid = frozen.lease.gid;
+        let generation = frozen.install_generation;
+        let mut removed = false;
+        self.players.rcu(|current| {
+            let mut next = (**current).clone();
+            next.retain(|entry| {
+                let same = Arc::ptr_eq(entry, player)
+                    && entry.cluster_gid() == Some(gid)
+                    && entry
+                        .cluster_owner_install_generation
+                        .load(Ordering::Acquire)
+                        == generation;
+                removed |= same;
+                !same
+            });
+            next
+        });
+        removed
+    }
+
     pub async fn remove_player(
         &self,
         player: &Arc<Player>,
@@ -6021,6 +6301,16 @@ impl World {
 
     #[must_use]
     pub fn get_sky_darken(&self) -> i32 {
+        if self
+            .server
+            .upgrade()
+            .is_some_and(|server| server.advanced_config.cluster.enabled)
+        {
+            return crate::server::cluster_environment::sky_darkening(
+                &self.cluster_environment_view.load(),
+                &self.dimension,
+            );
+        }
         let sky_light_level = self.environment_attributes().get_dimension_value_f32(
             pumpkin_data::environment_attribute::EnvironmentAttribute::GameplaySkyLightLevel,
         );
@@ -6473,6 +6763,32 @@ impl World {
             return None;
         }
 
+        if let Some(server) = self.server.upgrade()
+            && server.advanced_config.cluster.enabled
+        {
+            let chunk = pumpkin_cluster::protocol::ChunkKey::new(
+                crate::server::cluster_world_delta::world_id(self),
+                position.0.x.div_euclid(16),
+                position.0.z.div_euclid(16),
+            );
+            let block = pumpkin_cluster::protocol::BlockPos {
+                x: position.0.x,
+                y: position.0.y,
+                z: position.0.z,
+            };
+            let published = server
+                .cluster_owned_chunk_blocks
+                .load()
+                .get(&chunk)
+                .and_then(|snapshot| snapshot.block(chunk, block).ok());
+            if published.is_some()
+                || server.advanced_config.cluster.role
+                    == pumpkin_config::cluster::ClusterRole::Secondary
+            {
+                return published;
+            }
+        }
+
         let (chunk_coordinate, relative) = position.chunk_and_chunk_relative_position();
         self.level.read_chunk_sync(&chunk_coordinate, |chunk| {
             chunk
@@ -6492,63 +6808,12 @@ impl World {
         self.get_block_state_id_if_loaded(position).is_some()
     }
 
-    fn get_fluid_from_state_id(id: BlockStateId) -> &'static pumpkin_data::fluid::Fluid {
-        if let Some(fluid) = Fluid::from_state_id(id) {
-            return fluid.to_flowing();
-        }
-        // These blocks contain source water without a `waterlogged` property.
-        if matches!(
-            id.to_block_id(),
-            pumpkin_data::BlockId::KELP
-                | pumpkin_data::BlockId::KELP_PLANT
-                | pumpkin_data::BlockId::SEAGRASS
-                | pumpkin_data::BlockId::TALL_SEAGRASS
-                | pumpkin_data::BlockId::BUBBLE_COLUMN
-        ) || id.is_waterlogged()
-        {
-            &Fluid::FLOWING_WATER
-        } else {
-            &Fluid::EMPTY
-        }
+    pub(crate) fn get_fluid_from_state_id(id: BlockStateId) -> &'static pumpkin_data::fluid::Fluid {
+        pumpkin_world::fluid_snapshot::fluid_from_block_state(id)
     }
 
     fn fluid_state_from_block_state(id: BlockStateId) -> (&'static Fluid, FluidState) {
-        let fluid = Self::get_fluid_from_state_id(id);
-        let source = if fluid.matches_type(&Fluid::WATER) {
-            &Fluid::WATER
-        } else if fluid.matches_type(&Fluid::LAVA) {
-            &Fluid::LAVA
-        } else {
-            &Fluid::EMPTY
-        };
-        let mut state = source.states[source.default_state_index as usize].clone();
-
-        if matches!(
-            id.to_block_id(),
-            pumpkin_data::BlockId::WATER | pumpkin_data::BlockId::LAVA
-        ) {
-            // LiquidBlock#getFluidState: source, amounts 7..1, then falling amount 8.
-            // The fluid family's first state is not the state of the actual block.
-            let level =
-                pumpkin_data::block_properties::WaterLikeProperties::from_state_id(id).level;
-            let amount = if level == 0 || level >= 8 {
-                8
-            } else {
-                8 - level
-            };
-            state.height = f32::from(amount) / 9.0;
-            state.level = i16::from(amount);
-            state.is_source = level == 0;
-            state.is_still = state.is_source;
-            state.falling = level >= 8;
-            state.block_state_id = pumpkin_data::block_properties::WaterLikeProperties {
-                level: level.min(8),
-            }
-            .to_state_id(id.to_block());
-        }
-
-        // Keep the normalized family used by fluid callbacks, independently of source state.
-        (fluid, state)
+        pumpkin_world::fluid_snapshot::fluid_state_from_block_state(id)
     }
 
     pub fn get_fluid(&self, position: &BlockPos) -> &'static pumpkin_data::fluid::Fluid {
@@ -6575,13 +6840,10 @@ impl World {
     /// `FluidState#getHeight` includes the full block when the same fluid is above.
     /// Keep `state.height` as the own height used by flow-velocity calculations.
     pub fn get_fluid_height(&self, position: &BlockPos, fluid: &Fluid, state: &FluidState) -> f32 {
-        if state.is_empty {
-            0.0
-        } else if fluid.matches_type(self.get_fluid(&position.up())) {
-            1.0
-        } else {
-            state.height
-        }
+        pumpkin_world::fluid_snapshot::fluid_height(*position, fluid, state, |at| {
+            Ok::<_, std::convert::Infallible>(self.get_block_state_id(&at))
+        })
+        .unwrap_or(state.height)
     }
 
     pub fn get_block_state_id(&self, position: &BlockPos) -> BlockStateId {
@@ -7304,7 +7566,7 @@ impl World {
 
         let mut hits = Vec::new();
 
-        for entity in self.entities.load().iter() {
+        for entity in self.entity_query_snapshot().iter() {
             let bb = entity.get_entity().bounding_box.load();
             if bb.intersects(&ray_box)
                 && let Some((t, _, hit_pos)) =
@@ -7463,15 +7725,36 @@ impl World {
         None
     }
 
+    fn chunk_recipients(&self, chunk_pos: Vector2<i32>) -> Vec<Arc<Player>> {
+        if let Some(server) = self.server.upgrade()
+            && server.advanced_config.cluster.enabled
+        {
+            return crate::server::cluster_chunk_watch::recipients(
+                &server,
+                pumpkin_cluster::protocol::ChunkKey::new(
+                    crate::server::cluster_world_delta::world_id(self),
+                    chunk_pos.x,
+                    chunk_pos.y,
+                ),
+            );
+        }
+        self.players
+            .load()
+            .iter()
+            .filter(|player| {
+                player
+                    .watched_section
+                    .load()
+                    .is_within_distance(chunk_pos.x, chunk_pos.y)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Broadcasts a packet to all players who currently have the target chunk loaded.
     pub fn broadcast_to_chunk<P: ClientPacket>(&self, chunk_pos: Vector2<i32>, packet: &P) {
-        let players = self.players.load();
-
-        let recipients = players.iter().filter(|p| {
-            p.watched_section
-                .load()
-                .is_within_distance(chunk_pos.x, chunk_pos.y)
-        });
+        let players = self.chunk_recipients(chunk_pos);
+        let recipients = players.iter();
 
         let recipients_by_version = Self::collect_java_recipients_by_version(recipients);
         Self::broadcast_java_grouped(packet, recipients_by_version);
@@ -7482,14 +7765,9 @@ impl World {
         chunk_pos: Vector2<i32>,
         packet: &P,
     ) {
-        let players = self.players.load();
+        let players = self.chunk_recipients(chunk_pos);
         let recipients = players.iter().filter_map(|player| {
-            if player
-                .watched_section
-                .load()
-                .is_within_distance(chunk_pos.x, chunk_pos.y)
-                && let ClientPlatform::Bedrock(client) = player.client.as_ref()
-            {
+            if let ClientPlatform::Bedrock(client) = player.client.as_ref() {
                 return Some(client);
             }
             None
@@ -7503,15 +7781,11 @@ impl World {
         je_packet: &J,
         be_packet: &B,
     ) {
-        let players = self.players.load();
+        let players = self.chunk_recipients(chunk_pos);
         let mut java_recipients = Vec::new();
         let mut bedrock_recipients = Vec::new();
 
-        let recipients = players.iter().filter(|p| {
-            p.watched_section
-                .load()
-                .is_within_distance(chunk_pos.x, chunk_pos.y)
-        });
+        let recipients = players.iter();
 
         for p in recipients {
             match p.client.as_ref() {
@@ -7533,16 +7807,10 @@ impl World {
         except: &[uuid::Uuid],
         packet: &P,
     ) {
-        let players = self.players.load();
-
-        let recipients = players.iter().filter(|p| {
-            if except.contains(&p.get_entity().entity_uuid) {
-                return false;
-            }
-            p.watched_section
-                .load()
-                .is_within_distance(chunk_pos.x, chunk_pos.y)
-        });
+        let players = self.chunk_recipients(chunk_pos);
+        let recipients = players
+            .iter()
+            .filter(|p| !except.contains(&p.get_entity().entity_uuid));
 
         let recipients_by_version = Self::collect_java_recipients_by_version(recipients);
         Self::broadcast_java_grouped(packet, recipients_by_version);
@@ -7555,15 +7823,10 @@ impl World {
         je_packet: &J,
         be_packet: &B,
     ) {
-        let players = self.players.load();
-        let recipients = players.iter().filter(|p| {
-            if except.contains(&p.get_entity().entity_uuid) {
-                return false;
-            }
-            p.watched_section
-                .load()
-                .is_within_distance(chunk_pos.x, chunk_pos.y)
-        });
+        let players = self.chunk_recipients(chunk_pos);
+        let recipients = players
+            .iter()
+            .filter(|p| !except.contains(&p.get_entity().entity_uuid));
 
         let mut java_recipients = Vec::new();
         let mut bedrock_recipients = Vec::new();

@@ -190,6 +190,12 @@ pub enum Chunk {
     Proto(Box<ProtoChunk>),
 }
 
+pub struct InitialChunkPalettes {
+    pub min_y: i32,
+    pub blocks: Box<[BlockPalette]>,
+    pub biomes: Box<[BiomePalette]>,
+}
+
 impl Chunk {
     #[must_use]
     pub fn get_stage_id(&self) -> u8 {
@@ -268,11 +274,29 @@ impl Chunk {
         dimension: &Dimension,
         lighting_config: &LightingEngineConfig,
     ) {
+        let _ = self.upgrade_to_level_chunk_inner(dimension, lighting_config, false);
+    }
+
+    pub fn upgrade_to_level_chunk_with_seed(
+        &mut self,
+        dimension: &Dimension,
+        lighting_config: &LightingEngineConfig,
+    ) -> Option<InitialChunkPalettes> {
+        self.upgrade_to_level_chunk_inner(dimension, lighting_config, true)
+    }
+
+    fn upgrade_to_level_chunk_inner(
+        &mut self,
+        dimension: &Dimension,
+        lighting_config: &LightingEngineConfig,
+        capture_seed: bool,
+    ) -> Option<InitialChunkPalettes> {
         // Take ownership of the ProtoChunk by temporarily replacing with a dummy value
         // This allows us to move the light data instead of cloning it
         let proto_chunk_box = match std::mem::replace(
             self,
             Self::Level(Arc::new(ChunkData {
+                origin: crate::chunk::ChunkOrigin::Unknown,
                 section: ChunkSections::new(0, 0),
                 heightmap: Mutex::default(),
                 x: 0,
@@ -295,13 +319,41 @@ impl Chunk {
 
         let proto_chunk = *proto_chunk_box;
 
-        let sections = Self::build_level_sections(&proto_chunk, dimension);
+        let mut sections = Self::build_level_sections(&proto_chunk, dimension);
+        let initial_palettes = (capture_seed
+            && proto_chunk.origin == crate::chunk::ChunkOrigin::FreshGenerated)
+            .then(|| InitialChunkPalettes {
+                min_y: dimension.min_y,
+                blocks: sections
+                    .block_sections
+                    .get_mut()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+                biomes: sections
+                    .biome_sections
+                    .get_mut()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            });
         let heightmaps = Self::build_level_heightmaps(&proto_chunk, dimension.min_y);
 
         // Move the light data instead of cloning it
         // By taking ownership of proto_chunk, we can move the light data directly
         // This prevents keeping duplicate lighting data in memory
-        let light_data = proto_chunk.light;
+        let mut light_data = proto_chunk.light;
+        let light_value = match lighting_config {
+            LightingEngineConfig::Full => Some(15),
+            LightingEngineConfig::Dark => Some(0),
+            LightingEngineConfig::Default => None,
+        };
+        if let Some(light_value) = light_value {
+            for section in &mut light_data.block_light {
+                section.fill(light_value);
+            }
+            for section in &mut light_data.sky_light {
+                section.fill(light_value);
+            }
+        }
 
         // Only mark lit if past the lighting stage, and the lighting config is "default" ("full" and "dark" modes skip proper lighting)
         let is_lit = proto_chunk.stage >= StagedChunkEnum::Lighting
@@ -320,6 +372,7 @@ impl Chunk {
         }
 
         let chunk = ChunkData {
+            origin: proto_chunk.origin,
             light_engine: Mutex::new(light_data),
             light_populated: AtomicBool::new(is_lit),
             section: sections,
@@ -337,12 +390,97 @@ impl Chunk {
         };
 
         *self = Self::Level(Arc::new(chunk));
+        initial_palettes
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::StagedChunkEnum;
+    use super::{Chunk, StagedChunkEnum};
+
+    #[test]
+    fn generated_ground_seed_is_frozen_before_level_mutation() {
+        use crate::generation::{get_world_gen, proto_chunk::ProtoChunk};
+        use pumpkin_config::lighting::LightingEngineConfig;
+        use pumpkin_data::{Block, dimension::Dimension};
+        use pumpkin_util::world_seed::Seed;
+
+        let generator = get_world_gen(Seed(7), Dimension::OVERWORLD, true, vec![], String::new());
+        let mut proto = ProtoChunk::new(0, 0, &generator);
+        proto.set_block_state(1, 80, 1, &Block::STONE.default_state);
+        proto.stage = StagedChunkEnum::Full;
+        let mut chunk = Chunk::Proto(Box::new(proto));
+        let seed = chunk
+            .upgrade_to_level_chunk_with_seed(generator.dimension(), &LightingEngineConfig::Full)
+            .expect("fresh generation carries immutable ground");
+        let section = ((80 - seed.min_y) / 16) as usize;
+        let local_y = ((80 - seed.min_y) % 16) as usize;
+        assert_eq!(
+            seed.blocks[section].get(1, local_y, 1),
+            Block::STONE.default_state.id
+        );
+        let Chunk::Level(level) = chunk else {
+            panic!("upgraded chunk has a level representation");
+        };
+        {
+            let light = level.light_engine.lock().unwrap();
+            assert!(
+                light
+                    .block_light
+                    .iter()
+                    .all(|section| section.get(0, 0, 0) == 15)
+            );
+            assert!(
+                light
+                    .sky_light
+                    .iter()
+                    .all(|section| section.get(0, 0, 0) == 15)
+            );
+        }
+        level.set_block_absolute_y(1, 80, 1, Block::AIR.default_state.id);
+        assert_eq!(
+            seed.blocks[section].get(1, local_y, 1),
+            Block::STONE.default_state.id
+        );
+        assert_eq!(
+            level.section.get_block_absolute_y(1, 80, 1),
+            Some(Block::AIR.default_state.id)
+        );
+
+        let mut dark = ProtoChunk::new(1, 1, &generator);
+        dark.stage = StagedChunkEnum::Full;
+        let mut dark = Chunk::Proto(Box::new(dark));
+        dark.upgrade_to_level_chunk(generator.dimension(), &LightingEngineConfig::Dark);
+        let Chunk::Level(dark) = dark else {
+            panic!("dark chunk has a level representation");
+        };
+        let light = dark.light_engine.lock().unwrap();
+        assert!(
+            light
+                .block_light
+                .iter()
+                .all(|section| section.get(0, 0, 0) == 0)
+        );
+        assert!(
+            light
+                .sky_light
+                .iter()
+                .all(|section| section.get(0, 0, 0) == 0)
+        );
+
+        let mut persisted = ProtoChunk::new(0, 0, &generator);
+        persisted.origin = crate::chunk::ChunkOrigin::Persisted;
+        persisted.stage = StagedChunkEnum::Full;
+        let mut persisted = Chunk::Proto(Box::new(persisted));
+        assert!(
+            persisted
+                .upgrade_to_level_chunk_with_seed(
+                    generator.dimension(),
+                    &LightingEngineConfig::Full,
+                )
+                .is_none()
+        );
+    }
 
     #[test]
     fn surface_reads_neighbor_biomes_without_owning_neighbors() {

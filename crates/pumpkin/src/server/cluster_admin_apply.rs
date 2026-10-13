@@ -23,7 +23,6 @@ use pumpkin_util::text::color::{Color, NamedColor};
 use tracing::{debug, info, warn};
 
 use super::Server;
-use super::cluster_global_outbound::EventReservation;
 use crate::data::SaveJSONConfiguration;
 use crate::entity::EntityBase;
 use crate::net::DisconnectReason;
@@ -153,7 +152,6 @@ enum PreparedAdminRoute {
         tokio::sync::mpsc::OwnedPermit<LocalAdminMutation>,
         LocalAdminMutation,
     ),
-    Secondary(EventReservation, Vec<u8>),
 }
 
 pub fn admin_busy_error() -> crate::command::errors::command_syntax_error::CommandSyntaxError {
@@ -180,20 +178,10 @@ pub fn prepare_admin_mutation(
         });
     }
     let audit = AdminAudit::new(issuer.to_string(), mutation.clone());
-    let is_primary = matches!(server.advanced_config.cluster.role, ClusterRole::Primary);
     let id = *uuid::Uuid::new_v4().as_bytes();
-    let outbound = if is_primary {
-        let route = server.cluster_admin_local_route.load_full()?;
-        let reservation = route.as_ref().clone().try_reserve_owned().ok()?;
-        PreparedAdminRoute::Primary(reservation, LocalAdminMutation { id, audit })
-    } else {
-        let bytes =
-            encode_control_message(&AdminControlMessage::SequencedMutation { id, audit }).ok()?;
-        let reservation = server
-            .cluster_global_outbound
-            .try_reserve_primary_event(id)?;
-        PreparedAdminRoute::Secondary(reservation, bytes)
-    };
+    let route = server.cluster_admin_local_route.load_full()?;
+    let reservation = route.as_ref().clone().try_reserve_owned().ok()?;
+    let outbound = PreparedAdminRoute::Primary(reservation, LocalAdminMutation { id, audit });
     Some(PreparedAdminMutation {
         mutation,
         outbound: Some(outbound),
@@ -235,10 +223,7 @@ pub fn commit_admin_mutation(server: &Server, prepared: PreparedAdminMutation) {
         return;
     }
     let _ = persist_on_primary(server, &mutation);
-    if let Some(PreparedAdminRoute::Secondary(reservation, bytes)) = outbound {
-        reservation.commit(bytes);
-        ADMIN_MUTATION_SENT.fetch_add(1, Ordering::Relaxed);
-    }
+    let _ = outbound;
 }
 
 fn try_broadcast(server: &Server, message: &AdminControlMessage) -> usize {
@@ -318,31 +303,15 @@ pub fn propagate_admin_mutation(server: &Server, mutation: &AdminMutation, issue
     if !cluster_enabled(server) {
         return;
     }
-    let _ = persist_on_primary(server, mutation);
-    let sent = try_broadcast(
-        server,
-        &AdminControlMessage::MutationWithAudit(AdminAudit::new(
-            issuer.to_string(),
-            mutation.clone(),
-        )),
-    );
-    if sent > 0 {
-        debug!(peers = sent, "cluster admin mutation broadcast");
+    if let Some(prepared) = prepare_admin_mutation(server, mutation.clone(), issuer) {
+        commit_admin_mutation(server, prepared);
+    } else if admin_broadcast_warn_cooldown_elapsed() {
+        warn!("cluster admin mutation owner capacity exceeded");
     }
 }
 
 pub fn publish_admin_snapshot_to_peer(server: &Server, peer: u16) -> bool {
-    if !matches!(server.advanced_config.cluster.role, ClusterRole::Primary) {
-        let Ok(bytes) = encode_control_message(&AdminControlMessage::SnapshotRequest) else {
-            return false;
-        };
-        return server
-            .cluster_global_outbound
-            .try_event(server, vec![ServerId(peer)], bytes);
-    }
-    server
-        .cluster_admin_seed_route
-        .load_full()
+    server.cluster_admin_seed_route.load_full()
         .is_some_and(|route| route.try_send(ServerId(peer)).is_ok())
 }
 
@@ -449,6 +418,45 @@ pub(crate) fn enqueue_admin_snapshot(server: &Server, peer: ServerId, revision: 
         }
     };
     reservation.commit(frames);
+    true
+}
+
+pub(crate) fn valid_admin_snapshot(snapshot: &AdminSnapshot) -> bool {
+    if snapshot.operators.len() > 4096 || snapshot.banned_players.len() > 4096 {
+        return false;
+    }
+    let mut seen_ops = std::collections::HashSet::new();
+    for grant in &snapshot.operators {
+        let Some(level) = permission_level_from_u8(grant.level) else {
+            return false;
+        };
+        if grant.name.is_empty() || grant.name.len() > 256 || !seen_ops.insert(grant.uuid) {
+            return false;
+        }
+        let _ = level;
+    }
+    let mut seen_bans = std::collections::HashSet::new();
+    for ban in &snapshot.banned_players {
+        let Some(created) = epoch_to_datetime(ban.created_epoch_secs) else {
+            return false;
+        };
+        let expires = match ban.expires_epoch_secs {
+            Some(epoch) => match epoch_to_datetime(epoch) {
+                Some(expires) => Some(expires),
+                None => return false,
+            },
+            None => None,
+        };
+        if ban.name.is_empty()
+            || ban.name.len() > 256
+            || ban.source.len() > 4096
+            || ban.reason.len() > 4096
+            || !seen_bans.insert(ban.uuid)
+        {
+            return false;
+        }
+        let _ = (created, expires);
+    }
     true
 }
 

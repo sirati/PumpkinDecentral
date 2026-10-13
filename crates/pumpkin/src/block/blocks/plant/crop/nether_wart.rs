@@ -21,6 +21,7 @@ use crate::{
 #[pumpkin_block("minecraft:nether_wart")]
 pub struct NetherWartBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for NetherWartBlock {
     fn can_place_at(&self, args: CanPlaceAtArgs<'_>) -> bool {
         <Self as PlantBlockBase>::can_place_at(self, args.block_accessor, args.position)
@@ -40,6 +41,32 @@ impl BlockBehaviour for NetherWartBlock {
 
     fn random_tick(&self, args: RandomTickArgs<'_>) {
         <Self as CropBlockBase>::random_tick(self, args.world, args.position);
+    }
+
+    fn random_tick_intent(
+        &self,
+        args: crate::block::RandomTickIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        use pumpkin_util::random::RandomImpl;
+        let state = args.world.get_block_state_id(args.position);
+        let age = self.get_age(state, args.block);
+        if age >= self.max_age() || args.random.next_bounded_i32(10) != 0 {
+            return Some(Vec::new());
+        }
+        Some(vec![
+            crate::block::neighbor::BlockCallbackEffect::SetBlock {
+                position: *args.position,
+                state: self.state_with_age(args.block, state, age + 1),
+                flags: BlockFlags::NOTIFY_NEIGHBORS,
+            },
+        ])
+    }
+
+    fn callback_intent(
+        &self,
+        _args: crate::block::neighbor::BlockCallbackIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        Some(Vec::new())
     }
 }
 

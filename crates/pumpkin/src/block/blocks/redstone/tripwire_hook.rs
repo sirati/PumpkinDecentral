@@ -27,6 +27,7 @@ type TripwireHookProperties = pumpkin_data::block_properties::TripwireHookLikePr
 #[pumpkin_block("minecraft:tripwire_hook")]
 pub struct TripwireHookBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for TripwireHookBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut props = TripwireHookProperties::default(args.block);

@@ -7,11 +7,15 @@ use arc_swap::ArcSwap;
 use pumpkin_cluster::admin_sync::PlayerDirectorySnapshot;
 use pumpkin_cluster::hide::HideUpdate;
 use pumpkin_cluster::identity::{GlobalPlayerId, PlayerSlot, ServerId};
+use pumpkin_cluster::ordered_presence::{
+    OrderedPresence, PresenceDisposition, PresenceOrdering, PresencePayload,
+};
 use pumpkin_cluster::presence::{
-    PRESENCE_MAX_ENTRIES, PresenceControl, PresenceLogin, PresenceLogout, PresenceProperty,
-    RemotePlayerEntry, decode_control, encode_control, is_valid_presence_name,
+    PRESENCE_MAX_ENTRIES, PresenceLogin, PresenceLogout, PresenceProperty, RemotePlayerEntry,
+    is_valid_presence_name,
 };
 use pumpkin_cluster::protocol::StreamKind;
+use pumpkin_cluster::realm_completion::PeerGeneration;
 use pumpkin_cluster::streams::{InboundParcel, OutboundParcel, StreamHeader};
 use pumpkin_config::ClusterRole;
 use pumpkin_util::PermissionLvl;
@@ -28,22 +32,28 @@ const PENDING_STATES_PER_PEER: usize = PRESENCE_MAX_ENTRIES * 4;
 type PendingKey = (ServerId, u8, GlobalPlayerId);
 
 fn parcel_key(parcel: &OutboundParcel) -> Option<PendingKey> {
-    if let Ok(control) = decode_control(&parcel.bytes) {
-        let gid = match control {
-            PresenceControl::Login(login) => login.gid,
-            PresenceControl::Logout(logout) => logout.gid,
+    if let Some(envelope) = pumpkin_cluster::ordered_presence::decode(&parcel.bytes) {
+        let facet = if matches!(envelope.payload, PresencePayload::Hide { .. }) {
+            1
+        } else {
+            0
         };
-        return Some((parcel.peer, 0, gid));
+        return Some((parcel.peer, facet, envelope.gid()));
     }
-    pumpkin_cluster::hide::decode_hide(&parcel.bytes)
-        .ok()
-        .map(|update| (parcel.peer, 1, update.gid))
+    None
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct PresenceSnapshot {
+    pub names: HashMap<String, Option<GlobalPlayerId>>,
+    pub uuids: HashMap<[u8; 16], Option<GlobalPlayerId>>,
+    pub visible_uuids: HashSet<[u8; 16]>,
     pub revision: u64,
+    pub roster_order: Arc<[GlobalPlayerId]>,
+    pub roster_images: Arc<HashMap<GlobalPlayerId, Arc<RemotePlayerEntry>>>,
     pub entries: HashMap<GlobalPlayerId, RemotePlayerEntry>,
+    pub retired_gids: HashSet<GlobalPlayerId>,
+    pub retirement_sessions: HashMap<GlobalPlayerId, (PeerGeneration, u64)>,
     pub known_profiles: HashMap<[u8; 16], String>,
     pub failed_lookup_names: HashMap<String, std::time::Instant>,
     pub hidden_gids: HashSet<GlobalPlayerId>,
@@ -54,6 +64,18 @@ pub struct PresenceSnapshot {
 }
 
 impl PresenceSnapshot {
+    pub fn uuid_visible_to(&self, uuid: &[u8; 16], viewer: &[u8; 16]) -> bool {
+        self.visible_uuids.contains(uuid) || uuid == viewer && self.uuids.contains_key(uuid)
+    }
+
+    pub fn by_uuid(&self, uuid: &[u8; 16]) -> Option<&RemotePlayerEntry> {
+        self.uuids.get(uuid).copied().flatten().and_then(|gid| self.entries.get(&gid))
+    }
+
+    pub fn by_name(&self, name: &str) -> Option<GlobalPlayerId> {
+        self.names.get(&name.to_ascii_lowercase()).copied().flatten()
+    }
+
     #[must_use]
     pub fn is_hidden(&self, gid: &GlobalPlayerId, uuid: &[u8; 16]) -> bool {
         self.hidden_gids.contains(gid) || self.hidden_uuids.contains(uuid)
@@ -116,14 +138,20 @@ pub enum PresenceCommand {
         peers: Vec<u16>,
         outbound: mpsc::Sender<OutboundParcel>,
     },
-    LocalLogin(PresenceLogin),
-    LocalLogout(GlobalPlayerId),
-    RemoteControl {
+    LocalLogin(PresenceLogin, u64),
+    LocalLogout(GlobalPlayerId, [u8; 16], u64),
+    LocalDeparture {
+        gid: GlobalPlayerId,
+        uuid: [u8; 16],
+        session: u64,
+        message: Option<TextComponent>,
+    },
+    LocalHide(HideUpdate, u64),
+    RemoteOrdered {
         peer: ServerId,
         generation: u64,
-        control: PresenceControl,
+        envelope: OrderedPresence,
     },
-    LocalHide(HideUpdate),
     RemoteHide {
         peer: ServerId,
         generation: u64,
@@ -143,8 +171,14 @@ pub enum PresenceCommand {
 struct PresenceOwner {
     local: ServerId,
     peers: Vec<u16>,
+    transport_generations: HashMap<ServerId, u64>,
     outbound: Option<mpsc::Sender<OutboundParcel>>,
     entries: HashMap<GlobalPlayerId, RemotePlayerEntry>,
+    retired_gids: HashSet<GlobalPlayerId>,
+    ordering: PresenceOrdering,
+    retirement_sessions: HashMap<GlobalPlayerId, (PeerGeneration, u64)>,
+    deferred: HashMap<(PeerGeneration, GlobalPlayerId, u8), AuthenticatedPresence>,
+    deferred_order: VecDeque<(PeerGeneration, GlobalPlayerId, u8)>,
     known_profiles: HashMap<[u8; 16], String>,
     pending_lookups: HashSet<String>,
     failed_lookups: HashMap<String, std::time::Instant>,
@@ -154,6 +188,8 @@ struct PresenceOwner {
     permission_revision: u64,
     pending: HashMap<PendingKey, OutboundParcel>,
     pending_order: VecDeque<PendingKey>,
+    pending_roster: HashSet<GlobalPlayerId>,
+    roster_images: HashMap<GlobalPlayerId, Arc<RemotePlayerEntry>>,
     revision: u64,
     announced: u64,
 }
@@ -163,8 +199,14 @@ impl PresenceOwner {
         Self {
             local: ServerId(0),
             peers: Vec::new(),
+            transport_generations: HashMap::new(),
             outbound: None,
             entries: HashMap::new(),
+            retired_gids: HashSet::new(),
+            ordering: PresenceOrdering::default(),
+            retirement_sessions: HashMap::new(),
+            deferred: HashMap::new(),
+            deferred_order: VecDeque::new(),
             known_profiles: HashMap::new(),
             pending_lookups: HashSet::new(),
             failed_lookups: HashMap::new(),
@@ -174,16 +216,43 @@ impl PresenceOwner {
             permission_revision: 0,
             pending: HashMap::new(),
             pending_order: VecDeque::new(),
+            pending_roster: HashSet::new(),
+            roster_images: HashMap::new(),
             revision: 0,
             announced: 0,
         }
     }
 
     fn publish(&mut self, runtime: &PresenceRuntime) {
+        self.roster_images.retain(|gid, _| self.entries.contains_key(gid));
+        for (gid, entry) in &self.entries {
+            if self.roster_images.get(gid).is_none_or(|old| old.as_ref() != entry) {
+                self.roster_images.insert(*gid, Arc::new(entry.clone()));
+            }
+        }
         self.revision = self.revision.wrapping_add(1);
         runtime.snapshot.store(Arc::new(PresenceSnapshot {
+            names: {
+                let mut names = HashMap::with_capacity(self.entries.len());
+                for (gid, entry) in &self.entries {
+                    names.entry(entry.name.to_ascii_lowercase()).and_modify(|current| *current = None).or_insert(Some(*gid));
+                }
+                names
+            },
+            uuids: {
+                let mut uuids = HashMap::with_capacity(self.entries.len());
+                for (gid, entry) in &self.entries {
+                    uuids.entry(entry.uuid).and_modify(|current| *current = None).or_insert(Some(*gid));
+                }
+                uuids
+            },
+            visible_uuids: self.entries.values().filter(|entry| !self.hidden_gids.contains(&entry.gid) && !self.hidden_uuids.contains(&entry.uuid)).map(|entry| entry.uuid).collect(),
             revision: self.revision,
+            roster_order: self.entries.keys().copied().collect(),
+            roster_images: Arc::new(self.roster_images.clone()),
             entries: self.entries.clone(),
+            retired_gids: self.retired_gids.clone(),
+            retirement_sessions: self.retirement_sessions.clone(),
             known_profiles: self.known_profiles.clone(),
             failed_lookup_names: self.failed_lookups.clone(),
             hidden_gids: self.hidden_gids.clone(),
@@ -212,15 +281,6 @@ impl PresenceOwner {
                 header: StreamHeader::new(StreamKind::Control, None),
                 bytes: bytes.clone(),
             });
-        }
-    }
-
-    fn broadcast_except(&mut self, excluded: ServerId, bytes: Vec<u8>) {
-        let peers = self.peers.clone();
-        for peer in peers {
-            if peer != excluded.0 {
-                self.queue_to(ServerId(peer), bytes.clone());
-            }
         }
     }
 
@@ -261,6 +321,29 @@ impl PresenceOwner {
         }
     }
 
+    fn update_transport_generations(&mut self, generations: &HashMap<ServerId, u64>) {
+        let changed: Vec<_> = self
+            .peers
+            .iter()
+            .copied()
+            .map(ServerId)
+            .filter(|peer| {
+                generations.get(peer).is_some_and(|generation| {
+                    self.transport_generations.get(peer) != Some(generation)
+                })
+            })
+            .collect();
+        self.transport_generations = generations
+            .iter()
+            .filter(|(peer, _)| self.peers.contains(&peer.0))
+            .map(|(peer, generation)| (*peer, *generation))
+            .collect();
+        for peer in changed {
+            self.purge_target(peer);
+            self.publish_peer_state(peer);
+        }
+    }
+
     fn flush(&mut self) {
         let Some(outbound) = self.outbound.as_ref() else {
             return;
@@ -291,6 +374,7 @@ impl PresenceOwner {
         if !is_valid_presence_name(&login.name) {
             return None;
         }
+        self.retired_gids.remove(&login.gid);
         let previous = self.entries.get(&login.gid).cloned();
         if previous.is_none() && self.entries.len() >= PRESENCE_MAX_ENTRIES {
             return None;
@@ -313,9 +397,16 @@ impl PresenceOwner {
                 joined,
                 login.in_lobby,
                 login.listed,
-            ),
+            )
+            .with_native_skin(login.native_skin),
         );
         previous
+    }
+
+    fn remove(&mut self, gid: GlobalPlayerId) -> Option<RemotePlayerEntry> {
+        self.retired_gids.insert(gid);
+        self.pending_roster.insert(gid);
+        self.entries.remove(&gid)
     }
 
     fn can_insert(&self, login: &PresenceLogin) -> bool {
@@ -345,39 +436,11 @@ impl PresenceOwner {
     }
 
     fn publish_peer_state(&mut self, peer: ServerId) {
-        let local_entries: Vec<_> = self
-            .entries
-            .values()
-            .filter(|entry| entry.gid.server != peer)
-            .cloned()
-            .collect();
-        for entry in local_entries {
-            let login = PresenceLogin::new(
-                entry.gid,
-                entry.uuid,
-                entry.name,
-                entry.properties,
-                entry.in_lobby,
-            )
-            .with_listing(entry.listed);
-            if let Ok(bytes) = encode_control(&PresenceControl::Login(login)) {
-                self.queue_to(peer, bytes);
+        for envelope in self.ordering.snapshots() {
+            if envelope.source.server == peer {
+                continue;
             }
-        }
-        let hidden: Vec<_> = self
-            .entries
-            .values()
-            .filter(|entry| {
-                entry.gid.server != peer
-                    && (self.hidden_gids.contains(&entry.gid)
-                        || self.hidden_uuids.contains(&entry.uuid))
-            })
-            .cloned()
-            .collect();
-        for entry in hidden {
-            if let Ok(bytes) = pumpkin_cluster::hide::encode_hide(&HideUpdate::new(
-                entry.gid, entry.uuid, entry.name, true,
-            )) {
+            if let Some(bytes) = pumpkin_cluster::ordered_presence::encode(&envelope) {
                 self.queue_to(peer, bytes);
             }
         }
@@ -393,7 +456,7 @@ impl PresenceOwner {
             .cloned()
             .collect();
         for entry in &removed {
-            self.entries.remove(&entry.gid);
+            self.remove(entry.gid);
             self.hidden_gids.remove(&entry.gid);
         }
         removed
@@ -418,11 +481,14 @@ pub fn presence_properties_for(player: &Player) -> Vec<PresenceProperty> {
 }
 
 #[must_use]
-pub fn login_parcel_for_peer(login: &PresenceLogin, peer: ServerId) -> Option<OutboundParcel> {
+pub fn login_parcel_for_peer(envelope: &OrderedPresence, peer: ServerId) -> Option<OutboundParcel> {
+    if !matches!(envelope.payload, PresencePayload::Profile { .. }) {
+        return None;
+    }
     Some(OutboundParcel {
         peer,
         header: StreamHeader::new(StreamKind::Control, None),
-        bytes: encode_control(&PresenceControl::Login(login.clone())).ok()?,
+        bytes: pumpkin_cluster::ordered_presence::encode(envelope)?,
     })
 }
 
@@ -547,6 +613,8 @@ pub fn publish_lobby_profile(
     gid: GlobalPlayerId,
     profile: &crate::net::GameProfile,
     listed: bool,
+    native_skin: bool,
+    session: u64,
 ) {
     if !cluster_enabled(server) || !is_valid_presence_name(&profile.name) {
         return;
@@ -573,13 +641,15 @@ pub fn publish_lobby_profile(
                 properties,
                 true,
             )
-            .with_listing(listed),
+            .with_listing(listed)
+            .with_native_skin(native_skin),
+            session,
         ),
     );
 }
 
-pub fn publish_logout_gid(server: &Server, gid: GlobalPlayerId) {
-    let _ = submit(server, PresenceCommand::LocalLogout(gid));
+pub fn publish_logout_gid(server: &Server, gid: GlobalPlayerId, uuid: [u8; 16], session: u64) {
+    let _ = submit(server, PresenceCommand::LocalLogout(gid, uuid, session));
 }
 
 pub fn publish_login(server: &Server, player: &Player) {
@@ -594,8 +664,20 @@ pub fn publish_login(server: &Server, player: &Player) {
         presence_properties_for(player),
         player.is_in_cluster_lobby(),
     )
-    .with_listing(player.config.load().server_listing);
-    if submit(server, PresenceCommand::LocalLogin(login)) {
+    .with_listing(player.config.load().server_listing)
+    .with_native_skin(matches!(
+        player.client.as_ref(),
+        crate::net::ClientPlatform::Bedrock(_)
+    ));
+    if submit(
+        server,
+        PresenceCommand::LocalLogin(
+            login,
+            player
+                .cluster_owner_install_generation
+                .load(Ordering::Acquire),
+        ),
+    ) {
         player
             .cluster_login_announced
             .store(true, Ordering::Release);
@@ -617,7 +699,14 @@ pub fn publish_lobby_state(server: &Server, player: &Player) {
                 presence_properties_for(player),
                 player.is_in_cluster_lobby(),
             )
-            .with_listing(player.config.load().server_listing),
+            .with_listing(player.config.load().server_listing)
+            .with_native_skin(matches!(
+                player.client.as_ref(),
+                crate::net::ClientPlatform::Bedrock(_)
+            )),
+            player
+                .cluster_owner_install_generation
+                .load(Ordering::Acquire),
         ),
     );
 }
@@ -629,32 +718,34 @@ pub fn publish_logout(server: &Server, player: &Player) {
     let Some(gid) = player.cluster_gid() else {
         return;
     };
-    let _ = submit(server, PresenceCommand::LocalLogout(gid));
-    retain_player_handoff(server, player);
+    let _ = submit(
+        server,
+        PresenceCommand::LocalLogout(
+            gid,
+            *player.gameprofile.id.as_bytes(),
+            player
+                .cluster_owner_install_generation
+                .load(Ordering::Acquire),
+        ),
+    );
 }
 
 pub(crate) struct RetainedDeparture {
-    watched: Vec<pumpkin_util::math::vector2::Vector2<i32>>,
-    world_id: pumpkin_cluster::protocol::WorldId,
-    retained_until: u64,
+    pub(crate) chunks: Vec<pumpkin_cluster::protocol::ChunkKey>,
+    pub(crate) retained_until: u64,
 }
 
-pub(crate) fn freeze_player_handoff(player: &Player) -> Option<RetainedDeparture> {
-    if !pumpkin_world::level::is_cluster_secondary() {
-        return None;
-    }
-    let watched: Vec<pumpkin_util::math::vector2::Vector2<i32>> =
-        player.watched_section.load().all_chunks_within().collect();
-    let world = player.world();
-    let retained_until = now_millis().saturating_add(LOGOUT_GRACE_MILLIS);
-    let world_id = super::cluster_world_delta::world_id(&world);
-    world
-        .level
-        .keep_cluster_chunks_for_relog(watched.clone(), retained_until);
+pub(crate) fn freeze_player_handoff(server: &Server, player: &Player) -> Option<RetainedDeparture> {
+    let lease = super::cluster_world_owner::player_action_lease(server, player)?;
+    let watches = server.cluster_chunk_watches.load();
+    let chunks = watches
+        .get(&lease.gid)
+        .filter(|watch| watch.session == lease.incarnation)
+        .map(|watch| watch.delivered.iter().copied().collect())
+        .unwrap_or_default();
     Some(RetainedDeparture {
-        watched,
-        world_id,
-        retained_until,
+        chunks,
+        retained_until: now_millis().saturating_add(LOGOUT_GRACE_MILLIS),
     })
 }
 
@@ -663,24 +754,16 @@ pub(crate) fn commit_retained_departure(
     player: &Player,
     retained: &RetainedDeparture,
     logout: bool,
+    frozen: &super::cluster_controller::FrozenPlayerDeparture,
 ) -> Option<u64> {
-    let watched: Vec<pumpkin_util::math::vector2::Vector2<i32>> =
-        player.watched_section.load().all_chunks_within().collect();
-    let world = player.world();
-    if watched != retained.watched
-        || super::cluster_world_delta::world_id(&world) != retained.world_id
-    {
-        world
-            .level
-            .keep_cluster_chunks_for_relog(watched.clone(), retained.retained_until);
-    }
-    super::cluster_handoff::commit_logout(server, player, &watched, retained.retained_until, logout)
-}
-
-pub fn retain_player_handoff(server: &Server, player: &Player) {
-    if let Some(retained) = freeze_player_handoff(player) {
-        let _ = commit_retained_departure(server, player, &retained, true);
-    }
+    super::cluster_handoff::commit_logout(
+        server,
+        player,
+        &retained.chunks,
+        retained.retained_until,
+        logout,
+        frozen,
+    )
 }
 
 #[must_use]
@@ -768,31 +851,70 @@ pub fn apply_presence_bytes(
     generation: u64,
     bytes: &[u8],
 ) -> bool {
-    let Ok(control) = decode_control(bytes) else {
+    let Some(envelope) = pumpkin_cluster::ordered_presence::decode(bytes) else {
         return false;
     };
-    let claimed = match &control {
-        PresenceControl::Login(login) => login.gid.server,
-        PresenceControl::Logout(logout) => logout.gid.server,
-    };
-    if !inbound_control_allowed(
-        local,
+    let input = AuthenticatedPresence {
         peer,
         generation,
-        claimed,
+        envelope,
+    };
+    if authenticate_ordered(
+        local,
+        &input,
         &server.cluster_peer_generations.load(),
-        &server.cluster_primary_peers.load(),
-    ) {
+        &server.cluster_peer_incarnations.load(),
+    ) == PresenceAuthentication::Rejected
+    {
         return false;
     }
     submit(
         server,
-        PresenceCommand::RemoteControl {
+        PresenceCommand::RemoteOrdered {
             peer,
             generation,
-            control,
+            envelope: input.envelope,
         },
     )
+}
+
+fn receive_presence_parcel(
+    server: &Arc<Server>,
+    local: ServerId,
+    parcel: InboundParcel,
+) -> Result<(), InboundParcel> {
+    if parcel.header.kind != StreamKind::Control {
+        return Ok(());
+    }
+    let Some(envelope) = pumpkin_cluster::ordered_presence::decode(&parcel.bytes) else {
+        return Ok(());
+    };
+    let input = AuthenticatedPresence {
+        peer: parcel.peer,
+        generation: parcel.generation,
+        envelope,
+    };
+    if authenticate_ordered(
+        local,
+        &input,
+        &server.cluster_peer_generations.load(),
+        &server.cluster_peer_incarnations.load(),
+    ) == PresenceAuthentication::Rejected
+    {
+        return Ok(());
+    }
+    if submit(
+        server,
+        PresenceCommand::RemoteOrdered {
+            peer: parcel.peer,
+            generation: parcel.generation,
+            envelope: input.envelope,
+        },
+    ) {
+        Ok(())
+    } else {
+        Err(parcel)
+    }
 }
 
 pub async fn presence_task(
@@ -800,16 +922,14 @@ pub async fn presence_task(
     local: ServerId,
     mut presence_rx: mpsc::Receiver<InboundParcel>,
 ) {
-    while let Some(parcel) = presence_rx.recv().await {
-        if parcel.header.kind == StreamKind::Control {
-            let _ = apply_presence_bytes(
-                &server,
-                local,
-                parcel.peer,
-                parcel.generation,
-                &parcel.bytes,
-            );
-        }
+    let mut pending = None;
+    let mut retry = tokio::time::interval(Duration::from_millis(10));
+    loop {
+        let parcel = tokio::select! {
+            parcel = presence_rx.recv(), if pending.is_none() => { let Some(parcel) = parcel else { break; }; parcel },
+            _ = retry.tick(), if pending.is_some() => pending.take().unwrap(),
+        };
+        pending = receive_presence_parcel(&server, local, parcel).err();
     }
 }
 
@@ -846,36 +966,340 @@ fn broadcast_message(server: &Server, message: &TextComponent) {
     let _ = server.cluster_lobby_chat_tx.send((None, message.clone()));
 }
 
+#[derive(Clone)]
+struct AuthenticatedPresence {
+    peer: ServerId,
+    generation: u64,
+    envelope: OrderedPresence,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PresenceAuthentication {
+    Accepted,
+    Deferred,
+    Rejected,
+}
+
+fn authenticate_ordered(
+    local: ServerId,
+    input: &AuthenticatedPresence,
+    generations: &HashMap<ServerId, u64>,
+    incarnations: &HashMap<ServerId, u64>,
+) -> PresenceAuthentication {
+    if input.peer == local || input.generation == 0 || !input.envelope.valid() {
+        return PresenceAuthentication::Rejected;
+    }
+    match generations.get(&input.peer) {
+        None => return PresenceAuthentication::Deferred,
+        Some(generation) if *generation < input.generation => {
+            return PresenceAuthentication::Deferred;
+        }
+        Some(generation) if *generation > input.generation => {
+            return PresenceAuthentication::Rejected;
+        }
+        _ => {}
+    }
+    match incarnations.get(&input.envelope.source.server) {
+        Some(incarnation) if *incarnation == input.envelope.source.generation => {
+            PresenceAuthentication::Accepted
+        }
+        Some(_) => PresenceAuthentication::Rejected,
+        None => PresenceAuthentication::Deferred,
+    }
+}
+
+struct PresenceTransition {
+    envelope: OrderedPresence,
+    previous: Option<RemotePlayerEntry>,
+    current: Option<RemotePlayerEntry>,
+    previous_hidden: bool,
+    hidden: bool,
+    replaced_session: bool,
+}
+
+impl PresenceOwner {
+    fn defer(&mut self, input: AuthenticatedPresence) -> Result<(), AuthenticatedPresence> {
+        let facet = match input.envelope.payload {
+            PresencePayload::Profile { .. } => 0,
+            PresencePayload::Hide { .. } => 1,
+            _ => 2,
+        };
+        let key = (input.envelope.source, input.envelope.gid(), facet);
+        if let Some(old) = self.deferred.get_mut(&key) {
+            if (input.envelope.session, input.envelope.revision)
+                > (old.envelope.session, old.envelope.revision)
+            {
+                *old = input;
+            }
+            return Ok(());
+        }
+        if self.deferred.len() >= PENDING_STATES_PER_PEER {
+            return Err(input);
+        }
+        self.deferred.insert(key, input);
+        self.deferred_order.push_back(key);
+        Ok(())
+    }
+
+    fn apply_ordered(&mut self, envelope: &OrderedPresence) -> Option<PresenceTransition> {
+        let gid = envelope.gid();
+        if self
+            .retirement_sessions
+            .get(&gid)
+            .is_some_and(|(source, session)| {
+                *source == envelope.source && envelope.session <= *session
+            })
+        {
+            return None;
+        }
+        if let PresencePayload::Profile { login, .. } = &envelope.payload {
+            if !self.can_insert(login) {
+                return None;
+            }
+        }
+        if let PresencePayload::Logout(PresenceLogout {
+            announcement: pumpkin_cluster::presence::DepartureAnnouncement::CustomJson(json),
+            ..
+        }) = &envelope.payload
+        {
+            if serde_json::from_str::<TextComponent>(json).is_err() {
+                return None;
+            }
+        }
+        let previous = self.entries.get(&gid).cloned();
+        let previous_hidden = previous.as_ref().is_some_and(|entry| {
+            self.hidden_gids.contains(&gid) || self.hidden_uuids.contains(&entry.uuid)
+        });
+        let replaced_session = previous.as_ref().is_some_and(|entry| {
+            entry.session != envelope.session || entry.source != Some(envelope.source)
+        });
+        let mut disposition = self.ordering.observe(envelope);
+        if disposition == PresenceDisposition::Ignored
+            && previous.is_none()
+            && matches!(envelope.payload, PresencePayload::Profile { .. })
+            && self.ordering.session(gid) == Some(envelope.session)
+            && self.ordering.profile(gid) == Some(envelope)
+        {
+            disposition = PresenceDisposition::Profile { hidden: None };
+        }
+        if disposition == PresenceDisposition::Ignored {
+            return None;
+        }
+        if replaced_session {
+            self.entries.remove(&gid);
+            self.hidden_gids.remove(&gid);
+        }
+        match (&envelope.payload, disposition) {
+            (PresencePayload::Profile { login, .. }, PresenceDisposition::Profile { hidden }) => {
+                self.insert(login);
+                if let Some(entry) = self.entries.get_mut(&gid) {
+                    entry.session = envelope.session;
+                    entry.source = Some(envelope.source);
+                }
+                if let Some(hidden) = hidden {
+                    if hidden {
+                        self.hidden_gids.insert(gid);
+                        self.hidden_uuids.insert(envelope.uuid);
+                    } else {
+                        self.hidden_gids.remove(&gid);
+                        self.hidden_uuids.remove(&envelope.uuid);
+                    }
+                }
+                self.retirement_sessions.remove(&gid);
+            }
+            (PresencePayload::Hide { name, hidden, .. }, PresenceDisposition::Hide) => {
+                self.apply_hide(&HideUpdate::new(gid, envelope.uuid, name.clone(), *hidden));
+                self.retired_gids.remove(&gid);
+                self.retirement_sessions.remove(&gid);
+            }
+            (_, PresenceDisposition::Retired) => {
+                self.remove(gid);
+                self.hidden_gids.remove(&gid);
+                self.retirement_sessions
+                    .insert(gid, (envelope.source, envelope.session));
+            }
+            _ => return None,
+        }
+        let current = self.entries.get(&gid).cloned();
+        let hidden = self.hidden_gids.contains(&gid) || self.hidden_uuids.contains(&envelope.uuid);
+        self.pending_roster.insert(gid);
+        Some(PresenceTransition {
+            envelope: envelope.clone(),
+            previous,
+            current,
+            previous_hidden,
+            hidden,
+            replaced_session,
+        })
+    }
+}
+
+fn present_presence(server: &Server, transition: &PresenceTransition) {
+    let gid = transition.envelope.gid();
+    match &transition.envelope.payload {
+        PresencePayload::Profile { login, .. } => {
+            if let Some(previous) = &transition.previous {
+                if transition.replaced_session || transition.current.as_ref() != Some(previous) {
+                    super::cluster_hide::push_remote_logout_to_viewers(
+                        server,
+                        &gid,
+                        &previous.uuid,
+                        &previous.name,
+                    );
+                    if transition.replaced_session && !transition.previous_hidden {
+                        broadcast_message(server, &leave_message(&previous.name));
+                    }
+                    super::cluster_hide::push_remote_login_to_viewers(
+                        server,
+                        &gid,
+                        &login.uuid,
+                        &login.name,
+                        &super::cluster_chat_pm::protocol_properties(&login.properties),
+                    );
+                }
+            } else {
+                super::cluster_hide::push_remote_login_to_viewers(
+                    server,
+                    &gid,
+                    &login.uuid,
+                    &login.name,
+                    &super::cluster_chat_pm::protocol_properties(&login.properties),
+                );
+            }
+            if (transition.previous.is_none() || transition.replaced_session) && !transition.hidden
+            {
+                broadcast_message(server, &join_message(&login.name));
+            }
+            if transition.previous.is_some()
+                && !transition.replaced_session
+                && transition.previous_hidden != transition.hidden
+            {
+                super::cluster_hide::apply_hide_visibility(
+                    server,
+                    uuid::Uuid::from_bytes(login.uuid),
+                    Some(&login.name),
+                    transition.hidden,
+                );
+            }
+            if is_primary(server) && (transition.previous.is_none() || transition.replaced_session)
+            {
+                info!(
+                    name = login.name.as_str(),
+                    server = login.gid.server.0,
+                    "cluster player joined"
+                );
+            }
+        }
+        PresencePayload::Hide { name, hidden, .. } => {
+            if transition.replaced_session {
+                if let Some(previous) = &transition.previous {
+                    super::cluster_hide::push_remote_logout_to_viewers(
+                        server,
+                        &gid,
+                        &previous.uuid,
+                        &previous.name,
+                    );
+                    if !transition.previous_hidden {
+                        broadcast_message(server, &leave_message(&previous.name));
+                    }
+                }
+            } else if transition.current.is_some() && transition.previous_hidden != *hidden {
+                super::cluster_hide::apply_hide_visibility(
+                    server,
+                    uuid::Uuid::from_bytes(transition.envelope.uuid),
+                    Some(name),
+                    *hidden,
+                );
+            }
+        }
+        PresencePayload::Logout(_) | PresencePayload::Retired { .. } => {
+            if let Some(previous) = &transition.previous {
+                super::cluster_hide::push_remote_logout_to_viewers(
+                    server,
+                    &gid,
+                    &previous.uuid,
+                    &previous.name,
+                );
+                if !transition.previous_hidden {
+                    match &transition.envelope.payload {
+                        PresencePayload::Logout(PresenceLogout {
+                            announcement:
+                                pumpkin_cluster::presence::DepartureAnnouncement::Suppressed,
+                            ..
+                        }) => {}
+                        PresencePayload::Logout(PresenceLogout {
+                            announcement:
+                                pumpkin_cluster::presence::DepartureAnnouncement::CustomJson(json),
+                            ..
+                        }) => {
+                            if let Ok(message) = serde_json::from_str::<TextComponent>(json) {
+                                broadcast_message(server, &message);
+                            }
+                        }
+                        _ => broadcast_message(server, &leave_message(&previous.name)),
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn presence_owner(
     server: Arc<Server>,
     runtime: Arc<PresenceRuntime>,
     mut rx: mpsc::Receiver<PresenceCommand>,
 ) {
     let mut owner = PresenceOwner::new();
+    owner.local = local_server_id(&server);
     let mut retry = tokio::time::interval(Duration::from_millis(10));
+    let mut held_local = None;
+    let mut held_remote = None;
+    let mut warning = None::<std::time::Instant>;
     loop {
-        let command = tokio::select! {
-            command = rx.recv() => {
-                let Some(command) = command else {
-                    break;
-                };
-                command
-            }
-            _ = retry.tick() => {
-                owner.set_peers(
-                    server
-                        .cluster_connected_peers
-                        .load()
-                        .iter()
-                        .map(|peer| peer.0)
-                        .collect(),
-                );
-                let announced = owner.announced;
-                owner.flush();
-                if announced != owner.announced {
-                    owner.publish(&runtime);
+        let pending_roster = owner.pending_roster.iter().copied().take(256).collect::<Vec<_>>();
+        for gid in pending_roster {
+            if super::cluster_roster::changed(&server, gid) { owner.pending_roster.remove(&gid); } else { break; }
+        }
+        let local_source = server
+            .cluster_peer_incarnations
+            .load()
+            .get(&owner.local)
+            .copied()
+            .filter(|boot| *boot != 0)
+            .map(|generation| PeerGeneration {
+                server: owner.local,
+                generation,
+            });
+        let command = if held_local.is_some() && local_source.is_some() {
+            held_local.take().unwrap()
+        } else {
+            tokio::select! {
+                command = rx.recv(), if held_local.is_none() && held_remote.is_none() => { let Some(command) = command else { break; }; command }
+                _ = retry.tick() => {
+                    owner.set_peers(server.cluster_connected_peers.load().iter().map(|peer| peer.0).collect());
+                    owner.update_transport_generations(&server.cluster_peer_generations.load());
+                    for _ in 0..256 {
+                        let Some(key) = owner.deferred_order.pop_front() else { break; };
+                        let Some(input) = owner.deferred.remove(&key) else { continue; };
+                        match authenticate_ordered(owner.local, &input, &server.cluster_peer_generations.load(), &server.cluster_peer_incarnations.load()) {
+                            PresenceAuthentication::Accepted => {
+                                if let Some(transition) = owner.apply_ordered(&input.envelope) { owner.publish(&runtime); present_presence(&server, &transition); }
+                            }
+                            PresenceAuthentication::Deferred => { owner.deferred.insert(key, input); owner.deferred_order.push_back(key); }
+                            PresenceAuthentication::Rejected => {},
+                        }
+                    }
+                    if let Some(input) = held_remote.take() { held_remote = owner.defer(input).err(); }
+                    if held_remote.is_some() {
+                        let now = std::time::Instant::now();
+                        if warning.is_none_or(|last| now.duration_since(last).as_secs() >= 300) { warning = Some(now); tracing::warn!("ordered presence deferral capacity exhausted"); }
+                    }
+                    let announced = owner.announced;
+                    owner.flush();
+                    if announced != owner.announced { owner.publish(&runtime); }
+                    super::cluster_status::refresh_cluster_status(&server);
+                    continue;
                 }
-                continue;
             }
         };
         owner.set_peers(
@@ -886,7 +1310,18 @@ async fn presence_owner(
                 .map(|peer| peer.0)
                 .collect(),
         );
-        let mut published_before_effects = false;
+        owner.update_transport_generations(&server.cluster_peer_generations.load());
+        if matches!(
+            command,
+            PresenceCommand::LocalLogin(..)
+                | PresenceCommand::LocalLogout(..)
+                | PresenceCommand::LocalDeparture { .. }
+                | PresenceCommand::LocalHide(..)
+        ) && local_source.is_none()
+        {
+            held_local = Some(command);
+            continue;
+        }
         match command {
             PresenceCommand::Configure {
                 local,
@@ -895,233 +1330,109 @@ async fn presence_owner(
             } => {
                 owner.local = local;
                 owner.outbound = Some(outbound);
-                let peers = owner.peers.clone();
-                for peer in peers {
+                for peer in owner.peers.clone() {
                     owner.publish_peer_state(ServerId(peer));
                 }
             }
-            PresenceCommand::LocalLogin(login) => {
-                if login.gid.server == owner.local && owner.can_insert(&login) {
-                    let previous = owner.insert(&login);
-                    if login.in_lobby && previous.is_none() {
-                        owner.publish(&runtime);
-                        published_before_effects = true;
-                        super::cluster_hide::push_remote_login_to_viewers(
-                            &server,
-                            &login.gid,
-                            &login.uuid,
-                            &login.name,
-                            &super::cluster_chat_pm::protocol_properties(&login.properties),
-                        );
-                        if !owner.hidden_gids.contains(&login.gid)
-                            && !owner.hidden_uuids.contains(&login.uuid)
-                        {
-                            broadcast_message(&server, &join_message(&login.name));
-                        }
+            local @ (PresenceCommand::LocalLogin(..)
+            | PresenceCommand::LocalLogout(..)
+            | PresenceCommand::LocalDeparture { .. }
+            | PresenceCommand::LocalHide(..)) => {
+                let (session, uuid, payload) = match local {
+                    PresenceCommand::LocalLogin(login, session) => {
+                        let hidden = owner.hidden_gids.contains(&login.gid)
+                            || owner.hidden_uuids.contains(&login.uuid);
+                        (
+                            session,
+                            login.uuid,
+                            PresencePayload::Profile { login, hidden },
+                        )
                     }
-                    if let Ok(bytes) = encode_control(&PresenceControl::Login(login)) {
-                        owner.broadcast(bytes);
+                    PresenceCommand::LocalHide(update, session) => (
+                        session,
+                        update.uuid,
+                        PresencePayload::Hide {
+                            gid: update.gid,
+                            name: update.name,
+                            hidden: update.hidden,
+                        },
+                    ),
+                    PresenceCommand::LocalLogout(gid, uuid, session) => (
+                        session,
+                        uuid,
+                        PresencePayload::Logout(PresenceLogout::new(gid)),
+                    ),
+                    PresenceCommand::LocalDeparture {
+                        gid,
+                        uuid,
+                        session,
+                        message,
+                    } => {
+                        let announcement = match message {
+                            Some(message) => serde_json::to_string(&message)
+                                .ok()
+                                .filter(|json| json.len() <= 16384)
+                                .map(pumpkin_cluster::presence::DepartureAnnouncement::CustomJson)
+                                .unwrap_or(
+                                    pumpkin_cluster::presence::DepartureAnnouncement::Standard,
+                                ),
+                            None => pumpkin_cluster::presence::DepartureAnnouncement::Suppressed,
+                        };
+                        (
+                            session,
+                            uuid,
+                            PresencePayload::Logout(PresenceLogout { gid, announcement }),
+                        )
+                    }
+                    _ => unreachable!(),
+                };
+                let source = local_source.unwrap();
+                if let Some(envelope) = owner.ordering.issue(source, session, uuid, payload) {
+                    if let Some(transition) = owner.apply_ordered(&envelope) {
+                        owner.publish(&runtime);
+                        present_presence(&server, &transition);
+                        if let Some(bytes) = pumpkin_cluster::ordered_presence::encode(&envelope) {
+                            owner.broadcast(bytes);
+                        }
                     }
                 }
             }
-            PresenceCommand::LocalLogout(gid) => {
-                if gid.server == owner.local {
-                    let removed = owner.entries.remove(&gid);
-                    let hidden = removed.as_ref().is_some_and(|entry| {
-                        owner.hidden_gids.contains(&gid) || owner.hidden_uuids.contains(&entry.uuid)
-                    });
-                    owner.hidden_gids.remove(&gid);
-                    if let Some(entry) = removed.as_ref()
-                        && entry.in_lobby
-                    {
-                        owner.publish(&runtime);
-                        published_before_effects = true;
-                        super::cluster_hide::push_remote_logout_to_viewers(
-                            &server,
-                            &gid,
-                            &entry.uuid,
-                            &entry.name,
-                        );
-                        if !hidden {
-                            broadcast_message(&server, &leave_message(&entry.name));
-                        }
-                    }
-                    if removed.is_some()
-                        && let Ok(bytes) =
-                            encode_control(&PresenceControl::Logout(PresenceLogout::new(gid)))
-                    {
-                        owner.broadcast(bytes);
-                    }
-                }
-            }
-            PresenceCommand::RemoteControl {
+            PresenceCommand::RemoteOrdered {
                 peer,
                 generation,
-                control,
-            } => match control {
-                PresenceControl::Login(login)
-                    if inbound_control_allowed(
-                        owner.local,
-                        peer,
-                        generation,
-                        login.gid.server,
-                        &server.cluster_peer_generations.load(),
-                        &server.cluster_primary_peers.load(),
-                    ) =>
-                {
-                    if !owner.can_insert(&login) {
-                        continue;
-                    }
-                    let direct = login.gid.server == peer;
-                    let previous = owner.insert(&login);
-                    let hidden = owner.hidden_gids.contains(&login.gid)
-                        || owner.hidden_uuids.contains(&login.uuid);
-                    if let Some(previous) = previous.as_ref() {
-                        if previous.uuid != login.uuid
-                            || previous.name != login.name
-                            || previous.properties != login.properties
-                            || previous.in_lobby != login.in_lobby
-                        {
-                            super::cluster_hide::push_remote_logout_to_viewers(
-                                &server,
-                                &login.gid,
-                                &previous.uuid,
-                                &previous.name,
-                            );
-                            super::cluster_hide::push_remote_login_to_viewers(
-                                &server,
-                                &login.gid,
-                                &login.uuid,
-                                &login.name,
-                                &super::cluster_chat_pm::protocol_properties(&login.properties),
-                            );
-                        }
-                    } else {
-                        super::cluster_hide::push_remote_login_to_viewers(
-                            &server,
-                            &login.gid,
-                            &login.uuid,
-                            &login.name,
-                            &super::cluster_chat_pm::protocol_properties(&login.properties),
-                        );
-                        if !hidden {
-                            broadcast_message(&server, &join_message(&login.name));
-                        }
-                    }
-                    if login.in_lobby {
-                        super::cluster_ghost::remove_remote_player_ghost(&server, login.gid);
-                    }
-                    if is_primary(&server) && previous.is_none() {
-                        info!(
-                            name = login.name.as_str(),
-                            server = peer.0,
-                            "cluster player joined"
-                        );
-                    }
-                    if is_primary(&server)
-                        && direct
-                        && let Ok(bytes) = encode_control(&PresenceControl::Login(login))
-                    {
-                        owner.broadcast_except(peer, bytes);
-                    }
-                }
-                PresenceControl::Logout(logout)
-                    if inbound_control_allowed(
-                        owner.local,
-                        peer,
-                        generation,
-                        logout.gid.server,
-                        &server.cluster_peer_generations.load(),
-                        &server.cluster_primary_peers.load(),
-                    ) =>
-                {
-                    let direct = logout.gid.server == peer;
-                    let removed = owner.entries.remove(&logout.gid);
-                    if let Some(entry) = removed.as_ref() {
-                        let hidden = owner.hidden_gids.remove(&logout.gid)
-                            || owner.hidden_uuids.contains(&entry.uuid);
-                        super::cluster_hide::push_remote_logout_to_viewers(
-                            &server,
-                            &logout.gid,
-                            &entry.uuid,
-                            &entry.name,
-                        );
-                        super::cluster_ghost::remove_remote_player_ghost(&server, logout.gid);
-                        if !hidden {
-                            broadcast_message(&server, &leave_message(&entry.name));
-                        }
-                    }
-                    if is_primary(&server)
-                        && direct
-                        && removed.is_some()
-                        && let Ok(bytes) = encode_control(&PresenceControl::Logout(logout))
-                    {
-                        owner.broadcast_except(peer, bytes);
-                    }
-                }
-                PresenceControl::Login(_) | PresenceControl::Logout(_) => {}
-            },
-            PresenceCommand::LocalHide(update) => {
-                if update.gid.server == owner.local && owner.apply_hide(&update) {
-                    owner.publish(&runtime);
-                    published_before_effects = true;
-                    if let Ok(bytes) = pumpkin_cluster::hide::encode_hide(&update) {
-                        owner.broadcast(bytes);
-                    }
-                    super::cluster_hide::apply_hide_visibility(
-                        &server,
-                        uuid::Uuid::from_bytes(update.uuid),
-                        Some(&update.name),
-                        update.hidden,
-                    );
-                }
-            }
-            PresenceCommand::RemoteHide {
-                peer,
-                generation,
-                update,
+                envelope,
             } => {
-                let direct = update.gid.server == peer;
-                if inbound_control_allowed(
-                    owner.local,
+                let input = AuthenticatedPresence {
                     peer,
                     generation,
-                    update.gid.server,
+                    envelope,
+                };
+                match authenticate_ordered(
+                    owner.local,
+                    &input,
                     &server.cluster_peer_generations.load(),
-                    &server.cluster_primary_peers.load(),
-                ) && owner.apply_hide(&update)
-                {
-                    owner.publish(&runtime);
-                    published_before_effects = true;
-                    super::cluster_hide::apply_hide_visibility(
-                        &server,
-                        uuid::Uuid::from_bytes(update.uuid),
-                        Some(&update.name),
-                        update.hidden,
-                    );
-                    if is_primary(&server)
-                        && direct
-                        && let Ok(bytes) = pumpkin_cluster::hide::encode_hide(&update)
-                    {
-                        owner.broadcast_except(peer, bytes);
+                    &server.cluster_peer_incarnations.load(),
+                ) {
+                    PresenceAuthentication::Accepted => {
+                        if let Some(transition) = owner.apply_ordered(&input.envelope) {
+                            owner.publish(&runtime);
+                            present_presence(&server, &transition);
+                        }
                     }
+                    PresenceAuthentication::Deferred => held_remote = owner.defer(input).err(),
+                    PresenceAuthentication::Rejected => {}
                 }
             }
+            PresenceCommand::RemoteHide { .. } => {}
             PresenceCommand::PeerDropped(peer) => {
                 for entry in owner.drop_peer(peer) {
-                    if is_primary(&server)
-                        && let Ok(bytes) =
-                            encode_control(&PresenceControl::Logout(PresenceLogout::new(entry.gid)))
-                    {
-                        owner.broadcast_except(peer, bytes);
-                    }
+                    owner.publish(&runtime);
                     super::cluster_hide::push_remote_logout_to_viewers(
                         &server,
                         &entry.gid,
                         &entry.uuid,
                         &entry.name,
                     );
-                    super::cluster_ghost::remove_remote_player_ghost(&server, entry.gid);
                     if !owner.hidden_uuids.contains(&entry.uuid) {
                         broadcast_message(&server, &leave_message(&entry.name));
                     }
@@ -1191,9 +1502,8 @@ async fn presence_owner(
         }
         let announced_before_flush = owner.announced;
         owner.flush();
-        if !published_before_effects || announced_before_flush != owner.announced {
-            owner.publish(&runtime);
-        }
+        let _ = announced_before_flush;
+        owner.publish(&runtime);
         super::cluster_status::refresh_cluster_status(&server);
     }
     debug!("cluster presence owner closed");
@@ -1231,8 +1541,425 @@ pub fn admin_directory_snapshot(server: &Server) -> PlayerDirectorySnapshot {
 mod tests {
     use super::*;
 
-    fn gid(server: u16, player: u16) -> GlobalPlayerId {
-        GlobalPlayerId::new(ServerId(server), PlayerSlot(player))
+    #[test]
+    fn uuid_visibility_survives_old_gid_retirement_and_tracks_new_profile_hide() {
+        let mut owner = PresenceOwner::new();
+        let old = login(1, 1, true);
+        let mut successor = login(2, 2, true);
+        successor.uuid = old.uuid;
+        profile(&mut owner, old.clone(), 8, false);
+        profile(&mut owner, successor.clone(), 9, false);
+        issue(&mut owner, source(1), 8, old.uuid, PresencePayload::Logout(PresenceLogout::new(old.gid)));
+        let (runtime, _) = PresenceRuntime::new(1);
+        owner.publish(&runtime);
+        let snapshot = runtime.snapshot();
+        assert!(!snapshot.entries.contains_key(&old.gid));
+        assert_eq!(snapshot.by_uuid(&old.uuid).unwrap().gid, successor.gid);
+        assert!(snapshot.uuid_visible_to(&old.uuid, &[99; 16]));
+        assert_eq!(snapshot.roster_order.len(), snapshot.entries.len());
+        hide(&mut owner, &successor, 9, true);
+        owner.publish(&runtime);
+        let snapshot = runtime.snapshot();
+        assert!(!snapshot.uuid_visible_to(&old.uuid, &[99; 16]));
+        assert!(snapshot.uuid_visible_to(&old.uuid, &old.uuid));
+    }
+
+    fn gid(server: u16, slot: u16) -> GlobalPlayerId {
+        GlobalPlayerId::new(ServerId(server), PlayerSlot(slot))
+    }
+    fn source(server: u16) -> PeerGeneration {
+        PeerGeneration {
+            server: ServerId(server),
+            generation: 100 + u64::from(server),
+        }
+    }
+    fn login(server: u16, slot: u16, lobby: bool) -> PresenceLogin {
+        PresenceLogin::new(
+            gid(server, slot),
+            [slot as u8; 16],
+            format!("Player{slot}"),
+            vec![PresenceProperty::new(
+                "textures".into(),
+                format!("texture-{slot}"),
+                Some(format!("signature-{slot}")),
+            )],
+            lobby,
+        )
+    }
+    fn issue(
+        owner: &mut PresenceOwner,
+        source: PeerGeneration,
+        session: u64,
+        uuid: [u8; 16],
+        payload: PresencePayload,
+    ) -> OrderedPresence {
+        let envelope = owner
+            .ordering
+            .issue(source, session, uuid, payload)
+            .unwrap();
+        assert!(owner.apply_ordered(&envelope).is_some());
+        envelope
+    }
+    fn profile(
+        owner: &mut PresenceOwner,
+        login: PresenceLogin,
+        session: u64,
+        hidden: bool,
+    ) -> OrderedPresence {
+        issue(
+            owner,
+            source(login.gid.server.0),
+            session,
+            login.uuid,
+            PresencePayload::Profile { login, hidden },
+        )
+    }
+    fn hide(
+        owner: &mut PresenceOwner,
+        login: &PresenceLogin,
+        session: u64,
+        hidden: bool,
+    ) -> OrderedPresence {
+        issue(
+            owner,
+            source(login.gid.server.0),
+            session,
+            login.uuid,
+            PresencePayload::Hide {
+                gid: login.gid,
+                name: login.name.clone(),
+                hidden,
+            },
+        )
+    }
+    fn retire(owner: &mut PresenceOwner, login: &PresenceLogin, session: u64) -> OrderedPresence {
+        issue(
+            owner,
+            source(login.gid.server.0),
+            session,
+            login.uuid,
+            PresencePayload::Logout(PresenceLogout::new(login.gid)),
+        )
+    }
+
+    #[test]
+    fn original_profile_and_hide_facets_survive_reverse_arrival() {
+        let mut issuer = PresenceOwner::new();
+        let waiting = login(2, 7, true).with_native_skin(true).with_listing(false);
+        let announced = profile(&mut issuer, waiting.clone(), 17, false);
+        let hidden = hide(&mut issuer, &waiting, 17, true);
+        let mut receiver = PresenceOwner::new();
+        assert!(receiver.apply_ordered(&hidden).is_some());
+        assert!(receiver.apply_ordered(&announced).is_some());
+        let entry = &receiver.entries[&waiting.gid];
+        assert!(entry.native_skin);
+        assert!(entry.in_lobby);
+        assert!(!entry.listed);
+        assert_eq!(entry.properties, waiting.properties);
+        assert_eq!(entry.session, 17);
+        assert_eq!(entry.source, Some(source(2)));
+        assert!(receiver.hidden_gids.contains(&waiting.gid));
+        let shown = hide(&mut issuer, &waiting, 17, false);
+        receiver.apply_ordered(&shown).unwrap();
+        assert!(!receiver.hidden_gids.contains(&waiting.gid));
+        assert!(receiver.apply_ordered(&hidden).is_none());
+        assert!(!receiver.hidden_uuids.contains(&waiting.uuid));
+    }
+
+    #[test]
+    fn logout_seed_retains_exact_boot_session_and_rejects_late_profile() {
+        let mut issuer = PresenceOwner::new();
+        let waiting = login(2, 7, true);
+        let announced = profile(&mut issuer, waiting.clone(), 17, false);
+        let logout = retire(&mut issuer, &waiting, 17);
+        issuer.peers = vec![3];
+        issuer.publish_peer_state(ServerId(3));
+        let parcel = issuer.pending.values().next().unwrap();
+        let tombstone = pumpkin_cluster::ordered_presence::decode(&parcel.bytes).unwrap();
+        assert_eq!(tombstone.source, announced.source);
+        assert_eq!(tombstone.session, 17);
+        assert_eq!(tombstone.revision, logout.revision);
+        assert!(matches!(tombstone.payload, PresencePayload::Retired { .. }));
+        let mut receiver = PresenceOwner::new();
+        receiver.apply_ordered(&tombstone).unwrap();
+        assert!(receiver.apply_ordered(&announced).is_none());
+        let mut invalid_revival = announced;
+        invalid_revival.revision = logout.revision + 1;
+        assert!(receiver.apply_ordered(&invalid_revival).is_none());
+        let (runtime, _rx) = PresenceRuntime::new(1);
+        receiver.publish(&runtime);
+        assert_eq!(
+            runtime.snapshot().retirement_sessions[&waiting.gid],
+            (source(2), 17)
+        );
+        assert!(runtime.snapshot().entries.is_empty());
+    }
+
+    #[test]
+    fn gid_reuse_rejects_old_session_even_when_uuid_is_reused() {
+        for replacement_uuid in [[7; 16], [8; 16]] {
+            let mut owner = PresenceOwner::new();
+            let previous = login(2, 7, false);
+            let stale_profile = profile(&mut owner, previous.clone(), 17, false);
+            let stale_logout = retire(&mut owner, &previous, 17);
+            let replacement = PresenceLogin::new(
+                previous.gid,
+                replacement_uuid,
+                "Replacement".into(),
+                vec![],
+                true,
+            );
+            profile(&mut owner, replacement.clone(), 18, false);
+            assert!(owner.apply_ordered(&stale_profile).is_none());
+            assert!(owner.apply_ordered(&stale_logout).is_none());
+            let current = &owner.entries[&previous.gid];
+            assert_eq!(current.name, replacement.name);
+            assert_eq!(current.uuid, replacement.uuid);
+            assert_eq!(current.session, 18);
+            assert!(!owner.retirement_sessions.contains_key(&previous.gid));
+        }
+    }
+
+    #[test]
+    fn relay_seed_keeps_original_envelopes_without_new_revisions() {
+        let mut owner = PresenceOwner::new();
+        owner.local = ServerId(1);
+        let remote = login(2, 7, true);
+        let original = profile(&mut owner, remote.clone(), 17, false);
+        let hidden = hide(&mut owner, &remote, 17, true);
+        owner.peers = vec![3];
+        owner.publish_peer_state(ServerId(3));
+        let (tx, mut rx) = mpsc::channel(2);
+        owner.outbound = Some(tx);
+        owner.flush();
+        let received = [rx.try_recv().unwrap(), rx.try_recv().unwrap()]
+            .map(|parcel| pumpkin_cluster::ordered_presence::decode(&parcel.bytes).unwrap());
+        assert_eq!(received, [original, hidden]);
+    }
+
+    #[test]
+    fn unknown_source_boot_is_deferred_and_exact_transport_and_boot_are_required() {
+        let mut owner = PresenceOwner::new();
+        let original = profile(&mut owner, login(2, 7, true), 17, false);
+        let input = AuthenticatedPresence {
+            peer: ServerId(3),
+            generation: 11,
+            envelope: original,
+        };
+        let transports = HashMap::from([(ServerId(3), 11)]);
+        assert_eq!(
+            authenticate_ordered(
+                ServerId(1),
+                &input,
+                &HashMap::from([(ServerId(3), 10)]),
+                &HashMap::from([(ServerId(2), 102)])
+            ),
+            PresenceAuthentication::Deferred
+        );
+        assert_eq!(
+            authenticate_ordered(ServerId(1), &input, &transports, &HashMap::new()),
+            PresenceAuthentication::Deferred
+        );
+        assert_eq!(
+            authenticate_ordered(
+                ServerId(1),
+                &input,
+                &transports,
+                &HashMap::from([(ServerId(2), 101)])
+            ),
+            PresenceAuthentication::Rejected
+        );
+        assert_eq!(
+            authenticate_ordered(
+                ServerId(1),
+                &input,
+                &transports,
+                &HashMap::from([(ServerId(2), 102)])
+            ),
+            PresenceAuthentication::Accepted
+        );
+        assert_eq!(
+            authenticate_ordered(
+                ServerId(1),
+                &input,
+                &HashMap::from([(ServerId(3), 12)]),
+                &HashMap::from([(ServerId(2), 102)])
+            ),
+            PresenceAuthentication::Rejected
+        );
+        assert_eq!(
+            authenticate_ordered(
+                ServerId(3),
+                &input,
+                &transports,
+                &HashMap::from([(ServerId(2), 102)])
+            ),
+            PresenceAuthentication::Rejected
+        );
+    }
+
+    #[test]
+    fn deferred_unknown_boot_keeps_independent_facets_and_latest_session() {
+        let mut source_owner = PresenceOwner::new();
+        let login = login(2, 7, true);
+        let original = profile(&mut source_owner, login.clone(), 17, false);
+        let hidden = hide(&mut source_owner, &login, 17, true);
+        let replacement = profile(&mut source_owner, login.clone(), 18, false);
+        let input = |envelope| AuthenticatedPresence {
+            peer: ServerId(3),
+            generation: 11,
+            envelope,
+        };
+        let mut owner = PresenceOwner::new();
+        assert!(owner.defer(input(original.clone())).is_ok());
+        assert!(owner.defer(input(hidden)).is_ok());
+        assert!(owner.defer(input(replacement.clone())).is_ok());
+        assert!(owner.defer(input(original)).is_ok());
+        assert_eq!(owner.deferred.len(), 2);
+        while let Some(key) = owner.deferred_order.pop_front() {
+            let envelope = owner.deferred.remove(&key).unwrap().envelope;
+            owner.apply_ordered(&envelope);
+        }
+        assert_eq!(owner.entries[&login.gid].session, 18);
+        assert!(!owner.hidden_gids.contains(&login.gid));
+        assert_eq!(owner.ordering.profile(login.gid), Some(&replacement));
+    }
+
+    #[test]
+    fn new_boot_replaces_old_projection_but_old_boot_cannot_return() {
+        let mut owner = PresenceOwner::new();
+        let old = profile(&mut owner, login(2, 7, false), 99, false);
+        let mut replacement = old.clone();
+        replacement.source.generation += 1;
+        replacement.session = 1;
+        replacement.revision = 1;
+        if let PresencePayload::Profile { login, .. } = &mut replacement.payload {
+            login.name = "Restarted".into();
+        }
+        let transports = HashMap::from([(ServerId(2), 12)]);
+        let boots = HashMap::from([(ServerId(2), replacement.source.generation)]);
+        let new_input = AuthenticatedPresence {
+            peer: ServerId(2),
+            generation: 12,
+            envelope: replacement.clone(),
+        };
+        assert_eq!(
+            authenticate_ordered(ServerId(1), &new_input, &transports, &boots),
+            PresenceAuthentication::Accepted
+        );
+        owner.apply_ordered(&replacement).unwrap();
+        let old_input = AuthenticatedPresence {
+            peer: ServerId(2),
+            generation: 12,
+            envelope: old,
+        };
+        assert_eq!(
+            authenticate_ordered(ServerId(1), &old_input, &transports, &boots),
+            PresenceAuthentication::Rejected
+        );
+        assert_eq!(owner.entries[&replacement.gid()].name, "Restarted");
+        assert_eq!(
+            owner.entries[&replacement.gid()].source,
+            Some(replacement.source)
+        );
+    }
+
+    #[test]
+    fn saturated_transport_retains_distinct_original_states_and_coalesces_retirement() {
+        let mut owner = PresenceOwner::new();
+        owner.peers = vec![9];
+        let (tx, mut rx) = mpsc::channel(1);
+        owner.outbound = Some(tx);
+        for slot in 1..=256 {
+            let envelope = profile(&mut owner, login(1, slot, false), 17, false);
+            owner.queue_to(
+                ServerId(9),
+                pumpkin_cluster::ordered_presence::encode(&envelope).unwrap(),
+            );
+        }
+        owner.flush();
+        assert_eq!(owner.pending.len(), 255);
+        let retired = retire(&mut owner, &login(1, 256, false), 17);
+        owner.queue_to(
+            ServerId(9),
+            pumpkin_cluster::ordered_presence::encode(&retired).unwrap(),
+        );
+        assert_eq!(owner.pending.len(), 255);
+        let mut last =
+            pumpkin_cluster::ordered_presence::decode(&rx.try_recv().unwrap().bytes).unwrap();
+        for _ in 0..255 {
+            owner.flush();
+            last =
+                pumpkin_cluster::ordered_presence::decode(&rx.try_recv().unwrap().bytes).unwrap();
+        }
+        assert!(owner.pending.is_empty());
+        assert_eq!(last, retired);
+    }
+
+    #[test]
+    fn same_peer_transport_epoch_reseeds_original_envelopes() {
+        let mut owner = PresenceOwner::new();
+        let original = profile(&mut owner, login(1, 3, true), 17, false);
+        let (tx, mut rx) = mpsc::channel(8);
+        owner.outbound = Some(tx);
+        owner.set_peers(vec![9]);
+        owner.update_transport_generations(&HashMap::from([(ServerId(9), 10)]));
+        owner.flush();
+        assert_eq!(
+            pumpkin_cluster::ordered_presence::decode(&rx.try_recv().unwrap().bytes),
+            Some(original.clone())
+        );
+        assert!(rx.try_recv().is_err());
+        owner.update_transport_generations(&HashMap::from([(ServerId(9), 10)]));
+        owner.flush();
+        assert!(rx.try_recv().is_err());
+        owner.update_transport_generations(&HashMap::from([(ServerId(9), 11)]));
+        owner.flush();
+        assert_eq!(
+            pumpkin_cluster::ordered_presence::decode(&rx.try_recv().unwrap().bytes),
+            Some(original)
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn disconnected_projection_can_restore_only_the_retained_original_profile() {
+        let mut owner = PresenceOwner::new();
+        let original = profile(&mut owner, login(2, 7, true), 17, false);
+        owner.drop_peer(ServerId(2));
+        assert!(!owner.entries.contains_key(&original.gid()));
+        assert!(owner.apply_ordered(&original).is_some());
+        assert_eq!(owner.entries[&original.gid()].session, original.session);
+        assert!(!owner.retired_gids.contains(&original.gid()));
+        let mut stale = original.clone();
+        stale.revision += 1;
+        if let PresencePayload::Profile { login, .. } = &mut stale.payload {
+            login.listed = false;
+        }
+        owner.apply_ordered(&stale).unwrap();
+        owner.drop_peer(ServerId(2));
+        assert!(owner.apply_ordered(&original).is_none());
+        assert!(owner.apply_ordered(&stale).is_some());
+        assert!(!owner.entries[&original.gid()].listed);
+    }
+
+    #[test]
+    fn hidden_lobby_profile_updates_preserve_visibility_and_prior_snapshots() {
+        let mut owner = PresenceOwner::new();
+        let waiting = login(2, 7, true);
+        profile(&mut owner, waiting.clone(), 17, false);
+        let (runtime, _rx) = PresenceRuntime::new(1);
+        owner.publish(&runtime);
+        let before = runtime.snapshot();
+        hide(&mut owner, &waiting, 17, true);
+        profile(&mut owner, waiting.clone().with_listing(false), 17, true);
+        owner.publish(&runtime);
+        let after = runtime.snapshot();
+        assert!(before.is_visible_to(&waiting.gid, &waiting.uuid, Some(&[9; 16])));
+        assert!(!after.is_visible_to(&waiting.gid, &waiting.uuid, Some(&[9; 16])));
+        assert!(after.is_visible_to(&waiting.gid, &waiting.uuid, Some(&waiting.uuid)));
+        assert!(after.entries[&waiting.gid].in_lobby);
+        assert!(!after.entries[&waiting.gid].listed);
     }
 
     #[test]
@@ -1245,285 +1972,9 @@ mod tests {
             permission_fingerprint(&first),
             permission_fingerprint(&second)
         );
-        let revoked = HashMap::from([(b, PermissionLvl::Two)]);
         assert_ne!(
             permission_fingerprint(&first),
-            permission_fingerprint(&revoked)
-        );
-    }
-
-    fn login(server: u16, player: u16, lobby: bool) -> PresenceLogin {
-        PresenceLogin::new(
-            gid(server, player),
-            [player as u8; 16],
-            format!("Player{player}"),
-            vec![PresenceProperty::new(
-                String::from("textures"),
-                format!("texture-{player}"),
-                Some(format!("signature-{player}")),
-            )],
-            lobby,
-        )
-    }
-
-    #[test]
-    fn owner_state_preserves_profiles_and_visibility_across_transitions() {
-        let mut owner = PresenceOwner::new();
-        owner.local = ServerId(2);
-        let waiting = login(2, 7, true).with_listing(false);
-        assert!(owner.insert(&waiting).is_none());
-        assert_eq!(owner.entries[&waiting.gid].properties, waiting.properties);
-        assert!(!owner.entries[&waiting.gid].listed);
-        let joined = login(2, 7, false);
-        let previous = owner.insert(&joined).unwrap();
-        assert!(previous.in_lobby);
-        assert!(!previous.listed);
-        assert!(!owner.entries[&joined.gid].in_lobby);
-        assert!(owner.entries[&joined.gid].listed);
-        let hide = HideUpdate::new(joined.gid, joined.uuid, joined.name.clone(), true);
-        assert!(owner.apply_hide(&hide));
-        assert!(owner.hidden_gids.contains(&joined.gid));
-        assert!(owner.hidden_uuids.contains(&joined.uuid));
-        let show = HideUpdate::new(joined.gid, joined.uuid, joined.name.clone(), false);
-        assert!(owner.apply_hide(&show));
-        assert!(!owner.hidden_gids.contains(&joined.gid));
-        assert!(!owner.hidden_uuids.contains(&joined.uuid));
-    }
-
-    #[test]
-    fn dropped_peer_removal_can_be_derived_without_touching_other_hosts() {
-        let mut owner = PresenceOwner::new();
-        owner.local = ServerId(1);
-        for entry in [login(2, 1, false), login(2, 2, true), login(3, 1, false)] {
-            owner.insert(&entry);
-        }
-        let removed = owner.drop_peer(ServerId(2));
-        assert_eq!(removed.len(), 2);
-        assert_eq!(owner.entries.len(), 1);
-        assert!(owner.entries.contains_key(&gid(3, 1)));
-    }
-
-    #[test]
-    fn peer_connect_after_lobby_login_receives_full_profile_without_admission_event() {
-        let mut owner = PresenceOwner::new();
-        owner.local = ServerId(1);
-        let profile = login(1, 7, true);
-        owner.insert(&profile);
-        owner.set_peers(vec![2]);
-        let sent = owner
-            .pending
-            .values()
-            .find(|parcel| parcel.peer == ServerId(2))
-            .unwrap();
-        let PresenceControl::Login(received) = decode_control(&sent.bytes).unwrap() else {
-            panic!("expected profile login");
-        };
-        assert_eq!(received.gid, profile.gid);
-        assert_eq!(received.properties, profile.properties);
-    }
-
-    #[test]
-    fn newcomer_receives_relayed_profiles_before_hidden_state() {
-        let mut owner = PresenceOwner::new();
-        owner.local = ServerId(1);
-        owner.peers = vec![3];
-        let remote = login(2, 7, true);
-        owner.insert(&remote);
-        owner.apply_hide(&HideUpdate::new(
-            remote.gid,
-            remote.uuid,
-            remote.name.clone(),
-            true,
-        ));
-        owner.publish_peer_state(ServerId(3));
-        assert_eq!(owner.pending.len(), 2);
-        let (tx, mut rx) = mpsc::channel(2);
-        owner.outbound = Some(tx);
-        owner.flush();
-        let profile = rx.try_recv().unwrap();
-        let hidden = rx.try_recv().unwrap();
-        assert_eq!(profile.peer, ServerId(3));
-        assert_eq!(hidden.peer, ServerId(3));
-        assert_eq!(
-            decode_control(&profile.bytes).unwrap(),
-            PresenceControl::Login(remote.clone())
-        );
-        assert_eq!(
-            pumpkin_cluster::hide::decode_hide(&hidden.bytes).unwrap(),
-            HideUpdate::new(remote.gid, remote.uuid, remote.name, true)
-        );
-    }
-
-    #[test]
-    fn saturated_transport_retains_distinct_states_and_coalesces_replacement() {
-        let mut owner = PresenceOwner::new();
-        owner.peers = vec![9];
-        let (tx, mut rx) = mpsc::channel(1);
-        owner.outbound = Some(tx);
-        let entries: Vec<_> = (1..=256).map(|slot| login(1, slot, false)).collect();
-        for entry in &entries {
-            owner.queue_to(
-                ServerId(9),
-                encode_control(&PresenceControl::Login(entry.clone())).unwrap(),
-            );
-        }
-        owner.flush();
-        assert_eq!(owner.pending.len(), 255);
-        let replacement = PresenceLogout::new(entries.last().unwrap().gid);
-        owner.queue_to(
-            ServerId(9),
-            encode_control(&PresenceControl::Logout(replacement)).unwrap(),
-        );
-        assert_eq!(owner.pending.len(), 255);
-        let mut delivered = vec![decode_control(&rx.try_recv().unwrap().bytes).unwrap()];
-        while !owner.pending.is_empty() {
-            owner.flush();
-            delivered.push(decode_control(&rx.try_recv().unwrap().bytes).unwrap());
-        }
-        assert_eq!(delivered.len(), 256);
-        assert_eq!(
-            delivered.last(),
-            Some(&PresenceControl::Logout(replacement))
-        );
-    }
-
-    #[test]
-    fn peer_drop_discards_saturated_state_before_replacement_publish() {
-        let mut owner = PresenceOwner::new();
-        owner.local = ServerId(1);
-        owner.peers = vec![2];
-        let current = login(1, 7, false);
-        owner.insert(&current);
-        let (tx, mut rx) = mpsc::channel(1);
-        tx.try_send(OutboundParcel {
-            peer: ServerId(99),
-            header: StreamHeader::new(StreamKind::Control, None),
-            bytes: vec![0],
-        })
-        .unwrap();
-        owner.outbound = Some(tx);
-        owner.queue_to(
-            ServerId(2),
-            encode_control(&PresenceControl::Login(current.clone())).unwrap(),
-        );
-        owner.queue_to(
-            ServerId(2),
-            pumpkin_cluster::hide::encode_hide(&HideUpdate::new(
-                current.gid,
-                current.uuid,
-                current.name.clone(),
-                true,
-            ))
-            .unwrap(),
-        );
-        owner.queue_to(
-            ServerId(2),
-            encode_control(&PresenceControl::Logout(PresenceLogout::new(current.gid))).unwrap(),
-        );
-        owner.flush();
-        assert_eq!(owner.pending.len(), 2);
-        owner.drop_peer(ServerId(2));
-        assert!(owner.pending.is_empty());
-        assert!(owner.pending_order.is_empty());
-        rx.try_recv().unwrap();
-        let replacement_current = current.clone().with_listing(false);
-        owner.insert(&replacement_current);
-        owner.peers.push(2);
-        owner.publish_peer_state(ServerId(2));
-        owner.flush();
-        let replacement = rx.try_recv().unwrap();
-        assert_eq!(
-            decode_control(&replacement.bytes).unwrap(),
-            PresenceControl::Login(replacement_current)
-        );
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn superseded_direct_and_primary_relay_generations_are_rejected() {
-        let local = ServerId(1);
-        let direct = ServerId(2);
-        let primary = ServerId(3);
-        let relayed_origin = ServerId(4);
-        let generations = HashMap::from([(direct, 7), (primary, 11)]);
-        let primaries = HashSet::from([primary]);
-        assert!(inbound_control_allowed(
-            local,
-            direct,
-            7,
-            direct,
-            &generations,
-            &primaries
-        ));
-        assert!(!inbound_control_allowed(
-            local,
-            direct,
-            6,
-            direct,
-            &generations,
-            &primaries
-        ));
-        assert!(inbound_control_allowed(
-            local,
-            primary,
-            11,
-            relayed_origin,
-            &generations,
-            &primaries
-        ));
-        assert!(!inbound_control_allowed(
-            local,
-            primary,
-            10,
-            relayed_origin,
-            &generations,
-            &primaries
-        ));
-        assert!(!inbound_control_allowed(
-            local,
-            direct,
-            7,
-            relayed_origin,
-            &generations,
-            &primaries
-        ));
-    }
-
-    #[test]
-    fn hiding_removes_profile_from_other_rosters_and_restoration_returns_it() {
-        let mut owner = PresenceOwner::new();
-        let hidden = login(1, 1, false);
-        let viewer = login(1, 2, false);
-        owner.insert(&hidden);
-        owner.insert(&viewer);
-        let (runtime, _rx) = PresenceRuntime::new(1);
-        owner.publish(&runtime);
-        assert!(
-            runtime
-                .snapshot()
-                .is_visible_to(&hidden.gid, &hidden.uuid, Some(&viewer.uuid))
-        );
-        owner.apply_hide(&HideUpdate::new(
-            hidden.gid,
-            hidden.uuid,
-            hidden.name.clone(),
-            true,
-        ));
-        owner.publish(&runtime);
-        let during = runtime.snapshot();
-        assert!(!during.is_visible_to(&hidden.gid, &hidden.uuid, Some(&viewer.uuid)));
-        assert!(during.is_visible_to(&hidden.gid, &hidden.uuid, Some(&hidden.uuid)));
-        owner.apply_hide(&HideUpdate::new(
-            hidden.gid,
-            hidden.uuid,
-            hidden.name,
-            false,
-        ));
-        owner.publish(&runtime);
-        assert!(
-            runtime
-                .snapshot()
-                .is_visible_to(&hidden.gid, &hidden.uuid, Some(&viewer.uuid))
+            permission_fingerprint(&HashMap::from([(b, PermissionLvl::Two)]))
         );
     }
 }

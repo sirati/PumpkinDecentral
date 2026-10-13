@@ -3857,7 +3857,7 @@ impl pumpkin::plugin::player::HostJavaPlayer for PluginHostState {
             .map_err(|_| wasmtime::Error::msg("invalid java-player resource handle"))?
             .provider
             .clone();
-        player.reset_scoreboard();
+        player.reset_scoreboard()?;
         Ok(())
     }
 
@@ -4564,7 +4564,7 @@ impl pumpkin::plugin::player::HostBedrockPlayer for PluginHostState {
             .map_err(|_| wasmtime::Error::msg("invalid bedrock-player resource handle"))?
             .provider
             .clone();
-        player.reset_scoreboard();
+        player.reset_scoreboard()?;
         Ok(())
     }
 

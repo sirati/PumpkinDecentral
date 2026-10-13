@@ -4,22 +4,24 @@ use std::sync::Arc;
 use pumpkin_cluster::controller::ControllerDecision;
 use pumpkin_cluster::identity::{GlobalPlayerId, ServerId};
 use pumpkin_cluster::inventory::{
-    INV_ARMOR, INV_MAIN, INV_OFFHAND, INV_SELECTED, InvLoc, InventoryCell, InventoryMutation,
-    InventoryStateSnapshot, InventoryTarget,
+    INV_ARMOR, INV_MAIN, INV_OFFHAND, INV_SELECTED, InvLoc, InventoryCell, InventoryTarget,
 };
-use pumpkin_cluster::player_admin::{PlayerAdministrativeIntent, PlayerAdministrativeMutation};
 use pumpkin_cluster::protocol::{BlockPos as ClusterBlockPos, StreamKind};
 use pumpkin_cluster::streams::{InboundParcel, OutboundParcel, StreamHeader};
-use pumpkin_cluster::time::TickStamp;
 use pumpkin_config::ClusterRole;
 use pumpkin_data::{Block, dimension::Dimension, item::Item, item_stack::ItemStack};
-use pumpkin_inventory::Inventory;
-use pumpkin_util::math::position::BlockPos;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use super::Server;
-use super::cluster_player_admin::PlayerAdministrativeIntentFailure;
+
+#[path = "cluster_test_avatar.rs"]
+mod avatar;
+#[path = "cluster_test_interactions.rs"]
+mod interactions;
+#[path = "cluster_test_loadouts.rs"]
+mod loadouts;
+pub(crate) use loadouts::FixtureLoadoutReceipt;
 
 const MAGIC: [u8; 8] = *b"PCTE\0\0\0\x02";
 const ARENA_X: [f64; 2] = [-0.5, 1.5];
@@ -34,12 +36,24 @@ enum TestCommand {
 
 pub(crate) struct TestRuntime {
     commands: crossbeam::queue::ArrayQueue<TestCommand>,
+    loadout_requests: crossbeam::queue::ArrayQueue<loadouts::RoutedLoadoutRequest>,
+    pub(crate) observations: super::cluster_test_observation::ObservationQueue,
+    pub(crate) scenarios: super::cluster_test_scenarios::ScenarioRuntime,
+    pub(crate) preflight: super::cluster_test_preflight::PreflightRuntime,
+    pub(crate) handoff: super::cluster_test_handoff::HandoffRuntime,
+    pub(crate) health_policy: super::cluster_test_health_policy::HealthPolicyRuntime,
 }
 
 impl TestRuntime {
     pub(crate) fn new() -> Self {
         Self {
             commands: crossbeam::queue::ArrayQueue::new(64),
+            loadout_requests: crossbeam::queue::ArrayQueue::new(64),
+            observations: super::cluster_test_observation::ObservationQueue::new(),
+            scenarios: super::cluster_test_scenarios::ScenarioRuntime::new(),
+            preflight: super::cluster_test_preflight::PreflightRuntime::new(),
+            handoff: super::cluster_test_handoff::HandoffRuntime::new(),
+            health_policy: super::cluster_test_health_policy::HealthPolicyRuntime::new(),
         }
     }
 }
@@ -53,10 +67,30 @@ enum TestKind {
     Beacon,
     DepartureAdminLobby,
     DepartureAdminDisconnect,
+    HandoffRevisionMismatch,
+    PacketPreflightLobbyDepart,
+    HandoffCallbackRelease,
+    DoorTrapdoor,
+    ButtonLever,
+    EndFrameAnchor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum TestWire {
+    LoadoutRequest {
+        origin: ServerId,
+        target: pumpkin_cluster::canonical_action::LivePlayerLease,
+        template: super::cluster_test_scenarios::FixtureLoadoutTemplate,
+        token: [u8; 16],
+    },
+    LoadoutPhase {
+        token: [u8; 16],
+        target: pumpkin_cluster::canonical_action::LivePlayerLease,
+        template: super::cluster_test_scenarios::FixtureLoadoutTemplate,
+        phase: super::cluster_test_scenarios::InventoryScenarioPhase,
+        digest: [u8; 32],
+        count: u16,
+    },
     Request {
         kind: TestKind,
         request: u64,
@@ -81,18 +115,20 @@ struct PendingParcel {
 struct ArenaRun {
     request: TestWire,
     participants: [GlobalPlayerId; 2],
+    participant_leases: [pumpkin_cluster::canonical_action::LivePlayerLease; 2],
     world: Arc<crate::world::World>,
     world_origin: u64,
     world_submitted: bool,
     desired: BTreeMap<ClusterBlockPos, u16>,
     observed: BTreeSet<ClusterBlockPos>,
     inventory_origins: [u64; 2],
+    loadout_tokens: [Option<[u8; 16]>; 2],
     inventory_submitted: [bool; 2],
     inventory_accepted: [bool; 2],
-    reset_origins: [u64; 2],
+    reset_correlations: [Option<[u8; 16]>; 2],
     reset_submitted: [bool; 2],
     reset_accepted: [bool; 2],
-    teleport_origins: [u64; 2],
+    teleport_correlations: [Option<[u8; 16]>; 2],
     teleport_submitted: [bool; 2],
     teleport_accepted: [bool; 2],
 }
@@ -115,12 +151,14 @@ struct BeaconRun {
 struct ItemRun {
     request: TestWire,
     target: GlobalPlayerId,
+    target_lease: pumpkin_cluster::canonical_action::LivePlayerLease,
     world: Arc<crate::world::World>,
     world_origin: u64,
     world_submitted: bool,
     desired: BTreeMap<ClusterBlockPos, u16>,
     observed: BTreeSet<ClusterBlockPos>,
     inventory_origin: u64,
+    loadout_token: Option<[u8; 16]>,
     inventory_submitted: bool,
     inventory_accepted: bool,
 }
@@ -144,22 +182,9 @@ struct DepartureRun {
     position: [f64; 3],
     origin: u64,
     prior_revision: u64,
-    armed: bool,
+    correlation: Option<[u8; 16]>,
     submitted: bool,
     accepted: bool,
-}
-
-fn failed_arena_intent(
-    run: &ArenaRun,
-    failure: &PlayerAdministrativeIntentFailure,
-    local: ServerId,
-) -> bool {
-    failure.source == local
-        && (0..2).any(|index| {
-            failure.target == run.participants[index]
-                && (failure.origin == Some(run.reset_origins[index])
-                    || failure.origin == Some(run.teleport_origins[index]))
-        })
 }
 
 fn beacon_target(world: &Arc<crate::world::World>) -> pumpkin_cluster::inventory::InventoryTarget {
@@ -173,23 +198,8 @@ fn beacon_target(world: &Arc<crate::world::World>) -> pumpkin_cluster::inventory
     }
 }
 
-fn seed_beacon(run: &BeaconClientRun) -> bool {
-    let position = BlockPos::new(BEACON_POS.x, BEACON_POS.y, BEACON_POS.z);
-    let Some(entity) = run.world.get_block_entity(&position) else {
-        return false;
-    };
-    let Some(beacon) = entity
-        .as_any()
-        .downcast_ref::<crate::block::entities::beacon::BeaconBlockEntity>()
-    else {
-        return false;
-    };
-    beacon.set_data(
-        crate::block::entities::beacon::BeaconBlockEntity::DATA_LEVELS,
-        1,
-    );
-    beacon.set_stack(0, ItemStack::new(1, &Item::IRON_INGOT));
-    true
+fn seed_beacon(_run: &BeaconClientRun) -> bool {
+    false
 }
 
 fn beacon_payment_count(
@@ -259,7 +269,7 @@ fn registry_names() -> [String; 2] {
     ]
 }
 
-fn registered_players(server: &Server) -> Option<[GlobalPlayerId; 2]> {
+pub(crate) fn registered_players(server: &Server) -> Option<[GlobalPlayerId; 2]> {
     let names = registry_names();
     let entries = super::cluster_presence::all_presence_entries(server)
         .into_iter()
@@ -291,6 +301,12 @@ pub fn submit(server: &Server, test_id: &str) -> bool {
         "beacon" => TestKind::Beacon,
         "departure-admin-lobby" => TestKind::DepartureAdminLobby,
         "departure-admin-disconnect" => TestKind::DepartureAdminDisconnect,
+        "handoff-revision-mismatch" => TestKind::HandoffRevisionMismatch,
+        "packet-preflight-lobby-depart" => TestKind::PacketPreflightLobbyDepart,
+        "handoff-callback-release" => TestKind::HandoffCallbackRelease,
+        "door-trapdoor" => TestKind::DoorTrapdoor,
+        "button-lever" => TestKind::ButtonLever,
+        "end-frame-anchor" => TestKind::EndFrameAnchor,
         _ => return false,
     };
     server
@@ -309,6 +325,12 @@ fn announce(server: &Server, kind: TestKind, success: bool) {
         TestKind::Beacon => "beacon",
         TestKind::DepartureAdminLobby => "departure-admin-lobby",
         TestKind::DepartureAdminDisconnect => "departure-admin-disconnect",
+        TestKind::HandoffRevisionMismatch => "handoff-revision-mismatch",
+        TestKind::PacketPreflightLobbyDepart => "packet-preflight-lobby-depart",
+        TestKind::HandoffCallbackRelease => "handoff-callback-release",
+        TestKind::DoorTrapdoor => "door-trapdoor",
+        TestKind::ButtonLever => "button-lever",
+        TestKind::EndFrameAnchor => "end-frame-anchor",
     };
     let state = if success { "accepted" } else { "failed" };
     for player in server.get_all_players() {
@@ -379,6 +401,10 @@ fn origin(request: u64, source: ServerId, generation: u64, phase: u8, index: usi
 
 fn start_arena(server: &Server, request: TestWire, source_generation: u64) -> Option<ArenaRun> {
     let participants = registered_players(server)?;
+    let participant_leases = [
+        loadouts::lease_for(server, participants[0])?,
+        loadouts::lease_for(server, participants[1])?,
+    ];
     let world = arena_world(server)?;
     let (request_id, source) = match request {
         TestWire::Request {
@@ -389,6 +415,7 @@ fn start_arena(server: &Server, request: TestWire, source_generation: u64) -> Op
     Some(ArenaRun {
         request,
         participants,
+        participant_leases,
         world,
         world_origin: origin(request_id, source, source_generation, 1, 0),
         world_submitted: false,
@@ -398,18 +425,13 @@ fn start_arena(server: &Server, request: TestWire, source_generation: u64) -> Op
             origin(request_id, source, source_generation, 2, 0),
             origin(request_id, source, source_generation, 2, 1),
         ],
+        loadout_tokens: [None; 2],
         inventory_submitted: [false; 2],
         inventory_accepted: [false; 2],
-        reset_origins: [
-            origin(request_id, source, source_generation, 3, 0),
-            origin(request_id, source, source_generation, 3, 1),
-        ],
+        reset_correlations: [None; 2],
         reset_submitted: [false; 2],
         reset_accepted: [false; 2],
-        teleport_origins: [
-            origin(request_id, source, source_generation, 4, 0),
-            origin(request_id, source, source_generation, 4, 1),
-        ],
+        teleport_correlations: [None; 2],
         teleport_submitted: [false; 2],
         teleport_accepted: [false; 2],
     })
@@ -436,8 +458,15 @@ fn start_beacon(server: &Server, request: TestWire, source_generation: u64) -> O
 
 fn start_item(server: &Server, request: TestWire, source_generation: u64) -> Option<ItemRun> {
     let target = registered_players(server)?[0];
+    let target_lease = loadouts::lease_for(server, target)?;
     let world = arena_world(server)?;
-    let TestWire::Request { kind, request: request_id, origin: source, .. } = request else {
+    let TestWire::Request {
+        kind,
+        request: request_id,
+        origin: source,
+        ..
+    } = request
+    else {
         return None;
     };
     let stone = Block::STONE.default_state.id.as_u16();
@@ -453,23 +482,26 @@ fn start_item(server: &Server, request: TestWire, source_generation: u64) -> Opt
     Some(ItemRun {
         request,
         target,
+        target_lease,
         world,
         world_origin: origin(request_id, source, source_generation, 6, 0),
         world_submitted: false,
         desired,
         observed: BTreeSet::new(),
         inventory_origin: origin(request_id, source, source_generation, 7, 0),
+        loadout_token: None,
         inventory_submitted: false,
         inventory_accepted: false,
     })
 }
 
-fn item_inventory_cells() -> Option<Vec<InventoryCell>> {
+pub(crate) fn item_inventory_cells() -> Option<Vec<InventoryCell>> {
     Some(vec![
         super::cluster_invsee::inventory_cell_from_item_stack(
             InvLoc::new(INV_MAIN, 4),
             &ItemStack::new(2, &Item::STONE),
-        ).ok()?,
+        )
+        .ok()?,
         InventoryCell {
             loc: InvLoc::new(INV_SELECTED, 0),
             item: 5,
@@ -479,36 +511,25 @@ fn item_inventory_cells() -> Option<Vec<InventoryCell>> {
     ])
 }
 
-fn submit_item_inventory(server: &Arc<Server>, run: &mut ItemRun) {
-    if run.inventory_submitted {
-        return;
+fn submit_item_inventory(
+    server: &Arc<Server>,
+    local: ServerId,
+    run: &mut ItemRun,
+    loadouts: &mut loadouts::Loadouts,
+    pending: &mut VecDeque<PendingParcel>,
+) {
+    if !run.inventory_submitted {
+        run.loadout_token = loadouts.request(
+            server,
+            local,
+            run.target_lease,
+            super::cluster_test_scenarios::FixtureLoadoutTemplate::ItemPlace,
+            run.inventory_origin,
+            pending,
+        );
+        run.inventory_submitted = run.loadout_token.is_some();
     }
-    let Some(snapshot) = super::cluster_invsee::inventory_snapshot(server, InventoryTarget::Player(run.target)) else {
-        return;
-    };
-    let Some(mutation) = item_inventory_cells().and_then(|cells| InventoryMutation::replace(&snapshot, cells).ok()) else {
-        return;
-    };
-    let chunk = pumpkin_cluster::world_delta::chunk_of_block(
-        super::cluster_world_delta::world_id(&run.world), 0, 2,
-    );
-    if super::cluster_invsee::submit_inventory_mutation(
-        server, run.target, TickStamp::now(), mutation, vec![chunk], Some(run.inventory_origin),
-    ).is_ok() {
-        run.inventory_submitted = true;
-    }
-}
-
-fn exact_item_inventory(snapshot: &InventoryStateSnapshot, target: GlobalPlayerId) -> bool {
-    let Some(desired) = item_inventory_cells() else {
-        return false;
-    };
-    snapshot.target == InventoryTarget::Player(target)
-        && snapshot.cells.iter().all(|cell| {
-            desired.iter().find(|expected| expected.loc == cell.loc)
-                .map_or_else(|| cell.is_empty(), |expected| expected == cell)
-        })
-        && desired.iter().all(|expected| snapshot.cells.iter().any(|cell| cell == expected))
+    run.inventory_accepted = loadouts.ready(run.loadout_token);
 }
 
 fn start_departure(
@@ -551,24 +572,41 @@ fn start_departure(
             usize::from(matches!(kind, TestKind::DepartureAdminDisconnect)),
         ),
         prior_revision,
-        armed: false,
+        correlation: None,
         submitted: false,
         accepted: false,
     })
 }
 
-fn submit_departure(server: &Server, run: &DepartureRun) -> bool {
-    let intent = PlayerAdministrativeIntent {
-        target: run.target,
-        mutation: PlayerAdministrativeMutation::Teleport {
-            world: run.world,
-            position: run.position,
-            yaw: 0.0,
-            pitch: 0.0,
-        },
-        origin: Some(run.origin),
-    };
-    super::cluster_player_admin::submit_player_administrative(server, intent).is_ok()
+fn submit_departure(server: &Arc<Server>, run: &DepartureRun) -> Option<[u8; 16]> {
+    let player = server
+        .get_all_players()
+        .into_iter()
+        .find(|player| player.cluster_gid() == Some(run.target))?;
+    let source = crate::command::CommandSource::new(
+        crate::command::CommandSender::Console,
+        player.world(),
+        None,
+        pumpkin_util::math::vector3::Vector3::default(),
+        pumpkin_util::math::vector2::Vector2::default(),
+        "cluster-e2e".to_owned(),
+        pumpkin_util::text::TextComponent::text("cluster-e2e"),
+        Arc::clone(server),
+    );
+    super::cluster_player_commands::submit_test_departure(
+        server,
+        &source,
+        run.target,
+        *run.uuid.as_bytes(),
+        pumpkin_cluster::player_command_control::PlayerCommandMutation::Teleport(
+            pumpkin_cluster::player_command_control::TeleportDestination::Absolute {
+                world: run.world,
+                position: run.position,
+                rotation: Some([0.0, 0.0]),
+            },
+        ),
+    )
+    .ok()
 }
 
 fn departure_committed(server: &Server, run: &DepartureRun) -> Option<u64> {
@@ -614,13 +652,7 @@ fn observe_installed_ground(
     }
 }
 
-fn loadout_mutation(server: &Server, target: GlobalPlayerId) -> Option<InventoryMutation> {
-    let snapshot =
-        super::cluster_invsee::inventory_snapshot(server, InventoryTarget::Player(target))?;
-    InventoryMutation::replace(&snapshot, desired_loadout()?).ok()
-}
-
-fn desired_loadout() -> Option<Vec<InventoryCell>> {
+pub(crate) fn desired_loadout() -> Option<Vec<InventoryCell>> {
     let stacks = [
         (
             InvLoc::new(INV_MAIN, 0),
@@ -663,56 +695,59 @@ fn desired_loadout() -> Option<Vec<InventoryCell>> {
     Some(desired)
 }
 
-fn exact_loadout(snapshot: &InventoryStateSnapshot, target: GlobalPlayerId) -> bool {
-    if snapshot.target != InventoryTarget::Player(target) {
-        return false;
+fn submit_inventory(
+    server: &Arc<Server>,
+    local: ServerId,
+    run: &mut ArenaRun,
+    index: usize,
+    loadouts: &mut loadouts::Loadouts,
+    pending: &mut VecDeque<PendingParcel>,
+) {
+    if !run.inventory_submitted[index] {
+        run.loadout_tokens[index] = loadouts.request(
+            server,
+            local,
+            run.participant_leases[index],
+            super::cluster_test_scenarios::FixtureLoadoutTemplate::Arena,
+            run.inventory_origins[index],
+            pending,
+        );
+        run.inventory_submitted[index] = run.loadout_tokens[index].is_some();
     }
-    let Some(desired) = desired_loadout() else {
-        return false;
-    };
-    snapshot.cells.iter().all(|cell| {
-        desired
-            .iter()
-            .find(|expected| expected.loc == cell.loc)
-            .map_or_else(|| cell.is_empty(), |expected| expected == cell)
-    }) && desired
-        .iter()
-        .all(|expected| snapshot.cells.iter().any(|cell| cell == expected))
+    run.inventory_accepted[index] = loadouts.ready(run.loadout_tokens[index]);
 }
 
-fn submit_inventory(server: &Arc<Server>, run: &mut ArenaRun, index: usize) {
-    if run.inventory_submitted[index] {
-        return;
-    }
-    let Some(mutation) = loadout_mutation(server, run.participants[index]) else {
-        return;
-    };
-    let chunk = pumpkin_cluster::world_delta::chunk_of_block(
-        super::cluster_world_delta::world_id(&run.world),
-        0,
-        0,
+fn submit_arena_player_command(
+    server: &Arc<Server>,
+    run: &ArenaRun,
+    index: usize,
+    mutation: pumpkin_cluster::player_command_control::PlayerCommandMutation,
+) -> Option<[u8; 16]> {
+    let target = run.participants[index];
+    let uuid = super::cluster_presence::all_presence_entries(server)
+        .into_iter()
+        .find(|(gid, entry)| *gid == target && !entry.in_lobby)?
+        .1
+        .uuid;
+    let source = crate::command::CommandSource::new(
+        crate::command::CommandSender::Console,
+        Arc::clone(&run.world),
+        None,
+        pumpkin_util::math::vector3::Vector3::default(),
+        pumpkin_util::math::vector2::Vector2::default(),
+        "cluster-e2e".to_owned(),
+        pumpkin_util::text::TextComponent::text("cluster-e2e"),
+        Arc::clone(server),
     );
-    if super::cluster_invsee::submit_inventory_mutation(
-        server,
-        run.participants[index],
-        TickStamp::now(),
-        mutation,
-        vec![chunk],
-        Some(run.inventory_origins[index]),
-    )
-    .is_ok()
-    {
-        run.inventory_submitted[index] = true;
-    }
+    super::cluster_player_commands::submit(server, &source, target, uuid, mutation).ok()
 }
 
-fn submit_reset(server: &Server, run: &mut ArenaRun, index: usize) {
+fn submit_reset(server: &Arc<Server>, run: &mut ArenaRun, index: usize) {
     if run.reset_submitted[index] {
         return;
     }
-    let intent = PlayerAdministrativeIntent {
-        target: run.participants[index],
-        mutation: PlayerAdministrativeMutation::Reset {
+    let mutation = pumpkin_cluster::player_command_control::PlayerCommandMutation::Reset(
+        pumpkin_cluster::player_command_control::PlayerResetState {
             health: 20.0,
             absorption: 0.0,
             food: 20,
@@ -723,29 +758,51 @@ fn submit_reset(server: &Server, run: &mut ArenaRun, index: usize) {
             fall_distance: 0.0,
             on_fire: false,
         },
-        origin: Some(run.reset_origins[index]),
-    };
-    if super::cluster_player_admin::submit_player_administrative(server, intent).is_ok() {
+    );
+    if let Some(correlation) = submit_arena_player_command(server, run, index, mutation) {
+        run.reset_correlations[index] = Some(correlation);
         run.reset_submitted[index] = true;
     }
 }
 
-fn submit_teleport(server: &Server, run: &mut ArenaRun, index: usize) {
+fn submit_teleport(server: &Arc<Server>, run: &mut ArenaRun, index: usize) {
     if run.teleport_submitted[index] {
         return;
     }
-    let intent = PlayerAdministrativeIntent {
-        target: run.participants[index],
-        mutation: PlayerAdministrativeMutation::Teleport {
+    let mutation = pumpkin_cluster::player_command_control::PlayerCommandMutation::Teleport(
+        pumpkin_cluster::player_command_control::TeleportDestination::Absolute {
             world: super::cluster_world_delta::world_id(&run.world),
             position: [ARENA_X[index], ARENA_Y, ARENA_Z],
-            yaw: if index == 0 { -90.0 } else { 90.0 },
-            pitch: 0.0,
+            rotation: Some([if index == 0 { -90.0 } else { 90.0 }, 0.0]),
         },
-        origin: Some(run.teleport_origins[index]),
-    };
-    if super::cluster_player_admin::submit_player_administrative(server, intent).is_ok() {
+    );
+    if let Some(correlation) = submit_arena_player_command(server, run, index, mutation) {
+        run.teleport_correlations[index] = Some(correlation);
         run.teleport_submitted[index] = true;
+    }
+}
+
+fn arena_commands_failed(server: &Server, run: &ArenaRun) -> bool {
+    run.reset_correlations
+        .into_iter()
+        .chain(run.teleport_correlations)
+        .flatten()
+        .any(|correlation| {
+            server
+                .cluster_player_commands
+                .terminal(correlation)
+                .is_some_and(|terminal| !terminal.applied || terminal.action.is_none())
+        })
+}
+
+fn observe_arena_commands(server: &Server, run: &mut ArenaRun) {
+    for index in 0..2 {
+        run.reset_accepted[index] = run.reset_correlations[index]
+            .and_then(|correlation| server.cluster_player_commands.terminal(correlation))
+            .is_some_and(|terminal| terminal.applied && terminal.action.is_some());
+        run.teleport_accepted[index] = run.teleport_correlations[index]
+            .and_then(|correlation| server.cluster_player_commands.terminal(correlation))
+            .is_some_and(|terminal| terminal.applied && terminal.action.is_some());
     }
 }
 
@@ -822,6 +879,13 @@ pub fn spawn_test_apply(
 ) {
     let server = Arc::clone(server);
     server.clone().spawn_task(async move {
+        let mut interaction_setup: Option<interactions::Setup> = None;
+        let mut interaction_client: Option<interactions::ClientSetup> = None;
+        let mut interaction_observers = interactions::Observer::selected();
+        let mut preflight = super::cluster_test_preflight::PreflightOwner::default();
+        let mut loadouts = loadouts::Loadouts::default();
+        let mut avatar_observer=avatar::AvatarObserver::selected();
+        let mut prepared_tokens=BTreeSet::new();
         let mut next_request = 1_u64;
         let mut pending: VecDeque<PendingParcel> = VecDeque::new();
         let mut outstanding = BTreeMap::new();
@@ -833,14 +897,32 @@ pub fn spawn_test_apply(
         let mut beacon_client: Option<BeaconClientRun> = None;
         let mut departure: Option<DepartureRun> = None;
         let mut divergence: Option<DivergenceRun> = None;
+        let mut revision_fault: Option<(uuid::Uuid, std::time::Instant)> = None;
         let mut world_publications = super::cluster_world_delta::subscribe_administrative_publications(&server);
         let mut inventory_publications = super::cluster_invsee::subscribe_inventory_publications(&server);
-        let mut player_publications = super::cluster_player_admin::subscribe_player_administrative(&server);
-        let mut player_failures = super::cluster_player_admin::subscribe_player_administrative_failures(&server);
         let mut advance = tokio::time::interval(std::time::Duration::from_millis(50));
         loop {
             tokio::select! {
                 _ = advance.tick() => {
+                    let departure_context = departure.as_ref().filter(|run| run.submitted).map(|run| super::cluster_test_preflight::DepartureContext {
+                        scenario: if run.kind == TestKind::DepartureAdminLobby { super::cluster_test_preflight::PreflightScenario::Lobby } else { super::cluster_test_preflight::PreflightScenario::Disconnect },
+                        target: run.target, uuid: run.uuid, world: run.world, position: run.position, prior_revision: run.prior_revision,
+                    });
+                    preflight.advance(&server, departure_context);
+                    loadouts.advance(&server,local,&mut pending);
+                    for _ in 0..64 {
+                        let Some(event)=server.cluster_test.scenarios.pop_prepared_action() else {break};
+                        if prepared_tokens.len()==64 || !prepared_tokens.insert(event.token) {tracing::error!(token=?event.token,"cluster test prepared action duplicate or capacity failure");continue;}
+                        announce_action_prepared(&server,event);
+                    }
+                    if let Some(observer)=avatar_observer.as_mut() {observer.advance(&server,local);}
+                    for observer in &mut interaction_observers { observer.advance(&server); }
+                    if let Some(setup) = interaction_setup.as_mut() && let Some(reply) = setup.advance(&server) {
+                        pending.push_back(reply); interaction_setup = None;
+                    }
+                    if let Some(setup) = interaction_client.as_mut() && let Some(success) = setup.advance(&server,local,&mut loadouts,&mut pending) {
+                        announce(&server, setup.kind(), success); interaction_client = None;
+                    }
                     if pending.front().is_some_and(|parcel| {
                         generation(&server, parcel.target)
                             .is_some_and(|generation| generation != parcel.generation)
@@ -862,10 +944,35 @@ pub fn spawn_test_apply(
                                     "cluster test completion route generation changed"
                                 );
                             }
-                            None => {}
+                            _ => {}
+                        }
+                    }
+                    if let Some((uuid, started)) = revision_fault {
+                        let state = server.cluster_handoff.load();
+                        if state.revision_mismatch_armed == Some(uuid) {
+                            for player in server.get_all_players() {
+                                player.send_system_message(&pumpkin_util::text::TextComponent::text("cluster test handoff-revision-mismatch armed"));
+                            }
+                            revision_fault = None;
+                        } else if started.elapsed() > std::time::Duration::from_secs(5) {
+                            announce(&server, TestKind::HandoffRevisionMismatch, false);
+                            revision_fault = None;
                         }
                     }
                     if let Some(TestCommand::Run(kind)) = retained_command.take().or_else(|| server.cluster_test.commands.pop()) {
+                    if kind == TestKind::HandoffRevisionMismatch {
+                        let Ok(uuid) = crate::net::offline_uuid("PumpkinE2eE") else {
+                            announce(&server, kind, false);
+                            continue;
+                        };
+                        if revision_fault.is_some() { continue; }
+                        if server.cluster_handoff_tx.get().is_some_and(|sender| sender.try_send(super::cluster_handoff::HandoffCommand::ArmRevisionMismatch { uuid }).is_ok()) {
+                            revision_fault = Some((uuid, std::time::Instant::now()));
+                        } else {
+                            announce(&server, kind, false);
+                        }
+                        continue;
+                    }
                     if matches!(kind, TestKind::DepartureAdminLobby | TestKind::DepartureAdminDisconnect) {
                         let request = next_request;
                         if let Some(run) = start_departure(&server, local, kind, request) {
@@ -891,11 +998,14 @@ pub fn spawn_test_apply(
                         continue;
                     }
                     let destination = match kind {
-                        TestKind::Arena | TestKind::Beacon | TestKind::ItemPlace | TestKind::ItemStale => connected_primary(&server),
+                        TestKind::Arena | TestKind::Beacon | TestKind::ItemPlace | TestKind::ItemStale | TestKind::DoorTrapdoor | TestKind::ButtonLever | TestKind::EndFrameAnchor => connected_primary(&server),
                         TestKind::ControllerDivergence => registered_players(&server)
                             .map(|players| players[0].server)
                             .and_then(|target| generation(&server, target).map(|epoch| (target, epoch))),
-                        TestKind::DepartureAdminLobby | TestKind::DepartureAdminDisconnect => None,
+                        TestKind::PacketPreflightLobbyDepart | TestKind::HandoffCallbackRelease => registered_players(&server)
+                            .map(|players| players[0].server)
+                            .and_then(|target| generation(&server, target).map(|epoch| (target, epoch))),
+                        TestKind::DepartureAdminLobby | TestKind::DepartureAdminDisconnect | TestKind::HandoffRevisionMismatch => None,
                     };
                     if let Some((target, target_epoch)) = destination {
                         let request = next_request;
@@ -910,12 +1020,19 @@ pub fn spawn_test_apply(
                     }
                     }
                     flush(&server, &outbound, &mut pending);
+                    if arena.as_ref().is_some_and(|run| arena_commands_failed(&server, run)) {
+                        if let Some(run) = arena.take()
+                            && let Some(reply) = observed_reply(&server, run.request, false) {
+                            pending.push_back(reply);
+                        }
+                    }
                     if let Some(run) = arena.as_mut() {
+                        observe_arena_commands(&server, run);
                         if !run.world_submitted && submit_world(&run.world, &run.desired, run.world_origin) {
                             run.world_submitted = true;
                         }
                         if run.observed.len() == run.desired.len() {
-                            for index in 0..2 { submit_inventory(&server, run, index); }
+                            for index in 0..2 { submit_inventory(&server,local,run,index,&mut loadouts,&mut pending); }
                         }
                         if run.inventory_accepted.into_iter().all(|ready| ready) {
                             for index in 0..2 { submit_reset(&server, run, index); }
@@ -925,22 +1042,18 @@ pub fn spawn_test_apply(
                         }
                     }
                     if arena.as_ref().is_some_and(|run| run.teleport_accepted.into_iter().all(|ready| ready)) {
-                        if let Some(run) = arena.take() { if let Some(reply) = observed_reply(&server, run.request, true) { pending.push_back(reply); } }
+                        if let Some(run) = arena.take() { for token in run.loadout_tokens {loadouts.retire(token);} if let Some(reply) = observed_reply(&server, run.request, true) { pending.push_back(reply); } }
                     }
                     if let Some(run) = item.as_mut() {
                         if !run.world_submitted && submit_world(&run.world, &run.desired, run.world_origin) {
                             run.world_submitted = true;
                         }
                         if run.observed.len() == run.desired.len() {
-                            submit_item_inventory(&server, run);
+                            submit_item_inventory(&server,local,run,&mut loadouts,&mut pending);
                         }
                     }
                     if item.as_ref().is_some_and(|run| run.inventory_accepted) {
-                        if let Some(run) = item.take()
-                            && let Some(reply) = observed_reply(&server, run.request, true)
-                        {
-                            pending.push_back(reply);
-                        }
+                        if let Some(run)=item.take() {loadouts.retire(run.loadout_token);if let Some(reply)=observed_reply(&server,run.request,true) {pending.push_back(reply);}}
                     }
                     if let Some(run) = beacon_setup.as_mut() {
                         if !run.world_submitted && submit_world(&run.world, &run.desired, run.world_origin) {
@@ -999,17 +1112,9 @@ pub fn spawn_test_apply(
                         }
                     }
                     if let Some(run) = departure.as_mut() {
-                        if !run.armed {
-                            run.armed = server.cluster_controller.arm_test_departure_admin(run.target, run.origin);
-                        }
-                        if !run.armed {
-                            tracing::error!(test = ?run.kind, gid = ?run.target, "cluster test departure admin arm failed");
-                            departure = None;
-                        }
-                    }
-                    if let Some(run) = departure.as_mut() {
                         if !run.submitted {
-                            run.submitted = submit_departure(&server, run);
+                            run.correlation = submit_departure(&server, run);
+                            run.submitted = run.correlation.is_some();
                             if run.submitted {
                                 let stage = if run.kind == TestKind::DepartureAdminLobby {
                                     "cluster test departure-admin-lobby staged"
@@ -1022,6 +1127,16 @@ pub fn spawn_test_apply(
                             }
                         }
                     }
+                    if let Some(run) = departure.as_mut()
+                        && let Some(terminal) = run.correlation
+                            .and_then(|correlation| server.cluster_player_commands.terminal(correlation)) {
+                        run.accepted = terminal.applied && terminal.action.is_some();
+                        if !run.accepted {
+                            tracing::error!(test = ?run.kind, correlation = ?run.correlation,
+                                "cluster test canonical departure action rejected");
+                            departure = None;
+                        }
+                    }
                     if let Some(run) = departure.as_ref()
                         && run.accepted
                         && let Some(revision) = departure_committed(&server, run)
@@ -1029,6 +1144,9 @@ pub fn spawn_test_apply(
                         tracing::info!(
                             test = ?run.kind,
                             origin = run.origin,
+                            correlation = ?run.correlation,
+                            ground_action = ?run.correlation.and_then(|correlation| server.cluster_player_commands.terminal(correlation)).and_then(|terminal| terminal.action),
+                            canonical_ground = run.accepted,
                             gid = ?run.target,
                             %revision,
                             position = ?run.position,
@@ -1055,6 +1173,12 @@ pub fn spawn_test_apply(
                 Some(parcel) = inbound.recv() => {
                     let Some(message) = decode(&parcel.bytes) else { continue };
                     match message {
+                        TestWire::LoadoutRequest {origin,target,template,token} => {
+                            loadouts.receive_request(&server,local,parcel.peer,parcel.generation,origin,target,template,token);
+                        }
+                        TestWire::LoadoutPhase {token,target,template,phase,digest,count} => {
+                            loadouts.receive_phase(&server,parcel.peer,parcel.generation,token,target,template,phase,digest,count);
+                        }
                         TestWire::Request { kind: TestKind::Arena, .. }
                             if server.advanced_config.cluster.role == ClusterRole::Primary
                                 && valid_request(&server, &parcel, message, local) => {
@@ -1080,6 +1204,21 @@ pub fn spawn_test_apply(
                             if let Some(target) = registered_players(&server).map(|players| players[0]).filter(|gid| gid.server == local) {
                                 divergence = Some(DivergenceRun { request: message, target, armed: false });
                             }
+                        }
+                        TestWire::Request { kind: TestKind::DoorTrapdoor | TestKind::ButtonLever | TestKind::EndFrameAnchor, .. }
+                            if server.advanced_config.cluster.role == ClusterRole::Primary && valid_request(&server, &parcel, message, local) => {
+                            interaction_setup = interactions::Setup::new(&server, message, parcel.generation);
+                            if interaction_setup.is_none() && let Some(reply) = observed_reply(&server,message,false) {pending.push_back(reply);}
+                        }
+                        TestWire::Request { kind: TestKind::HandoffCallbackRelease, origin, .. }
+                            if valid_request(&server, &parcel, message, local) => {
+                            let success = super::cluster_test_handoff::release(&server, origin);
+                            if let Some(reply) = observed_reply(&server, message, success) { pending.push_back(reply); }
+                        }
+                        TestWire::Request { kind: TestKind::PacketPreflightLobbyDepart, origin, .. }
+                            if valid_request(&server, &parcel, message, local) => {
+                            let success = preflight.request_external_departure(&server, origin);
+                            if let Some(reply) = observed_reply(&server, message, success) { pending.push_back(reply); }
                         }
                         TestWire::Request { kind: TestKind::Beacon, .. }
                             if server.advanced_config.cluster.role == ClusterRole::Primary
@@ -1109,7 +1248,9 @@ pub fn spawn_test_apply(
                                     "cluster test preparation failed"
                                 );
                             }
-                            if kind == TestKind::Beacon && success {
+                            if success && let Some(scenario) = interactions::Scenario::from_kind(kind) {
+                                interaction_client = interactions::ClientSetup::new(&server,scenario,request);
+                            } else                             if kind == TestKind::Beacon && success {
                                 let world = arena_world(&server);
                                 let participant = registered_players(&server).map(|players| players[0]);
                                 if let (Some(world), Some(participant)) = (world, participant)
@@ -1147,87 +1288,12 @@ pub fn spawn_test_apply(
                     }
                 }
                 Ok(publication) = inventory_publications.recv(), if arena.is_some() || beacon_client.is_some() || item.is_some() => {
-                    if let Some(run) = arena.as_mut() {
-                        for index in 0..2 {
-                            if publication.origin == Some(run.inventory_origins[index])
-                                && publication.resolution.result.is_ok()
-                                && publication
-                                    .resolution
-                                    .authoritative
-                                    .iter()
-                                    .any(|snapshot| exact_loadout(snapshot, run.participants[index]))
-                            {
-                                run.inventory_accepted[index] = true;
-                            }
-                        }
-                    }
                     if let Some(run) = beacon_client.as_mut()
                         && run.base_revision.is_some()
                         && publication.resolution.result.is_err()
                         && publication.resolution.authoritative.iter().any(|snapshot| snapshot.target == run.target)
                     {
                         run.rejected = true;
-                    }
-                    if let Some(run) = item.as_mut()
-                        && publication.origin == Some(run.inventory_origin)
-                        && publication.resolution.result.is_ok()
-                        && publication.resolution.authoritative.iter().any(|snapshot| exact_item_inventory(snapshot, run.target))
-                    {
-                        run.inventory_accepted = true;
-                    }
-                }
-                Ok(publication) = player_publications.recv(), if arena.is_some() || departure.is_some() => {
-                    if let Some(run) = arena.as_mut() {
-                        for index in 0..2 {
-                            if publication.origin == Some(run.reset_origins[index])
-                                && publication.accepted
-                                && publication.state.health == 20.0
-                                && publication.state.absorption == 0.0
-                                && publication.state.food == 20
-                                && publication.state.saturation == 5.0
-                                && publication.state.gamemode == 0
-                                && publication.state.effects.is_empty()
-                                && publication.state.velocity == [0.0; 3]
-                                && publication.state.fall_distance == 0.0
-                                && !publication.state.on_fire
-                            {
-                                run.reset_accepted[index] = true;
-                            }
-                            if publication.origin == Some(run.teleport_origins[index])
-                                && publication.accepted
-                                && publication.state.world == super::cluster_world_delta::world_id(&run.world)
-                                && publication.state.position == [ARENA_X[index], ARENA_Y, ARENA_Z]
-                                && publication.state.yaw == if index == 0 { -90.0 } else { 90.0 }
-                                && publication.state.pitch == 0.0
-                            {
-                                run.teleport_accepted[index] = true;
-                            }
-                        }
-                    }
-                    if let Some(run) = departure.as_mut()
-                        && publication.origin == Some(run.origin)
-                        && publication.target == run.target
-                        && publication.accepted
-                        && publication.state.world == run.world
-                        && publication.state.position == run.position
-                    {
-                        run.accepted = true;
-                    }
-                }
-                Ok(failure) = player_failures.recv(), if arena.is_some() || departure.is_some() => {
-                    if arena.as_ref().is_some_and(|run| failed_arena_intent(run, &failure, local))
-                        && let Some(run) = arena.take()
-                        && let Some(reply) = observed_reply(&server, run.request, false)
-                    {
-                        pending.push_back(reply);
-                    }
-                    if let Some(run) = departure.as_ref()
-                        && failure.source == local
-                        && failure.target == run.target
-                        && failure.origin == Some(run.origin)
-                    {
-                        tracing::error!(test = ?run.kind, origin = run.origin, gid = ?run.target, "cluster test departure admin failed");
-                        departure = None;
                     }
                 }
                 else => break,
@@ -1255,6 +1321,7 @@ mod tests {
     fn saturated_command_queue_preserves_the_queued_request() {
         let runtime = TestRuntime {
             commands: crossbeam::queue::ArrayQueue::new(1),
+            ..TestRuntime::new()
         };
         runtime
             .commands
@@ -1295,4 +1362,55 @@ mod tests {
         ];
         assert_eq!(select_registered_players(&names, &entries), Some([a, b]));
     }
+}
+
+pub(crate) fn submit_console_loadout(
+    server: &Server,
+    target: pumpkin_cluster::canonical_action::LivePlayerLease,
+    template: super::cluster_test_scenarios::FixtureLoadoutTemplate,
+    token: [u8; 16],
+) -> Result<tokio::sync::oneshot::Receiver<Result<FixtureLoadoutReceipt, ()>>, ()> {
+    let (completion, receipt) = tokio::sync::oneshot::channel();
+    server
+        .cluster_test
+        .loadout_requests
+        .push(loadouts::RoutedLoadoutRequest {
+            target,
+            template,
+            token,
+            completion,
+        })
+        .map_err(|_| ())?;
+    Ok(receipt)
+}
+
+fn announce_action_prepared(
+    server: &Server,
+    event: super::cluster_test_scenarios::PreparedActionScenario,
+) {
+    if event
+        .actors
+        .iter()
+        .any(|lease| loadouts::lease_for(server, lease.gid) != Some(*lease))
+    {
+        tracing::error!(token=?event.token,"cluster test prepared action target lease changed");
+        return;
+    }
+    let target = event.actors[0];
+    let Some(player) = server.get_all_players().into_iter().find(|player| {
+        super::cluster_world_owner::player_action_lease(server, player) == Some(target)
+    }) else {
+        tracing::error!(token=?event.token,?target,"cluster test prepared action feedback host unavailable");
+        return;
+    };
+    let token = event
+        .token
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    tracing::info!(scenario=event.command.id(),%token,actors=?event.actors,world=?event.world,world_actions=?event.world_actions,teleports=?event.teleports,grant_actions=event.loadouts.iter().map(|receipt|u64::from(receipt.grant_action_count)).sum::<u64>(),"cluster e2e action scenario prepared");
+    player.send_system_message(&pumpkin_util::text::TextComponent::text(format!(
+        "cluster test {} prepared",
+        event.command.id()
+    )));
 }

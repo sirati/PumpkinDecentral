@@ -77,7 +77,91 @@ pub fn toggle_fence_gate(
 #[pumpkin_block_from_tag("minecraft:fence_gates")]
 pub struct FenceGateBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for FenceGateBlock {
+    fn placement_intent(
+        &self,
+        args: crate::block::PlacementIntentArgs<'_>,
+    ) -> Option<BlockStateId> {
+        let mut properties = FenceGateProperties::default(args.block);
+        properties.facing = args.facing;
+        let powered = args.world.receives_redstone_power(args.position);
+        properties.powered = powered;
+        properties.open = powered;
+        Some(properties.to_state_id(args.block))
+    }
+
+    fn normal_use_intent(
+        &self,
+        args: crate::block::NormalUseIntentArgs<'_>,
+    ) -> Option<(
+        BlockActionResult,
+        Vec<crate::block::neighbor::BlockCallbackEffect>,
+    )> {
+        use crate::block::neighbor::BlockCallbackEffect;
+        if !args.can_modify_world {
+            return Some((BlockActionResult::Pass, Vec::new()));
+        }
+        let mut props =
+            FenceGateProperties::from_state_id(args.world.get_block_state_id(args.position));
+        if !props.open && props.facing == args.facing.opposite() {
+            props.facing = args.facing;
+        }
+        props.open = !props.open;
+        Some((
+            BlockActionResult::Success,
+            vec![
+                BlockCallbackEffect::SetBlock {
+                    position: *args.position,
+                    state: props.to_state_id(args.block),
+                    flags: BlockFlags::NOTIFY_LISTENERS,
+                },
+                BlockCallbackEffect::Sound {
+                    position: *args.position,
+                    sound: get_sound(args.block, props.open),
+                    volume_milli: 1000,
+                    pitch_milli: 1000,
+                },
+            ],
+        ))
+    }
+
+    fn callback_intent(
+        &self,
+        args: crate::block::neighbor::BlockCallbackIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        use crate::block::neighbor::BlockCallbackEffect;
+        if !matches!(
+            args.event,
+            crate::block::neighbor::BlockCallbackEvent::Neighbor { .. }
+        ) {
+            return Some(Vec::new());
+        }
+        let mut props =
+            FenceGateProperties::from_state_id(args.world.get_block_state_id(args.position));
+        let powered = args.world.receives_redstone_power(args.position);
+        if props.powered == powered {
+            return Some(Vec::new());
+        }
+        props.powered = powered;
+        let mut effects = Vec::new();
+        if props.open != powered {
+            props.open = powered;
+            effects.push(BlockCallbackEffect::Sound {
+                position: *args.position,
+                sound: get_sound(args.block, powered),
+                volume_milli: 1000,
+                pitch_milli: 1000,
+            });
+        }
+        effects.push(BlockCallbackEffect::SetBlock {
+            position: *args.position,
+            state: props.to_state_id(args.block),
+            flags: BlockFlags::NOTIFY_LISTENERS,
+        });
+        Some(effects)
+    }
+
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut fence_gate_props = FenceGateProperties::default(args.block);
         fence_gate_props.facing = args.player.get_entity().get_horizontal_facing();

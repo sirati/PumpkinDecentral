@@ -225,6 +225,7 @@ pub fn get_nearest_looking_directions(
     directions
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for VineBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let (clicked_block, clicked_state_id) = args.world.get_block_and_state_id(args.position);

@@ -35,6 +35,7 @@ const HORIZONTAL_DIRECTIONS: [BlockDirection; 4] = [
 #[pumpkin_block("minecraft:chorus_flower")]
 pub struct ChorusFlowerBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for ChorusFlowerBlock {
     fn can_place_at(&self, args: CanPlaceAtArgs<'_>) -> bool {
         can_survive(args.block_accessor, args.position)

@@ -19,6 +19,17 @@ impl PendingConnection {
             server,
             self.version.load().protocol_version(),
         );
+        if server.advanced_config.cluster.enabled {
+            server.cluster_status_hooks.apply_and_refresh(
+                self.server_address.clone(),
+                self.address,
+                &mut status_response,
+            );
+            let status_json = serde_json::to_string(&status_response).unwrap_or_default();
+            self.send_packet_now(&CStatusResponse::new(status_json))
+                .await;
+            return;
+        }
 
         let (max_players, num_players) = status_response
             .players

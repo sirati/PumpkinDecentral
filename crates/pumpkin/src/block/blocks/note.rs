@@ -43,7 +43,7 @@ impl NoteBlock {
     }
 
     fn get_state_with_instrument(
-        world: &World,
+        world: &dyn pumpkin_world::world::BlockAccessor,
         pos: &BlockPos,
         state: BlockStateId,
         block: &Block,
@@ -66,6 +66,7 @@ impl NoteBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for NoteBlock {
     fn on_neighbor_update(&self, args: OnNeighborUpdateArgs<'_>) {
         let block_state = args.world.get_block_state(args.position);

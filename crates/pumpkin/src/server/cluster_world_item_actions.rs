@@ -18,6 +18,894 @@ use tokio::sync::mpsc;
 use super::Server;
 use super::cluster_item_action::LocalItemActionIntent;
 
+pub(super) fn derive_item_transform(
+    source: &pumpkin_cluster::inventory::InventoryCell,
+    operation: &pumpkin_cluster::canonical_inventory::ItemTransformOperation,
+    id: pumpkin_cluster::canonical_action::ActionId,
+    tick: pumpkin_cluster::time::TickStamp,
+) -> Result<
+    pumpkin_cluster::canonical_inventory::ItemTransformOutput,
+    pumpkin_cluster::canonical_action::ApplyFailure,
+> {
+    use pumpkin_cluster::canonical_action::ApplyFailure;
+    use pumpkin_cluster::canonical_inventory::{ItemTransformOperation, ItemTransformOutput};
+    let mut stack = super::cluster_invsee::item_stack_from_inventory_cell(source)
+        .map_err(|_| ApplyFailure::InvalidAction)?;
+    let mut remainder = None;
+    match *operation {
+        ItemTransformOperation::ExchangeBucket { contents, fill } => {
+            use pumpkin_cluster::canonical_inventory::BucketContents;
+            let filled = match contents {
+                BucketContents::Water => &pumpkin_data::item::Item::WATER_BUCKET,
+                BucketContents::Lava => &pumpkin_data::item::Item::LAVA_BUCKET,
+                BucketContents::PowderSnow => &pumpkin_data::item::Item::POWDER_SNOW_BUCKET,
+            };
+            let expected = if fill { &pumpkin_data::item::Item::BUCKET } else { filled };
+            if stack.item != expected || stack.item_count == 0 || !fill && stack.item_count != 1 {
+                return Err(ApplyFailure::InvalidAction);
+            }
+            let result = pumpkin_data::item_stack::ItemStack::static_new_java(1,
+                if fill { filled } else { &pumpkin_data::item::Item::BUCKET });
+            let result = super::cluster_invsee::inventory_cell_from_item_stack(source.loc, &result)
+                .map_err(|_| ApplyFailure::InvalidAction)?;
+            if stack.item_count == 1 { return Ok(ItemTransformOutput { source_after: result, remainder: None }); }
+            stack.item_count -= 1;
+            return Ok(ItemTransformOutput { source_after: super::cluster_invsee::inventory_cell_from_item_stack(source.loc, &stack)
+                .map_err(|_| ApplyFailure::InvalidAction)?, remainder: Some(result) });
+        }
+        ItemTransformOperation::MendingRepair { experience } => {
+            return derive_mending_repair(source, experience).map(|(output, _)| output);
+        }
+        ItemTransformOperation::ThrowTrident => {
+            if stack.item != &pumpkin_data::item::Item::TRIDENT || stack.item_count != 1 {
+                return Err(ApplyFailure::InvalidAction);
+            }
+            let worn = derive_item_transform(source, &ItemTransformOperation::Damage { amount: 1 }, id, tick)?.source_after;
+            if worn.is_empty() { return Err(ApplyFailure::InvalidAction); }
+            return Ok(ItemTransformOutput { source_after: pumpkin_cluster::inventory::InventoryCell::empty(source.loc), remainder: None });
+        }
+        ItemTransformOperation::Consume { count } => {
+            if count == 0 || stack.item_count < count {
+                return Err(ApplyFailure::InvalidAction);
+            }
+            if let Some(component) =
+                stack.get_data_component::<pumpkin_data::data_component_impl::UseRemainderImpl>()
+            {
+                let mut output = component
+                    .remainder_stack()
+                    .ok_or(ApplyFailure::InvalidAction)?;
+                output.item_count = output
+                    .item_count
+                    .checked_mul(count)
+                    .filter(|count| *count <= 99)
+                    .ok_or(ApplyFailure::InvalidAction)?;
+                remainder = Some(
+                    super::cluster_invsee::inventory_cell_from_item_stack(source.loc, &output)
+                        .map_err(|_| ApplyFailure::InvalidAction)?,
+                );
+            }
+            stack.item_count -= count;
+        }
+        ItemTransformOperation::Damage { .. }
+        | ItemTransformOperation::AttackDamage
+        | ItemTransformOperation::MineDamage { .. }
+        | ItemTransformOperation::ShieldDamage { .. }
+        | ItemTransformOperation::ArmorDamage { .. } => {
+            let amount = match *operation {
+                ItemTransformOperation::Damage { amount } => amount,
+                ItemTransformOperation::AttackDamage => {
+                    let amount = stack
+                        .get_data_component::<pumpkin_data::data_component_impl::WeaponImpl>()
+                        .map_or(0, |weapon| weapon.item_damage_per_attack);
+                    if amount == 0 || !stack.is_damageable() {
+                        return Ok(ItemTransformOutput {
+                            source_after: source.clone(),
+                            remainder: None,
+                        });
+                    }
+                    u16::try_from(amount).map_err(|_| ApplyFailure::InvalidAction)?
+                }
+                ItemTransformOperation::MineDamage { hardness } => {
+                    let hardness = f32::from_bits(hardness);
+                    if !hardness.is_finite() || hardness < 0.0 { return Err(ApplyFailure::InvalidAction); }
+                    let wear = stack.get_data_component::<pumpkin_data::data_component_impl::ToolImpl>()
+                        .map_or(1, |tool| tool.damage_per_block);
+                    if hardness == 0.0 || wear == 0 || !stack.is_damageable() {
+                        return Ok(ItemTransformOutput { source_after: source.clone(), remainder: None });
+                    }
+                    u16::try_from(wear).map_err(|_| ApplyFailure::InvalidAction)?
+                }
+                ItemTransformOperation::ShieldDamage { incoming_milli } => {
+                    if incoming_milli == 0 { return Err(ApplyFailure::InvalidAction); }
+                    if stack.get_data_component::<pumpkin_data::data_component_impl::BlocksAttacksImpl>().is_none()
+                        || !stack.is_damageable() {
+                        return Ok(ItemTransformOutput { source_after: source.clone(), remainder: None });
+                    }
+                    u16::try_from((incoming_milli / 1_000).max(1)).map_err(|_| ApplyFailure::InvalidAction)?
+                }
+                ItemTransformOperation::ArmorDamage {
+                    incoming_milli,
+                    armor_slot,
+                } => {
+                    use pumpkin_data::data_component_impl::EquipmentSlot;
+                    let applicable = stack
+                        .get_data_component::<pumpkin_data::data_component_impl::EquippableImpl>()
+                        .is_some_and(|equippable| {
+                            equippable.damage_on_hurt
+                                && matches!(
+                                    (armor_slot, equippable.slot),
+                                    (0, EquipmentSlot::Feet(_))
+                                        | (1, EquipmentSlot::Legs(_))
+                                        | (2, EquipmentSlot::Chest(_))
+                                        | (3, EquipmentSlot::Head(_))
+                                )
+                        });
+                    if incoming_milli == 0 || armor_slot >= 4 {
+                        return Err(ApplyFailure::InvalidAction);
+                    }
+                    if !applicable || !stack.is_armor() || !stack.is_damageable() {
+                        return Ok(ItemTransformOutput {
+                            source_after: source.clone(),
+                            remainder: None,
+                        });
+                    }
+                    u16::try_from((incoming_milli / 4_000).max(1))
+                        .map_err(|_| ApplyFailure::InvalidAction)?
+                }
+                _ => unreachable!(),
+            };
+            if !stack.is_damageable() || amount == 0 {
+                return Err(ApplyFailure::InvalidAction);
+            }
+            if !stack.is_unbreakable() {
+                let level = stack
+                    .get_enchantment_level(&pumpkin_data::Enchantment::UNBREAKING)
+                    .max(0) as u64;
+                let mut damage = 0_i32;
+                for index in 0..amount {
+                    let seed = super::cluster_world_apply::CLUSTER_SEED
+                        ^ id.incarnation
+                        ^ (u64::from(id.sequence) << 32)
+                        ^ (u64::from(id.family) << 48)
+                        ^ u64::from(index);
+                    let random = pumpkin_cluster::order::rank_tick_actor(seed, tick, id.actor);
+                    let applies = if stack.is_armor() {
+                        u128::from(random) * u128::from(5 * (level + 1))
+                            < u128::from(u64::MAX) * u128::from(3 * (level + 1) + 2)
+                    } else {
+                        random % (level + 1) == 0
+                    };
+                    if applies {
+                        damage += 1;
+                    }
+                }
+                let damage = stack.get_damage().saturating_add(damage);
+                if damage >= stack.get_max_damage().ok_or(ApplyFailure::InvalidAction)? {
+                    stack.item_count -= 1;
+                    if stack.item_count != 0 {
+                        stack.set_damage(0);
+                    }
+                } else {
+                    stack.set_damage(damage);
+                }
+            }
+        }
+    }
+    let source_after = super::cluster_invsee::inventory_cell_from_item_stack(source.loc, &stack)
+        .map_err(|_| ApplyFailure::InvalidAction)?;
+    Ok(ItemTransformOutput {
+        source_after,
+        remainder,
+    })
+}
+
+fn derive_vehicle_use<S: pumpkin_cluster::canonical_action::ActionState>(
+    context: &S,
+    intent: &pumpkin_cluster::item_use::ItemUseIntent,
+    action_id: pumpkin_cluster::canonical_action::ActionId,
+    tick: pumpkin_cluster::time::TickStamp,
+    values: &std::collections::BTreeMap<
+        pumpkin_cluster::canonical_action::Target,
+        pumpkin_cluster::canonical_action::Cell,
+    >,
+) -> Result<
+    Vec<pumpkin_cluster::canonical_action::Effect>,
+    pumpkin_cluster::canonical_action::ApplyFailure,
+> {
+    use pumpkin_cluster::canonical_action::{ApplyFailure, ChunkPart, Effect, Target, Value};
+    use pumpkin_cluster::canonical_inventory::{ItemTransformIntent, ItemTransformOperation};
+    use pumpkin_cluster::entity_body::{EntityPayload, VehicleKind};
+    use pumpkin_cluster::vehicle_property::{VehicleProperty as P, VehiclePropertyValue as V};
+    if !matches!(values.get(&intent.property_target(pumpkin_cluster::living_property::LivingProperty::Health)).map(|cell| &cell.value),
+        Some(Value::LivingProperty(pumpkin_cluster::living_property::LivingPropertyValue::Unsigned(health))) if *health > 0)
+    {
+        return Err(ApplyFailure::InvalidAction);
+    }
+    let creative = match values
+        .get(&intent.property_target(pumpkin_cluster::living_property::LivingProperty::GameMode))
+        .map(|cell| &cell.value)
+    {
+        Some(Value::LivingProperty(
+            pumpkin_cluster::living_property::LivingPropertyValue::Unsigned(1),
+        )) => true,
+        Some(Value::LivingProperty(
+            pumpkin_cluster::living_property::LivingPropertyValue::Unsigned(3),
+        )) => return Err(ApplyFailure::InvalidAction),
+        Some(Value::LivingProperty(
+            pumpkin_cluster::living_property::LivingPropertyValue::Unsigned(_),
+        )) => false,
+        None if matches!(action_id.actor, pumpkin_cluster::actor::ActorId::Entity(_)) => false,
+        _ => return Err(ApplyFailure::InvalidAction),
+    };
+    let contact = intent.vehicle.as_ref().ok_or(ApplyFailure::InvalidAction)?;
+    let Value::Entity(body) = &values
+        .get(&contact.target())
+        .ok_or(ApplyFailure::InvalidAction)?
+        .value
+    else {
+        return Err(ApplyFailure::InvalidAction);
+    };
+    let pumpkin_cluster::item_contact::ContactIdentity::Entity { id, birth } = &contact.identity
+    else {
+        return Err(ApplyFailure::InvalidAction);
+    };
+    if body.id != *id
+        || body.birth != *birth
+        || body.owner != contact.owner
+        || body.spatial_epoch != contact.epoch
+    {
+        return Err(ApplyFailure::InvalidAction);
+    }
+    let EntityPayload::Vehicle(vehicle) = &body.payload else {
+        return Err(ApplyFailure::InvalidAction);
+    };
+    let Value::Inventory(source) = &values
+        .get(&intent.source.target)
+        .ok_or(ApplyFailure::InvalidAction)?
+        .value
+    else {
+        return Err(ApplyFailure::InvalidAction);
+    };
+    let stack = super::cluster_invsee::item_stack_from_inventory_cell(source)
+        .map_err(|_| ApplyFailure::InvalidAction)?;
+    if vehicle.kind == VehicleKind::TntMinecart {
+        let fuse = Target::Chunk {
+            key: contact.chunk,
+            part: ChunkPart::VehicleProperty {
+                actor: *id,
+                property: P::Fuse,
+            },
+            inventory: None,
+        };
+        if !matches!(
+            values.get(&fuse).map(|cell| &cell.value),
+            Some(Value::VehicleProperty(V::Fuse(None)))
+        ) {
+            return Err(ApplyFailure::InvalidAction);
+        }
+    }
+    let (property, value, operation) = match vehicle.kind {
+        VehicleKind::FurnaceMinecart
+            if stack.item == &pumpkin_data::item::Item::COAL
+                || stack.item == &pumpkin_data::item::Item::CHARCOAL =>
+        {
+            let target = Target::Chunk {
+                key: contact.chunk,
+                part: ChunkPart::VehicleProperty {
+                    actor: *id,
+                    property: P::Fuel,
+                },
+                inventory: None,
+            };
+            let Some(Value::VehicleProperty(V::Unsigned(fuel))) =
+                values.get(&target).map(|cell| &cell.value)
+            else {
+                return Err(ApplyFailure::InvalidAction);
+            };
+            (
+                P::Fuel,
+                V::Unsigned(
+                    fuel.checked_add(3600)
+                        .filter(|fuel| *fuel <= 32000)
+                        .ok_or(ApplyFailure::InvalidAction)?,
+                ),
+                ItemTransformOperation::Consume { count: 1 },
+            )
+        }
+        VehicleKind::TntMinecart if stack.item == &pumpkin_data::item::Item::FIRE_CHARGE => (
+            P::Fuse,
+            V::Fuse(Some(80)),
+            ItemTransformOperation::Consume { count: 1 },
+        ),
+        VehicleKind::TntMinecart if stack.item == &pumpkin_data::item::Item::FLINT_AND_STEEL => (
+            P::Fuse,
+            V::Fuse(Some(80)),
+            ItemTransformOperation::Damage { amount: 1 },
+        ),
+        _ => return Err(ApplyFailure::InvalidAction),
+    };
+    let transform = ItemTransformIntent {
+        source: intent.source.clone(),
+        item: source.item,
+        components: source.nbt.clone(),
+        operation,
+        remainder_destinations: intent.remainder_destinations.clone(),
+    };
+    let mut projected = values.clone();
+    if !creative {
+        for (target, value) in transform.derive(context, action_id, tick, &projected)? {
+            projected.insert(
+                target,
+                pumpkin_cluster::canonical_action::Cell {
+                    revision: values.get(&target).map_or(0, |cell| cell.revision),
+                    value: Value::Inventory(value),
+                },
+            );
+        }
+    }
+    let mut effects = vec![Effect::Put {
+        target: Target::Chunk {
+            key: contact.chunk,
+            part: ChunkPart::VehicleProperty {
+                actor: body.id,
+                property,
+            },
+            inventory: None,
+        },
+        value: Value::VehicleProperty(value),
+    }];
+    if !creative {
+        effects.push(Effect::TransformItems { intent: transform });
+    }
+    if vehicle.kind == VehicleKind::FurnaceMinecart {
+        let driver = intent
+            .vehicle_source
+            .as_ref()
+            .ok_or(ApplyFailure::InvalidAction)?;
+        if driver.actor() != action_id.actor || driver.world != contact.world {
+            return Err(ApplyFailure::InvalidAction);
+        }
+        let push = [0, 2].map(|axis| {
+            f64::from_bits(contact.position[axis]) - f64::from_bits(driver.position[axis])
+        });
+        let magnitude = push[0].hypot(push[1]);
+        let push = if magnitude > 0.00001 {
+            push.map(|axis| (axis / magnitude * 1_000_000.0).round() as i64)
+        } else {
+            [0; 2]
+        };
+        effects.push(Effect::Put {
+            target: Target::Chunk {
+                key: contact.chunk,
+                part: ChunkPart::VehicleProperty {
+                    actor: body.id,
+                    property: P::FurnacePush,
+                },
+                inventory: None,
+            },
+            value: Value::VehicleProperty(V::Push(push)),
+        });
+    }
+    if !creative {
+        pumpkin_cluster::canonical_inventory::append_equipment_effects_from_projection(
+            values,
+            &projected,
+            &mut effects,
+            &intent.equipment,
+            context,
+        )
+        .map_err(|_| ApplyFailure::InvalidAction)?;
+    }
+    Ok(effects)
+}
+
+pub(super) fn derive_canonical_use<S: pumpkin_cluster::canonical_action::ActionState>(
+    context: &S,
+    intent: &pumpkin_cluster::item_use::ItemUseIntent,
+    id: pumpkin_cluster::canonical_action::ActionId,
+    tick: pumpkin_cluster::time::TickStamp,
+    values: &std::collections::BTreeMap<
+        pumpkin_cluster::canonical_action::Target,
+        pumpkin_cluster::canonical_action::Cell,
+    >,
+) -> Result<
+    Vec<pumpkin_cluster::canonical_action::Effect>,
+    pumpkin_cluster::canonical_action::ApplyFailure,
+> {
+    use pumpkin_cluster::canonical_action::{ApplyFailure, Effect, Value};
+    use pumpkin_cluster::canonical_inventory::{ItemTransformIntent, ItemTransformOperation};
+    use pumpkin_cluster::item_use::ItemUseOperation;
+    if intent.vehicle.is_some() {
+        return derive_vehicle_use(context, intent, id, tick, values);
+    }
+    let failure = ApplyFailure::Inventory(intent.source.target);
+    let source = match &values
+        .get(&intent.source.target)
+        .ok_or_else(|| failure.clone())?
+        .value
+    {
+        Value::Inventory(item) => item,
+        _ => return Err(failure.clone()),
+    };
+    use pumpkin_cluster::living_property::{LivingProperty as P, LivingPropertyValue as V};
+    let read = |property| {
+        values
+            .get(&intent.property_target(property))
+            .map(|cell| &cell.value)
+            .ok_or(ApplyFailure::Type(intent.property_target(property)))
+    };
+    let Value::LivingProperty(V::ItemUse(before_use)) = read(P::ItemUse)? else {
+        return Err(ApplyFailure::InvalidAction);
+    };
+    let Value::LivingProperty(V::Food(before_food)) = read(P::Food)? else {
+        return Err(ApplyFailure::InvalidAction);
+    };
+    let Value::LivingProperty(V::Cooldowns(before_cooldowns)) = read(P::Cooldowns)? else {
+        return Err(ApplyFailure::InvalidAction);
+    };
+    let Value::LivingProperty(V::StatusEffects(before_effects)) = read(P::StatusEffects)? else {
+        return Err(ApplyFailure::InvalidAction);
+    };
+    let Value::LivingProperty(V::Unsigned(health)) = read(P::Health)? else {
+        return Err(ApplyFailure::InvalidAction);
+    };
+    if *health == 0 {
+        return Err(ApplyFailure::InvalidAction);
+    }
+    let mut active_use = before_use.clone();
+    let mut food_state = *before_food;
+    let mut cooldowns = before_cooldowns.clone();
+    let mut active_effects = before_effects.clone();
+    let stack = super::cluster_invsee::item_stack_from_inventory_cell(source)
+        .map_err(|_| failure.clone())?;
+    let creative = match values.get(&intent.property_target(P::GameMode)).map(|cell| &cell.value) {
+        Some(Value::LivingProperty(V::Unsigned(1))) => true,
+        Some(Value::LivingProperty(V::Unsigned(3))) => return Err(ApplyFailure::InvalidAction),
+        Some(Value::LivingProperty(V::Unsigned(_))) => false,
+        None if matches!(id.actor, ActorId::Entity(_)) => false,
+        _ => return Err(ApplyFailure::InvalidAction),
+    };
+    let mut effects = Vec::new();
+    let mut instant_projection = values.clone();
+    if let Some((category, key)) = intent.used_statistic {
+        if category != pumpkin_data::statistic::StatisticCategory::Used as u16
+            || key != u32::from(source.item)
+        {
+            return Err(ApplyFailure::InvalidAction);
+        }
+    }
+    match intent.operation {
+        ItemUseOperation::Start => {
+            let group = item_cooldown_group(source)?;
+            if cooldowns.get(&group).is_some_and(|state| state.until.is_after(tick)) {
+                return Err(ApplyFailure::InvalidAction);
+            }
+            if stack.item == &pumpkin_data::item::Item::CROSSBOW
+                && stack.get_data_component::<pumpkin_data::data_component_impl::ChargedProjectilesImpl>()
+                    .is_some_and(|charged| !charged.projectiles.is_empty()) {
+                effects.extend(super::cluster_item_launch::crossbow_fire(intent, id, tick, &stack, values)?);
+                active_use = None;
+            } else if super::cluster_item_launch::thrown_kind(stack.item).is_some() {
+                effects.extend(super::cluster_item_launch::thrown(intent, id, tick, &stack, values)?);
+                if stack.item == &pumpkin_data::item::Item::ENDER_PEARL {
+                    let revision = cooldowns.get(&group).map_or(Some(1), |state| state.revision.checked_add(1))
+                        .ok_or(ApplyFailure::Overflow(intent.living))?;
+                    cooldowns.insert(group.clone(), pumpkin_cluster::item_action::ItemCooldownState {
+                        actor: id.actor, group, until: pumpkin_cluster::time::TickStamp(tick.0.wrapping_add(20)), revision,
+                    });
+                }
+                active_use = None;
+            } else {
+            let consumable =
+                stack.get_data_component::<pumpkin_data::data_component_impl::ConsumableImpl>();
+            let blocking = stack
+                .get_data_component::<pumpkin_data::data_component_impl::BlocksAttacksImpl>()
+                .is_some();
+            let mode = if blocking {
+                ItemUseMode::Block
+            } else if consumable.is_some() {
+                ItemUseMode::Consume
+            } else if stack.item == &pumpkin_data::item::Item::BOW {
+                ItemUseMode::Bow
+            } else if stack.item == &pumpkin_data::item::Item::CROSSBOW {
+                ItemUseMode::Crossbow
+            } else if stack.item == &pumpkin_data::item::Item::TRIDENT {
+                ItemUseMode::Trident
+            } else {
+                return Err(ApplyFailure::InvalidAction);
+            };
+            if let Some(food) =
+                stack.get_data_component::<pumpkin_data::data_component_impl::FoodImpl>()
+                && food_state.food >= 20
+                && !food.can_always_eat
+                && !creative
+            {
+                return Err(ApplyFailure::InvalidAction);
+            }
+            active_use = Some(ItemUseState {
+                actor: id.actor,
+                source: intent.source.slot,
+                item: source.clone(),
+                started: tick,
+                mode,
+                duration_ticks: consumable
+                    .map_or(72_000, |component| component.consume_ticks().max(0) as u32),
+                cooldown_ticks: stack.get_use_cooldown().map_or(0, |cooldown| {
+                    (cooldown.seconds.max(0.0) * 20.0).ceil() as u32
+                }),
+                has_remainder: stack
+                    .get_data_component::<pumpkin_data::data_component_impl::UseRemainderImpl>()
+                    .is_some(),
+                blocking_delay_ticks: intent.blocking_delay_ticks,
+            });
+            }
+        }
+        ItemUseOperation::Release => {
+            let active = active_use.as_ref().ok_or(ApplyFailure::InvalidAction)?;
+            if active.actor != id.actor || active.source != intent.source.slot
+                || active.item.item != source.item || active.item.nbt != source.nbt {
+                return Err(ApplyFailure::InvalidAction);
+            }
+            match active.mode {
+                ItemUseMode::Bow => effects.extend(super::cluster_item_launch::bow(
+                    intent, id, tick, active.started, &stack, values,
+                )?),
+                ItemUseMode::Crossbow => effects.extend(super::cluster_item_launch::crossbow_load(
+                    intent, id, tick, active.started, &stack, values,
+                )?),
+                ItemUseMode::Trident => effects.extend(super::cluster_item_launch::trident(
+                    intent, id, tick, active.started, &stack, values,
+                )?),
+                _ => {}
+            }
+            active_use = None;
+        }
+        ItemUseOperation::Complete => {
+            let active = active_use.as_ref().ok_or(ApplyFailure::InvalidAction)?;
+            if active.actor != id.actor
+                || active.mode != ItemUseMode::Consume
+                || active.source != intent.source.slot
+                || active.item.item != source.item
+                || active.item.nbt != source.nbt
+                || u32::from(tick.distance_since(active.started)) < active.duration_ticks
+            {
+                return Err(ApplyFailure::InvalidAction);
+            }
+            let consumable = stack
+                .get_data_component::<pumpkin_data::data_component_impl::ConsumableImpl>()
+                .ok_or(ApplyFailure::InvalidAction)?;
+            if let Some(food) =
+                stack.get_data_component::<pumpkin_data::data_component_impl::FoodImpl>()
+            {
+                if food.nutrition < 0
+                    || !food.saturation.is_finite()
+                    || !(0.0..=20.0).contains(&food.saturation)
+                {
+                    return Err(ApplyFailure::InvalidAction);
+                }
+                let effect = pumpkin_cluster::item_action::ItemFoodEffect::new(
+                    food_state,
+                    u8::try_from(food.nutrition).map_err(|_| ApplyFailure::InvalidAction)?,
+                    (food.saturation * 1000.0).round() as u32,
+                );
+                food_state = effect.after;
+            }
+            use pumpkin_data::data_component_impl::{ConsumeEffect, IDSet};
+            for (index, effect) in consumable.effects.iter().enumerate() {
+                match effect {
+                    ConsumeEffect::ApplyEffects((effects, probability)) => {
+                        if !probability.is_finite() || !(0.0..=1.0).contains(probability) {
+                            return Err(ApplyFailure::InvalidAction);
+                        }
+                        let random = pumpkin_cluster::order::rank_tick_actor(
+                            super::cluster_world_apply::CLUSTER_SEED
+                                ^ id.incarnation
+                                ^ (u64::from(id.sequence) << 32)
+                                ^ index as u64,
+                            tick,
+                            id.actor,
+                        );
+                        if *probability < 1.0
+                            && random as f64 / u64::MAX as f64 >= f64::from(*probability)
+                        {
+                            continue;
+                        }
+                        for effect in effects.iter() {
+                            let kind = pumpkin_data::effect::StatusEffect::from_minecraft_name(
+                                &effect.effect_id,
+                            )
+                            .ok_or(ApplyFailure::InvalidAction)?;
+                            if kind == &pumpkin_data::effect::StatusEffect::INSTANT_HEALTH
+                                || kind == &pumpkin_data::effect::StatusEffect::INSTANT_DAMAGE
+                            {
+                                let healing =
+                                    kind == &pumpkin_data::effect::StatusEffect::INSTANT_HEALTH;
+                                let base: u32 = if healing { 4000 } else { 6000 };
+                                let multiplier = 1u32
+                                    .checked_shl(
+                                        u32::try_from(effect.amplifier)
+                                            .map_err(|_| ApplyFailure::InvalidAction)?,
+                                    )
+                                    .ok_or(ApplyFailure::InvalidAction)?;
+                                let amount = base
+                                    .checked_mul(multiplier)
+                                    .ok_or(ApplyFailure::InvalidAction)?;
+                                let delta = pumpkin_cluster::combat_action::derive_instant_health(
+                                    id,
+                                    intent.living,
+                                    id.actor,
+                                    tick,
+                                    healing,
+                                    amount,
+                                    intent.max_health_attribute,
+                                    &instant_projection,
+                                )?;
+                                for effect in delta {
+                                    let Effect::Put { target, value } = &effect else {
+                                        return Err(ApplyFailure::InvalidAction);
+                                    };
+                                    instant_projection.insert(
+                                        *target,
+                                        pumpkin_cluster::canonical_action::Cell {
+                                            revision: values[target].revision,
+                                            value: value.clone(),
+                                        },
+                                    );
+                                }
+                                continue;
+                            }
+                            if !active_effects.insert(pumpkin_cluster::player_admin::EffectState {
+                                kind: u16::from(kind.id),
+                                duration: effect.duration,
+                                amplifier: u8::try_from(effect.amplifier)
+                                    .map_err(|_| ApplyFailure::InvalidAction)?,
+                                ambient: effect.ambient,
+                                show_particles: effect.show_particles,
+                                show_icon: effect.show_icon,
+                                blend: false,
+                            }) {
+                                return Err(ApplyFailure::InvalidAction);
+                            }
+                        }
+                    }
+                    ConsumeEffect::RemoveEffects(IDSet::IDs(kinds)) => {
+                        for kind in kinds.iter() {
+                            active_effects.remove(u16::from(kind.id));
+                        }
+                    }
+                    ConsumeEffect::ClearAllEffects => active_effects = Default::default(),
+                    ConsumeEffect::PlaySound(_) => {}
+                    ConsumeEffect::RemoveEffects(IDSet::Tag(_))
+                    | ConsumeEffect::TeleportRandomly(_) => {
+                        return Err(ApplyFailure::InvalidAction);
+                    }
+                }
+                let resistance_target = intent.property_target(P::Resistance);
+                let resistance = active_effects
+                    .visible
+                    .iter()
+                    .find(|active| {
+                        active.duration != 0
+                            && active.kind
+                                == u16::from(pumpkin_data::effect::StatusEffect::RESISTANCE.id)
+                    })
+                    .map(|active| active.amplifier);
+                instant_projection.insert(
+                    resistance_target,
+                    pumpkin_cluster::canonical_action::Cell {
+                        revision: values[&resistance_target].revision,
+                        value: Value::LivingProperty(V::Amplifier(resistance)),
+                    },
+                );
+                let status_target = intent.property_target(P::StatusEffects);
+                instant_projection.insert(
+                    status_target,
+                    pumpkin_cluster::canonical_action::Cell {
+                        revision: values[&status_target].revision,
+                        value: Value::LivingProperty(V::StatusEffects(active_effects.clone())),
+                    },
+                );
+                let mut normalization = Vec::new();
+                pumpkin_cluster::canonical_inventory::append_equipment_effects_from_projection(
+                    values,
+                    &instant_projection,
+                    &mut normalization,
+                    &intent.equipment,
+                    context,
+                )
+                .map_err(|_| ApplyFailure::InvalidAction)?;
+                for effect in normalization {
+                    let Effect::Put { target, value } = effect else {
+                        return Err(ApplyFailure::InvalidAction);
+                    };
+                    instant_projection.insert(
+                        target,
+                        pumpkin_cluster::canonical_action::Cell {
+                            revision: values[&target].revision,
+                            value,
+                        },
+                    );
+                }
+            }
+            let potion = super::cluster_projectile_potion::potion_effects(&stack)?;
+            if !potion.is_empty() {
+                let attributes = intent.equipment.iter().flat_map(|binding| binding.attribute_ids.iter().copied())
+                    .collect::<std::collections::BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+                let deltas = super::cluster_projectile_potion::apply(context, id, tick, id.actor, intent.living,
+                    &potion, 1.0, 1.0, 1, intent.max_health_attribute, &attributes, &instant_projection)?;
+                for delta in deltas {
+                    let Effect::Put { target, value } = delta else { return Err(ApplyFailure::InvalidAction); };
+                    let revision = instant_projection.get(&target).ok_or(ApplyFailure::Condition(target))?.revision;
+                    instant_projection.insert(target, pumpkin_cluster::canonical_action::Cell { revision, value });
+                }
+                let Some(pumpkin_cluster::canonical_action::Cell { value: Value::LivingProperty(V::StatusEffects(potion_active)), .. }) =
+                    instant_projection.get(&intent.property_target(P::StatusEffects)) else { return Err(ApplyFailure::InvalidAction); };
+                active_effects = potion_active.clone();
+            }
+            active_use = None;
+            if let Some(cooldown) = stack.get_use_cooldown() {
+                if !cooldown.seconds.is_finite() || !(0.0..=1600.0).contains(&cooldown.seconds) {
+                    return Err(ApplyFailure::InvalidAction);
+                }
+                let group = cooldown
+                    .cooldown_group
+                    .clone()
+                    .unwrap_or_else(|| stack.item.registry_key.to_string());
+                let revision = cooldowns
+                    .get(&group)
+                    .map_or(Some(1), |state| state.revision.checked_add(1))
+                    .ok_or(ApplyFailure::Overflow(intent.living))?;
+                cooldowns.insert(
+                    group.clone(),
+                    pumpkin_cluster::item_action::ItemCooldownState {
+                        actor: id.actor,
+                        group,
+                        until: pumpkin_cluster::time::TickStamp(
+                            tick.0.wrapping_add((cooldown.seconds * 20.0).ceil() as u16),
+                        ),
+                        revision,
+                    },
+                );
+            }
+            if !creative { effects.push(Effect::TransformItems {
+                intent: ItemTransformIntent {
+                    source: intent.source.clone(),
+                    item: source.item,
+                    components: source.nbt.clone(),
+                    operation: ItemTransformOperation::Consume { count: 1 },
+                    remainder_destinations: intent.remainder_destinations.clone(),
+                },
+            }); }
+        }
+    }
+    if let Some((category, key)) = intent.used_statistic
+        && (intent.operation == ItemUseOperation::Complete || effects.iter().any(|effect|
+            matches!(effect, Effect::Put { value: Value::Entity(body), .. }
+                if matches!(body.payload, pumpkin_cluster::entity_body::EntityPayload::Projectile(_))))) {
+        let target = intent.property_target(P::Statistic { category, key });
+        let Value::LivingProperty(V::Unsigned(before)) = read(P::Statistic { category, key })? else {
+            return Err(ApplyFailure::Type(target));
+        };
+        let after = before.checked_add(1).filter(|value| *value <= i32::MAX as u32)
+            .ok_or(ApplyFailure::Overflow(target))?;
+        effects.push(Effect::Put { target, value: Value::LivingProperty(V::Unsigned(after)) });
+    }
+    for (property, before, after) in [
+        (
+            P::ItemUse,
+            V::ItemUse(before_use.clone()),
+            V::ItemUse(active_use),
+        ),
+        (P::Food, V::Food(*before_food), V::Food(food_state)),
+        (
+            P::Cooldowns,
+            V::Cooldowns(before_cooldowns.clone()),
+            V::Cooldowns(cooldowns),
+        ),
+        (
+            P::StatusEffects,
+            V::StatusEffects(before_effects.clone()),
+            V::StatusEffects(active_effects.clone()),
+        ),
+    ] {
+        if before != after {
+            effects.push(Effect::Put {
+                target: intent.property_target(property),
+                value: Value::LivingProperty(after),
+            });
+        }
+    }
+    if active_effects != *before_effects {
+        let facts = context.status_effect_facts(&active_effects)?;
+        for (property, value) in [
+            (P::Strength, V::Amplifier(facts.strength)),
+            (P::Weakness, V::Amplifier(facts.weakness)),
+            (P::Resistance, V::Amplifier(facts.resistance)),
+            (P::FireResistance, V::Boolean(facts.fire_resistance)),
+            (P::Blindness, V::Boolean(facts.blindness)),
+        ] {
+            if read(property)? != &Value::LivingProperty(value.clone()) {
+                effects.push(Effect::Put {
+                    target: intent.property_target(property),
+                    value: Value::LivingProperty(value),
+                });
+            }
+        }
+    }
+    for (target, cell) in &instant_projection {
+        if values[target].value != cell.value {
+            if let Some(Effect::Put { value, .. }) = effects.iter_mut().find(|effect| matches!(effect, Effect::Put { target: existing, .. } if existing == target)) {
+                *value = cell.value.clone();
+            } else {
+                effects.push(Effect::Put { target: *target, value: cell.value.clone() });
+            }
+        }
+    }
+    if intent.operation == ItemUseOperation::Complete && matches!(id.actor, ActorId::Player(_)) {
+        let pumpkin_cluster::canonical_action::Target::Chunk { key, .. } = intent.living else {
+            return Err(ApplyFailure::InvalidAction);
+        };
+        pumpkin_cluster::player_advancement_event::append_effects(context,
+            pumpkin_cluster::canonical_action::ActionRef { id, tick }, id.actor, key, values, &mut effects,
+            &pumpkin_cluster::player_advancement::AdvancementEvent::ConsumeItem { item: source.item })?;
+    }
+    let mut projected = values.clone();
+    for effect in &effects {
+        match effect {
+            Effect::CrossbowItems { intent: crossbow } => {
+                for (target, value) in crossbow.derive(context, id, tick, &projected)? {
+                    projected.insert(target, pumpkin_cluster::canonical_action::Cell {
+                        revision: values[&target].revision, value: Value::Inventory(value),
+                    });
+                }
+            }
+            Effect::TransformItems { intent: transform } => {
+                for (target, value) in transform.derive(context, id, tick, &projected)? {
+                    projected.insert(
+                        target,
+                        pumpkin_cluster::canonical_action::Cell {
+                            revision: values[&target].revision,
+                            value: Value::Inventory(value),
+                        },
+                    );
+                }
+            }
+            Effect::Put { target, value } => {
+                projected.insert(
+                    *target,
+                    pumpkin_cluster::canonical_action::Cell {
+                        revision: values.get(target).map_or(0, |cell| cell.revision),
+                        value: value.clone(),
+                    },
+                );
+            }
+            _ => return Err(ApplyFailure::InvalidAction),
+        }
+    }
+    pumpkin_cluster::canonical_inventory::append_equipment_effects_from_projection(
+        values,
+        &projected,
+        &mut effects,
+        &intent.equipment,
+        context,
+    )
+    .map_err(|_| ApplyFailure::InvalidAction)?;
+    let mut writes = std::collections::BTreeMap::new();
+    effects.retain(|effect| match effect {
+        Effect::Put { target, value } => {
+            writes.insert(*target, value.clone());
+            false
+        }
+        _ => true,
+    });
+    effects.extend(
+        writes
+            .into_iter()
+            .map(|(target, value)| Effect::Put { target, value }),
+    );
+    Ok(effects)
+}
+
 pub(super) struct PreparedItemAction {
     pub blocks: Vec<super::cluster_chunk_state::BlockChange>,
     pub block_undo: Vec<super::cluster_chunk_state::BlockChange>,
@@ -97,7 +985,7 @@ impl PreparedItemAction {
             inventory_undo,
             use_transition: action.use_transition.clone(),
             cooldown_transition: action.cooldown_transition.clone(),
-            combat: action.combat,
+            combat: action.combat.clone(),
             projectile: action.projectile.clone(),
             actors: action.actors.clone(),
             actor_effects: action.actor_effects.clone(),
@@ -155,11 +1043,13 @@ impl PreparedItemAction {
             let mutations = self
                 .statistics
                 .iter()
-                .map(|mutation| super::cluster_actor_statistics::StatisticMutation::Increment {
-                    category: mutation.category,
-                    stat: mutation.statistic,
-                    amount: mutation.amount,
-                })
+                .map(
+                    |mutation| super::cluster_actor_statistics::StatisticMutation::Increment {
+                        category: mutation.category,
+                        stat: mutation.statistic,
+                        amount: mutation.amount,
+                    },
+                )
                 .collect::<Vec<_>>();
             Some(
                 statistics
@@ -632,6 +1522,7 @@ impl ItemActionOwner {
                         duration_ticks,
                         cooldown_ticks,
                         has_remainder: stack.get_data_component::<pumpkin_data::data_component_impl::UseRemainderImpl>().is_some(),
+                        blocking_delay_ticks: 5,
                     });
                 Some(ItemActionPlan {
                     use_transition: Some(ItemUseTransition {
@@ -835,6 +1726,7 @@ impl ItemActionOwner {
         let next = self.sequences.entry(staged.intent.actor).or_default();
         let sequence = staged.input_sequence.unwrap_or(PlayerSeq(*next));
         let key = ActionKey {
+            incarnation: 0,
             actor: staged.intent.actor,
             sequence: sequence.0,
             family: 10,
@@ -1275,6 +2167,8 @@ mod tests {
             ),
         );
         let before = pumpkin_cluster::item_action::ActorFoodState {
+            exhaustion_milli: 0,
+            tick_timer: 0,
             actor,
             food: 18,
             saturation_milli: 17_000,
@@ -1291,4 +2185,39 @@ mod tests {
         let golden = ItemStack::new(1, &Item::GOLDEN_APPLE);
         assert!(super::plan_food_effect(&golden, before).is_none());
     }
+}
+
+pub(super) fn derive_mending_repair(
+    source: &pumpkin_cluster::inventory::InventoryCell,
+    experience: u32,
+) -> Result<(pumpkin_cluster::canonical_inventory::ItemTransformOutput, u32), pumpkin_cluster::canonical_action::ApplyFailure> {
+    use pumpkin_cluster::canonical_action::ApplyFailure;
+    use pumpkin_cluster::canonical_inventory::ItemTransformOutput;
+    if source.is_empty() {
+        return Ok((ItemTransformOutput { source_after: source.clone(), remainder: None }, 0));
+    }
+    let mut stack = super::cluster_invsee::item_stack_from_inventory_cell(source)
+        .map_err(|_| ApplyFailure::InvalidAction)?;
+    if !stack.is_damageable() || stack.get_enchantment_level(&pumpkin_data::Enchantment::MENDING) <= 0 {
+        return Ok((ItemTransformOutput { source_after: source.clone(), remainder: None }, 0));
+    }
+    let damage = u32::try_from(stack.get_damage()).map_err(|_| ApplyFailure::InvalidAction)?;
+    let repaired = damage.min(experience.saturating_mul(2));
+    if repaired == 0 {
+        return Ok((ItemTransformOutput { source_after: source.clone(), remainder: None }, 0));
+    }
+    stack.patch.retain(|(component, _)| *component != pumpkin_data::data_component::DataComponent::Damage);
+    stack.patch.push((pumpkin_data::data_component::DataComponent::Damage,
+        Some(Box::new(pumpkin_data::data_component_impl::DamageImpl { damage: (damage - repaired) as i32 }))));
+    let after = super::cluster_invsee::inventory_cell_from_item_stack(source.loc, &stack)
+        .map_err(|_| ApplyFailure::InvalidAction)?;
+    Ok((ItemTransformOutput { source_after: after, remainder: None }, repaired / 2))
+}
+
+pub(super) fn item_cooldown_group(source: &pumpkin_cluster::inventory::InventoryCell)
+    -> Result<String, pumpkin_cluster::canonical_action::ApplyFailure> {
+    let stack = super::cluster_invsee::item_stack_from_inventory_cell(source)
+        .map_err(|_| pumpkin_cluster::canonical_action::ApplyFailure::InvalidAction)?;
+    Ok(stack.get_use_cooldown().and_then(|cooldown| cooldown.cooldown_group.clone())
+        .unwrap_or_else(|| stack.item.registry_key.to_string()))
 }

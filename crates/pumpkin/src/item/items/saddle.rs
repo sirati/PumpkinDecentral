@@ -16,6 +16,7 @@ impl ItemMetadata for SaddleItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for SaddleItem {
     fn use_on_entity(&self, item: &mut ItemStack, player: &Player, entity: Arc<dyn EntityBase>) {
         if let Some(mob) = entity.get_mob()

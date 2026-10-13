@@ -64,7 +64,76 @@ const NO_SLEEP_IDS: &[u16] = &[
 #[pumpkin_block_from_tag("minecraft:beds")]
 pub struct BedBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for BedBlock {
+    fn callback_intent(
+        &self,
+        args: crate::block::neighbor::BlockCallbackIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        use crate::block::neighbor::{BlockCallbackEffect, BlockCallbackEvent};
+        match args.event {
+            BlockCallbackEvent::StateReplaced { old_state, moved } => {
+                if moved {
+                    return Some(Vec::new());
+                }
+                let properties = BedProperties::from_state_id(old_state);
+                let other = if properties.part == BedPart::Head {
+                    args.position
+                        .offset(properties.facing.opposite().to_offset())
+                } else {
+                    args.position.offset(properties.facing.to_offset())
+                };
+                let state = args.world.get_block_state_id(&other);
+                if state.to_block_id() == args.block.id
+                    && BedProperties::from_state_id(state).part != properties.part
+                {
+                    Some(vec![BlockCallbackEffect::BreakBlock {
+                        position: other,
+                        flags: BlockFlags::NOTIFY_ALL | BlockFlags::SKIP_DROPS,
+                    }])
+                } else {
+                    Some(Vec::new())
+                }
+            }
+            BlockCallbackEvent::Placed { .. } => None,
+            BlockCallbackEvent::Scheduled
+            | BlockCallbackEvent::Prepare { .. }
+            | BlockCallbackEvent::Neighbor { .. } => Some(Vec::new()),
+        }
+    }
+
+    fn player_broken_intent(
+        &self,
+        args: crate::block::neighbor::PlayerBrokenIntentArgs<'_>,
+    ) -> Option<Vec<crate::block::neighbor::BlockCallbackEffect>> {
+        let properties = BedProperties::from_state_id(args.context.state);
+        let other = if properties.part == BedPart::Head {
+            args.position
+                .offset(properties.facing.opposite().to_offset())
+        } else {
+            args.position.offset(properties.facing.to_offset())
+        };
+        if args.world.get_block_state_id(&other).to_block_id() != args.block.id {
+            return Some(vec![
+                crate::block::neighbor::BlockCallbackEffect::NotifyNeighbors {
+                    position: other,
+                    except: None,
+                },
+            ]);
+        }
+        let flags = if properties.part == BedPart::Foot && !args.context.creative {
+            BlockFlags::NOTIFY_ALL
+        } else {
+            BlockFlags::NOTIFY_ALL | BlockFlags::SKIP_DROPS
+        };
+        Some(vec![
+            crate::block::neighbor::BlockCallbackEffect::BreakBlock {
+                position: other,
+                flags,
+            },
+        ])
+    }
+
     fn can_place_at(&self, args: CanPlaceAtArgs<'_>) -> bool {
         if let Some(player) = args.player {
             let facing = player.get_entity().get_horizontal_facing();

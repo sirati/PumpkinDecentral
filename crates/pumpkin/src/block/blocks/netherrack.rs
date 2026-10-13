@@ -9,6 +9,7 @@ use rand::random;
 #[pumpkin_block("minecraft:netherrack")]
 pub struct NetherrackBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for NetherrackBlock {
     fn is_valid_bonemeal_target(&self, args: crate::block::BonemealArgs<'_>) -> bool {
         let above_block = args.world.get_block_state(&args.position.up());

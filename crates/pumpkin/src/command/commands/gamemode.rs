@@ -46,6 +46,20 @@ impl CommandExecutor for GamemodeExecutor {
 
         let mut succeeded: i32 = 0;
         let server = context.source.server();
+        if server.advanced_config.cluster.enabled {
+            for target in &targets {
+                let Some(lease) = crate::server::cluster_world_owner::player_action_lease(server, target) else {
+                    context.source.send_error(TextComponent::text("Game mode target has no current canonical avatar"));
+                    continue;
+                };
+                let success = TextComponent::text(format!("Set {} game mode to {}", target.gameprofile.name, format!("{gamemode:?}").to_lowercase()));
+                match crate::server::cluster_gamemode_commands::submit(server, &context.source, lease, gamemode as u8, Some(success)) {
+                    Ok(_) => succeeded += 1,
+                    Err(error) => context.source.send_error(TextComponent::text(format!("Game mode change could not be queued: {error:?}"))),
+                }
+            }
+            return Ok(succeeded);
+        }
 
         for target in &targets {
             if target.gamemode.load() != gamemode {

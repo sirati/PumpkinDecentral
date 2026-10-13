@@ -727,9 +727,19 @@ impl pumpkin::plugin::world::HostWorld for PluginHostState {
     }
 
     async fn set_time_of_day(&mut self, world: Resource<World>, time: u64) -> wasmtime::Result<()> {
-        self.get_world_res(&world)?
-            .provider
-            .set_time_of_day(time as i64);
+        let world = self.get_world_res(&world)?.provider.clone();
+        if let Some(server) = world.server.upgrade()
+            && server.advanced_config.cluster.enabled
+        {
+            if !server.cluster_environment.time(
+                &world,
+                crate::server::cluster_environment::TimeMutation::Set(time as i64),
+            ) {
+                return Err(wasmtime::Error::msg("Cluster world time queue is full"));
+            }
+        } else {
+            world.set_time_of_day(time as i64);
+        }
         Ok(())
     }
 
@@ -1224,9 +1234,9 @@ impl pumpkin::plugin::world::HostWorld for PluginHostState {
         let world_res = self.get_world_res(&world)?;
         let internal_rule = from_wit_game_rule(rule);
         let internal_value = from_wit_game_rule_value(value);
-        world_res
-            .provider
-            .set_game_rule(&internal_rule, internal_value);
+        if !world_res.provider.set_game_rule(&internal_rule, internal_value) {
+            return Err(wasmtime::Error::msg("Game rule change could not be queued"));
+        }
         Ok(())
     }
 
@@ -1245,6 +1255,17 @@ impl pumpkin::plugin::world::HostWorldWithStore<PluginHostState> for HasSelf<Plu
         raining: bool,
     ) -> wasmtime::Result<()> {
         let (world, plugin) = world_and_plugin(host.get(), &world)?;
+        if let Some(server) = world.server.upgrade()
+            && server.advanced_config.cluster.enabled
+        {
+            if !server
+                .cluster_environment
+                .weather_flag(&world, Some(raining), None)
+            {
+                return Err(wasmtime::Error::msg("Cluster weather queue is full"));
+            }
+            return Ok(());
+        }
         plugin
             .store
             .pump_blocking(&mut host, move || world.set_raining(raining))
@@ -1257,6 +1278,17 @@ impl pumpkin::plugin::world::HostWorldWithStore<PluginHostState> for HasSelf<Plu
         thundering: bool,
     ) -> wasmtime::Result<()> {
         let (world, plugin) = world_and_plugin(host.get(), &world)?;
+        if let Some(server) = world.server.upgrade()
+            && server.advanced_config.cluster.enabled
+        {
+            if !server
+                .cluster_environment
+                .weather_flag(&world, None, Some(thundering))
+            {
+                return Err(wasmtime::Error::msg("Cluster weather queue is full"));
+            }
+            return Ok(());
+        }
         plugin
             .store
             .pump_blocking(&mut host, move || world.set_thundering(thundering))
@@ -1694,9 +1726,7 @@ impl pumpkin::plugin::world::HostWorldBorder for PluginHostState {
         let border_res = self.get_world_border_res(&border)?;
         Ok(border_res
             .provider
-            .worldborder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .border_for_command()
             .center_x)
     }
 
@@ -1704,9 +1734,7 @@ impl pumpkin::plugin::world::HostWorldBorder for PluginHostState {
         let border_res = self.get_world_border_res(&border)?;
         Ok(border_res
             .provider
-            .worldborder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .border_for_command()
             .center_z)
     }
 
@@ -1717,9 +1745,7 @@ impl pumpkin::plugin::world::HostWorldBorder for PluginHostState {
         let border_res = self.get_world_border_res(&border)?;
         let guard = border_res
             .provider
-            .worldborder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .border_for_command();
         Ok(super::events::to_wasm_position(
             pumpkin_util::math::vector3::Vector3::new(guard.center_x, 0.0, guard.center_z),
         ))
@@ -1734,9 +1760,7 @@ impl pumpkin::plugin::world::HostWorldBorder for PluginHostState {
         let border_res = self.get_world_border_res(&border)?;
         let world = border_res.provider.clone();
         world
-            .worldborder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .border_for_command()
             .set_center(&world, x, z);
         Ok(())
     }
@@ -1745,9 +1769,7 @@ impl pumpkin::plugin::world::HostWorldBorder for PluginHostState {
         let border_res = self.get_world_border_res(&border)?;
         Ok(border_res
             .provider
-            .worldborder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .border_for_command()
             .new_diameter)
     }
 
@@ -1764,9 +1786,7 @@ impl pumpkin::plugin::world::HostWorldBorder for PluginHostState {
         let border_res = self.get_world_border_res(&border)?;
         let world = border_res.provider.clone();
         world
-            .worldborder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .border_for_command()
             .set_diameter(&world, diameter, speed.map(|s| s as i64));
         Ok(())
     }
@@ -1797,9 +1817,7 @@ impl pumpkin::plugin::world::HostWorldBorder for PluginHostState {
         let border_res = self.get_world_border_res(&border)?;
         Ok(border_res
             .provider
-            .worldborder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .border_for_command()
             .new_diameter)
     }
 
@@ -1810,9 +1828,7 @@ impl pumpkin::plugin::world::HostWorldBorder for PluginHostState {
         let border_res = self.get_world_border_res(&border)?;
         Ok(border_res
             .provider
-            .worldborder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .border_for_command()
             .speed)
     }
 
@@ -1823,9 +1839,7 @@ impl pumpkin::plugin::world::HostWorldBorder for PluginHostState {
         let border_res = self.get_world_border_res(&border)?;
         Ok(border_res
             .provider
-            .worldborder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .border_for_command()
             .warning_blocks)
     }
 
@@ -1837,9 +1851,7 @@ impl pumpkin::plugin::world::HostWorldBorder for PluginHostState {
         let border_res = self.get_world_border_res(&border)?;
         let world = border_res.provider.clone();
         world
-            .worldborder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .border_for_command()
             .set_warning_distance(&world, distance);
         Ok(())
     }
@@ -1851,9 +1863,7 @@ impl pumpkin::plugin::world::HostWorldBorder for PluginHostState {
         let border_res = self.get_world_border_res(&border)?;
         Ok(border_res
             .provider
-            .worldborder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .border_for_command()
             .warning_time)
     }
 
@@ -1865,9 +1875,7 @@ impl pumpkin::plugin::world::HostWorldBorder for PluginHostState {
         let border_res = self.get_world_border_res(&border)?;
         let world = border_res.provider.clone();
         world
-            .worldborder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .border_for_command()
             .set_warning_delay(&world, delay);
         Ok(())
     }
@@ -1895,9 +1903,7 @@ impl pumpkin::plugin::world::HostWorldBorder for PluginHostState {
         Ok(f64::from(
             border_res
                 .provider
-                .worldborder
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .border_for_command()
                 .buffer,
         ))
     }
@@ -1910,10 +1916,8 @@ impl pumpkin::plugin::world::HostWorldBorder for PluginHostState {
         let border_res = self.get_world_border_res(&border)?;
         border_res
             .provider
-            .worldborder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .set_damage_buffer(buffer as f32);
+            .border_for_command()
+            .set_damage_buffer(&border_res.provider, buffer as f32);
         Ok(())
     }
 
@@ -1925,9 +1929,7 @@ impl pumpkin::plugin::world::HostWorldBorder for PluginHostState {
         Ok(f64::from(
             border_res
                 .provider
-                .worldborder
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .border_for_command()
                 .damage_per_block,
         ))
     }
@@ -1940,10 +1942,8 @@ impl pumpkin::plugin::world::HostWorldBorder for PluginHostState {
         let border_res = self.get_world_border_res(&border)?;
         border_res
             .provider
-            .worldborder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .set_damage_per_block(damage as f32);
+            .border_for_command()
+            .set_damage_per_block(&border_res.provider, damage as f32);
         Ok(())
     }
 
@@ -1956,9 +1956,7 @@ impl pumpkin::plugin::world::HostWorldBorder for PluginHostState {
         let border_res = self.get_world_border_res(&border)?;
         Ok(border_res
             .provider
-            .worldborder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .border_for_command()
             .contains(x, z))
     }
 
@@ -1970,9 +1968,7 @@ impl pumpkin::plugin::world::HostWorldBorder for PluginHostState {
         let border_res = self.get_world_border_res(&border)?;
         Ok(border_res
             .provider
-            .worldborder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .border_for_command()
             .contains(pos.0, pos.2))
     }
 
@@ -1980,9 +1976,7 @@ impl pumpkin::plugin::world::HostWorldBorder for PluginHostState {
         let border_res = self.get_world_border_res(&border)?;
         let world = border_res.provider.clone();
         world
-            .worldborder
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .border_for_command()
             .reset(&world);
         Ok(())
     }

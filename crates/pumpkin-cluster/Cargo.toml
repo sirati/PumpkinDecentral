@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 serde.workspace = true
+uuid.workspace = true
 postcard.workspace = true
 tokio = { workspace = true, features = ["sync", "time", "net", "rt", "macros"] }
 sha2.workspace = true

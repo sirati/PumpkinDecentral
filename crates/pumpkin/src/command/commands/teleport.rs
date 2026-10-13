@@ -1,12 +1,9 @@
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
 
-use pumpkin_cluster::player_admin::{PlayerAdministrativeIntent, PlayerAdministrativeMutation};
 use pumpkin_data::translation;
 use pumpkin_util::PermissionLvl;
 use pumpkin_util::math::position::BlockPos;
-use pumpkin_util::math::vector3::Vector3;
+use pumpkin_util::math::vector3::{Axis, Vector3};
 use pumpkin_util::permission::{Permission, PermissionDefault, PermissionRegistry};
 use pumpkin_util::text::TextComponent;
 
@@ -32,6 +29,42 @@ const ERROR_INVALID_POSITION: CommandErrorType<0> = CommandErrorType::new(
     translation::java::COMMANDS_TELEPORT_INVALIDPOSITION,
     translation::java::COMMANDS_TELEPORT_INVALIDPOSITION,
 );
+
+fn resolve_position(
+    context: &CommandContext,
+    name: &str,
+) -> Result<Vector3<f64>, crate::command::errors::command_syntax_error::CommandSyntaxError> {
+    let coordinates = Vec3ArgumentType::get_coordinates(context, name)?;
+    if matches!(
+        &context.source.output,
+        crate::command::CommandSender::PreJoin(_)
+    ) && [Axis::X, Axis::Y, Axis::Z]
+        .into_iter()
+        .any(|axis| coordinates.is_relative(axis))
+    {
+        context.source.entity_or_err()?;
+    }
+    Ok(coordinates.resolve(&context.source))
+}
+
+fn resolve_rotation(
+    context: &CommandContext,
+) -> Result<
+    pumpkin_util::math::vector2::Vector2<f32>,
+    crate::command::errors::command_syntax_error::CommandSyntaxError,
+> {
+    let coordinates = RotationArgumentType::get(context, "rotation")?;
+    if matches!(
+        &context.source.output,
+        crate::command::CommandSender::PreJoin(_)
+    ) && [Axis::X, Axis::Y]
+        .into_iter()
+        .any(|axis| coordinates.is_relative(axis))
+    {
+        context.source.entity_or_err()?;
+    }
+    Ok(coordinates.rotation(&context.source))
+}
 
 fn yaw_pitch_facing_position(
     looking_from: &Vector3<f64>,
@@ -68,32 +101,6 @@ struct TeleportDestination {
     display_name: TextComponent,
 }
 
-fn remote_destination(context: &CommandContext, argument: &str) -> Option<TeleportDestination> {
-    let selector = context.get_argument::<EntitySelector>(argument).ok()?;
-    let name = selector.player_name.as_deref()?;
-    if crate::server::cluster_presence::remote_player_in_lobby(context.server(), name) {
-        return None;
-    }
-    let (gid, entry) = crate::server::cluster_presence::remote_presence_entries(context.server())
-        .into_iter()
-        .find(|(_, entry)| entry.name.eq_ignore_ascii_case(name))?;
-    let sample = crate::server::cluster_ghost::remote_player_position(gid)?;
-    let world = context
-        .server()
-        .worlds
-        .load()
-        .iter()
-        .find(|world| crate::server::cluster_world_delta::world_id(world) == sample.world)?
-        .clone();
-    Some(TeleportDestination {
-        pos: Vector3::new(sample.pos[0], sample.pos[1], sample.pos[2]),
-        yaw: sample.yaw,
-        pitch: sample.pitch,
-        world,
-        display_name: TextComponent::text(entry.name),
-    })
-}
-
 fn destination_or_lobby_error(
     context: &CommandContext,
     argument: &str,
@@ -109,138 +116,162 @@ fn destination_or_lobby_error(
     Some(Ok(0))
 }
 
+fn submit_player_teleport(
+    context: &CommandContext,
+    gid: pumpkin_cluster::identity::GlobalPlayerId,
+    uuid: [u8; 16],
+    destination: pumpkin_cluster::player_command_control::TeleportDestination,
+) -> CommandExecutorResult {
+    let directory = crate::server::cluster_presence::all_presence_entries(context.server());
+    let target_name = directory
+        .iter()
+        .find(|(_, entry)| entry.uuid == uuid)
+        .map_or_else(
+            || uuid::Uuid::from_bytes(uuid).to_string(),
+            |(_, entry)| entry.name.clone(),
+        );
+    let feedback = match &destination {
+        pumpkin_cluster::player_command_control::TeleportDestination::Absolute {
+            position, ..
+        } => TextComponent::translate_cross(
+            translation::java::COMMANDS_TELEPORT_SUCCESS_LOCATION_SINGLE,
+            translation::bedrock::COMMANDS_TP_SUCCESS_COORDINATES,
+            [
+                TextComponent::text(target_name),
+                TextComponent::text(position[0].to_string()),
+                TextComponent::text(position[1].to_string()),
+                TextComponent::text(position[2].to_string()),
+            ],
+        ),
+        pumpkin_cluster::player_command_control::TeleportDestination::Player {
+            uuid: destination_uuid,
+            ..
+        } => {
+            let destination_name = directory
+                .iter()
+                .find(|(_, entry)| entry.uuid == *destination_uuid)
+                .map_or_else(
+                    || uuid::Uuid::from_bytes(*destination_uuid).to_string(),
+                    |(_, entry)| entry.name.clone(),
+                );
+            TextComponent::translate_cross(
+                translation::java::COMMANDS_TELEPORT_SUCCESS_ENTITY_SINGLE,
+                translation::bedrock::COMMANDS_TP_SUCCESSVICTIM,
+                [
+                    TextComponent::text(target_name),
+                    TextComponent::text(destination_name),
+                ],
+            )
+        }
+    };
+    match crate::server::cluster_player_commands::submit_with_feedback(
+        context.server(),
+        &context.source,
+        gid,
+        uuid,
+        pumpkin_cluster::player_command_control::PlayerCommandMutation::Teleport(destination),
+        Some(feedback),
+    ) {
+        Ok(_) => Ok(1),
+        Err(error) => {
+            context.source.send_error(TextComponent::text(format!(
+                "Cluster teleport unavailable: {error:?}"
+            )));
+            Ok(0)
+        }
+    }
+}
+
+fn named_identity(
+    context: &CommandContext,
+    argument: &str,
+) -> Option<(pumpkin_cluster::identity::GlobalPlayerId, [u8; 16])> {
+    let selector = context.get_argument::<EntitySelector>(argument).ok()?;
+    let directory = crate::server::cluster_presence::all_presence_entries(context.server());
+    let (gid, entry) = if let Some(name) = selector.player_name.as_deref() {
+        directory
+            .into_iter()
+            .find(|(_, entry)| entry.name.eq_ignore_ascii_case(name))?
+    } else {
+        let entity = EntityArgumentType::get_entity(context, argument).ok()?;
+        let uuid = entity.get_entity().entity_uuid;
+        directory
+            .into_iter()
+            .find(|(_, entry)| entry.uuid == *uuid.as_bytes())?
+    };
+    (!entry.in_lobby).then_some((gid, entry.uuid))
+}
+
+fn player_target_identities(
+    context: &CommandContext,
+    argument: &str,
+) -> Option<Vec<(pumpkin_cluster::identity::GlobalPlayerId, [u8; 16])>> {
+    if let Some(target) = named_identity(context, argument) {
+        return Some(vec![target]);
+    }
+    let entities = EntityArgumentType::get_entities(context, argument).ok()?;
+    let directory = crate::server::cluster_presence::all_presence_entries(context.server());
+    entities
+        .iter()
+        .map(|entity| {
+            let uuid = entity.get_entity().entity_uuid;
+            directory
+                .iter()
+                .find(|(_, entry)| !entry.in_lobby && entry.uuid == *uuid.as_bytes())
+                .map(|(gid, entry)| (*gid, entry.uuid))
+        })
+        .collect()
+}
+
 fn teleport_named_player(
     context: &CommandContext,
     argument: &str,
     pos: Vector3<f64>,
     rotation: Option<(f32, f32)>,
     world: &Arc<World>,
-    destination: Option<TextComponent>,
+    _destination: Option<TextComponent>,
 ) -> Option<CommandExecutorResult> {
     if !context.server().advanced_config.cluster.enabled {
         return None;
     }
-    let selector = context.get_argument::<EntitySelector>(argument).ok()?;
-    let name = selector.player_name.as_deref()?;
-    let target = crate::server::cluster_presence::all_presence_entries(context.server())
-        .into_iter()
-        .find(|(_, entry)| entry.name.eq_ignore_ascii_case(name))
-        .map(|(gid, entry)| (gid, entry.name, entry.in_lobby))
-        .or_else(|| {
-            let player = context.server().get_player_by_name(name)?;
-            Some((
-                player.cluster_gid()?,
-                player.gameprofile.name.clone(),
-                player.is_in_cluster_lobby(),
-            ))
-        })?;
-    let (gid, target_name, in_lobby) = target;
-    if in_lobby {
-        context.source.send_error(TextComponent::text(format!(
-            "{} is currently in the lobby, and not in the game world",
-            target_name
-        )));
-        return Some(Ok(0));
+    if let Some(result) = destination_or_lobby_error(context, argument) {
+        return Some(result);
     }
-    let (yaw, pitch) = rotation.unwrap_or_else(|| {
-        context
-            .server()
-            .get_player_by_name(&target_name)
-            .map(|player| player.rotation())
-            .or_else(|| {
-                crate::server::cluster_ghost::remote_player_position(gid)
-                    .map(|sample| (sample.yaw, sample.pitch))
-            })
-            .unwrap_or((0.0, 0.0))
-    });
-    let origin = (1_u64 << 63)
-        | context
-            .server()
-            .cluster_lobby_session_generation
-            .fetch_add(1, Ordering::Relaxed);
-    let intent = PlayerAdministrativeIntent {
-        target: gid,
-        mutation: PlayerAdministrativeMutation::Teleport {
-            world: crate::server::cluster_world_delta::world_id(world),
-            position: [pos.x, pos.y, pos.z],
-            yaw,
-            pitch,
-        },
-        origin: Some(origin),
+    let targets = player_target_identities(context, argument)?;
+    let destination = pumpkin_cluster::player_command_control::TeleportDestination::Absolute {
+        world: crate::server::cluster_world_delta::world_id(world),
+        position: [pos.x, pos.y, pos.z],
+        rotation: rotation.map(|(yaw, pitch)| [yaw, pitch]),
     };
-    let mut publications =
-        crate::server::cluster_player_admin::subscribe_player_administrative(context.server());
-    let mut failures =
-        crate::server::cluster_player_admin::subscribe_player_administrative_failures(
-            context.server(),
-        );
-    let submitted = if let Some(issuer) = context.source.output.as_pre_join() {
-        crate::server::cluster_player_admin::submit_lobby_player_administrative(
-            context.server(),
-            issuer.gid,
-            issuer.profile.id,
-            intent,
-        )
-    } else {
-        crate::server::cluster_player_admin::submit_player_administrative(context.server(), intent)
-    };
-    if submitted.is_err() {
-        context
-            .source
-            .send_error(TextComponent::text("Cluster teleport unavailable"));
-        return Some(Ok(0));
+    Some(targets.into_iter().try_fold(0, |count, (gid, uuid)| {
+        submit_player_teleport(context, gid, uuid, destination.clone()).map(|value| count + value)
+    }))
+}
+
+fn teleport_named_destination(
+    context: &CommandContext,
+    self_target: bool,
+) -> Option<CommandExecutorResult> {
+    if !context.server().advanced_config.cluster.enabled {
+        return None;
     }
-    let feedback = if let Some(destination) = destination {
-        TextComponent::translate_cross(
-            translation::java::COMMANDS_TELEPORT_SUCCESS_ENTITY_SINGLE,
-            translation::bedrock::COMMANDS_TP_SUCCESSVICTIM,
-            [TextComponent::text(target_name), destination],
-        )
+    if let Some(result) = destination_or_lobby_error(context, "destination") {
+        return Some(result);
+    }
+    let (destination_gid, destination_uuid) = named_identity(context, "destination")?;
+    let targets = if self_target {
+        let player = context.source.output.as_player()?;
+        vec![(player.cluster_gid()?, *player.gameprofile.id.as_bytes())]
     } else {
-        TextComponent::translate_cross(
-            translation::java::COMMANDS_TELEPORT_SUCCESS_LOCATION_SINGLE,
-            translation::bedrock::COMMANDS_TP_SUCCESS_COORDINATES,
-            [
-                TextComponent::text(target_name),
-                TextComponent::text(pos.x.to_string()),
-                TextComponent::text(pos.y.to_string()),
-                TextComponent::text(pos.z.to_string()),
-            ],
-        )
+        player_target_identities(context, "targets")?
     };
-    let sender = context.source.output.clone();
-    let server = context.server().clone();
-    server.spawn_task(async move {
-        let result = tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                tokio::select! {
-                    publication = publications.recv() => match publication {
-                        Ok(publication) if publication.target == gid && publication.origin == Some(origin) => {
-                            return publication.accepted;
-                        }
-                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return false,
-                    },
-                    failure = failures.recv() => match failure {
-                        Ok(failure) if failure.target == gid && failure.origin == Some(origin) => {
-                            return false;
-                        }
-                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return false,
-                    }
-                }
-            }
-        }).await;
-        match result {
-            Ok(true) => sender.send_message(feedback),
-            Ok(false) => sender.send_message(TextComponent::text("Teleport failed")),
-            Err(_) => {
-                tracing::error!(target = gid.pack_u32(), origin, "cluster teleport did not settle within 30 seconds");
-                sender.send_message(TextComponent::text("Teleport timed out"));
-            }
-        }
-    });
-    Some(Ok(1))
+    let destination = pumpkin_cluster::player_command_control::TeleportDestination::Player {
+        gid: destination_gid,
+        uuid: destination_uuid,
+    };
+    Some(targets.into_iter().try_fold(0, |count, (gid, uuid)| {
+        submit_player_teleport(context, gid, uuid, destination.clone()).map(|value| count + value)
+    }))
 }
 
 struct SelfToPosExecutor;
@@ -249,9 +280,25 @@ impl CommandExecutor for SelfToPosExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let entity = context.source.entity_or_err()?;
 
-        let pos = Vec3ArgumentType::get_coordinates(context, "location")?.resolve(&context.source);
+        let pos = resolve_position(context, "location")?;
         if !World::is_valid(BlockPos(pos.floor_to_i32())) {
             return Err(ERROR_INVALID_POSITION.create_without_context());
+        }
+
+        if context.server().advanced_config.cluster.enabled
+            && let Some(player) = context.source.output.as_player()
+            && let Some(gid) = player.cluster_gid()
+        {
+            return submit_player_teleport(
+                context,
+                gid,
+                *player.gameprofile.id.as_bytes(),
+                pumpkin_cluster::player_command_control::TeleportDestination::Absolute {
+                    world: crate::server::cluster_world_delta::world_id(context.source.world()),
+                    position: [pos.x, pos.y, pos.z],
+                    rotation: None,
+                },
+            );
         }
 
         let yaw = entity.get_entity().yaw.load();
@@ -282,6 +329,9 @@ struct SelfToEntityExecutor;
 impl CommandExecutor for SelfToEntityExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
         let entity = context.source.entity_or_err()?;
+        if let Some(result) = teleport_named_destination(context, true) {
+            return result;
+        }
 
         let destination = match EntityArgumentType::get_entity(context, "destination") {
             Ok(destination) => {
@@ -294,15 +344,12 @@ impl CommandExecutor for SelfToEntityExecutor {
                     display_name: entity.get_display_name(),
                 }
             }
-            Err(error) => match remote_destination(context, "destination") {
-                Some(destination) => destination,
-                None => {
-                    if let Some(result) = destination_or_lobby_error(context, "destination") {
-                        return result;
-                    }
-                    return Err(error);
+            Err(error) => {
+                if let Some(result) = destination_or_lobby_error(context, "destination") {
+                    return result;
                 }
-            },
+                return Err(error);
+            }
         };
         let pos = destination.pos;
 
@@ -334,6 +381,9 @@ struct EntitiesToEntityExecutor;
 
 impl CommandExecutor for EntitiesToEntityExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
+        if let Some(result) = teleport_named_destination(context, false) {
+            return result;
+        }
         let destination = match EntityArgumentType::get_entity(context, "destination") {
             Ok(destination) => {
                 let entity = destination.get_entity();
@@ -345,15 +395,12 @@ impl CommandExecutor for EntitiesToEntityExecutor {
                     display_name: entity.get_display_name(),
                 }
             }
-            Err(error) => match remote_destination(context, "destination") {
-                Some(destination) => destination,
-                None => {
-                    if let Some(result) = destination_or_lobby_error(context, "destination") {
-                        return result;
-                    }
-                    return Err(error);
+            Err(error) => {
+                if let Some(result) = destination_or_lobby_error(context, "destination") {
+                    return result;
                 }
-            },
+                return Err(error);
+            }
         };
         let pos = destination.pos;
 
@@ -405,7 +452,7 @@ struct EntitiesToPosExecutor;
 
 impl CommandExecutor for EntitiesToPosExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
-        let pos = Vec3ArgumentType::get_coordinates(context, "location")?.resolve(&context.source);
+        let pos = resolve_position(context, "location")?;
 
         if !World::is_valid(BlockPos(pos.floor_to_i32())) {
             return Err(ERROR_INVALID_POSITION.create_without_context());
@@ -449,13 +496,13 @@ struct EntitiesToPosWithRotationExecutor;
 
 impl CommandExecutor for EntitiesToPosWithRotationExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
-        let pos = Vec3ArgumentType::get_coordinates(context, "location")?.resolve(&context.source);
+        let pos = resolve_position(context, "location")?;
 
         if !World::is_valid(BlockPos(pos.floor_to_i32())) {
             return Err(ERROR_INVALID_POSITION.create_without_context());
         }
 
-        let rot = RotationArgumentType::get(context, "rotation")?.rotation(&context.source);
+        let rot = resolve_rotation(context)?;
         let yaw = rot.y;
         let pitch = rot.x;
         let world = context.source.world();
@@ -498,14 +545,13 @@ struct EntitiesToPosFacingPosExecutor;
 
 impl CommandExecutor for EntitiesToPosFacingPosExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
-        let pos = Vec3ArgumentType::get_coordinates(context, "location")?.resolve(&context.source);
+        let pos = resolve_position(context, "location")?;
 
         if !World::is_valid(BlockPos(pos.floor_to_i32())) {
             return Err(ERROR_INVALID_POSITION.create_without_context());
         }
 
-        let facing_pos =
-            Vec3ArgumentType::get_coordinates(context, "facingLocation")?.resolve(&context.source);
+        let facing_pos = resolve_position(context, "facingLocation")?;
         let world = context.source.world();
         let (named_yaw, named_pitch) = yaw_pitch_facing_position(&pos, &facing_pos);
 
@@ -560,7 +606,7 @@ struct EntitiesToPosFacingEntityExecutor {
 
 impl CommandExecutor for EntitiesToPosFacingEntityExecutor {
     fn execute(&self, context: &CommandContext) -> CommandExecutorResult {
-        let pos = Vec3ArgumentType::get_coordinates(context, "location")?.resolve(&context.source);
+        let pos = resolve_position(context, "location")?;
 
         if !World::is_valid(BlockPos(pos.floor_to_i32())) {
             return Err(ERROR_INVALID_POSITION.create_without_context());

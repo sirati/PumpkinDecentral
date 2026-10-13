@@ -59,7 +59,7 @@ mod plugins;
 mod pumpkin;
 mod raid;
 mod random;
-mod recipe;
+pub(crate) mod recipe;
 mod reload;
 mod r#return;
 mod ride;

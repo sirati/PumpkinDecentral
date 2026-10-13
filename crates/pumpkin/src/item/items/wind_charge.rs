@@ -21,6 +21,7 @@ impl ItemMetadata for WindChargeItem {
 
 const POWER: f32 = 1.5;
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for WindChargeItem {
     fn normal_use(&self, _block: &Item, player: &Player) {
         let world = player.world();

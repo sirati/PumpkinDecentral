@@ -1,5 +1,6 @@
 pub mod flowing_trait;
 pub mod lava;
+pub mod owned;
 pub mod pathfinder;
 pub mod physics;
 pub mod water;

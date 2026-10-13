@@ -901,9 +901,7 @@ pub fn is_right_distance_to_player_and_spawn_point(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(&target_chunk)
             && world
-                .worldborder
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .border_for_command()
                 .contains_block(pos.0.x, pos.0.z))
 }
 
@@ -1013,9 +1011,7 @@ pub fn is_spawn_position_ok(
     entity_type: &'static EntityType,
 ) -> bool {
     let within_bounds = world
-        .worldborder
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .border_for_command()
         .contains_block(block_pos.0.x, block_pos.0.z);
 
     match entity_type.spawn_restriction.location {
@@ -1108,7 +1104,7 @@ pub fn is_valid_empty_spawn_block(
 }
 
 #[must_use]
-fn is_valid_spawn_floor(state: &'static BlockState, entity_type: &'static EntityType) -> bool {
+pub(crate) fn is_valid_spawn_floor(state: &'static BlockState, entity_type: &'static EntityType) -> bool {
     match Block::from_state_id(state.id).spawn_floor_predicate() {
         SpawnFloorPredicate::Default => {
             state.is_side_solid(BlockDirection::Up) && state.luminance < 14

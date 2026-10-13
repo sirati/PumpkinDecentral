@@ -82,6 +82,18 @@ impl GlobalOutboundRuntime {
         })
     }
 
+    pub(crate) fn try_reserve_event(
+        &self,
+        server: &Server,
+        peers: Vec<ServerId>,
+    ) -> Option<EventReservation> {
+        let targets = Self::targets(server, peers)?;
+        Some(EventReservation {
+            permit: self.tx.clone().try_reserve_owned().ok()?,
+            route: EventRoute::Fixed(targets),
+        })
+    }
+
     pub(crate) fn acknowledge_primary_event(&self, id: [u8; 16]) -> bool {
         self.ack_tx.try_send(id).is_ok()
     }

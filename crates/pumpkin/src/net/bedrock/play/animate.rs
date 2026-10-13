@@ -6,6 +6,20 @@ impl BedrockClient {
         if !player.has_client_loaded() {
             return;
         }
+        if player.cluster_gid().is_some() {
+            if packet.action == AnimateAction::SwingArm
+                && let Some(server) = player.world().server.upgrade()
+            {
+                crate::server::cluster_remote_player_presentation::submit_cosmetic(
+                    &server,
+                    player,
+                    crate::server::cluster_remote_player_presentation::CosmeticChange::Swing(
+                        pumpkin_cluster::replica_visual::SwingArm::Main,
+                    ),
+                );
+            }
+            return;
+        }
 
         let entity = &player.get_entity();
         let world = entity.world.load();

@@ -39,6 +39,7 @@ impl NyliumBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for NyliumBlock {
     fn random_tick(&self, args: RandomTickArgs<'_>) {
         let state = args.world.get_block_state(args.position);

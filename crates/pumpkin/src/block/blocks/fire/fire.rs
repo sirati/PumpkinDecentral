@@ -57,7 +57,7 @@ impl FireBlock {
 
     pub fn get_state_for_position(
         &self,
-        world: &World,
+        world: &dyn pumpkin_world::world::BlockAccessor,
         block: &Block,
         pos: &BlockPos,
     ) -> BlockStateId {
@@ -176,6 +176,7 @@ impl FireBlock {
     }
 }
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for FireBlock {
     fn placed(&self, args: PlacedArgs<'_>) {
         if args.old_state_id == args.state_id {
@@ -211,7 +212,7 @@ impl BlockBehaviour for FireBlock {
     ) -> BlockStateId {
         if self.can_place_at(CanPlaceAtArgs {
             server: None,
-            world: Some(args.world),
+            world: None,
             block_accessor: args.world,
             block: &Block::FIRE,
             state: Block::FIRE.default_state,

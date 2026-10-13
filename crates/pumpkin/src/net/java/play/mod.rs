@@ -257,6 +257,7 @@ pub mod recipe_book_seen_recipe;
 pub mod resource_pack_response;
 pub mod seen_advancement;
 pub mod select_trade;
+pub(crate) mod session;
 pub mod set_beacon;
 pub mod set_command_block;
 pub mod set_command_minecart;

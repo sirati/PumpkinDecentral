@@ -26,6 +26,7 @@ use pumpkin_util::math::{position::BlockPos, vector2::Vector2};
 #[pumpkin_block("minecraft:chiseled_bookshelf")]
 pub struct ChiseledBookshelfBlock;
 
+#[pumpkin_macros::canonical_callback_defaults]
 impl BlockBehaviour for ChiseledBookshelfBlock {
     fn on_place(&self, args: OnPlaceArgs<'_>) -> BlockStateId {
         let mut properties = ChiseledBookshelfLikeProperties::default(args.block);

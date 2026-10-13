@@ -15,6 +15,7 @@ impl ItemMetadata for WritableBookItem {
     }
 }
 
+#[pumpkin_macros::canonical_item_defaults]
 impl ItemBehaviour for WritableBookItem {
     fn normal_use(&self, _item: &Item, player: &Player) {
         player.try_send_client_packet(&COpenBook::new(VarInt(0)));

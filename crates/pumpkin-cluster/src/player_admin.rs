@@ -81,6 +81,7 @@ pub struct PlayerAdministrativeAction {
     pub forward: PlayerAdministrativeState,
     pub undo: PlayerAdministrativeState,
     pub origin: Option<u64>,
+    pub mutation: PlayerAdministrativeMutation,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -102,6 +103,47 @@ pub enum PlayerAdministrativeMutation {
         yaw: f32,
         pitch: f32,
     },
+}
+
+impl PlayerAdministrativeMutation {
+    pub fn apply(&self, state: &mut PlayerAdministrativeState) {
+        match self {
+            Self::Reset {
+                health,
+                absorption,
+                food,
+                saturation,
+                gamemode,
+                clear_effects,
+                velocity,
+                fall_distance,
+                on_fire,
+            } => {
+                state.health = *health;
+                state.absorption = *absorption;
+                state.food = *food;
+                state.saturation = *saturation;
+                state.gamemode = *gamemode;
+                if *clear_effects {
+                    state.effects.clear();
+                }
+                state.velocity = *velocity;
+                state.fall_distance = *fall_distance;
+                state.on_fire = *on_fire;
+            }
+            Self::Teleport {
+                world,
+                position,
+                yaw,
+                pitch,
+            } => {
+                state.world = *world;
+                state.position = *position;
+                state.yaw = *yaw;
+                state.pitch = *pitch;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -135,42 +177,7 @@ pub fn capture_action(
         return None;
     }
     let mut forward = expected.clone();
-    match mutation {
-        PlayerAdministrativeMutation::Reset {
-            health,
-            absorption,
-            food,
-            saturation,
-            gamemode,
-            clear_effects,
-            velocity,
-            fall_distance,
-            on_fire,
-        } => {
-            forward.health = *health;
-            forward.absorption = *absorption;
-            forward.food = *food;
-            forward.saturation = *saturation;
-            forward.gamemode = *gamemode;
-            if *clear_effects {
-                forward.effects.clear();
-            }
-            forward.velocity = *velocity;
-            forward.fall_distance = *fall_distance;
-            forward.on_fire = *on_fire;
-        }
-        PlayerAdministrativeMutation::Teleport {
-            world,
-            position,
-            yaw,
-            pitch,
-        } => {
-            forward.world = *world;
-            forward.position = *position;
-            forward.yaw = *yaw;
-            forward.pitch = *pitch;
-        }
-    }
+    mutation.apply(&mut forward);
     Some(PlayerAdministrativeAction {
         target,
         seq,
@@ -180,6 +187,7 @@ pub fn capture_action(
         forward,
         undo: expected,
         origin,
+        mutation: mutation.clone(),
     })
 }
 
