@@ -362,8 +362,6 @@ pub(super) fn capture_block_inventory_root<S: pumpkin_cluster::canonical_action:
     chunk: pumpkin_cluster::protocol::ChunkKey, position: pumpkin_cluster::protocol::BlockPos)
     -> Result<pumpkin_cluster::canonical_block_inventory_tick::BlockInventoryTickRoot, ApplyFailure> {
     use pumpkin_cluster::canonical_action::{Cell, ChunkPart, Target, TruthView, Value};
-    use pumpkin_cluster::canonical_inventory::InventorySlotBinding;
-    use pumpkin_cluster::inventory::{InventorySlotRef, InventoryTarget};
     let block = Target::Chunk { key: chunk, part: ChunkPart::Block(position), inventory: None };
     let Some(Cell { value: Value::Block(state), .. }) = view.read(TruthView::Local, block) else { return Err(ApplyFailure::Condition(block)); };
     let entity_target = Target::Chunk { key: chunk, part: ChunkPart::BlockEntity(position), inventory: None };
